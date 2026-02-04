@@ -33,17 +33,19 @@ Jan_30_comparison/
 
 ## How to Build and Run
 
-### C++ Standalone
+### Run Order: R first, then C++
+
+**R must run first** because it generates bypass files (random vectors, QR transform) that C++ reads.
+
 ```bash
+# Step 1: Run R (generates bypass files in output/bypass/)
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison
+~/.pixi/bin/pixi run --manifest-path=code_copy/SAIGE_isolated/pixi.toml Rscript test_sparse_grm.R 2>&1 | tee /tmp/r_output.txt
+
+# Step 2: Build and run C++ (reads bypass files)
 cd code_copy/cpp_standalone
 make clean && make
 ./saige-null -c config_test.yaml 2>&1 | tee /tmp/cpp_output.txt
-```
-
-### R SAIGE
-```bash
-cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison
-~/.pixi/bin/pixi run --manifest-path=code_copy/SAIGE_isolated/pixi.toml Rscript test_sparse_grm.R 2>&1 | tee /tmp/r_output.txt
 ```
 
 ### Rebuild R Package
@@ -60,15 +62,20 @@ cd code_copy/SAIGE_isolated
 - **Impact if disabled:** ~6.4% tau difference (0.2901 vs 0.3087). This is expected -- even different seeds within R would produce similar variation, since trace estimation is stochastic with only 30 vectors.
 - R generates this file when run first; C++ reads it at startup in `GetTrace()`.
 
-### Disabled: QR Transform
-- **Files:** `output/bypass/R_qr_X1_transformed.csv.disabled`, `R_qr_qrr.csv.disabled`
-- **Reason:** R and C++ QR decompositions differ slightly (sign conventions, column ordering), but the back-transformed coefficients and final tau converge to nearly identical values.
-- **Impact when disabled:** ~2e-5 tau difference (negligible). C++ uses its own Eigen QR decomposition.
-- **Status:** Disabled as of Feb 3, 2025. Can be re-enabled by removing `.disabled` suffix.
+### Active: QR Transform
+- **Files:** `output/bypass/R_qr_X1_transformed.csv`, `R_qr_qrr.csv`
+- **Reason:** R and C++ QR decompositions differ slightly (sign conventions, column ordering).
+- **Toggle:** Local `bool use_r_qr_bypass = true;` in `null_model_engine.cpp` (~line 361). Set to `false` to use C++ Eigen QR instead.
+- **Impact when disabled:** ~2e-5 tau difference (negligible).
+- R generates these files when run first; C++ loads them if `use_r_qr_bypass = true` and files exist.
 
 ## Critical Configuration
 
-The R test script **must** use `usePCGwithSparseGRM = TRUE` so R uses the PCG solver (matching C++). Without this, R uses a direct sparse solve that produces slightly different intermediate values.
+C++ now supports both solver paths matching R's `getPCG1ofSigmaAndVector`:
+- `use_pcg_with_sparse_grm: false` (default) → direct sparse solve via `gen_spsolve_v4()` (matches R default `usePCGwithSparseGRM=FALSE`)
+- `use_pcg_with_sparse_grm: true` → PCG iterative solver
+
+Both R and C++ now default to the direct sparse solve. The R test script uses `usePCGwithSparseGRM = FALSE`.
 
 ## Current Status: VALUES MATCH (random vector bypass only)
 
@@ -92,6 +99,37 @@ The ~6.4% difference without random vector bypass is expected and acceptable: Mo
 - **Problem:** Line `eta = (p > 0) ? (X * alpha + offset) : offset;` overwrote correct eta from getCoefficients
 - **Why wrong:** In mixed models, `eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / W`, not simply `X * alpha`
 - **Fix:** Removed the line
+
+## Quantitative Trait Support (Feb 4, 2025)
+
+Ported binary trait C++ code to support quantitative traits. See `code_copy/cpp_standalone/quantitative_conversion.txt` for full details.
+
+**Status:** COMPLETE — Values match R.
+
+| Metric | R | C++ (with bypass) | Difference |
+|--------|---|-------------------|-----------|
+| tau[0] | 0.210876 | 0.210876 | ~0 (float32 precision) |
+| tau[1] | 0.474525 | 0.474526 | ~1e-6 |
+| Iterations | 5 | 5 | Match |
+
+**Key difference from binary:** Quantitative estimates 2 variance components (tau[0], tau[1] both free) vs binary (tau[0]=1 fixed). This means 2x2 AI matrix, 2 traces, 2 scores — but same algorithm. Initial tau is [1, 0] (not [0.5, 0.5]).
+
+**Changes made:**
+1. `GetTrace_q` — replaced Rcpp RNG with rademacher_vec + bypass loading (seed0)
+2. `quant_glmm_solver` — full rewrite from binary_glmm_solver with 2D adaptations (inner IRLS, conservative first iteration, step halving, convergence after iter 1)
+3. `getAIScore_q_cpp` — already structurally correct, added debug output
+4. R's `GetTrace_q` (in SAIGE_isolated/src/) — added bypass file saving (random_vectors_seed0.csv)
+
+### Bypass: Random Vectors (Quantitative)
+- **File:** `output/bypass/random_vectors_seed0.csv` (30 vectors, N x 30 matrix)
+- **Reason:** Same as binary — R and C++ RNG algorithms are incompatible
+- R generates this file when run first; C++ reads it at startup in `GetTrace_q()`
+
+**Test data:** `pheno_1000samples.txt_withdosages_withBothTraitTypes.txt` has `y_quantitative` column.
+
+### hasCovariate QR Gating (Feb 4, 2025)
+
+Added `hasCovariate` logic to `null_model_engine.cpp` to match R's QR transform gating. Binary trait with exactly 1 non-intercept covariate now correctly skips QR (matching R). Verified across 3 covariate configs: x1+x2, x1 only, none — all tau values match R.
 
 ## Rules for AI Agents
 

@@ -353,33 +353,67 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
   Eigen::MatrixXd r_qrr_matrix;
   bool using_r_bypass = false;
 
-  if (cfg_.covariate_qr && design_in.p > 0) {
+  // --- Determine hasCovariate (match R's logic in SAIGE_fitGLMM_fast.R lines 1485-1617) ---
+  // design_in.p includes the intercept column, so non-intercept covariate count = p - 1
+  int n_covariates = design_in.p - 1;
+  bool hasCovariate;
+  if (n_covariates <= 0) {
+    hasCovariate = false;
+  } else if (cfg_.trait == "binary" && n_covariates == 1) {
+    // R special case: binary trait with exactly 1 covariate -> skip QR
+    hasCovariate = false;
+  } else {
+    hasCovariate = true;
+  }
 
-    // === Check if R bypass files exist ===
-    if (bypass_files_exist()) {
-      std::cout << "\n========================================" << std::endl;
-      std::cout << "[R BYPASS] Using R's QR transformation values!" << std::endl;
-      std::cout << "========================================\n" << std::endl;
-      
-      // Load R's pre-computed QR-transformed X
-      X = load_r_qr_x1_transformed(design_in.n);
-      
-      // Load R's QRR matrix for back-transformation
-      r_qrr_matrix = load_r_qrr();
-      
-      // Set up minimal QRMap for bypass mode
-      qrmap.rank = static_cast<int>(X.cols());
-      qrmap.R = r_qrr_matrix;  // Store R's qrr for back-transform
-      qrmap.valid = true;
-      // R's transformed X is Q*sqrt(N), so back-transform needs sqrt(N) multiplication
-      qrmap.scaled_sqrt_n = true;
-      // R doesn't use column pivoting, so P is identity
-      qrmap.P.setIdentity(p_orig);
-      using_r_bypass = true;
-      
-      std::cout << "[R BYPASS] X dimensions: " << X.rows() << " x " << X.cols() << std::endl;
-      std::cout << "[R BYPASS] QRR dimensions: " << r_qrr_matrix.rows() << " x " << r_qrr_matrix.cols() << std::endl;
-    } else {
+  if (!hasCovariate) {
+    std::cout << "[QR] hasCovariate=false (trait=" << cfg_.trait
+              << ", n_covariates=" << n_covariates
+              << ") — skipping QR transform (matches R behavior)\n";
+  }
+
+  if (cfg_.covariate_qr && hasCovariate) {
+
+    // === QR bypass: load R's QR-transformed X instead of using Eigen QR ===
+    // Toggle this to true/false to enable/disable the R QR bypass
+    bool use_r_qr_bypass = true;
+
+    if (use_r_qr_bypass && bypass_files_exist()) {
+      // Tentatively load to check column count matches current design
+      auto X_bypass = load_r_qr_x1_transformed(design_in.n);
+      auto qrr_bypass = load_r_qrr();
+
+      if (static_cast<int>(X_bypass.cols()) != p_orig) {
+        // Stale bypass files from a different covariate config — skip
+        std::cout << "[R BYPASS] Column mismatch: bypass has " << X_bypass.cols()
+                  << " cols but design has " << p_orig << " — falling back to C++ QR\n";
+        use_r_qr_bypass = false;
+      }
+
+      if (use_r_qr_bypass) {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "[R BYPASS] Using R's QR transformation values!" << std::endl;
+        std::cout << "========================================\n" << std::endl;
+
+        X = X_bypass;
+        r_qrr_matrix = qrr_bypass;
+
+        // Set up minimal QRMap for bypass mode
+        qrmap.rank = static_cast<int>(X.cols());
+        qrmap.R = r_qrr_matrix;  // Store R's qrr for back-transform
+        qrmap.valid = true;
+        // R's transformed X is Q*sqrt(N), so back-transform needs sqrt(N) multiplication
+        qrmap.scaled_sqrt_n = true;
+        // R doesn't use column pivoting, so P is identity
+        qrmap.P.setIdentity(p_orig);
+        using_r_bypass = true;
+
+        std::cout << "[R BYPASS] X dimensions: " << X.rows() << " x " << X.cols() << std::endl;
+        std::cout << "[R BYPASS] QRR dimensions: " << r_qrr_matrix.rows() << " x " << r_qrr_matrix.cols() << std::endl;
+      }
+    }
+
+    if (!use_r_qr_bypass) {
       // Use C++ Eigen's QR decomposition
       std::cout << "[C++ QR] R bypass files not found, using Eigen QR decomposition" << std::endl;
       X = qr_transform(X, qrmap, design_in.n); // X becomes orthonormal columns (rank cols)

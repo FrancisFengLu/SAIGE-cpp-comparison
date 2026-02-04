@@ -5906,6 +5906,9 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
         arma::fvec Au;
         arma::fvec uVec;
 
+        // Storage for random vectors to save for C++ bypass
+        std::vector<arma::fvec> allUVecs;
+
         int nrunStart = 0;
         int nrunEnd = nrun;
         float traceCV = traceCVcutoff + 0.1;
@@ -5920,6 +5923,10 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
     		uVec0 = nb(Nnomissing);
     		uVec = as<arma::fvec>(uVec0);
     		uVec = uVec*2 - 1;
+
+    		// Save this vector for bypass output
+    		allUVecs.push_back(uVec);
+
   //  		arma::fvec Sigma_iu;
     		Sigma_iu = getPCG1ofSigmaAndVector(wVec, tauVec, uVec, maxiterPCG, tolPCG);
   //  		arma::fcolvec Pu;
@@ -5935,19 +5942,46 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
   	}
 	traceCV = calCV(tempVec);
 	traceCV0 = calCV(tempVec0);
-	
+
 	if((traceCV > traceCVcutoff) | (traceCV0 > traceCVcutoff)){
           nrunStart = nrunEnd;
           nrunEnd = nrunEnd + 10;
           tempVec.resize(nrunEnd);
           tempVec0.resize(nrunEnd);
 
-	  //std::cout << "arma::mean(tempVec0): " << arma::mean(tempVec0) << std::endl;	
+	  //std::cout << "arma::mean(tempVec0): " << arma::mean(tempVec0) << std::endl;
           cout << "CV for trace random estimator using "<< nrunStart << " runs is " << traceCV <<  "(> " << traceCVcutoff << endl;
           cout << "try " << nrunEnd << "runs" << endl;
         }
 
-    }   
+    }
+
+  // Save random vectors to bypass file for C++ to read
+  std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed0.csv";
+  std::ofstream outfile(bypass_path);
+  if (outfile.is_open()) {
+    cout << "=== SAVING RANDOM VECTORS (GetTrace_q) FOR C++ BYPASS ===" << endl;
+    cout << "Saving " << allUVecs.size() << " random vectors to: " << bypass_path << endl;
+    // Write header
+    outfile << "vector_id";
+    for (int j = 0; j < Nnomissing; j++) {
+      outfile << ",sample_" << j;
+    }
+    outfile << "\n";
+    // Write each vector as a row
+    for (size_t i = 0; i < allUVecs.size(); i++) {
+      outfile << i;
+      for (size_t j = 0; j < allUVecs[i].n_elem; j++) {
+        outfile << "," << allUVecs[i](j);
+      }
+      outfile << "\n";
+    }
+    outfile.close();
+    cout << "SUCCESS: Random vectors saved" << endl;
+    cout << "===========================================" << endl;
+  } else {
+    cerr << "WARNING: Could not open " << bypass_path << " for writing" << endl;
+  }
 
   	arma::fvec traVec(2);
   	traVec(1) = arma::mean(tempVec);

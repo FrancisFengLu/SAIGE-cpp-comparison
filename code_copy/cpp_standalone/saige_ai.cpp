@@ -38,22 +38,30 @@ CoefficientsOut getCoefficients_cpp(const arma::fvec& Y,
   std::cout << "tauVec: [" << tau(0) << ", " << tau(1) << "]" << std::endl;
   std::cout << "Yvec[0:5]: " << Y(0) << " " << Y(1) << " " << Y(2) << " " << Y(3) << " " << Y(4) << std::endl;
   std::cout << "wVec[0:5]: " << w(0) << " " << w(1) << " " << w(2) << " " << w(3) << " " << w(4) << std::endl;
-  std::cout << "============================================" << std::endl; 
+  std::cout << "============================================" << std::endl;
+  std::cout << std::flush;
   // Sigma^{-1}Y and Sigma^{-1}X via PCG
-  arma::fvec Sigma_iY = getPCG1ofSigmaAndVector(w, tau, Y, maxiterPCG, tolPCG);                // :contentReference[oaicite:0]{index=0}
+  std::cout << "[DEBUG] About to call getPCG1ofSigmaAndVector for Y..." << std::endl << std::flush;
+  arma::fvec Sigma_iY = getPCG1ofSigmaAndVector(w, tau, Y, maxiterPCG, tolPCG);
+  std::cout << "[DEBUG] getPCG1ofSigmaAndVector for Y done" << std::endl << std::flush;                // :contentReference[oaicite:0]{index=0}
   arma::fmat Sigma_iX(Y.n_rows, X.n_cols);
   for (int j = 0; j < static_cast<int>(X.n_cols); ++j) {
-    Sigma_iX.col(j) = getPCG1ofSigmaAndVector(w, tau, X.col(j), maxiterPCG, tolPCG);           // :contentReference[oaicite:1]{index=1}
+    std::cout << "[DEBUG] getPCG for X col " << j << "..." << std::endl << std::flush;
+    Sigma_iX.col(j) = getPCG1ofSigmaAndVector(w, tau, X.col(j), maxiterPCG, tolPCG);
   }
+  std::cout << "[DEBUG] All Sigma_iX done" << std::endl << std::flush;
 
   // cov = (X' Σ^{-1} X)^{-1} with PSD fallback
-  arma::fmat cov = inv_psd_or_pinv(X.t() * Sigma_iX);                                          // :contentReference[oaicite:2]{index=2}
+  arma::fmat cov = inv_psd_or_pinv(X.t() * Sigma_iX);
+  std::cout << "[DEBUG] cov done" << std::endl << std::flush;
 
   // alpha = cov * X' Σ^{-1} Y
-  arma::fvec alpha = cov * (Sigma_iX.t() * Y);                                                 // :contentReference[oaicite:3]{index=3}
+  arma::fvec alpha = cov * (Sigma_iX.t() * Y);
+  std::cout << "[DEBUG] alpha done" << std::endl << std::flush;
 
   // eta = Y - τ0 * (Σ^{-1}Y - Σ^{-1}X α) ./ w
-  arma::fvec eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / w;                             // :contentReference[oaicite:4]{index=4}
+  arma::fvec eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / w;
+  std::cout << "[DEBUG] eta done, returning from getCoefficients_cpp" << std::endl << std::flush;
 
   return {Sigma_iY, Sigma_iX, cov, alpha, eta};
 }
@@ -141,13 +149,17 @@ AIScoreQOut getAIScore_q_cpp(const arma::fvec& Y,
   arma::fmat Xmatt     = X.t();
   arma::fmat cov1      = inv_psd_or_pinv(Xmatt * Sigma_iX);                                      // :contentReference[oaicite:12]{index=12}
 
-  arma::fvec PY    = Sigma_iY - Sigma_iX * (cov1 * (Sigma_iXt * Y));                              // :contentReference[oaicite:13]{index=13}
+  arma::fvec PY    = Sigma_iY - Sigma_iX * (cov1 * (Sigma_iXt * Y));
+  std::cout << "[DEBUG-Q] PY computed, |PY|=" << arma::norm(PY) << std::endl << std::flush;
   arma::fvec APY   = getCrossprodMatAndKin(PY);
-  float YPAPY      = arma::dot(PY, APY);                                                          // :contentReference[oaicite:14]{index=14}
-  arma::fvec A0PY  = PY;                                                                          // quantitative “A0” path
-  float YPA0PY     = arma::dot(PY, A0PY);                                                         // :contentReference[oaicite:15]{index=15}
+  std::cout << "[DEBUG-Q] APY computed, |APY|=" << arma::norm(APY) << std::endl << std::flush;
+  float YPAPY      = arma::dot(PY, APY);
+  arma::fvec A0PY  = PY;
+  float YPA0PY     = arma::dot(PY, A0PY);
 
-  arma::fvec Trace = GetTrace_q(Sigma_iX, X, w, tau, cov1, nrun, maxiterPCG, tolPCG, traceCVcutoff); // :contentReference[oaicite:16]{index=16}
+  std::cout << "[DEBUG-Q] About to call GetTrace_q..." << std::endl << std::flush;
+  arma::fvec Trace = GetTrace_q(Sigma_iX, X, w, tau, cov1, nrun, maxiterPCG, tolPCG, traceCVcutoff);
+  std::cout << "[DEBUG-Q] GetTrace_q done" << std::endl << std::flush;
 
   arma::fvec PA0PY_1 = getPCG1ofSigmaAndVector(w, tau, A0PY, maxiterPCG, tolPCG);
   arma::fvec PA0PY   = PA0PY_1 - Sigma_iX * (cov1 * (Sigma_iXt * PA0PY_1));

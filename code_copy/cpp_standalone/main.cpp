@@ -224,6 +224,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("vr_min_mac")) c.vr_min_mac = get("vr_min_mac").as<int>();
   if (get("vr_max_mac")) c.vr_max_mac = get("vr_max_mac").as<int>();
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
+  if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
   return c;
 }
 
@@ -1165,6 +1166,9 @@ int main(int argc, char** argv) {
     if (!get_isUseSparseSigmaforModelFitting()) {
       throw std::runtime_error("Sparse GRM enabled, but sparse-Sigma flag is off; aborting.");
     }
+    setisUsePCGwithSparseSigma(cfg.use_pcg_with_sparse_grm);
+    std::cout << "[sparse] use_pcg_with_sparse_grm=" << (cfg.use_pcg_with_sparse_grm ? "true" : "false")
+              << (cfg.use_pcg_with_sparse_grm ? " (PCG solver)" : " (direct sparse solve, R default)") << "\n";
   }
 
   // Early exit: construct-only

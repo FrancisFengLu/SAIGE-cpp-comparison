@@ -1,0 +1,6 @@
+*.o
+*.d
+*.o.tmp
+*.bak
+.DS_Store
+saige-null

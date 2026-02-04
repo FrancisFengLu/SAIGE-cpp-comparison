@@ -4045,6 +4045,16 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& wVec,
     if (wVec.n_elem != n) throw std::invalid_argument("PCG: wVec.len != bVec.len");
     if (tauVec.n_elem < 2) throw std::invalid_argument("PCG: tauVec must have >=2 elems");
 
+    // Direct sparse solve path (R default when usePCGwithSparseGRM=FALSE)
+    // Matches R's getPCG1ofSigmaAndVector path 2:
+    //   if (isUseSparseSigmaforModelFitting && !isUsePCGwithSparseSigma) → direct solve
+    if (isUseSparseSigmaforModelFitting && !isUsePCGwithSparseSigma) {
+        arma::fvec w   = wVec;
+        arma::fvec tau = tauVec;
+        arma::fvec b   = bVec;
+        return gen_spsolve_v4(w, tau, b);
+    }
+
     // make non-const copies to satisfy legacy APIs
     arma::fvec w  = wVec;
     arma::fvec tau = tauVec;
@@ -6335,69 +6345,102 @@ arma::fvec  getSigma_G_Surv_new_LOCO(arma::fvec& wVec, arma::fvec& tauVec,arma::
 
 //This function needs the function getPCG1ofSigmaAndVector and function getCrossprodMatAndKin
 
-arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, arma::fvec& tauVec, arma::fmat& cov1,  int nrun, int maxiterPCG, float tolPCG, float traceCVcutoff){
-  	set_seed(200);
-  	arma::fmat Sigma_iXt = Sigma_iX.t();
-  	int Nnomissing = geno.getNnomissing();
-  	arma::fvec tempVec(nrun);
-  	tempVec.zeros();
-  	arma::fvec tempVec0(nrun);
-  	tempVec0.zeros();
+arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, arma::fvec& tauVec, arma::fmat& cov1, int nrun, int maxiterPCG, float tolPCG, float traceCVcutoff){
+  std::cout << "=== Entering GetTrace_q ===" << std::endl << std::flush;
 
-        arma::fvec Sigma_iu;
-        arma::fcolvec Pu;
-        arma::fvec Au;
-        arma::fvec uVec;
+  // Load precomputed vectors from R if file exists (quantitative trait version)
+  static bool load_attempted_q = false;
+  if (!load_attempted_q) {
+    load_attempted_q = true;
+    std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed0.csv";
+    std::cout << "=== RANDOM VECTOR BYPASS CHECK (GetTrace_q) ===" << std::endl;
+    std::cout << "Looking for: " << bypass_path << std::endl;
 
-        int nrunStart = 0;
-        int nrunEnd = nrun;
-        float traceCV = traceCVcutoff + 0.1;
-        float traceCV0 = traceCVcutoff + 0.1;
+    // Check if file exists
+    std::ifstream test_file(bypass_path);
+    if (test_file.good()) {
+      test_file.close();
+      std::cout << "FILE EXISTS - attempting to load..." << std::endl;
+      load_vectors_from_csv(bypass_path);
+      if (use_preloaded_vectors) {
+        std::cout << "SUCCESS: Loaded " << preloaded_vectors.size() << " random vectors from R bypass file (seed0)" << std::endl;
+      } else {
+        std::cout << "FAILED: Could not parse random vectors from file" << std::endl;
+      }
+    } else {
+      std::cout << "FILE NOT FOUND - will use C++ random generation" << std::endl;
+      std::cout << "To enable bypass: Run R version first to generate this file" << std::endl;
+    }
+    std::cout << "================================================" << std::endl;
+  }
+  // Reset vector index on each GetTrace_q call (mimics R's set.seed(0) behavior)
+  preloaded_vector_idx = 0;
 
-        while((traceCV > traceCVcutoff) | (traceCV0 > traceCVcutoff)){
+  const int n = Sigma_iX.n_rows;
+  arma::fmat Sigma_iXt = Sigma_iX.t();
 
+  int nrunStart = 0;
+  int nrunEnd = std::max(1, nrun);
+  float traceCV  = traceCVcutoff + 0.1f;
+  float traceCV0 = traceCVcutoff + 0.1f;
 
-  	for(int i = nrunStart; i < nrunEnd; i++){
+  arma::fvec tempVec(nrunEnd, arma::fill::zeros);
+  arma::fvec tempVec0(nrunEnd, arma::fill::zeros);
 
-    		Rcpp::NumericVector uVec0;
-    		uVec0 = nb(Nnomissing);
-    		uVec = as<arma::fvec>(uVec0);
-    		uVec = uVec*2 - 1;
-  //  		arma::fvec Sigma_iu;
-    		Sigma_iu = getPCG1ofSigmaAndVector(wVec, tauVec, uVec, maxiterPCG, tolPCG);
-  //  		arma::fcolvec Pu;
-    		Pu = Sigma_iu - Sigma_iX * (cov1 *  (Sigma_iXt * uVec));
-  //  		arma::fvec Au;
-    		Au = getCrossprodMatAndKin(uVec);
-    		tempVec(i) = dot(Au, Pu);
-    		tempVec0(i) = dot(uVec, Pu);
-                Au.clear();
-      		Pu.clear();
-      		Sigma_iu.clear();
-      		uVec.clear();
-  	}
-	traceCV = calCV(tempVec);
-	traceCV0 = calCV(tempVec0);
-	
-	if((traceCV > traceCVcutoff) | (traceCV0 > traceCVcutoff)){
-          nrunStart = nrunEnd;
-          nrunEnd = nrunEnd + 10;
-          tempVec.resize(nrunEnd);
-          tempVec0.resize(nrunEnd);
+  while ((traceCV > traceCVcutoff) || (traceCV0 > traceCVcutoff)) {
+    if ((int)tempVec.n_rows < nrunEnd) {
+      const int old = tempVec.n_rows;
+      tempVec.resize(nrunEnd);
+      tempVec.rows(old, nrunEnd - 1).zeros();
+      tempVec0.resize(nrunEnd);
+      tempVec0.rows(old, nrunEnd - 1).zeros();
+    }
 
-	  //std::cout << "arma::mean(tempVec0): " << arma::mean(tempVec0) << std::endl;	
-          cout << "CV for trace random estimator using "<< nrunStart << " runs is " << traceCV <<  "(> " << traceCVcutoff << endl;
-          cout << "try " << nrunEnd << "runs" << endl;
-        }
+    for (int i = nrunStart; i < nrunEnd; ++i) {
+      arma::fvec uVec = rademacher_vec(n);
 
-    }   
+      arma::fvec Sigma_iu = getPCG1ofSigmaAndVector(wVec, tauVec, uVec, maxiterPCG, tolPCG);
+      arma::fvec Pu = Sigma_iu - Sigma_iX * (cov1 * (Sigma_iXt * uVec));
+      arma::fvec Au = getCrossprodMatAndKin(uVec);
 
-  	arma::fvec traVec(2);
-  	traVec(1) = arma::mean(tempVec);
-  	traVec(0) = arma::mean(tempVec0);
-	tempVec.clear();
-	tempVec0.clear();
-  	return(traVec);
+      tempVec(i)  = arma::dot(Au, Pu);   // trace for kinship component (tau[1])
+      tempVec0(i) = arma::dot(uVec, Pu); // trace for identity component (tau[0])
+
+      Au.reset(); Pu.reset(); Sigma_iu.reset(); uVec.reset();
+    }
+
+    // Compute CV for both trace estimators
+    {
+      const arma::fvec slice = tempVec.rows(0, nrunEnd - 1);
+      const double mu = arma::mean(slice);
+      const double sd = arma::stddev(slice);
+      traceCV = (mu != 0.0) ? static_cast<float>((sd / std::abs(mu)) / nrunEnd)
+                             : std::numeric_limits<float>::infinity();
+    }
+    {
+      const arma::fvec slice0 = tempVec0.rows(0, nrunEnd - 1);
+      const double mu0 = arma::mean(slice0);
+      const double sd0 = arma::stddev(slice0);
+      traceCV0 = (mu0 != 0.0) ? static_cast<float>((sd0 / std::abs(mu0)) / nrunEnd)
+                               : std::numeric_limits<float>::infinity();
+    }
+
+    if ((traceCV > traceCVcutoff) || (traceCV0 > traceCVcutoff)) {
+      std::cout << "CV for trace random estimator using " << nrunEnd
+                << " runs is " << traceCV << " / " << traceCV0
+                << " (> " << traceCVcutoff << ")" << std::endl;
+      nrunStart = nrunEnd;
+      nrunEnd += 10;
+      std::cout << "try " << nrunEnd << " runs" << std::endl;
+    }
+  }
+
+  arma::fvec traVec(2);
+  traVec(1) = arma::mean(tempVec.rows(0, nrunEnd - 1));
+  traVec(0) = arma::mean(tempVec0.rows(0, nrunEnd - 1));
+  std::cout << "GetTrace_q: Trace[0] (identity) = " << traVec(0)
+            << ", Trace[1] (kinship) = " << traVec(1) << std::endl;
+  return traVec;
 }
 
 //Rcpp::List getAIScore_q(arma::fvec& Yvec, arma::fmat& Xmat, arma::fvec& wVec,  arma::fvec& tauVec, int nrun, int maxiterPCG, float tolPCG, float traceCVcutoff){

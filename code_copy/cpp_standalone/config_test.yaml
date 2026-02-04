@@ -15,7 +15,7 @@ design:
     - x2
 
 fit:
-  trait: binary
+  trait: quantitative
   loco: false
   nthreads: 1
   maxiter: 20
@@ -24,5 +24,6 @@ fit:
   maxiterPCG: 500
   nrun: 30
   num_markers_for_vr: 30
-  use_sparse_grm_to_fit: true
+  use_sparse_grm_to_fit: true  # false = dense GRM (PCG with full kinship), true = sparse GRM
+  use_pcg_with_sparse_grm: false  # false = direct solve (R default), true = PCG (only relevant when sparse)
   relatedness_cutoff: 0.125

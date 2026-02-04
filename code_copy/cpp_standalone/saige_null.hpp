@@ -30,6 +30,7 @@ struct FitNullConfig {
   bool include_nonauto_for_vr{false};
   bool isDiagofKinSetAsOne{true};
   bool make_sparse_grm_only{false};  // NEW
+  bool use_pcg_with_sparse_grm{false};  // false = direct solve (R default), true = PCG
 
   // Convergence / runtime
   double tol{0.02};

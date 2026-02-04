@@ -1,0 +1,93 @@
+# Quantitative Trait Conversion: Porting Binary C++ Code to Quantitative
+
+## Background
+
+The C++ standalone SAIGE binary trait path was debugged and validated against R.
+The quantitative path was left as raw Rcpp code and crashes standalone (segfault).
+R's binary vs quantitative implementations are largely identical with small math differences.
+
+## Key Difference: Binary vs Quantitative in R
+
+Binary: 1 variance component to estimate (tau[1]; tau[0]=1 fixed)
+Quantitative: 2 variance components to estimate (tau[0] and tau[1] both free)
+
+This affects:
+- GetTrace returns scalar (binary) vs 2-element vector (quantitative)
+- getAIScore returns scalar AI (binary) vs 2x2 AI matrix (quantitative)
+- Tau update uses scalar division (binary) vs 2x2 solve (quantitative)
+- W = mu*(1-mu) for binary, W = 1 for quantitative (from GLM family)
+
+Everything else is the SAME: getCoefficients, inner IRLS, PCG, step halving, convergence.
+
+## Changes Made
+
+### 1. GetTrace_q (SAIGE_step1_fast.cpp)
+- BEFORE: Used Rcpp::NumericVector, nb(), as<>, set_seed(0) -- crashes standalone
+- AFTER: Ported from working GetTrace -- uses rademacher_vec(), bypass loading
+- Returns 2-element arma::fvec: traVec(0)=mean(tempVec0), traVec(1)=mean(tempVec)
+- Tracks BOTH traceCV and traceCV0 for convergence (binary only tracks one)
+- R uses set_seed(0) for quantitative (vs set_seed(10) for binary)
+
+### 2. quant_glmm_solver (glmm.cpp)
+- BEFORE: Minimal implementation, no inner IRLS, no conservative update, no debug output
+- AFTER: Ported from binary_glmm_solver with these adaptations:
+  a) irls_gaussian_build instead of irls_binary_build (W=1, identity link)
+  b) getAIScore_q_cpp instead of getAIScore_cpp (returns 2x2 AI, 2 scores)
+  c) 2x2 AI solve: delta = solve(AI, scores) instead of Dtau = score/AI
+  d) Update BOTH tau[0] and tau[1] (binary only updates tau[1])
+  e) Step halving checks both components < 0
+  f) First-iteration conservative update adapted for 2 components
+  g) Convergence check after iteration 1 (not iteration 0)
+  h) Inner IRLS loop with alpha convergence
+  i) Debug output matching binary format for comparison
+  j) Checkpoint saving for comparison with R
+
+### 3. getAIScore_q_cpp (saige_ai.cpp)
+- Already structurally correct (2x2 AI, 2 scores)
+- Only needed GetTrace_q fix to stop crashing
+- Added debug output matching getAIScore_cpp format
+
+## Files Modified
+
+| File | Function | Change |
+|------|----------|--------|
+| SAIGE_step1_fast.cpp (standalone) | GetTrace_q | Replace Rcpp with rademacher_vec + bypass loading (seed0) |
+| glmm.cpp | quant_glmm_solver | Full rewrite from binary_glmm_solver with 2D adaptations |
+| saige_ai.cpp | getAIScore_q_cpp | Add debug output |
+| SAIGE_isolated/src/SAIGE_fitGLMM_fast.cpp | GetTrace_q | Add bypass file saving (random_vectors_seed0.csv) |
+
+## Resolved Questions
+
+- [x] R uses set_seed(0) for quantitative random vectors (confirmed, binary uses seed 10)
+- [x] R's first-iteration conservative update: YES, same pattern for both binary and quantitative
+      tau[i] = max(0, tau[i] + tau[i]^2 * score[i] / n)
+- [x] Generated R bypass files: random_vectors_seed0.csv (30 vectors)
+      Added saving code to SAIGE_isolated/src/SAIGE_fitGLMM_fast.cpp GetTrace_q function
+- [x] Ran R then C++ and compared — values match within float32 precision
+- [x] traceCVcutoff: same default (0.1) works for quantitative
+- [x] R quantitative solver uses same inner IRLS loop (Get_Coef) — confirmed
+      For gaussian/identity link, inner loop converges in 1 iteration (W=1 constant)
+- [x] Tau initialization: R quantitative starts at tau=[1,0] (NOT [0.5,0.5])
+      R code: tau[1]=1 (residual), tau[2]=0 (genetic) at lines 874-884
+
+## Test Results (Feb 4, 2025)
+
+Config: quantitative trait, x1+x2 covariates, sparse GRM, with random vector bypass
+
+| Metric | R | C++ | Difference |
+|--------|---|-----|-----------|
+| tau[0] | 0.210876 | 0.210876 | ~0 |
+| tau[1] | 0.474525 | 0.474526 | ~1e-6 |
+| Iterations | 5 | 5 | Match |
+| alpha[0] | — | 0.00966 | — |
+| alpha[1] | — | -0.51857 | — |
+| alpha[2] | — | -0.25453 | — |
+
+Per-iteration tau convergence:
+| Iter | tau[0] | tau[1] | Update type |
+|------|--------|--------|-------------|
+| 0 | 0.6850 | 0.0000 | Conservative (tau^2*score/n) |
+| 1 | 0.1734 | 0.3156 | Standard AI-REML |
+| 2 | 0.2063 | 0.4222 | Standard AI-REML |
+| 3 | 0.2115 | 0.4689 | Standard AI-REML |
+| 4 | 0.2109 | 0.4745 | Standard AI-REML (converged) |

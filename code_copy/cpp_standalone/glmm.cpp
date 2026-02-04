@@ -919,7 +919,14 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
   return out;
 }
 
-// ---------- Quantitative solver (2×2 AI-REML on [A0, A]) ----------
+// ---------- Quantitative solver (2×2 AI-REML on [tau0, tau1]) ----------
+// Ported from binary_glmm_solver with adaptations:
+// - tau starts at [1, 0] (R's default: residual=1, genetic=0)
+// - Both tau[0] and tau[1] are free (binary fixes tau[0]=1)
+// - Uses irls_gaussian_build (W=1, identity link)
+// - 2x2 AI matrix, 2 scores, 2 traces
+// - Conservative first iteration, standard AI-REML after
+// - Step halving when any tau < 0
 
 FitNullResult quant_glmm_solver(const Paths& paths,
                                 const FitNullConfig& cfg,
@@ -933,83 +940,254 @@ FitNullResult quant_glmm_solver(const Paths& paths,
   arma::fvec y = map_y(d);
   arma::fvec offset = map_offset(d, offset_in);
   arma::fvec beta_init = map_beta_init(d, beta_init_in);
-
   arma::fvec eta = (p > 0) ? (X * beta_init + offset) : offset;
 
   const int   maxiter    = std::max(5, cfg.maxiter);
-  const float tol_coef   = static_cast<float>(std::max(1e-4, cfg.tol));
+  const float tol_coef   = static_cast<float>(std::max(1e-6, cfg.tol));
   const int   maxiterPCG = cfg.maxiterPCG > 0 ? cfg.maxiterPCG : 500;
   const float tolPCG     = cfg.tolPCG > 0.0 ? static_cast<float>(cfg.tolPCG) : 1e-5f;
   const int   nrun       = cfg.nrun > 0 ? cfg.nrun : 30;
   const float trace_cut  = cfg.traceCVcutoff > 0.0 ? static_cast<float>(cfg.traceCVcutoff) : 0.1f;
 
-  arma::fvec tau(2); tau.fill(0.5f);
+  // R quantitative initializes tau = [1, 0] (residual=1, genetic=0)
+  arma::fvec tau(2); tau[0] = 1.0f; tau[1] = 0.0f;
 
   arma::fvec mu, mu_eta, W, Y;
   arma::fvec alpha_prev(p, arma::fill::zeros);
-  arma::fvec tau_prev   = tau;
+  arma::fvec tau_prev = tau;
+
+  // Track alpha across outer iterations (matching R's Get_Coef alpha0)
+  arma::fvec alpha_outer_prev = arma::conv_to<arma::fvec>::from(beta_init);
+  CoefficientsOut coef;
+
+  // ===== Debug: Initial values =====
+  std::cout << "\n===== C++ Quantitative GLMM Solver Initial Values =====" << std::endl;
+  std::cout << "tau: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+  std::cout << "beta_init: [";
+  for (size_t i = 0; i < beta_init.n_elem; ++i) {
+    std::cout << beta_init[i];
+    if (i < beta_init.n_elem - 1) std::cout << ", ";
+  }
+  std::cout << "]" << std::endl;
+  std::cout << "eta[0:5]: " << eta[0] << " " << eta[1] << " " << eta[2] << " " << eta[3] << " " << eta[4] << std::endl;
+  std::cout << "y[0:5]: " << y[0] << " " << y[1] << " " << y[2] << " " << y[3] << " " << y[4] << std::endl;
+  std::cout << "n=" << n << ", p=" << p << std::endl;
+  std::cout << "==========================================\n" << std::endl;
+
+  // Checkpoint 2
+  save_vec_csv(eta, CP_DIR + "/CPP_CP2_eta.csv");
+  save_vec_csv(y, CP_DIR + "/CPP_CP2_y.csv");
+  {
+    std::ofstream f(CP_DIR + "/CPP_CP2_initial.txt");
+    f << "tau: " << tau[0] << " " << tau[1] << "\n";
+    f << "n: " << n << "\np: " << p << "\n";
+    f << "beta_init: ";
+    for (size_t i = 0; i < beta_init.n_elem; ++i) f << beta_init[i] << " ";
+    f << "\n";
+  }
 
   for (int it = 0; it < maxiter; ++it) {
-    irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y); // W=1, Y=y-offset
+    std::cout << "\n" << std::string(70, '=') << std::endl;
+    std::cout << "=== C++ QUANT OUTER ITERATION " << it << " START ===" << std::endl;
+    std::cout << "tau at start: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+    std::cout << std::string(70, '=') << std::endl;
 
+    // ======================================================================
+    // Inner IRLS loop (for gaussian W=1, converges in 1 step)
+    // ======================================================================
+    arma::fvec alpha0_outer = alpha_outer_prev;
 
-    auto coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+    for (int inner_it = 0; inner_it < maxiter; ++inner_it) {
+      std::cout << "\n--- Inner IRLS iteration " << inner_it << " ---" << std::endl;
 
-    auto aiq  = getAIScore_q_cpp(Y, X, W, tau, coef.Sigma_iY, coef.Sigma_iX,
-                                 const_cast<arma::fmat&>(coef.cov),
-                                 nrun, maxiterPCG, tolPCG, trace_cut);
+      irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
 
-    arma::fvec s(2);
-    s[0] = aiq.YPA0PY - aiq.Trace[0];
-    s[1] = aiq.YPAPY  - aiq.Trace[1];
+      std::cout << "After irls_gaussian_build:" << std::endl;
+      std::cout << "  W[0:5]: " << W[0] << " " << W[1] << " " << W[2] << " " << W[3] << " " << W[4] << std::endl;
+      std::cout << "  Y[0:5]: " << Y[0] << " " << Y[1] << " " << Y[2] << " " << Y[3] << " " << Y[4] << std::endl;
+      std::cout << "  |Y|: " << arma::norm(Y) << ", |W|: " << arma::norm(W) << std::endl;
 
-    arma::fmat AI = aiq.AI;
-    if (!AI.is_sympd()) { AI = 0.5f * (AI + AI.t()); }
-    arma::fvec delta = arma::solve(AI, s, arma::solve_opts::likely_sympd + arma::solve_opts::fast);
+      coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
 
-    arma::fvec tau_new = tau + delta;
-    tau_new[0] = static_cast<float>(clamp_nonneg(tau_new[0]));
-    tau_new[1] = static_cast<float>(clamp_nonneg(tau_new[1]));
+      std::cout << "After getCoefficients_cpp:" << std::endl;
+      std::cout << "  alpha: [";
+      for (size_t i = 0; i < coef.alpha.n_elem; ++i) {
+        std::cout << coef.alpha[i];
+        if (i < coef.alpha.n_elem - 1) std::cout << ", ";
+      }
+      std::cout << "]" << std::endl;
+      std::cout << "  coef.eta[0:5]: " << coef.eta[0] << " " << coef.eta[1] << " " << coef.eta[2] << " " << coef.eta[3] << " " << coef.eta[4] << std::endl;
 
-    arma::fvec alpha = coef.alpha;
-    eta = (p > 0) ? (X * alpha + offset) : offset;
+      // Update eta from coefficient solve (NOT X*alpha -- same fix as binary)
+      eta = coef.eta + offset;
+      std::cout << "  eta after update [0:5]: " << eta[0] << " " << eta[1] << " " << eta[2] << " " << eta[3] << " " << eta[4] << std::endl;
 
-    tau_prev = tau; tau = tau_new;
+      // Check convergence of alpha
+      double rc_alpha_inner = (p > 0) ? rel_change_R_style(coef.alpha, alpha0_outer, tol_coef) : 0.0;
+      std::cout << "  rc_alpha (vs alpha0_outer): " << rc_alpha_inner << " (tol=" << tol_coef << ")" << std::endl;
 
-    double rc_tau   = rel_change_inf(tau, tau_prev, tol_coef);
-    double rc_alpha = (p > 0) ? rel_change_inf(alpha, alpha_prev, tol_coef) : 0.0;
-    if (std::max(rc_tau, rc_alpha) < tol_coef) {
-      arma::fvec mu_final = eta;                      // identity link
+      if (rc_alpha_inner < tol_coef) {
+        std::cout << "  [Inner IRLS] CONVERGED after " << (inner_it + 1) << " iterations" << std::endl;
+        break;
+      }
+      alpha0_outer = coef.alpha;
+    }
+
+    alpha_outer_prev = coef.alpha;
+
+    // Final IRLS build with converged eta
+    std::cout << "\n--- Final IRLS build after inner loop ---" << std::endl;
+    irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
+    std::cout << "Final W[0:5]: " << W[0] << " " << W[1] << " " << W[2] << " " << W[3] << " " << W[4] << std::endl;
+    std::cout << "Final Y[0:5]: " << Y[0] << " " << Y[1] << " " << Y[2] << " " << Y[3] << " " << Y[4] << std::endl;
+    std::cout << "Final |Y|: " << arma::norm(Y) << ", |W|: " << arma::norm(W) << std::endl;
+
+    // ===== AI-REML step: 2D score and AI =====
+    auto aiq = getAIScore_q_cpp(Y, X, W, tau, coef.Sigma_iY, coef.Sigma_iX,
+                                coef.cov, nrun, maxiterPCG, tolPCG, trace_cut);
+
+    // 2D scores
+    double score0 = static_cast<double>(aiq.YPA0PY - aiq.Trace[0]);
+    double score1 = static_cast<double>(aiq.YPAPY  - aiq.Trace[1]);
+
+    // Debug output
+    std::cout << "\n========== C++ QUANT ITERATION " << it << " ==========" << std::endl;
+    std::cout << "tau_before: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+    std::cout << "YPA0PY: " << aiq.YPA0PY << std::endl;
+    std::cout << "YPAPY: " << aiq.YPAPY << std::endl;
+    std::cout << "Trace: [" << aiq.Trace[0] << ", " << aiq.Trace[1] << "]" << std::endl;
+    std::cout << "Score: [" << score0 << ", " << score1 << "]" << std::endl;
+    std::cout << "AI:" << std::endl;
+    std::cout << "  [" << aiq.AI(0,0) << ", " << aiq.AI(0,1) << "]" << std::endl;
+    std::cout << "  [" << aiq.AI(1,0) << ", " << aiq.AI(1,1) << "]" << std::endl;
+
+    arma::fvec tau_new(2);
+
+    if (it == 0) {
+      // Conservative update (R SAIGE lines 891-892):
+      // tau[i] = max(0, tau[i] + tau[i]^2 * score[i] / n)
+      double tau0_d = static_cast<double>(tau[0]);
+      double tau1_d = static_cast<double>(tau[1]);
+      double Dtau0 = tau0_d * tau0_d * score0 / static_cast<double>(n);
+      double Dtau1 = tau1_d * tau1_d * score1 / static_cast<double>(n);
+      tau_new[0] = static_cast<float>(std::max(0.0, tau0_d + Dtau0));
+      tau_new[1] = static_cast<float>(std::max(0.0, tau1_d + Dtau1));
+      std::cout << "[CONSERVATIVE] Dtau: [" << Dtau0 << ", " << Dtau1 << "]" << std::endl;
+    } else {
+      // Standard AI-REML: delta = solve(AI_2x2, score_2)
+      arma::fvec s(2);
+      s[0] = static_cast<float>(score0);
+      s[1] = static_cast<float>(score1);
+
+      arma::fmat AI = aiq.AI;
+      if (!AI.is_sympd()) { AI = 0.5f * (AI + AI.t()); }
+      arma::fvec delta = arma::solve(AI, s, arma::solve_opts::likely_sympd + arma::solve_opts::fast);
+
+      tau_new = tau + delta;
+
+      // Step halving if any component negative (R SAIGE behavior)
+      double step = 1.0;
+      while ((tau_new[0] < 0.0f || tau_new[1] < 0.0f) && step > 1e-10) {
+        step *= 0.5;
+        tau_new = tau + static_cast<float>(step) * delta;
+      }
+      // Final clamp
+      tau_new[0] = static_cast<float>(std::max(0.0, static_cast<double>(tau_new[0])));
+      tau_new[1] = static_cast<float>(std::max(0.0, static_cast<double>(tau_new[1])));
+
+      std::cout << "[STANDARD AI-REML] delta: [" << delta[0] << ", " << delta[1] << "]" << std::endl;
+      std::cout << "[STANDARD AI-REML] step: " << step << std::endl;
+    }
+
+    tau_prev = tau;
+    tau = tau_new;
+
+    // R-style convergence: max(abs(tau - tau0)/(abs(tau) + abs(tau0) + tol)) < tol
+    double rc_tau = rel_change_R_style(tau, tau_prev, tol_coef);
+
+    std::cout << "tau_after: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+    std::cout << "rc_tau: " << rc_tau << " (converge if < " << tol_coef << ")" << std::endl;
+    std::cout << "alpha: [";
+    for (size_t i = 0; i < coef.alpha.n_elem; ++i) {
+      std::cout << coef.alpha[i];
+      if (i < coef.alpha.n_elem - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    std::cout << "==========================================\n" << std::endl;
+
+    // Save iteration to CSV
+    {
+      std::ofstream f(CP_DIR + "/CPP_iteration_summary.csv",
+                      it == 0 ? std::ios::trunc : std::ios::app);
+      if (it == 0) {
+        f << "iteration,tau0_before,tau1_before,tau0_after,tau1_after,score0,score1,YPA0PY,YPAPY,Trace0,Trace1\n";
+      }
+      f << std::setprecision(10);
+      f << it << "," << tau_prev[0] << "," << tau_prev[1] << "," << tau[0] << "," << tau[1]
+        << "," << score0 << "," << score1 << "," << aiq.YPA0PY << "," << aiq.YPAPY
+        << "," << aiq.Trace[0] << "," << aiq.Trace[1] << "\n";
+    }
+
+    // Convergence check (only after iteration 1, matching R)
+    if (it > 0 && rc_tau < tol_coef) {
+      arma::fvec mu_final = eta;  // identity link
       float tau0_inv = (tau[0] > 0.0f) ? 1.0f / tau[0] : 0.0f;
       auto sn = saige::build_score_null_quant(X, y, mu_final, tau0_inv);
 
       FitNullResult out;
-      out.alpha  = std::vector<double>(alpha.begin(), alpha.end());
-      out.theta  = {static_cast<double>(tau[0]), static_cast<double>(tau[1])};
+      out.alpha = std::vector<double>(coef.alpha.begin(), coef.alpha.end());
+      out.theta = {static_cast<double>(tau[0]), static_cast<double>(tau[1])};
       out.offset = offset_in;
 
       stash_score_null_into(out, sn, n, p);
-      // export_score_null_json(paths, out);
+      export_score_null_json(paths, out);
+
+      std::cout << "=== CONVERGED at iteration " << it << " ===" << std::endl;
+      std::cout << "Final tau: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+      std::cout << "Iterations: " << (it + 1) << std::endl;
+
+      // Save final checkpoint
+      {
+        std::ofstream f(CP_DIR + "/CPP_CP6_final.csv");
+        f << "tau0," << tau[0] << "\ntau1," << tau[1] << "\n";
+        f << "converged,1\niterations," << (it + 1) << "\n";
+        for (size_t i = 0; i < coef.alpha.n_elem; ++i)
+          f << "alpha" << i << "," << coef.alpha[i] << "\n";
+      }
+
       return out;
     }
-    alpha_prev = alpha;
+
+    alpha_prev = coef.alpha;
   }
 
-  // finalize with last coefficient refresh
+  // Fallthrough: max iterations reached
   irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
-  auto coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+  coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
 
   arma::fvec mu_final = eta;
   float tau0_inv = (tau[0] > 0.0f) ? 1.0f / tau[0] : 0.0f;
   auto sn = saige::build_score_null_quant(X, y, mu_final, tau0_inv);
 
   FitNullResult out;
-  out.alpha  = std::vector<double>(coef.alpha.begin(), coef.alpha.end());
-  out.theta  = {static_cast<double>(tau[0]), static_cast<double>(tau[1])};
+  out.alpha = std::vector<double>(coef.alpha.begin(), coef.alpha.end());
+  out.theta = {static_cast<double>(tau[0]), static_cast<double>(tau[1])};
   out.offset = offset_in;
 
   stash_score_null_into(out, sn, n, p);
-  // export_score_null_json(paths, out);
+
+  std::cout << "\n=== MAX ITERATIONS REACHED ===" << std::endl;
+  std::cout << "Final tau: [" << tau[0] << ", " << tau[1] << "]" << std::endl;
+  std::cout << "Iterations: " << maxiter << std::endl;
+
+  {
+    std::ofstream f(CP_DIR + "/CPP_CP6_final.csv");
+    f << "tau0," << tau[0] << "\ntau1," << tau[1] << "\n";
+    f << "converged,0\niterations," << maxiter << "\n";
+    for (size_t i = 0; i < coef.alpha.n_elem; ++i)
+      f << "alpha" << i << "," << coef.alpha[i] << "\n";
+  }
+
   return out;
 }
 
