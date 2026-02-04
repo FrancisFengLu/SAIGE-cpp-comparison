@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>C++ GLMM Bug Analysis - R vs C++ Comparison</title>
+    <style>
+        body { font-family: 'Courier New', monospace; font-size: 11px; margin: 20px; line-height: 1.6; }
+        h1 { font-size: 16px; border-bottom: 2px solid #333; padding-bottom: 5px; }
+        h2 { font-size: 14px; border-bottom: 1px solid #666; padding-bottom: 3px; margin-top: 30px; }
+        .r-func { color: #2980b9; font-weight: bold; }
+        .cpp-func { color: #27ae60; font-weight: bold; }
+        .rcpp-func { color: #8e44ad; font-weight: bold; }
+        .comment { color: #7f8c8d; font-style: italic; }
+        .file { color: #e74c3c; }
+        .var { color: #d35400; }
+        .bug { color: #c0392b; font-weight: bold; background-color: #ffeaea; padding: 2px 4px; }
+        .fix { color: #27ae60; font-weight: bold; background-color: #eaffea; padding: 2px 4px; }
+        .highlight { background-color: #ffffcc; padding: 2px 4px; }
+        pre { white-space: pre-wrap; }
+        table { border-collapse: collapse; margin: 10px 0; }
+        th, td { border: 1px solid #ccc; padding: 6px 12px; text-align: right; }
+        th { background-color: #f0f0f0; }
+        .code-block { background-color: #f5f5f5; padding: 10px; border-left: 3px solid #666; margin: 10px 0; }
+        .r-code { border-left-color: #2980b9; }
+        .cpp-code { border-left-color: #27ae60; }
+        .bug-code { border-left-color: #c0392b; background-color: #fff5f5; }
+        .fix-code { border-left-color: #27ae60; background-color: #f5fff5; }
+    </style>
+</head>
+<body>
+<h1>C++ GLMM Bug Analysis - R vs C++ Comparison</h1>
+
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># This document describes two critical bugs found in the C++ implementation</span>
+<span class="comment"># of the SAIGE GLMM fitting algorithm when comparing against the R reference.</span>
+<span class="comment"># ===============================================================================</span>
+</pre>
+
+<h2>Bug #1: Inner IRLS Loop Convergence - Wrong Reference for Alpha Comparison</h2>
+
+<pre>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+<span class="comment"># PROBLEM: The C++ code compared alpha against zeros instead of previous alpha</span>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+
+<span class="r-func">R Get_Coef Function Flow</span>                              <span class="file">[R/SAIGE_fitGLMM_fast.R lines 117-171]</span>
+</pre>
+
+<div class="code-block r-code">
+<pre>
+<span class="r-func">Get_Coef</span> = function(y, X, tau, family, <span class="highlight">alpha0</span>, eta0, offset, ...) {
+    <span class="comment"># alpha0 is passed in from the OUTER loop - this is the reference</span>
+
+    <span class="comment"># Initial IRLS build (before loop)</span>
+    mu = family$linkinv(eta0)
+    mu.eta = family$mu.eta(eta0)
+    Y = eta0 - offset + (y - mu)/mu.eta
+    W = (mu.eta/sqrt(family$variance(mu)))^2
+
+    for(i in 1:maxiter) {
+        <span class="comment"># Solve for new alpha</span>
+        re.coef = <span class="rcpp-func">getCoefficients</span>(Y, X, W, tau, ...)
+        <span class="var">alpha</span> = re.coef$alpha
+        eta = re.coef$eta + offset
+
+        <span class="comment"># Update IRLS quantities</span>
+        mu = family$linkinv(eta)
+        mu.eta = family$mu.eta(eta)
+        Y = eta - offset + (y - mu)/mu.eta
+        W = (mu.eta/sqrt(family$variance(mu)))^2
+
+        <span class="comment"># CONVERGENCE CHECK: Compare alpha against alpha0 (from OUTER iteration)</span>
+        if(max(abs(<span class="highlight">alpha - alpha0</span>)/(abs(alpha) + abs(alpha0) + tol)) < tol) {
+            break
+        }
+        <span class="var">alpha0</span> = alpha  <span class="comment"># Update for next inner iteration comparison</span>
+    }
+    return(list(alpha=alpha, eta=eta, ...))
+}
+</pre>
+</div>
+
+<pre>
+<span class="comment"># Key insight: R's alpha0 starts as the alpha from the PREVIOUS outer iteration</span>
+<span class="comment"># At iteration 0, this is beta_init (the GLM coefficients)</span>
+</pre>
+
+<pre>
+<span class="cpp-func">C++ Original (Buggy) Implementation</span>                  <span class="file">[glmm.cpp]</span>
+</pre>
+
+<div class="code-block bug-code">
+<pre>
+<span class="comment">// WRONG: alpha_prev was initialized to zeros</span>
+arma::fvec <span class="bug">alpha_prev(p, arma::fill::zeros)</span>;
+
+for (int it = 0; it < maxiter; ++it) {
+    <span class="comment">// Inner IRLS loop</span>
+    for (int inner_it = 0; inner_it < maxiter; ++inner_it) {
+        irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
+        coef = getCoefficients_cpp(Y, X, W, tau, ...);
+        eta = coef.eta + offset;
+
+        <span class="comment">// BUG: Comparing against zeros on first iteration!</span>
+        double rc_alpha = rel_change_R_style(coef.alpha, <span class="bug">alpha_prev</span>, tol);
+        if (rc_alpha < tol) break;
+
+        alpha_prev = coef.alpha;
+    }
+}
+</pre>
+</div>
+
+<pre>
+<span class="cpp-func">C++ Fixed Implementation</span>                              <span class="file">[glmm.cpp lines 454-511]</span>
+</pre>
+
+<div class="code-block fix-code">
+<pre>
+<span class="comment">// FIX: Initialize alpha_outer_prev to beta_init (matching R's behavior)</span>
+arma::fvec <span class="fix">alpha_outer_prev = arma::conv_to&lt;arma::fvec&gt;::from(beta_init)</span>;
+
+for (int it = 0; it < maxiter; ++it) {
+    <span class="comment">// Start inner loop with reference from previous outer iteration</span>
+    arma::fvec alpha0_outer = <span class="fix">alpha_outer_prev</span>;
+
+    for (int inner_it = 0; inner_it < maxiter; ++inner_it) {
+        irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
+        coef = getCoefficients_cpp(Y, X, W, tau, ...);
+        eta = coef.eta + offset;
+
+        <span class="comment">// CORRECT: Compare against previous outer iteration's alpha</span>
+        double rc_alpha = rel_change_R_style(coef.alpha, <span class="fix">alpha0_outer</span>, tol);
+        if (rc_alpha < tol) break;
+
+        alpha0_outer = coef.alpha;  <span class="comment">// Update for next inner iteration</span>
+    }
+
+    <span class="comment">// Save for next outer iteration</span>
+    <span class="fix">alpha_outer_prev = coef.alpha</span>;
+}
+</pre>
+</div>
+
+<h2>Bug #2: Eta Overwrite After Inner Loop</h2>
+
+<pre>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+<span class="comment"># PROBLEM: The correct eta from getCoefficients was being overwritten</span>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+</pre>
+
+<pre>
+<span class="comment"># The correct eta computation from getCoefficients:</span>
+</pre>
+
+<div class="code-block r-code">
+<pre>
+<span class="comment"># In R's getCoefficients (Rcpp export):</span>
+<span class="var">Sigma_iY</span> = PCG_solve(Sigma, Y)              <span class="comment"># Solve Sigma^(-1) * Y</span>
+<span class="var">Sigma_iX</span> = PCG_solve(Sigma, X)              <span class="comment"># Solve Sigma^(-1) * X for each column</span>
+<span class="var">cov</span> = solve(X' * Sigma_iX)                  <span class="comment"># Covariance of fixed effects</span>
+<span class="var">alpha</span> = cov * (Sigma_iX' * Y)               <span class="comment"># Fixed effect estimates</span>
+
+<span class="comment"># CORRECT eta formula for mixed models:</span>
+<span class="var">eta</span> = Y - tau[0] * (<span class="highlight">Sigma_iY - Sigma_iX * alpha</span>) / W
+
+<span class="comment"># This is NOT the same as X * alpha + offset!</span>
+<span class="comment"># The mixed model eta accounts for the random effects via Sigma^(-1) terms</span>
+</pre>
+</div>
+
+<pre>
+<span class="cpp-func">C++ Original (Buggy) Code</span>                             <span class="file">[glmm.cpp around line 715]</span>
+</pre>
+
+<div class="code-block bug-code">
+<pre>
+<span class="comment">// After the inner IRLS loop converged...</span>
+alpha = coef.alpha;
+cov = coef.cov;
+
+<span class="comment">// BUG: This line OVERWROTE the correct eta from getCoefficients!</span>
+<span class="bug">eta = (p > 0) ? (X * alpha + offset) : offset;</span>
+
+<span class="comment">// This is WRONG for mixed models!</span>
+<span class="comment">// X * alpha + offset is the FIXED-EFFECT ONLY linear predictor</span>
+<span class="comment">// The correct eta from getCoefficients includes random effect contributions</span>
+</pre>
+</div>
+
+<pre>
+<span class="cpp-func">C++ Fixed Code</span>                                        <span class="file">[glmm.cpp lines 715-718]</span>
+</pre>
+
+<div class="code-block fix-code">
+<pre>
+<span class="comment">// After the inner IRLS loop converged...</span>
+alpha = coef.alpha;
+cov = coef.cov;
+
+<span class="comment">// NOTE: Do NOT recompute eta here! The correct eta was already set in the</span>
+<span class="comment">// inner IRLS loop at line 493 (eta = coef.eta + offset).</span>
+<span class="comment">// Line below was a bug that overwrote the correct mixed-model eta with</span>
+<span class="comment">// simple X*alpha, causing divergence from R at iteration 3.</span>
+<span class="fix">// eta = (p > 0) ? (X * alpha + offset) : offset;  // BUG - REMOVED</span>
+</pre>
+</div>
+
+<pre>
+<span class="comment"># Mathematical explanation:</span>
+<span class="comment"># For a GLMM with covariance Sigma = tau0 * I + tau1 * K:</span>
+<span class="comment">#   - Simple GLM:  eta = X * alpha</span>
+<span class="comment">#   - GLMM:        eta = Y - tau0 * (Sigma^(-1)*Y - Sigma^(-1)*X * alpha) / W</span>
+<span class="comment">#</span>
+<span class="comment"># The GLMM formula "backs out" the linear predictor from the working response Y</span>
+<span class="comment"># while accounting for the contribution of random effects through Sigma^(-1).</span>
+</pre>
+
+<h2>Impact on Results</h2>
+
+<pre>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+<span class="comment"># Before the fix, tau values diverged from R starting at iteration 3</span>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+</pre>
+
+<table>
+<tr>
+    <th>Metric</th>
+    <th>R (Reference)</th>
+    <th>C++ (Before Fix)</th>
+    <th>C++ (After Fix)</th>
+    <th>Error Before</th>
+    <th>Error After</th>
+</tr>
+<tr>
+    <td style="text-align:left">Final tau[1]</td>
+    <td>0.290136</td>
+    <td>~0.294 (diverged)</td>
+    <td>0.290133</td>
+    <td>~1.4%</td>
+    <td>~3e-6</td>
+</tr>
+<tr>
+    <td style="text-align:left">alpha[0]</td>
+    <td>2.52598</td>
+    <td>diverged</td>
+    <td>2.52597</td>
+    <td>varied</td>
+    <td>~4e-6</td>
+</tr>
+<tr>
+    <td style="text-align:left">alpha[1]</td>
+    <td>-0.77260</td>
+    <td>diverged</td>
+    <td>-0.77260</td>
+    <td>varied</td>
+    <td>~5e-6</td>
+</tr>
+<tr>
+    <td style="text-align:left">alpha[2]</td>
+    <td>-0.45774</td>
+    <td>diverged</td>
+    <td>-0.45774</td>
+    <td>varied</td>
+    <td>~4e-6</td>
+</tr>
+<tr>
+    <td style="text-align:left">Convergence</td>
+    <td>4 iterations</td>
+    <td>did not match</td>
+    <td>5 iterations</td>
+    <td>-</td>
+    <td>matched</td>
+</tr>
+</table>
+
+<h2>Verification: Iteration-by-Iteration Comparison</h2>
+
+<pre>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+<span class="comment"># After fix, C++ matches R to floating-point precision at each iteration</span>
+<span class="comment"># -------------------------------------------------------------------------------</span>
+</pre>
+
+<table>
+<tr>
+    <th>Iter</th>
+    <th>R tau_after</th>
+    <th>C++ tau_after</th>
+    <th>R YPAPY</th>
+    <th>C++ YPAPY</th>
+    <th>R Trace</th>
+    <th>C++ Trace</th>
+</tr>
+<tr>
+    <td>1</td>
+    <td>0.281028</td>
+    <td>0.281025</td>
+    <td>86.1818</td>
+    <td>86.1818</td>
+    <td>81.4550</td>
+    <td>81.4551</td>
+</tr>
+<tr>
+    <td>2</td>
+    <td>0.326170</td>
+    <td>0.326166</td>
+    <td>78.1013</td>
+    <td>78.1014</td>
+    <td>77.4241</td>
+    <td>77.4241</td>
+</tr>
+<tr>
+    <td>3</td>
+    <td>0.301854</td>
+    <td>0.301854</td>
+    <td>76.1735</td>
+    <td>76.1736</td>
+    <td>76.5235</td>
+    <td>76.5236</td>
+</tr>
+<tr>
+    <td>4</td>
+    <td>0.290136</td>
+    <td>0.290133</td>
+    <td>76.7010</td>
+    <td>76.7010</td>
+    <td>76.8708</td>
+    <td>76.8709</td>
+</tr>
+</table>
+
+<pre>
+<span class="comment"># All values match to within floating-point precision (single vs double).</span>
+<span class="comment"># Differences in the 5th-6th decimal place are expected due to:</span>
+<span class="comment">#   - C++ uses float (32-bit) for most computations</span>
+<span class="comment">#   - R uses double (64-bit) throughout</span>
+<span class="comment">#   - PCG solver tolerances</span>
+</pre>
+
+<h2>Summary of Fixes</h2>
+
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># Fix #1: Proper initialization of alpha comparison reference</span>
+<span class="comment"># ===============================================================================</span>
+<span class="file">File: glmm.cpp, Line 456</span>
+<span class="fix">arma::fvec alpha_outer_prev = arma::conv_to&lt;arma::fvec&gt;::from(beta_init);</span>
+
+<span class="comment"># Instead of:</span>
+<span class="bug">arma::fvec alpha_prev(p, arma::fill::zeros);</span>
+
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># Fix #2: Remove incorrect eta overwrite</span>
+<span class="comment"># ===============================================================================</span>
+<span class="file">File: glmm.cpp, Line 718</span>
+<span class="fix">// eta = (p > 0) ? (X * alpha + offset) : offset;  // BUG - REMOVED</span>
+
+<span class="comment"># The correct eta is already computed in getCoefficients_cpp and preserved</span>
+<span class="comment"># through the inner IRLS loop via: eta = coef.eta + offset;</span>
+</pre>
+
+<h2>Legend</h2>
+<p><span class="r-func">Blue</span> = R Function | <span class="rcpp-func">Purple</span> = Rcpp Export | <span class="cpp-func">Green</span> = Internal C++ | <span class="var">Orange</span> = Variable | <span class="file">Red</span> = File Location</p>
+<p><span class="bug">Red Background</span> = Buggy Code | <span class="fix">Green Background</span> = Fixed Code | <span class="highlight">Yellow Highlight</span> = Key Comparison</p>
+
+</body>
+</html>

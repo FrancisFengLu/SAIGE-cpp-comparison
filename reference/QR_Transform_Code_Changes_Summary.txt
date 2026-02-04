@@ -1,0 +1,163 @@
+================================================================================
+QR Transform Code Changes Summary - null_model_engine.cpp
+Date: January 28, 2026
+================================================================================
+
+文件位置:
+- 旧版本: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/null_model_engine.cpp
+- 新版本: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_QR_transform/null_model_engine.cpp
+
+================================================================================
+问题 1: Row-Major vs Column-Major (非今天修复)
+================================================================================
+
+旧版本 (错误):
+    static inline Eigen::Map<const Eigen::MatrixXd>
+    map_mat(const std::vector<double>& buf, int n, int p) {
+      return Eigen::Map<const Eigen::MatrixXd>(buf.data(), n, p);
+    }
+
+新版本 (正确):
+    using RowMajorMatrixXd = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    static inline Eigen::Map<const RowMajorMatrixXd>
+    map_mat(const std::vector<double>& buf, int n, int p) {
+      return Eigen::Map<const RowMajorMatrixXd>(buf.data(), n, p);
+    }
+
+说明:
+- design.X 存储为 row-major 格式
+- 旧版本错误地假设为 column-major
+- 这导致矩阵数据被错误解读，tau[2] = 0
+
+================================================================================
+问题 2: design_in 可变副本
+================================================================================
+
+旧版本:
+    FitNullResult NullModelEngine::run(const Design& design_in) {
+      // design_in 是 const，不能修改
+    }
+
+新版本:
+    FitNullResult NullModelEngine::run(const Design& design_in_const) {
+      Design design_in = design_in_const;  // 创建可变副本
+    }
+
+说明:
+- 原来 design_in 是 const reference，不能修改
+- 新版本创建可变副本，允许后续修改 design_in.X
+- 这是问题3的前提条件
+
+================================================================================
+问题 3: QR 变换后更新 design_in.X
+================================================================================
+
+旧版本:
+    X = qr_transform(X0, qrmap, ...);  // X 变成 Q×√n
+    // design_in.X 保持原样（原始 X）
+    // GLMM solver 收到的是原始 X
+    out = g_binary_solver(..., design_in, ...);
+
+新版本:
+    X = qr_transform(X, qrmap, ...);  // X 变成 Q×√n
+
+    // 把变换后的 X 写回 design_in.X
+    int new_p = static_cast<int>(X.cols());
+    design_in.X.resize(design_in.n * new_p);
+    for (int i = 0; i < design_in.n; ++i) {
+      for (int j = 0; j < new_p; ++j) {
+        design_in.X[i * new_p + j] = X(i, j);
+      }
+    }
+    design_in.p = new_p;
+
+    // GLMM solver 收到的是变换后的 X
+    out = g_binary_solver(..., design_in, ...);
+
+说明:
+- 旧版本: GLMM solver 始终收到原始 X，QR 只影响初始 GLM
+- 新版本: GLMM solver 收到变换后的 X（像 R 一样）
+- 这使得 C++ 行为与 R 一致
+
+================================================================================
+问题 4: beta_init 空间匹配
+================================================================================
+
+旧版本:
+    // 总是用 beta_cov（原始空间的系数）
+    beta_init.assign(beta_cov.data(), ...);
+    out = g_binary_solver(..., design_in, ..., beta_init);
+
+新版本:
+    if (cfg_.covariate_qr && qrmap.valid) {
+      // X 是 QR 空间，用 QR 空间的 beta
+      beta_init.assign(glm.beta.data(), ...);
+    } else {
+      // X 是原始空间，用原始空间的 beta
+      beta_init.assign(beta_cov.data(), ...);
+    }
+
+说明:
+- 如果 design_in.X 是变换后的（QR空间），但 beta_init 是原始空间的，空间不匹配
+- 空间不匹配会导致 GLMM 从错误的初始点开始，结果错误 (tau[2] = 5.7947)
+- 新版本确保 X 和 beta_init 在同一空间
+
+================================================================================
+问题 5: 最终 alpha 反变换
+================================================================================
+
+新版本添加:
+    if (cfg_.covariate_qr && qrmap.valid && !out.alpha.empty()) {
+      Eigen::VectorXd alpha_qr = Eigen::Map<Eigen::VectorXd>(out.alpha.data(), out.alpha.size());
+      Eigen::VectorXd alpha_orig = qr_backtransform_beta(alpha_qr, qrmap, p_orig, design_in.n);
+
+      out.alpha.resize(p_orig);
+      for (int i = 0; i < p_orig; ++i) {
+        out.alpha[i] = alpha_orig[i];
+      }
+    }
+
+说明:
+- GLMM solver 输出的 alpha 是 QR 空间的系数
+- 需要变换回原始空间，才能与原始协变量对应
+- 这确保最终输出的 alpha 可以直接用于原始 X
+
+================================================================================
+依赖关系
+================================================================================
+
+问题 2 → 问题 3 → 问题 4
+  │         │         │
+  │         │         └── beta_init 和 X 必须在同一空间
+  │         └── 需要修改 design_in.X
+  └── design_in 必须可变
+
+================================================================================
+测试结果
+================================================================================
+
+新版本 (QR 变换正常工作):
+- QR=TRUE:  tau[2] = 0.286783
+- QR=FALSE: tau[2] = 0.286785
+- 差异: 0.000002 (0.0007%)，在数值精度范围内
+
+旧版本 (Row-Major bug):
+- QR=TRUE:  tau[2] = 0 (错误!)
+- QR=FALSE: tau[2] = 0 (错误!)
+
+================================================================================
+R vs C++ 比较
+================================================================================
+
+|          | R (QR=TRUE) | R (QR=FALSE) | C++ (QR=TRUE) | C++ (QR=FALSE) |
+|----------|-------------|--------------|---------------|----------------|
+| tau[2]   | 0.2846      | 0.2820       | 0.286783      | 0.286785       |
+| 差异     |     ~0.9%   |              |     ~0.0007%  |                |
+
+说明:
+- C++ QR=TRUE 和 QR=FALSE 几乎相同（数学等价）
+- R 有 ~0.9% 的差异，可能是实现细节或数值精度导致
+
+================================================================================
+END OF SUMMARY
+================================================================================

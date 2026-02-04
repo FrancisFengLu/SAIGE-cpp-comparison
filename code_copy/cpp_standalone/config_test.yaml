@@ -1,0 +1,28 @@
+# Test config for SAIGE-null C++ standalone
+# Updated to use 128k marker dataset (128868 markers, 1000 samples)
+# Using sparse GRM for consistent comparison with R
+paths:
+  plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_output
+  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_vr
+  sparse_grm: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
+  sparse_grm_ids: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
+
+design:
+  csv: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone/design_test.csv
+  covar_cols:
+    - x1
+    - x2
+
+fit:
+  trait: binary
+  loco: false
+  nthreads: 1
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  num_markers_for_vr: 30
+  use_sparse_grm_to_fit: true
+  relatedness_cutoff: 0.125

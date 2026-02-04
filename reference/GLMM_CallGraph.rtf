@@ -1,0 +1,242 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2821
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fmodern\fcharset0 CourierNewPS-BoldMT;\f1\fmodern\fcharset0 Courier-Oblique;\f2\fmodern\fcharset0 Courier;
+\f3\fmodern\fcharset0 Courier-Bold;\f4\fmodern\fcharset0 CourierNewPSMT;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;\red108\green121\blue122;\red34\green107\blue170;
+\red222\green53\blue46;\red122\green43\blue157;\red37\green162\blue78;\red199\green63\blue5;}
+{\*\expandedcolortbl;;\cssrgb\c0\c0\c0;\cssrgb\c49804\c54902\c55294;\cssrgb\c16078\c50196\c72549;
+\cssrgb\c90588\c29804\c23529;\cssrgb\c55686\c26667\c67843;\cssrgb\c15294\c68235\c37647;\cssrgb\c82745\c32941\c0;}
+\deftab720
+\pard\pardeftab720\sa214\partightenfactor0
+
+\f0\b\fs32 \cf0 \expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Complete Call Graph: Binary Trait GLMM Fitting\
+\pard\pardeftab720\partightenfactor0
+
+\f1\i\b0\fs22 \cf3 \strokec3 # \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 
+\f2\i0 \cf0 \strokec2 \
+
+\f1\i \cf3 \strokec3 # ENTRY POINT: User calls fitNULLGLMM() from R
+\f2\i0 \cf0 \strokec2 \
+
+\f1\i \cf3 \strokec3 # File: SAIGE/R/SAIGE_fitGLMM_fast.R
+\f2\i0 \cf0 \strokec2 \
+
+\f1\i \cf3 \strokec3 # \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 
+\f2\i0 \cf0 \strokec2 \
+\
+\pard\pardeftab720\partightenfactor0
+
+\f3\b \cf4 \strokec4 fitNULLGLMM
+\f2\b0 \cf0 \strokec2 ()                                          \cf5 \strokec5 [R] Line 906\cf0 \strokec2 \
+\uc0\u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # Input validation, phenotype/covariate processing
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # Call appropriate trait-specific function:
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474 \
+\uc0\u9500 \u9472 \u9472  
+\f3\b \cf4 \strokec4 glmmkin.ai_PCG_Rcpp_Binary
+\f2\b0 \cf0 \strokec2 ()                       \cf5 \strokec5 [R] Line 241\cf0 \strokec2   
+\f1\i \cf3 \strokec3 # For binary traits
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # STEP 1: Load genotype data
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 setgeno
+\f2\b0 \cf0 \strokec2 (bedFile, bimFile, famFile, ...)             \cf5 \strokec5 [Rcpp] Line ~780\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9492 \u9472 \u9472  
+\f3\b \cf7 \strokec7 genoClass::setGenotype()
+\f2\b0 \cf0 \strokec2                          \cf5 \strokec5 [C++] internal\cf0 \strokec2 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  Read PLINK .bed/.bim/.fam files\
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  Compute allele frequencies: \cf8 \strokec8 alleleFreqVec\cf0 \strokec2 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  Compute inverse std dev: \cf8 \strokec8 invstdvVec\cf0 \strokec2 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  Build: \cf8 \strokec8 genoVecofPointers\cf0 \strokec2  (genotype storage)\
+\uc0\u9474    \u9474        \u9492 \u9472 \u9472  Set: \cf8 \strokec8 M\cf0 \strokec2 , \cf8 \strokec8 N\cf0 \strokec2 , \cf8 \strokec8 Nnomissing\cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # LOCO chromosome index setup if needed
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getQCdMarkerIndex
+\f2\b0 \cf0 \strokec2 ()                                  \cf5 \strokec5 [Rcpp]\cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # STEP 2: Initial coefficient estimation
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  Initialize: \cf8 \strokec8 tau\cf0 \strokec2  = [1, 0.5], \cf8 \strokec8 alpha0\cf0 \strokec2 , \cf8 \strokec8 eta0\cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f3\b \cf4 \strokec4 Get_Coef
+\f2\b0 \cf0 \strokec2 (y, X, tau, family, alpha0, eta0, ...)    \cf5 \strokec5 [R] Line 117\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  Compute working response: \cf8 \strokec8 Y\cf0 \strokec2  = eta - offset + (y - mu)/mu.eta\
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  Compute weights: \cf8 \strokec8 W\cf0 \strokec2  = sqrtW^2 where sqrtW = mu.eta/sqrt(variance(mu))\
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9492 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getCoefficients
+\f2\b0 \cf0 \strokec2 (Y, X, W, tau, maxiterPCG, tolPCG)  \cf5 \strokec5 [Rcpp] Line 5272\cf0 \strokec2 \
+\uc0\u9474    \u9474        \u9474 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  
+\f3\b \cf7 \strokec7 getPCG1ofSigmaAndVector
+\f2\b0 \cf0 \strokec2 (W, tau, Y, ...)       \cf5 \strokec5 [C++] Line ~4500\cf0 \strokec2 \
+\uc0\u9474    \u9474        \u9474    \u9500 \u9472 \u9472  PCG iterative solver\
+\uc0\u9474    \u9474        \u9474    \u9492 \u9472 \u9472  Returns: \cf8 \strokec8 Sigma_iY\cf0 \strokec2  = \uc0\u931 \u8315 \'b9 \'d7 Y\
+\uc0\u9474    \u9474        \u9474 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  For each column of X:\
+\uc0\u9474    \u9474        \u9474    \u9492 \u9472 \u9472  
+\f3\b \cf7 \strokec7 getPCG1ofSigmaAndVector
+\f2\b0 \cf0 \strokec2 (W, tau, X[:,i], ...)\
+\uc0\u9474    \u9474        \u9474        \u9492 \u9472 \u9472  Returns: \cf8 \strokec8 Sigma_iX\cf0 \strokec2 [:,i] = \uc0\u931 \u8315 \'b9 \'d7 X[:,i]\
+\uc0\u9474    \u9474        \u9474 \
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  \cf8 \strokec8 cov\cf0 \strokec2  = (X' \'d7 Sigma_iX)\uc0\u8315 \'b9\
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  \cf8 \strokec8 alpha\cf0 \strokec2  = cov \'d7 (Sigma_iX' \'d7 Y)\
+\uc0\u9474    \u9474        \u9500 \u9472 \u9472  \cf8 \strokec8 eta\cf0 \strokec2  = Y - tau[0] \'d7 (Sigma_iY - Sigma_iX \'d7 alpha) / W\
+\uc0\u9474    \u9474        \u9474 \
+\uc0\u9474    \u9474        \u9492 \u9472 \u9472  Returns: \{ Sigma_iY, Sigma_iX, cov, alpha, eta \}\
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # STEP 3: Initial Score/Trace estimation
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getAIScore
+\f2\b0 \cf0 \strokec2 (Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) \cf5 \strokec5 [Rcpp] Line 5384\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  Compute projection: \cf8 \strokec8 PY\cf0 \strokec2  = Sigma_iY - Sigma_iX \'d7 (cov \'d7 (Sigma_iX' \'d7 Y))\
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getCrossprodMatAndKin
+\f2\b0 \cf0 \strokec2 (PY)                         \cf5 \strokec5 [Rcpp] Line 1733\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9474    \u9500 \u9472 \u9472  If using sparse GRM:\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9492 \u9472 \u9472  Sparse matrix multiply: result \'d7 bVec\
+\uc0\u9474    \u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9474    \u9492 \u9472 \u9472  Else (full GRM):\
+\uc0\u9474    \u9474    \u9474        \u9492 \u9472 \u9472  
+\f3\b \cf7 \strokec7 parallelCrossProd
+\f2\b0 \cf0 \strokec2 (PY)                      \cf5 \strokec5 [C++] Line ~1600\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474            \u9500 \u9472 \u9472  For each marker k (parallel):\
+\uc0\u9474    \u9474    \u9474            \u9474    \u9500 \u9472 \u9472  col = \cf8 \strokec8 stdGenoMultiMarkersMat\cf0 \strokec2 .col(k)\
+\uc0\u9474    \u9474    \u9474            \u9474    \u9492 \u9472 \u9472  accumulate: col \'d7 (col' \'d7 PY)\
+\uc0\u9474    \u9474    \u9474            \u9492 \u9472 \u9472  Normalize: result / \cf8 \strokec8 Msub_MAFge_minMAFtoConstructGRM\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 APY\cf0 \strokec2  = getCrossprodMatAndKin(PY)  
+\f1\i \cf3 \strokec3 # = K \'d7 PY / M
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 YPAPY\cf0 \strokec2  = PY' \'d7 APY\
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 GetTrace
+\f2\b0 \cf0 \strokec2 (Sigma_iX, X, W, tau, cov, nrun, ...)      \cf5 \strokec5 [Rcpp] Line 5218\cf0 \strokec2 \
+\uc0\u9474    \u9474    \u9474    \u9500 \u9472 \u9472  For i = 1 to nrun:\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9500 \u9472 \u9472  Generate random vector: u ~ \{-1, +1\}^n\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9500 \u9472 \u9472  
+\f3\b \cf7 \strokec7 getPCG1ofSigmaAndVector
+\f2\b0 \cf0 \strokec2 (W, tau, u, ...)\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9500 \u9472 \u9472  Pu = Sigma_iu - Sigma_iX \'d7 (cov \'d7 (Sigma_iX' \'d7 u))\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9500 \u9472 \u9472  Au = getCrossprodMatAndKin(u)\
+\uc0\u9474    \u9474    \u9474    \u9474    \u9492 \u9472 \u9472  tempVec[i] = Au' \'d7 Pu\
+\uc0\u9474    \u9474    \u9474    \u9500 \u9472 \u9472  Check CV, increase nrun if needed\
+\uc0\u9474    \u9474    \u9474    \u9492 \u9472 \u9472  \cf8 \strokec8 Trace\cf0 \strokec2  = mean(tempVec)\
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY, ...)\
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  PAPY = PAPY_1 - Sigma_iX \'d7 (cov \'d7 (Sigma_iX' \'d7 PAPY_1))\
+\uc0\u9474    \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 AI\cf0 \strokec2  = APY' \'d7 PAPY\
+\uc0\u9474    \u9474    \u9474 \
+\uc0\u9474    \u9474    \u9492 \u9472 \u9472  Returns: \{ YPAPY, Trace, PY, AI \}\
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  Initial tau update: \cf8 \strokec8 tau[2]\cf0 \strokec2  = max(0, tau0[2] + tau0[2]\'b2 \'d7 (YPAPY - Trace)/n)\
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # MAIN ITERATION LOOP (AI-REML)
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9500 \u9472 \u9472  
+\f1\i \cf3 \strokec3 # \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9474 \
+\uc0\u9474    \u9492 \u9472 \u9472  FOR i = 1 to maxiter:\
+\uc0\u9474        \u9474 \
+\uc0\u9474        \u9500 \u9472 \u9472  
+\f3\b \cf4 \strokec4 Get_Coef
+\f2\b0 \cf0 \strokec2 (y, X, tau, family, alpha0, eta0, ...)    \cf5 \strokec5 [R] Line 361\cf0 \strokec2 \
+\uc0\u9474        \u9474    \u9492 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getCoefficients
+\f2\b0 \cf0 \strokec2 (...)                           \cf5 \strokec5 [Rcpp]\cf0 \strokec2 \
+\uc0\u9474        \u9474 \
+\uc0\u9474        \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 fitglmmaiRPCG
+\f2\b0 \cf0 \strokec2 (Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) \cf5 \strokec5 [Rcpp] Line 5413\cf0 \strokec2 \
+\uc0\u9474        \u9474    \u9474 \
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  
+\f3\b \cf6 \strokec6 getAIScore
+\f2\b0 \cf0 \strokec2 (...)                                \cf5 \strokec5 [Rcpp]\cf0 \strokec2 \
+\uc0\u9474        \u9474    \u9474    \u9500 \u9472 \u9472  Compute PY, APY, YPAPY\
+\uc0\u9474        \u9474    \u9474    \u9500 \u9472 \u9472  Compute Trace via Monte Carlo\
+\uc0\u9474        \u9474    \u9474    \u9492 \u9472 \u9472  Compute AI\
+\uc0\u9474        \u9474    \u9474 \
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 Score\cf0 \strokec2  = YPAPY - Trace\
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 Dtau\cf0 \strokec2  = Score / AI\
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  \cf8 \strokec8 tau[2]\cf0 \strokec2  = tau[2] + Dtau\
+\uc0\u9474        \u9474    \u9474 \
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  If tau[2] < 0: apply step halving\
+\uc0\u9474        \u9474    \u9500 \u9472 \u9472  If tau < tol: set to 0\
+\uc0\u9474        \u9474    \u9474 \
+\uc0\u9474        \u9474    \u9492 \u9472 \u9472  Returns: \{ tau \}\
+\uc0\u9474        \u9474 \
+\uc0\u9474        \u9500 \u9472 \u9472  Convergence check:\
+\uc0\u9474        \u9474    \u9492 \u9472 \u9472  max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol \u8594  BREAK\
+\uc0\u9474        \u9474 \
+\uc0\u9474        \u9492 \u9472 \u9472  Update: tau0 = tau, alpha0 = alpha\
+\uc0\u9474 \
+\uc0\u9474    
+\f1\i \cf3 \strokec3 # After loop: final results
+\f2\i0 \cf0 \strokec2 \
+\uc0\u9474    \u9492 \u9472 \u9472  Returns: glmmResult = \{ theta=tau, coefficients=alpha, linear.predictors=eta,\
+\uc0\u9474                                fitted.values=mu, Y, residuals, cov, converged, ... \}\
+\uc0\u9474 \
+\uc0\u9492 \u9472 \u9472  
+\f3\b \cf4 \strokec4 glmmkin.ai_PCG_Rcpp_Quantitative
+\f2\b0 \cf0 \strokec2 ()                  \cf5 \strokec5 [R] Line 525\cf0 \strokec2   
+\f1\i \cf3 \strokec3 # For quantitative traits
+\f2\i0 \cf0 \strokec2 \
+    \uc0\u9492 \u9472 \u9472  
+\f1\i \cf3 \strokec3 (Similar structure, uses fitglmmaiRPCG_q, getAIScore_q, GetTrace_q)
+\f2\i0 \cf0 \strokec2 \
+\pard\pardeftab720\sa273\partightenfactor0
+
+\f0\b\fs33 \cf0 Legend\
+\pard\pardeftab720\sa220\partightenfactor0
+
+\fs22 \cf4 \strokec4 Blue
+\f4\b0 \cf0 \strokec2  = R Function | 
+\f0\b \cf6 \strokec6 Purple
+\f4\b0 \cf0 \strokec2  = Rcpp Export | 
+\f0\b \cf7 \strokec7 Green
+\f4\b0 \cf0 \strokec2  = Internal C++ | \cf8 \strokec8 Orange\cf0 \strokec2  = Variable | \cf5 \strokec5 Red\cf0 \strokec2  = File Location\
+}

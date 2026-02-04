@@ -1,0 +1,183 @@
+================================================================================
+SAIGE R vs C++ Comparison Plan
+================================================================================
+Created: Feb 1, 2025
+Updated: Feb 1, 2025
+Goal: Ensure C++ standalone produces identical results to R SAIGE package
+
+================================================================================
+CURRENT STATUS
+================================================================================
+
+Phase 1-4 COMPLETE. Phase 5 IN PROGRESS.
+
+Key Findings:
+1. QR transformation coefficient ordering differs (FIXED: bypass from R)
+2. Different marker sets in dense GRM (FIXED: use sparse GRM)
+3. C++ was missing inner IRLS loop for alpha convergence (FIXED: added loop)
+
+Current Result: tau difference reduced from 2.8% to 1.4%
+
+================================================================================
+PHASE 1: Environment Setup [COMPLETE]
+================================================================================
+
+[X] 1.1 Install R dependencies in isolated environment
+    - SAIGE 1.5.1 installed and working
+
+[X] 1.2 Add checkpoint code to both R and C++
+    - R: SAIGE_fitGLMM_fast.R (CP1-CP6)
+    - C++: main.cpp (CP1), glmm.cpp (CP2-CP6)
+    - All outputs go to /output/checkpoints/
+
+[X] 1.3 Compile C++ standalone
+    - saige-null binary compiled successfully
+
+================================================================================
+PHASE 2: Checkpoint Comparison [COMPLETE]
+================================================================================
+
+[X] 2.1 Run R with 128k dataset
+    - Converged in 2 iterations
+    - Final tau: [1, 0.2821]
+    - All checkpoints generated
+
+[X] 2.2 Run C++ with 128k dataset
+    - Converged in 4 iterations
+    - Final tau: [1, 0.2868]
+    - All checkpoints generated
+
+[X] 2.3 Compare checkpoints
+    - Results documented in /output/COMPARISON_ANALYSIS.html
+    - Key differences identified:
+      * Coefficient ordering different (QR transform issue)
+      * Final tau differs by ~1.7%
+      * Iteration count differs (2 vs 4)
+
+================================================================================
+PHASE 3: QR Transformation Bypass [COMPLETE]
+================================================================================
+
+[X] 3.1 Understand R's QR transformation
+    - File: SAIGE_isolated/R/SAIGE_fitGLMM_fast.R
+    - Function: Covariate_Transform() at line ~1370
+    - Outputs: qrr matrix, transformed X, X_name
+
+[X] 3.2 Add R code to output QR values
+    - Location: After Covariate_Transform() call (~line 1458-1476)
+    - Output to: /output/bypass/R_qr_transform.rds, R_qr_qrr.csv, R_qr_X1_transformed.csv
+    - Include: qrr, X_transformed, X_name
+
+[X] 3.3 Modify C++ to read QR values from R
+    - Location: null_model_engine.cpp (lines 356-383)
+    - Functions: bypass_files_exist(), load_r_qr_x1_transformed(), load_r_qrr()
+    - Fixed: qrmap.P initialized as identity (R doesn't use pivoting)
+    - Fixed: qrmap.scaled_sqrt_n = true (R's X is Q*sqrt(N))
+
+[X] 3.4 Re-run and compare
+    - Run R first (generates QR bypass files)
+    - Run C++ (reads QR bypass files)
+    - Result: Initial alpha now matches! [2.52, -0.77, -0.46]
+    - Result: W, Y, Sigma_iY, PY all match to 5+ decimal places
+    - Result: tau still differs by ~2.8% (0.2788 vs 0.2868)
+
+[X] 3.5 Document changes
+    - Updated AI_INSTRUCTIONS.txt with comparison results
+    - Documented in CODE CHANGES LOG section
+
+================================================================================
+PHASE 4: Additional Investigation [COMPLETE]
+================================================================================
+
+[X] 4.1 Differences identified after QR bypass:
+    - YPAPY: 86.5906 (R) vs 86.6447 (C++) = 0.06% difference
+    - Score: 4.767 (R) vs 4.822 (C++) = 1.1% difference
+    - This accumulates to ~2.8% tau difference
+
+[X] 4.2 Root cause: different marker sets in dense GRM
+    - R: 110,455 markers
+    - C++: 111,305 markers
+    - Solution: Use sparse GRM (same file for both)
+
+[X] 4.3 Root cause: C++ missing inner IRLS loop
+    - R's Get_Coef() has inner loop to converge alpha
+    - C++ was calling getCoefficients_cpp() only once per tau update
+    - Solution: Added inner IRLS loop in glmm.cpp (lines ~450-491)
+
+[X] 4.4 Results after fixes:
+    - With sparse GRM + inner loop: tau difference reduced to 1.4%
+    - R tau = 0.2901, C++ tau = 0.2941
+    - Alpha values nearly identical: [2.526, -0.772, -0.458] vs [2.525, -0.772, -0.458]
+    - Iteration counts now match: both 4 iterations
+
+================================================================================
+PHASE 5: Final Verification
+================================================================================
+
+[ ] 5.1 Run full comparison with all bypasses enabled
+    - tau should match within 0.1%
+    - alpha should match within 0.01%
+    - Iteration count should match
+
+[ ] 5.2 Test with different datasets
+    - Quantitative trait
+    - Different covariate combinations
+    - LOCO enabled
+
+[ ] 5.3 Document final state
+    - Update all documentation
+    - List all bypass files needed
+    - Create test script for future verification
+
+================================================================================
+FILE LOCATIONS
+================================================================================
+
+Project Root: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/
+
+code_copy/
+├── SAIGE_isolated/          # Isolated R package
+│   ├── R/SAIGE_fitGLMM_fast.R    # Main R code (checkpoints added)
+│   ├── src/                      # Rcpp source code
+│   └── extdata/input/            # Test data
+└── cpp_standalone/          # C++ standalone code
+    ├── main.cpp                  # CP1 checkpoint
+    ├── glmm.cpp                  # CP2-CP6 checkpoints
+    └── saige-null                # Compiled binary
+
+output/
+├── checkpoints/             # R_CP*.rds and CPP_CP*.csv
+├── bypass/                  # R→C++ value transfer files
+│   ├── random_vectors_seed10.csv  # For GetTrace
+│   └── R_qr_transform.rds         # For QR bypass (to be created)
+└── COMPARISON_ANALYSIS.html # Current comparison results
+
+reference/                   # Documentation
+
+================================================================================
+TEST CONFIGURATION
+================================================================================
+
+Dataset: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/
+  - Genotype: nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  - Phenotype: pheno_1000samples.txt
+  - Markers: 128,868
+  - Samples: 1,000
+
+Settings:
+  - Trait: binary
+  - Covariates: x1, x2
+  - LOCO: FALSE
+  - MAF filter: 0.01
+  - Missing rate filter: 0.15
+
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+
+- tau values match within 0.1%
+- alpha values match within 0.01%
+- Same convergence behavior (iterations, converged flag)
+- All intermediate checkpoints match within tolerance
+
+================================================================================

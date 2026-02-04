@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Annotated Call Graph: Binary Trait GLMM Fitting - Bug Locations Marked</title>
+    <style>
+        body { font-family: 'Courier New', monospace; font-size: 11px; margin: 20px; line-height: 1.6; }
+        h1 { font-size: 16px; border-bottom: 2px solid #333; padding-bottom: 5px; }
+        h2 { font-size: 14px; margin-top: 30px; }
+        .r-func { color: #2980b9; font-weight: bold; }
+        .cpp-func { color: #27ae60; font-weight: bold; }
+        .rcpp-func { color: #8e44ad; font-weight: bold; }
+        .comment { color: #7f8c8d; font-style: italic; }
+        .file { color: #e74c3c; }
+        .var { color: #d35400; }
+        pre { white-space: pre-wrap; }
+
+        /* Bug annotation styles */
+        .bug-marker {
+            background-color: #ffcccc;
+            border: 2px solid #cc0000;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px 0;
+            display: block;
+        }
+        .bug-label {
+            color: #cc0000;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .bug-description {
+            color: #660000;
+            margin-top: 5px;
+        }
+
+        /* Bypass annotation styles */
+        .bypass-marker {
+            background-color: #ffffcc;
+            border: 2px solid #ccaa00;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px 0;
+            display: block;
+        }
+        .bypass-label {
+            color: #aa8800;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .bypass-description {
+            color: #665500;
+            margin-top: 5px;
+        }
+
+        /* Legend box */
+        .legend-box {
+            border: 2px solid #333;
+            padding: 15px;
+            margin: 20px 0;
+            background-color: #f9f9f9;
+        }
+        .legend-title {
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .legend-item {
+            margin: 5px 0;
+            padding: 5px;
+        }
+        .legend-bug {
+            background-color: #ffcccc;
+            border-left: 4px solid #cc0000;
+        }
+        .legend-bypass {
+            background-color: #ffffcc;
+            border-left: 4px solid #ccaa00;
+        }
+    </style>
+</head>
+<body>
+<h1>Annotated Call Graph: Binary Trait GLMM Fitting</h1>
+<p><strong>This version marks the bug locations and bypass points discovered during debugging.</strong></p>
+
+<div class="legend-box">
+    <div class="legend-title">ANNOTATION LEGEND</div>
+    <div class="legend-item legend-bug">
+        <span class="bug-label">BUG #N</span> - Location where a bug was found in the C++ implementation
+    </div>
+    <div class="legend-item legend-bypass">
+        <span class="bypass-label">BYPASS #N</span> - Location where R values are injected to bypass C++ code for debugging
+    </div>
+    <br>
+    <strong>Color Legend:</strong>
+    <span class="r-func">Blue</span> = R Function |
+    <span class="rcpp-func">Purple</span> = Rcpp Export |
+    <span class="cpp-func">Green</span> = Internal C++ |
+    <span class="var">Orange</span> = Variable |
+    <span class="file">Red</span> = File Location
+</div>
+
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># ENTRY POINT: User calls fitNULLGLMM() from R</span>
+<span class="comment"># File: SAIGE/R/SAIGE_fitGLMM_fast.R</span>
+<span class="comment"># ===============================================================================</span>
+
+<span class="r-func">fitNULLGLMM</span>()                                          <span class="file">[R] Line 906</span>
+|
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
++-- <span class="comment"># PREPROCESSING PHASE (Lines 963-1500)</span>
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
+|
++-- <span class="comment"># STEP 0.1: Output File Setup (Lines 980-1030)</span>
+|   +-- Create <span class="var">modelOut</span> = outputPrefix + ".rda"
+|   +-- Create <span class="var">varRatioFile</span> = outputPrefix + ".varianceRatio.txt"
+|   +-- If LOCO & isLowMemLOCO: modelOut = outputPrefix + "_noLOCO.rda"
+|
++-- <span class="comment"># STEP 0.2: PLINK File Setup (Lines 994-998)</span>
+|   +-- If plinkFile specified:
+|       +-- <span class="var">bedFile</span> = plinkFile + ".bed"
+|       +-- <span class="var">bimFile</span> = plinkFile + ".bim"
+|       +-- <span class="var">famFile</span> = plinkFile + ".fam"
+|
++-- <span class="comment"># STEP 0.3: Sparse GRM Configuration (Lines 1001-1052)</span>
+|   +-- If useSparseGRMtoFitNULL & no bedFile -> skipVarianceRatioEstimation = TRUE
+|   +-- If useSparseGRMtoFitNULL:
+|   |   +-- LOCO = FALSE
+|   |   +-- nThreads = 1
+|   +-- Validate sparseGRMFile & sparseGRMSampleIDFile exist
+|
++-- <span class="comment"># STEP 0.4: Thread Configuration (Lines 1055-1058)</span>
+|   +-- <span class="rcpp-func">RcppParallel:::setThreadOptions</span>(numThreads = nThreads)
+|
++-- <span class="comment"># STEP 0.5: Sex-Specific Setup (Lines 1060-1072)</span>
+|   +-- FemaleOnly -> outputPrefix = outputPrefix + "_FemaleOnly"
+|   +-- MaleOnly -> outputPrefix = outputPrefix + "_MaleOnly"
+|
++-- <span class="comment"># STEP 0.6: Genotype File Validation (Lines 1074-1119)</span>
+|   +-- Validate bed/bim/fam files exist
+|   +-- If LOCO:
+|   |   +-- Read chromosome info from bim: <span class="var">chrVec</span>
+|   |   +-- <span class="r-func">updateChrStartEndIndexVec</span>(chrVec)
+|   |       +-- Returns: <span class="var">chromosomeStartIndexVec</span>, <span class="var">chromosomeEndIndexVec</span>
+|   +-- Read fam file:
+|       +-- <span class="var">sampleListwithGenov0</span> = fread(famFile)  <span class="comment"># columns: FID,IID,father,mother,sex,phe</span>
+|       +-- <span class="var">sampleListwithGeno</span> = {IIDgeno, IndexGeno=1:N}
+|
++-- <span class="comment"># STEP 0.7: Phenotype File Processing (Lines 1122-1174)</span>
+|   +-- Read phenoFile (handles .gz/.bgz compression)
+|   +-- Validate required columns exist: phenoCol, covarColList, sampleIDColinphenoFile
+|   +-- If survival: validate eventTimeCol, handle eventTimeBinSize
+|   +-- <span class="var">data</span> = data[complete.cases(data), ]  <span class="comment"># Remove missing</span>
+|   +-- If SampleIDIncludeFile:
+|       +-- Filter to samples in include file
+|
++-- <span class="comment"># STEP 0.8: Categorical Covariate Conversion (Lines 1177-1186)</span>
+|   +-- For each q in qCovarCol:
+|       +-- data[,q] = as.factor(data[,q])
+|
++-- <span class="comment"># STEP 0.9: Sex-Specific Data Filtering (Lines 1189-1212)</span>
+|   +-- If FemaleOnly: data = data[sexCol == FemaleCode, ]
+|   +-- If MaleOnly: data = data[sexCol == MaleCode, ]
+|
++-- <span class="comment"># STEP 0.10: Formula Construction (Lines 1216-1230)</span>
+|   +-- If covariates: <span class="var">formula</span> = "phenoCol ~ covar1 + covar2 + ..."
+|   +-- Else: <span class="var">formula</span> = "phenoCol ~ 1"
+|   +-- <span class="var">formula.null</span> = as.formula(formula)
+|
++-- <span class="comment"># STEP 0.11: Model Matrix Creation (Lines 1233-1270)</span>
+|   +-- <span class="var">mmat</span> = model.matrix(formula.null, data)  <span class="comment"># Expands categorical vars</span>
+|   +-- mmat$IID = sample IDs
+|   +-- <span class="var">mmat_nomissing</span> = mmat[complete.cases, ]
+|   +-- mmat_nomissing$IndexPheno = 1:nrow
+|
++-- <span class="comment"># STEP 0.12: Sample Merging (Lines 1286-1314)</span>
+|   +-- <span class="var">dataMerge</span> = merge(mmat_nomissing, sampleListwithGeno, by IID)
+|   +-- <span class="var">dataMerge_sort</span> = sort by IndexGeno  <span class="comment"># Critical: match genotype order</span>
+|   +-- <span class="var">indicatorGenoSamplesWithPheno</span> = boolean vector
+|
++-- <span class="comment"># STEP 0.13: Inverse Normalization (Lines 1316-1323)</span>
+|   +-- If quantitative & invNormalize:
+|       +-- phenotype = qnorm((rank - 0.5) / n)
+|
++-- <span class="comment"># STEP 0.14: Perfect Separation Check (Lines 1325-1342)</span>
+|   +-- If binary & covariates:
+|       +-- <span class="r-func">checkPerfectSep</span>(formula.null, dataMerge_sort)
+|       +-- Remove problematic covariates causing separation
+|
++-- <span class="comment"># STEP 0.15: Covariate Transform - QR Decomposition (Lines 1348-1382)</span>
+|   +-- If isCovariateTransform & hasCovariate:
+|       +-- <span class="r-func">Covariate_Transform</span>(formula.null, dataMerge_sort, traitType)
+|       |   +-- Returns: {Y, X1, Param.transform={X_name, qrr}}
+|       +-- <span class="var">formula.new</span> = updated formula with transformed names
+|       +-- <span class="var">data.new</span> = data with transformed covariates
+|
+<span class="bypass-marker">       <span class="bypass-label">BYPASS #1: QR TRANSFORM MATRIX</span>
+       <span class="bypass-description">Location: After Covariate_Transform() completes</span>
+       <span class="bypass-description">What: R outputs the qrr matrix to file, C++ reads it instead of computing</span>
+       <span class="bypass-description">Why: Ensures identical QR decomposition between R and C++</span>
+       <span class="bypass-description">File: qrr matrix written to checkpoint file</span></span>
+|
++-- <span class="comment"># STEP 0.16: Initial GLM Fit - No Random Effects (Lines 1386-1392)</span>
+|   +-- If binary: <span class="var">modwitcov</span> = glm(formula.new, data.new, family=binomial)
+|   +-- If quantitative: <span class="var">modwitcov</span> = glm(formula.new, data.new, family=gaussian)
+|
++-- <span class="comment"># STEP 0.17: Covariate Offset Handling (Lines 1397-1407)</span>
+|   +-- If isCovariateOffset:
+|   |   +-- <span class="var">covoffset</span> = X[,-1] %*% modwitcov$coefficients[-1]
+|   |   +-- formula.new = "phenoCol ~ 1"  <span class="comment"># Remove covariates from model</span>
+|   +-- Else:
+|       +-- <span class="var">covoffset</span> = rep(0, n)
+|
++-- <span class="comment"># STEP 0.18: Sparse GRM Setup (Lines 1409-1420)</span>
+|   +-- If useSparseGRMtoFitNULL | useSparseGRMforVarRatio:
+|       +-- <span class="r-func">getsubGRM</span>(sparseGRMFile, sparseGRMSampleIDFile, cutoff, sampleIDs)
+|       +-- <span class="r-func">gen_sp_v2</span>(sparseGRMtest) -> <span class="var">m4</span>
+|       +-- A = summary(m4)  <span class="comment"># Extract i,j,x triplets</span>
+|       +-- <span class="var">locationMatinR</span> = rbind(A$i - 1, A$j - 1)  <span class="comment"># 0-indexed</span>
+|       +-- <span class="var">valueVecinR</span> = A$x
+|       +-- <span class="rcpp-func">setupSparseGRM</span>(dim, locationMatinR, valueVecinR)
+|
++-- <span class="comment"># STEP 0.19: Variance Ratio Parameters (Lines 1422-1434)</span>
+|   +-- <span class="rcpp-func">setminMAC_VarianceRatio</span>(minMAC_varRatio, maxMAC_varRatio, isVarianceRatioinGeno)
+|
++-- <span class="comment"># STEP 0.20: GRM Parameters (Lines 1437-1446)</span>
+|   +-- <span class="rcpp-func">setminMAFforGRM</span>(minMAFforGRM)  <span class="comment"># Default: 0.01</span>
+|   +-- <span class="rcpp-func">setmaxMissingRateforGRM</span>(maxMissingRateforGRM)  <span class="comment"># Default: 0.15</span>
+|
++-- <span class="comment"># STEP 0.21: Trait-Specific Validation (Lines 1450-1484)</span>
+|   +-- If binary:
+|       +-- Validate phenotype values are 0 or 1
+|       +-- If !isCovariateOffset:
+|       |   +-- <span class="var">fit0</span> = glm(formula.new, data.new, family=binomial)
+|       +-- Else:
+|           +-- <span class="var">fit0</span> = glm(formula.new, data.new, offset=covoffset, family=binomial)
+|
++-- <span class="comment"># STEP 0.22: Set Use Sparse GRM Flag (Line 1493)</span>
+|   +-- <span class="rcpp-func">setisUseSparseSigmaforNullModelFitting</span>(useSparseGRMtoFitNULL)
+|
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
++-- <span class="comment"># END PREPROCESSING - START GLMM FITTING</span>
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
+|
++-- <span class="r-func">glmmkin.ai_PCG_Rcpp_Binary</span>()                       <span class="file">[R] Line 241</span>  <span class="comment"># Called at Line 1501</span>
+|   |
+|   |   <span class="comment"># Arguments passed from fitNULLGLMM:</span>
+|   |   <span class="comment"># - bedFile, bimFile, famFile: PLINK genotype files</span>
+|   |   <span class="comment"># - fit0: initial GLM fit (no random effects)</span>
+|   |   <span class="comment"># - tau = c(0, 0): initial variance components</span>
+|   |   <span class="comment"># - subPheno = dataMerge_sort: merged phenotype data</span>
+|   |   <span class="comment"># - indicatorGenoSamplesWithPheno: sample indicator</span>
+|   |   <span class="comment"># - out.transform: QR transform parameters</span>
+|   |   <span class="comment"># - LOCO, chromosomeStartIndexVec, chromosomeEndIndexVec</span>
+|   |
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   +-- <span class="comment"># STEP 1: Load genotype data</span>
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   |
+|   +-- <span class="rcpp-func">setgeno</span>(bedFile, bimFile, famFile, ...)             <span class="file">[Rcpp] Line ~780</span>
+|   |   +-- <span class="cpp-func">genoClass::setGenotype()</span>                         <span class="file">[C++] internal</span>
+|   |       +-- Read PLINK .bed/.bim/.fam files
+|   |       +-- Compute allele frequencies: <span class="var">alleleFreqVec</span>
+|   |       +-- Compute inverse std dev: <span class="var">invstdvVec</span>
+|   |       +-- Build: <span class="var">genoVecofPointers</span> (genotype storage)
+|   |       +-- Set: <span class="var">M</span>, <span class="var">N</span>, <span class="var">Nnomissing</span>
+|   |
+|   +-- <span class="comment"># LOCO chromosome index setup if needed</span>
+|   +-- <span class="rcpp-func">getQCdMarkerIndex</span>()                                  <span class="file">[Rcpp]</span>
+|   |
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   +-- <span class="comment"># STEP 2: Initial coefficient estimation</span>
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   |
+|   +-- Initialize: <span class="var">tau</span> = [1, 0.5], <span class="var">alpha0</span>, <span class="var">eta0</span>
+|   |
+|   +-- <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 117</span>
+|   |   |
+|   |   +-- Compute working response: <span class="var">Y</span> = eta - offset + (y - mu)/mu.eta
+|   |   +-- Compute weights: <span class="var">W</span> = sqrtW^2 where sqrtW = mu.eta/sqrt(variance(mu))
+|   |   |
+|   |   +-- <span class="rcpp-func">getCoefficients</span>(Y, X, W, tau, maxiterPCG, tolPCG)  <span class="file">[Rcpp] Line 5272</span>
+|   |       |
+<span class="bug-marker">       |       <span class="bug-label">BUG #2: INNER IRLS ALPHA INITIALIZATION</span>
+       |       <span class="bug-description">Location: glmm.cpp line 455, inside getCoefficients / inner IRLS loop</span>
+       |       <span class="bug-description">What happened: C++ compared alpha against zeros instead of previous outer iteration's alpha</span>
+       |       <span class="bug-description">R behavior: Compares against alpha0 from BEFORE the inner loop started</span>
+       |       <span class="bug-description">Impact: Wrong convergence detection in inner IRLS iterations</span>
+       |       <span class="bug-description">Fix: Initialize comparison baseline with alpha0, not zeros</span></span>
+|   |       |
+|   |       +-- <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, Y, ...)       <span class="file">[C++] Line ~4500</span>
+|   |       |   +-- PCG iterative solver
+|   |       |   +-- Returns: <span class="var">Sigma_iY</span> = Sigma^-1 x Y
+|   |       |
+|   |       +-- For each column of X:
+|   |       |   +-- <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,i], ...)
+|   |       |       +-- Returns: <span class="var">Sigma_iX</span>[:,i] = Sigma^-1 x X[:,i]
+|   |       |
+|   |       +-- <span class="var">cov</span> = (X' x Sigma_iX)^-1
+|   |       +-- <span class="var">alpha</span> = cov x (Sigma_iX' x Y)
+|   |       +-- <span class="var">eta</span> = Y - tau[0] x (Sigma_iY - Sigma_iX x alpha) / W  <span class="comment"># CORRECT formula</span>
+|   |       |
+|   |       +-- Returns: { Sigma_iY, Sigma_iX, cov, alpha, eta }
+|   |
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   +-- <span class="comment"># STEP 3: Initial Score/Trace estimation</span>
+|   +-- <span class="comment"># ---------------------------------------------------------------------</span>
+|   |
+|   +-- <span class="rcpp-func">getAIScore</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5384</span>
+|   |   |
+|   |   +-- Compute projection: <span class="var">PY</span> = Sigma_iY - Sigma_iX x (cov x (Sigma_iX' x Y))
+|   |   |
+|   |   +-- <span class="rcpp-func">getCrossprodMatAndKin</span>(PY)                         <span class="file">[Rcpp] Line 1733</span>
+|   |   |   |
+|   |   |   +-- If using sparse GRM:
+|   |   |   |   +-- Sparse matrix multiply: result x bVec
+|   |   |   |
+|   |   |   +-- Else (full GRM):
+|   |   |       +-- <span class="cpp-func">parallelCrossProd</span>(PY)                      <span class="file">[C++] Line ~1600</span>
+|   |   |           +-- For each marker k (parallel):
+|   |   |           |   +-- col = <span class="var">stdGenoMultiMarkersMat</span>.col(k)
+|   |   |           |   +-- accumulate: col x (col' x PY)
+|   |   |           +-- Normalize: result / <span class="var">Msub_MAFge_minMAFtoConstructGRM</span>
+|   |   |
+|   |   +-- <span class="var">APY</span> = getCrossprodMatAndKin(PY)  <span class="comment"># = K x PY / M</span>
+|   |   +-- <span class="var">YPAPY</span> = PY' x APY
+|   |   |
+|   |   +-- <span class="rcpp-func">GetTrace</span>(Sigma_iX, X, W, tau, cov, nrun, ...)      <span class="file">[Rcpp] Line 5218</span>
+|   |   |   +-- For i = 1 to nrun:
+|   |   |   |   +-- Generate random vector: u ~ {-1, +1}^n
+<span class="bypass-marker">|   |   |   |   <span class="bypass-label">BYPASS #2: RANDOM VECTORS</span>
+|   |   |   |   <span class="bypass-description">Location: Inside GetTrace() function, random vector generation</span>
+|   |   |   |   <span class="bypass-description">What: R outputs 30 random vectors to file, C++ reads them instead of generating</span>
+|   |   |   |   <span class="bypass-description">Why: Ensures identical Monte Carlo trace estimates between R and C++</span>
+|   |   |   |   <span class="bypass-description">File: Random vectors written to checkpoint file</span></span>
+|   |   |   |   +-- <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, u, ...)
+|   |   |   |   +-- Pu = Sigma_iu - Sigma_iX x (cov x (Sigma_iX' x u))
+|   |   |   |   +-- Au = getCrossprodMatAndKin(u)
+|   |   |   |   +-- tempVec[i] = Au' x Pu
+|   |   |   +-- Check CV, increase nrun if needed
+|   |   |   +-- <span class="var">Trace</span> = mean(tempVec)
+|   |   |
+|   |   +-- PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY, ...)
+|   |   +-- PAPY = PAPY_1 - Sigma_iX x (cov x (Sigma_iX' x PAPY_1))
+|   |   +-- <span class="var">AI</span> = APY' x PAPY
+|   |   |
+|   |   +-- Returns: { YPAPY, Trace, PY, AI }
+|   |
+|   +-- Initial tau update: <span class="var">tau[2]</span> = max(0, tau0[2] + tau0[2]^2 x (YPAPY - Trace)/n)
+|   |
+|   +-- <span class="comment"># =======================================================================</span>
+|   +-- <span class="comment"># MAIN ITERATION LOOP (AI-REML)</span>
+|   +-- <span class="comment"># =======================================================================</span>
+|   |
+|   +-- FOR i = 1 to maxiter:
+|       |
+|       +-- <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 361</span>
+|       |   +-- <span class="rcpp-func">getCoefficients</span>(...)                           <span class="file">[Rcpp]</span>
+|       |       +-- <span class="comment">(Same as above - computes new alpha, eta)</span>
+|       |       +-- Returns correct eta using: eta = Y - tau[0] x (Sigma_iY - Sigma_iX x alpha) / W
+|       |
+|       +-- <span class="rcpp-func">fitglmmaiRPCG</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5413</span>
+|       |   |
+|       |   +-- <span class="rcpp-func">getAIScore</span>(...)                                <span class="file">[Rcpp]</span>
+|       |   |   +-- Compute PY, APY, YPAPY
+|       |   |   +-- Compute Trace via Monte Carlo
+|       |   |   +-- Compute AI
+|       |   |
+|       |   +-- <span class="var">Score</span> = YPAPY - Trace
+|       |   +-- <span class="var">Dtau</span> = Score / AI
+|       |   +-- <span class="var">tau[2]</span> = tau[2] + Dtau
+|       |   |
+|       |   +-- If tau[2] < 0: apply step halving
+|       |   +-- If tau < tol: set to 0
+|       |   |
+|       |   +-- Returns: { tau }
+|       |
+<span class="bug-marker">       +-- <span class="bug-label">BUG #1: ETA OVERWRITE</span>
+       |   <span class="bug-description">Location: glmm.cpp line 715, AFTER tau update, BEFORE next iteration</span>
+       |   <span class="bug-description">What happened: C++ overwrote the correct eta (from getCoefficients) with WRONG formula: eta = X * alpha</span>
+       |   <span class="bug-description">Correct formula: eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / W</span>
+       |   <span class="bug-description">Impact: In mixed model, eta depends on random effects, NOT just fixed effects!</span>
+       |   <span class="bug-description">Consequence: Wrong eta propagated to next iteration, causing divergence</span>
+       |   <span class="bug-description">Fix: Remove the eta = X * alpha line, keep eta from getCoefficients</span></span>
+|       |
+|       +-- Convergence check:
+|       |   +-- max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol -> BREAK
+|       |
+|       +-- Update: tau0 = tau, alpha0 = alpha
+|
+|   <span class="comment"># After loop: final results</span>
+|   +-- Returns: glmmResult = { theta=tau, coefficients=alpha, linear.predictors=eta,
+|                               fitted.values=mu, Y, residuals, cov, converged, ... }
+|
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
++-- <span class="comment"># POST-PROCESSING (Lines 1512-1700+)</span>
++-- <span class="comment"># ---------------------------------------------------------------------------</span>
+|
++-- <span class="comment"># STEP POST.1: Clean model attributes</span>
+|   +-- Remove .Environment attributes from glm object
+|
++-- <span class="comment"># STEP POST.2: Compute offset from fitted model</span>
+|   +-- If hasCovariate & !isCovariateOffset:
+|       +-- <span class="var">modglmm$offset</span> = X %*% coefficients[-1]
+|
++-- <span class="comment"># STEP POST.3: Transform coefficients back (if QR transformed)</span>
+|   +-- If out.transform & !offset:
+|       +-- <span class="r-func">Covariate_Transform_Back</span>(alpha0, Param.transform)
+|
++-- <span class="comment"># STEP POST.4: LOCO results (if isLowMemLOCO)</span>
+|   +-- Save noLOCO model, then fit LOCO per chromosome
+|
++-- <span class="comment"># STEP POST.5: Save final model</span>
+    +-- save(modglmm, file = modelOut)
+
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># ALTERNATE PATH: Quantitative Traits</span>
+<span class="comment"># ===============================================================================</span>
+
+<span class="r-func">glmmkin.ai_PCG_Rcpp_Quantitative</span>()                  <span class="file">[R] Line 525</span>  <span class="comment"># For quantitative traits</span>
+    +-- <span class="comment">(Similar structure, uses fitglmmaiRPCG_q, getAIScore_q, GetTrace_q)</span>
+</pre>
+
+<h2>Bug Summary</h2>
+
+<div class="bug-marker">
+    <span class="bug-label">BUG #1: Eta Overwrite (glmm.cpp line 715)</span>
+    <div class="bug-description">
+        <strong>Location in flow:</strong> After tau update in fitglmmaiRPCG, before returning to next outer iteration<br>
+        <strong>Root cause:</strong> C++ code contained line: <code>eta = X * alpha</code> which is WRONG for mixed models<br>
+        <strong>Correct formula:</strong> <code>eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / W</code><br>
+        <strong>Why it matters:</strong> In GLMM, the linear predictor includes contributions from random effects (via the covariance structure), not just X*alpha. The incorrect formula treated it like a regular GLM.<br>
+        <strong>Symptom:</strong> Tau values diverged from R, model failed to converge properly
+    </div>
+</div>
+
+<div class="bug-marker">
+    <span class="bug-label">BUG #2: Inner IRLS Alpha Initialization (glmm.cpp line 455)</span>
+    <div class="bug-description">
+        <strong>Location in flow:</strong> Inside getCoefficients function, at the start of inner IRLS iterations<br>
+        <strong>Root cause:</strong> C++ initialized comparison baseline as zeros: <code>alpha_old = zeros</code><br>
+        <strong>R behavior:</strong> R uses alpha0 (from the previous OUTER iteration) as the comparison baseline<br>
+        <strong>Why it matters:</strong> Convergence of inner loop is measured by change from the starting point, not from zero<br>
+        <strong>Symptom:</strong> Inner loop converged at wrong point, affecting alpha estimates
+    </div>
+</div>
+
+<h2>Bypass Summary</h2>
+
+<div class="bypass-marker">
+    <span class="bypass-label">BYPASS #1: QR Transform Matrix</span>
+    <div class="bypass-description">
+        <strong>Location:</strong> After Covariate_Transform() in preprocessing phase<br>
+        <strong>Purpose:</strong> Ensure R and C++ use identical QR decomposition results<br>
+        <strong>Implementation:</strong> R writes qrr matrix to checkpoint file, C++ reads it
+    </div>
+</div>
+
+<div class="bypass-marker">
+    <span class="bypass-label">BYPASS #2: Random Vectors for Trace Estimation</span>
+    <div class="bypass-description">
+        <strong>Location:</strong> Inside GetTrace() function during Monte Carlo trace estimation<br>
+        <strong>Purpose:</strong> Ensure R and C++ use identical random vectors for trace calculation<br>
+        <strong>Implementation:</strong> R writes 30 random vectors to checkpoint file, C++ reads them
+    </div>
+</div>
+
+<h2>Key Variables Summary</h2>
+<pre>
+<span class="comment"># From fitNULLGLMM preprocessing:</span>
+<span class="var">dataMerge_sort</span>    - Merged phenotype data, sorted by genotype index
+<span class="var">formula.new</span>       - Model formula (possibly with QR-transformed covariates)
+<span class="var">data.new</span>          - Data frame with transformed covariates
+<span class="var">fit0</span>              - Initial GLM fit without random effects
+<span class="var">covoffset</span>         - Covariate offset vector (0 if not using offset)
+<span class="var">out.transform</span>     - QR transformation parameters {X_name, qrr}
+<span class="var">indicatorGenoSamplesWithPheno</span> - Boolean: which geno samples have pheno
+
+<span class="comment"># From glmmkin.ai_PCG_Rcpp_Binary:</span>
+<span class="var">tau</span>               - Variance components [tau_e, tau_g]
+<span class="var">alpha</span>             - Fixed effect coefficients
+<span class="var">eta</span>               - Linear predictor (CORRECT: Y - tau[0]*(Sigma_iY - Sigma_iX*alpha)/W)
+<span class="var">mu</span>                - Fitted values (inverse link of eta)
+<span class="var">W</span>                 - Working weights = mu * (1 - mu) for binary
+<span class="var">Y</span>                 - Working response
+<span class="var">Sigma_iY</span>          - Sigma^-1 x Y (via PCG)
+<span class="var">Sigma_iX</span>          - Sigma^-1 x X (via PCG)
+<span class="var">PY</span>                - Projection: Sigma^-1*Y - Sigma^-1*X*(X'*Sigma^-1*X)^-1*X'*Sigma^-1*Y
+<span class="var">APY</span>               - K x PY / M
+<span class="var">YPAPY</span>             - PY' x K x PY / M
+<span class="var">Trace</span>             - Tr(P x K) via Monte Carlo
+<span class="var">AI</span>                - Average Information (Hessian)
+<span class="var">Score</span>             - YPAPY - Trace (gradient)
+</pre>
+
+<p><em>Generated: 2026-02-02 | This annotated version documents bugs found during R vs C++ comparison debugging.</em></p>
+
+</body>
+</html>

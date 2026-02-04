@@ -1,0 +1,29 @@
+# Pixi environment (1.7 GB)
+.pixi/
+
+# Compiled objects and binaries
+*.o
+*.d
+*.so
+*.dylib
+*.o.tmp
+code_copy/cpp_standalone/saige-null
+
+# Backup files
+*.bak
+*.backup
+*.disabled
+
+# macOS
+.DS_Store
+
+# Generated output (checkpoints, bypass, model results)
+output/
+
+# Large test data (PLINK .bed, VCF, etc.)
+code_copy/SAIGE_isolated/extdata/
+
+# R build artifacts
+code_copy/SAIGE_isolated/src/*.so
+code_copy/SAIGE_isolated/src/Makevars
+code_copy/SAIGE_isolated/src/RcppExports.cpp

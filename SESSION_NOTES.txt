@@ -1,0 +1,350 @@
+================================================================================
+SAIGE R vs C++ COMPARISON - SESSION NOTES
+================================================================================
+Date: Feb 1, 2025
+Purpose: Document all changes, configurations, and findings for context preservation
+
+================================================================================
+DIRECTORY STRUCTURE
+================================================================================
+
+Project Root: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/
+
+code_copy/
+├── SAIGE_isolated/              # R SAIGE package (modified for comparison)
+│   ├── R/SAIGE_fitGLMM_fast.R   # Main R fitting code with checkpoints
+│   ├── src/SAIGE_fitGLMM_fast.cpp  # Rcpp code (fitglmmaiRPCG modified)
+│   └── extdata/input/           # Test data
+└── cpp_standalone/              # C++ standalone implementation
+    ├── glmm.cpp                 # Main GLMM solver with checkpoints
+    ├── saige_ai.cpp             # getCoefficients_cpp, getAIScore_cpp
+    ├── SAIGE_step1_fast.cpp     # PCG solver, GRM operations
+    ├── config_test.yaml         # Configuration file
+    └── saige-null               # Compiled binary
+
+output/
+├── checkpoints/                 # Checkpoint files from both R and C++
+│   ├── CPP_iteration_summary.csv
+│   ├── R_iteration_summary.csv
+│   └── various R_CP*.rds and CPP_CP*.csv files
+└── bypass/                      # R→C++ value transfer files
+    ├── R_qr_X1_transformed.csv  # QR bypass: transformed covariate matrix
+    ├── R_qr_qrr.csv             # QR bypass: QR decomposition R matrix
+    ├── R_qr_transform.rds       # QR bypass: R format
+    └── random_vectors_30.csv    # Random vector bypass: 30 vectors (N x 30)
+
+================================================================================
+COMMANDS TO RUN
+================================================================================
+
+### Run C++ Standalone:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone
+./saige-null -c config_test.yaml 2>&1 | tee /tmp/cpp_output.txt
+
+### Run R SAIGE:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/pixi.toml Rscript test_sparse_grm.R 2>&1 | tee /tmp/r_output.txt
+
+### Rebuild C++:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone
+make
+
+### Rebuild R Package:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated
+~/.pixi/bin/pixi run --manifest-path=pixi.toml R CMD INSTALL .
+
+================================================================================
+CONFIGURATION FILES
+================================================================================
+
+### C++ Config: config_test.yaml
+paths:
+  plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_output
+  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_vr
+  sparse_grm: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
+  sparse_grm_ids: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
+
+fit:
+  trait: binary
+  loco: false
+  use_sparse_grm_to_fit: true
+  relatedness_cutoff: 0.125
+  tol: 0.02
+
+### R Test Script: test_sparse_grm.R
+- Uses same sparse GRM file as C++
+- phenoCol = "y"
+- covarColList = c("x1", "x2")
+- useSparseGRMtoFitNULL = TRUE
+- usePCGwithSparseGRM = TRUE   *** CRITICAL: Must be TRUE to match C++ ***
+- LOCO = FALSE
+- tol = 0.02
+
+NOTE: usePCGwithSparseGRM=TRUE is REQUIRED for R to use the PCG solver
+(Preconditioned Conjugate Gradient) in getCoefficients(), which matches
+C++ behavior. Without this flag, R uses a direct solve that produces
+slightly different intermediate values.
+
+================================================================================
+CODE CHANGES MADE
+================================================================================
+
+### 1. C++ glmm.cpp - Inner IRLS Loop (MAJOR FIX)
+Location: Lines ~450-491
+Purpose: Match R's Get_Coef behavior which has inner loop to converge alpha
+
+Before: Called getCoefficients_cpp() once per tau update
+After: Added inner IRLS loop that iterates until alpha converges:
+  for (int inner_it = 0; inner_it < maxiter; ++inner_it) {
+    irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
+    coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+    eta = coef.eta + offset;
+    if (alpha converged) break;
+  }
+
+### 2. C++ glmm.cpp - Iteration Summary CSV
+Location: Lines ~717-751
+Purpose: Output detailed values at every iteration
+
+Added code to save CPP_iteration_summary.csv with columns:
+iteration,tau_before,tau_after,Dtau,YPAPY,Trace,Score,AI,alpha0,alpha1,alpha2,
+eta_norm,W_norm,Y_norm,Sigma_iY_norm,PY_norm,APY_norm
+
+### 3. C++ glmm.cpp - Debug Flag
+Location: Line 451
+Change: const bool STOP_AFTER_FIRST_TAU_UPDATE = false;
+(Set to true to stop early for debugging, false for full run)
+
+### 4. R SAIGE_fitGLMM_fast.R - Iteration Summary
+Location: Lines ~534-582
+Purpose: Output detailed values at every iteration
+
+Added code to save R_iteration_summary.csv with same columns as C++
+
+### 5. R SAIGE_fitGLMM_fast.R - Debug Flag
+Location: Line 411
+Change: STOP_AFTER_FIRST_TAU_UPDATE = FALSE
+
+### 6. Rcpp SAIGE_fitGLMM_fast.cpp - fitglmmaiRPCG Return Values
+Location: Line 5464
+Before: return List::create(Named("tau") = tauVec);
+After: return List::create(Named("tau") = tauVec, Named("YPAPY") = YPAPY,
+                           Named("Trace") = Trace, Named("AI") = AI1,
+                           Named("Score") = score1);
+
+### 7. QR Bypass (Previously Implemented)
+- R outputs QR transformation to /output/bypass/
+- C++ reads these files instead of computing its own QR
+- Files: R_qr_X1_transformed.csv, R_qr_qrr.csv
+
+================================================================================
+KEY FINDINGS
+================================================================================
+
+### Iteration 1 (tau=0): PERFECT MATCH
+- All values match to 4+ decimal places
+- YPAPY: 86.1818 (both)
+- Score: 4.7267 (both)
+- tau_after: 0.2810 (both)
+
+### Iteration 2 (tau=0.281): DIVERGENCE BEGINS
+- YPAPY: R=78.10, C++=77.36 (0.95% diff)
+- Trace: R=77.43, C++=77.18 (0.32% diff)
+- Score: R=0.676, C++=0.190 (256% diff!)
+- Dtau: R=+0.045, C++=+0.013 (3.5x diff)
+- tau_after: R=0.326, C++=0.294 (10.9% diff)
+
+### Iteration 3: OPPOSITE DIRECTIONS
+- R: Score=-0.35 (tau decreases)
+- C++: Score=+0.002 (tau increases, converges)
+
+### Final Results:
+- R: tau=0.2901
+- C++: tau=0.2941
+- Difference: ~1.4%
+
+### Root Cause:
+YPAPY diverges by ~0.7 when tau[1] becomes non-zero.
+YPAPY = PY' * K * PY (involves GRM multiplication)
+This 0.7 difference causes 256% Score difference.
+
+The getCrossprodMatAndKin(PY) function or sparse GRM handling
+may behave differently when tau[1] > 0.
+
+================================================================================
+CHECKPOINT FILES GENERATED
+================================================================================
+
+### C++ Checkpoints (in /output/checkpoints/):
+- CPP_iteration_summary.csv - Summary of all iterations
+- CPP_CP2_*.csv - Initial values
+- CPP_CP3_*.csv - After first getCoefficients
+- CPP_CP4_*.csv - After first getAIScore
+- CPP_CP4b_*.csv - Iteration 2 intermediate values
+- CPP_FIRST_TAU_*.csv - First tau update checkpoint
+
+### R Checkpoints (in /output/checkpoints/):
+- R_iteration_summary.csv - Summary of all iterations
+- R_CP2_initial.rds
+- R_CP3_coef.rds
+- R_CP4_AIScore.rds
+- R_CP4b_iter2_inputs.rds
+- R_CP4b_iter2_outputs.rds
+- R_FIRST_TAU_UPDATE.rds
+
+================================================================================
+NEXT STEPS TO INVESTIGATE
+================================================================================
+
+1. YPAPY Calculation Difference:
+   - YPAPY = dot(PY, APY) where APY = getCrossprodMatAndKin(PY)
+   - Need to compare PY and APY vectors at iteration 2
+   - Check if sparse GRM multiplication differs
+
+2. Sparse GRM Handling:
+   - Both use same sparse GRM file
+   - Check getCrossprodMatAndKin implementation in both
+   - File: SAIGE_step1_fast.cpp, function getCrossprod or getCrossprodMatAndKin
+
+3. PCG Solver at tau > 0:
+   - When tau[1]=0, PCG returns immediately (trivial solve)
+   - When tau[1]=0.281, PCG actually runs
+   - Compare PCG convergence and intermediate values
+
+================================================================================
+FILES TO READ FOR CONTEXT
+================================================================================
+
+Main code files:
+- /code_copy/cpp_standalone/glmm.cpp (C++ GLMM solver)
+- /code_copy/cpp_standalone/saige_ai.cpp (getCoefficients, getAIScore)
+- /code_copy/cpp_standalone/SAIGE_step1_fast.cpp (PCG, GRM ops)
+- /code_copy/SAIGE_isolated/R/SAIGE_fitGLMM_fast.R (R GLMM)
+- /code_copy/SAIGE_isolated/src/SAIGE_fitGLMM_fast.cpp (Rcpp)
+
+Documentation:
+- /AI_INSTRUCTIONS.txt (detailed instructions and comparison results)
+- /PLAN.txt (project plan and status)
+- /SESSION_NOTES.txt (this file)
+
+================================================================================
+SESSION: Feb 2, 2025 - BUGS FOUND AND FIXED
+================================================================================
+
+### Final Results: C++ NOW MATCHES R
+
+| Metric       | R Value      | C++ Value    | Difference |
+|--------------|--------------|--------------|------------|
+| Final tau[1] | 0.290136     | 0.290133     | ~3e-6      |
+| Iterations   | 4            | 4            | 0          |
+| alpha0       | 2.525975     | 2.525974     | ~1e-6      |
+
+### Bug #1: Inner IRLS Loop Convergence (glmm.cpp ~line 455)
+
+**Problem:** C++ compared alpha against zeros, R compares against previous outer iteration's alpha.
+
+**R Get_Coef behavior:**
+```r
+for(i in 1:maxiter){
+    alpha = getCoefficients(...)
+    if( max(abs(alpha - alpha0)/...) < tol) break  # alpha0 = previous outer iter
+    alpha0 = alpha
+}
+```
+
+**C++ bug:** `arma::fvec alpha_inner_prev(p, arma::fill::zeros);`
+
+**Fix:** `arma::fvec alpha_outer_prev = arma::conv_to<arma::fvec>::from(beta_init);`
+
+### Bug #2: Eta Overwrite (glmm.cpp line 715)
+
+**Problem:** Line 715 overwrote correct eta with wrong formula.
+
+**Buggy line:** `eta = (p > 0) ? (X * alpha + offset) : offset;`
+
+**Correct eta (from getCoefficients):**
+`eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / W`
+
+In mixed models, eta includes random effect contribution, not just X*alpha.
+
+**Fix:** Removed/commented out line 715.
+
+### Investigation Path
+
+1. Found PCG vs direct solve difference (R uses direct solve, C++ uses PCG)
+   - Changed R to use PCG (usePCGwithSparseGRM=TRUE)
+   - Still had ~1.4% difference
+
+2. Found inner IRLS runs 2 iterations in C++, 1 in R
+   - Fixed alpha initialization
+   - Iterations 1-2 matched, but iteration 3 diverged
+
+3. Found eta overwrite bug
+   - Line 715 was overwriting correct eta after tau update
+   - This caused iteration 3 to start with wrong eta
+   - Removing the line fixed everything
+
+### Files Modified
+
+1. /code_copy/cpp_standalone/glmm.cpp
+   - Line ~455: Initialize alpha_outer_prev from beta_init
+   - Line ~505: Update alpha_outer_prev after inner loop
+   - Line ~715: Removed eta overwrite bug
+
+### New Documentation Created
+
+- /reference/CPP_BUG_ANALYSIS.html - Detailed bug analysis with code examples
+
+================================================================================
+SESSION: Feb 2, 2025 - RANDOM VECTOR BYPASS IMPLEMENTATION
+================================================================================
+
+### Random Vector Bypass Added
+
+The random vector bypass ensures R and C++ use identical random vectors for
+Monte Carlo trace estimation in GetTrace(). This is necessary because R and
+C++ random number generators are incompatible (different algorithms).
+
+**Implementation:**
+- R test script generates 30 random vectors using set.seed() + runif()
+- Saves to: /output/bypass/random_vectors_30.csv (N rows x 30 columns)
+- C++ loads this file at startup into global matrix
+- Both use identical vectors for trace estimation
+
+**Why 30 vectors:**
+The SAIGE algorithm uses 30 random vectors for Monte Carlo estimation of
+tr(P*K) in the AI-REML algorithm. This is hardcoded in both implementations.
+
+### Critical Configuration: usePCGwithSparseGRM=TRUE
+
+During investigation, discovered that R's solver selection affects results:
+- usePCGwithSparseGRM=FALSE (default): R uses direct solve
+- usePCGwithSparseGRM=TRUE: R uses PCG solver (matches C++)
+
+The C++ implementation always uses PCG. For exact matching, R must also use PCG.
+
+### Final Comparison Results
+
+With both bypasses active and usePCGwithSparseGRM=TRUE:
+
+| Metric       | R Value      | C++ Value    | Difference |
+|--------------|--------------|--------------|------------|
+| Final tau[1] | 0.290137     | 0.290133     | ~4e-6      |
+| Iterations   | 4            | 4            | 0          |
+| alpha[0]     | 2.525975     | 2.525974     | ~1e-6      |
+| alpha[1]     | -0.772380    | -0.772379    | ~1e-6      |
+| alpha[2]     | -0.457739    | -0.457738    | ~1e-6      |
+
+**Conclusion:** All values match within floating-point precision (~1e-6).
+
+### Summary of All Bypasses
+
+| Bypass          | Status | R Output File                  | Purpose                    |
+|-----------------|--------|--------------------------------|----------------------------|
+| QR Transform    | ACTIVE | R_qr_X1_transformed.csv        | Covariate transformation   |
+| Random Vectors  | ACTIVE | random_vectors_30.csv          | Trace estimation vectors   |
+
+================================================================================
+END OF SESSION NOTES
+================================================================================

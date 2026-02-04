@@ -1,0 +1,399 @@
+================================================================================
+AI AGENT INSTRUCTIONS FOR SAIGE R-to-C++ COMPARISON PROJECT
+================================================================================
+Last Updated: Feb 2, 2025
+Read this file first when starting a new session.
+
+================================================================================
+PROJECT OVERVIEW
+================================================================================
+
+Goal: Make C++ standalone SAIGE produce IDENTICAL results to R SAIGE package.
+
+The SAIGE software fits a null GLMM (Generalized Linear Mixed Model) for GWAS.
+We have two implementations:
+1. R package (with Rcpp): The reference implementation
+2. C++ standalone: Needs to match R exactly
+
+================================================================================
+KEY DIRECTORIES
+================================================================================
+
+PROJECT ROOT:
+/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/
+
+STRUCTURE:
+├── AI_INSTRUCTIONS.txt    ← YOU ARE HERE
+├── PLAN.txt               ← Current work plan with checkboxes
+├── reference/             ← Documentation (HTML call graphs, handoff notes)
+├── code_copy/
+│   ├── SAIGE_isolated/    ← Isolated R package (has own pixi environment)
+│   │   ├── R/             ← R source files
+│   │   ├── src/           ← Rcpp C++ source files
+│   │   ├── extdata/input/ ← Small test data
+│   │   └── pixi.toml      ← R environment config
+│   └── cpp_standalone/    ← C++ standalone code
+│       ├── SAIGE_step1_fast.cpp  ← Main GLMM logic
+│       ├── main.cpp              ← Entry point
+│       ├── glmm.cpp              ← GLMM solvers
+│       └── Makefile              ← Build config
+└── output/                ← Checkpoint outputs and bypass files
+    ├── checkpoints/       ← R_CP*.rds and CPP_CP*.csv files
+    └── bypass/            ← Files for R→C++ value transfer
+
+================================================================================
+RULES FOR AI AGENTS
+================================================================================
+
+1. READ-ONLY BY DEFAULT
+   - Use subagents (Explore type) for code exploration
+   - Only modify files when explicitly asked by user
+   - Never modify files outside Jan_30_comparison/ without permission
+
+2. WRITE PERMISSION
+   - You CAN write to: /Jan_30_comparison/ and subdirectories
+   - You CANNOT write to: /SAIGE/ (original package)
+   - Always work on copies in code_copy/
+
+3. CHECKPOINT COMPARISON STRATEGY
+   - BOTH R and C++ output their values independently to /output/checkpoints/
+   - Compare outputs manually or with comparison scripts
+   - They should match (within floating point tolerance)
+
+   EXCEPTION - When values CANNOT match (e.g., different implementations):
+   - MUST discuss with user first before implementing bypass
+   - If approved: R outputs values → C++ reads R's values
+   - Document each bypass case in BYPASS CASES section below
+
+4. ACCEPTABLE DIFFERENCES
+   - < 0.01% difference: ACCEPTABLE (floating point precision)
+   - < 0.1% difference: INVESTIGATE but may be acceptable
+   - > 1% difference: BUG - must fix
+
+5. DO NOT CHANGE ALGORITHM
+   - Fix bugs only, don't "improve" the algorithm
+   - Match R behavior exactly, even if R seems suboptimal
+
+================================================================================
+BYPASS CASES (User Approved)
+================================================================================
+
+These are cases where R and C++ cannot produce identical values independently,
+so we have R output values that C++ reads.
+
+BYPASS #1: Random Vectors in GetTrace()
+----------------------------------------
+- STATUS: ACTIVE
+- WHY: R and C++ random number generators are incompatible
+- APPROVED: Yes (pre-existing)
+- R OUTPUT: /output/bypass/random_vectors_30.csv (30 random vectors, N x 30 matrix)
+- C++ READS: Same file at startup
+- R CODE: test_sparse_grm.R generates vectors using set.seed() + runif()
+- C++ CODE: SAIGE_step1_fast.cpp loads vectors from CSV into global matrix
+
+BYPASS #2: QR Transformation Values
+----------------------------------------
+- STATUS: ACTIVE
+- WHY: R's Covariate_Transform() produces QR decomposition (qrr matrix)
+       that differs from C++ QR implementation. Coefficient ordering
+       and back-transformation differ.
+- APPROVED: Yes (Feb 1, 2025)
+- R OUTPUT: /output/bypass/R_qr_transform.rds
+  - Contains: qrr matrix, X_name, transformed X matrix
+- C++ READS: /output/bypass/R_qr_transform.csv (converted format)
+- R CODE CHANGE: SAIGE_isolated/R/SAIGE_fitGLMM_fast.R
+  - Location: After Covariate_Transform() call (~line 1370)
+  - Added: saveRDS() to output QR values
+- C++ CODE CHANGE: cpp_standalone/main.cpp or glmm.cpp
+  - Location: Before coefficient estimation
+  - Added: Load QR values from R output file
+
+================================================================================
+IMPORTANT: R TEST SCRIPT CONFIGURATION
+================================================================================
+
+For R to match C++ exactly, the test script MUST use:
+
+    usePCGwithSparseGRM = TRUE
+
+This ensures R uses the PCG (Preconditioned Conjugate Gradient) solver for
+getCoefficients(), matching C++ behavior. Without this flag, R uses a direct
+solve which produces slightly different intermediate values.
+
+================================================================================
+CODE CHANGES LOG
+================================================================================
+
+This section tracks all code modifications for bypass implementation.
+
+DATE: Feb 1, 2025
+PURPOSE: Add checkpoints for R vs C++ comparison
+
+FILES MODIFIED:
+1. SAIGE_isolated/R/SAIGE_fitGLMM_fast.R
+   - Lines ~280-450: Added CP1-CP6 checkpoint outputs
+   - Checkpoints save to /output/checkpoints/R_CP*.rds
+
+2. cpp_standalone/main.cpp
+   - Lines ~1100-1125: Added CP1 (after genotype loading)
+
+3. cpp_standalone/glmm.cpp
+   - Lines ~15-22: Added CP_DIR constant and helper functions
+   - Lines ~412-442: Added CP2 (initial values)
+   - Lines ~470-500: Added CP3 (after getCoefficients)
+   - Lines ~510-540: Added CP4 (after getAIScore)
+   - Lines ~597-616: Added CP5 (after iteration 1)
+   - Lines ~629-655, 677-702: Added CP6 (final results)
+
+DATE: Feb 1, 2025 (COMPLETED)
+PURPOSE: QR transformation bypass
+
+FILES MODIFIED:
+1. SAIGE_isolated/R/SAIGE_fitGLMM_fast.R
+   - Lines ~1458-1476: Added QR bypass output after Covariate_Transform() call
+   - Outputs: R_qr_transform.rds, R_qr_qrr.csv, R_qr_X1_transformed.csv
+   - Location: /output/bypass/
+
+2. cpp_standalone/null_model_engine.cpp
+   - Lines 60-150: Added CSV matrix loading functions (bypass_files_exist,
+     load_csv_matrix, load_r_qr_x1_transformed, load_r_qrr)
+   - Lines 356-383: Added QR bypass loading logic
+   - Key fix at lines 370-376: Initialize qrmap.P as identity (R doesn't use
+     column pivoting), set scaled_sqrt_n = true (R's X is Q*sqrt(N))
+
+================================================================================
+KEY FUNCTIONS TO UNDERSTAND
+================================================================================
+
+Main GLMM Loop (both R and C++):
+1. getCoefficients() - Solve for fixed effects using PCG
+2. getAIScore() - Compute Score and AI (Average Information)
+3. GetTrace() - Monte Carlo estimation of tr(P*K)
+4. fitglmmaiRPCG() - One AI-REML iteration
+
+Key Variables:
+- tau[0], tau[1]: Variance components (tau[0]=1 fixed, tau[1] estimated)
+- alpha: Fixed effect coefficients (in QR-transformed space during fitting)
+- eta: Linear predictor (X * alpha)
+- Sigma_iY, Sigma_iX: Sigma^(-1) * Y and Sigma^(-1) * X
+- PY: Projection of Y
+- YPAPY, Trace, AI: Components of AI-REML update
+- qrr: QR decomposition R matrix (for back-transformation)
+
+================================================================================
+HOW TO RUN CODE
+================================================================================
+
+R (Isolated Environment):
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated
+~/.pixi/bin/pixi run --manifest-path=pixi.toml Rscript <script.R>
+~/.pixi/bin/pixi run --manifest-path=pixi.toml R CMD INSTALL --preclean .
+
+C++ Standalone:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone
+make clean && make
+./saige-null -c <config.yaml>
+
+================================================================================
+REFERENCE DOCUMENTS (in /reference/)
+================================================================================
+
+MUST READ:
+- GLMM_CallGraph.html: R code call graph
+- FUNCTION_CALL_GRAPH.html: Detailed R/C++ mapping
+- COMPARISON_STRATEGY.md: Checkpoint comparison approach
+
+USEFUL:
+- SAIGE_sparse_GRM_handoff_Jan28.txt: Sparse GRM bug fixes
+- QR_Transform_Code_Changes_Summary.txt: QR transform bug fixes
+- SAIGE_testing_handoff_Jan27.txt: Previous testing notes
+
+ANALYSIS:
+- /output/COMPARISON_ANALYSIS.html: Current comparison results
+
+================================================================================
+KNOWN STRUCTURAL DIFFERENCES (R vs C++)
+================================================================================
+
+| Component              | R                  | C++                    |
+|------------------------|--------------------|-----------------------|
+| Entry point            | fitNULLGLMM()      | main() + YAML config  |
+| Categorical encoding   | model.matrix()     | plan_categoricals()   |
+| Inverse normalization  | qnorm()            | Acklam approximation  |
+| GLM baseline           | R's glm()          | Custom IRLS           |
+| Perfect separation     | checkPerfectSep()  | NOT implemented       |
+| Random vectors         | set.seed() + runif | Preload from CSV      |
+| QR transformation      | Covariate_Transform| BYPASS: Read from R   |
+
+================================================================================
+CURRENT COMPARISON RESULTS (Feb 2, 2025) - FINAL: ALL VALUES MATCH
+================================================================================
+
+Test: 128k markers, 1000 samples, binary trait, LOCO=FALSE, covariates=x1,x2
+Using SPARSE GRM for identical kinship matrices
+
+BYPASSES ACTIVE:
+1. QR Bypass: R outputs QR values → C++ reads them (coefficient ordering)
+2. Random Vector Bypass: R outputs 30 vectors → C++ reads them (RNG compatibility)
+
+CONFIGURATION REQUIREMENTS:
+- R test script MUST use: usePCGwithSparseGRM=TRUE (uses PCG solver like C++)
+
+FIXES IMPLEMENTED:
+1. C++ inner IRLS loop to converge alpha (matching R's Get_Coef)
+2. Fixed alpha_outer_prev initialization (was zeros, now beta_init)
+3. Removed eta overwrite bug at line 715
+
+| Checkpoint | Metric      | R Value  | C++ Value | Status      |
+|------------|-------------|----------|-----------|-------------|
+| CP1        | M           | 128,868  | 128,868   | MATCH       |
+| CP2        | alpha       | [2.52,-0.77,-0.46] | [2.52,-0.77,-0.46] | MATCH |
+| CP3        | W values    | [0.203,0.125,...] | [0.203,0.125,...] | MATCH |
+| CP3        | Y values    | [-2.33,-2.94,...] | [-2.33,-2.94,...] | MATCH |
+| CP3        | Sigma_iY    | [-0.47,-0.37,...] | [-0.47,-0.37,...] | MATCH |
+| CP4        | PY values   | [-0.28,-0.15,...] | [-0.28,-0.15,...] | MATCH |
+| CP4        | YPAPY       | 86.1818  | 86.1818   | MATCH       |
+| CP4        | Trace       | 81.455   | 81.455    | MATCH       |
+| CP4        | Score       | 4.727    | 4.727     | MATCH       |
+| CP6        | tau[1]      | 0.290137 | 0.290133  | MATCH (~4e-6) |
+| CP6        | iterations  | 4        | 4         | MATCH       |
+| CP6        | alpha       | [2.526,-0.772,-0.458] | [2.526,-0.772,-0.458] | MATCH |
+
+FINAL TAU DIFFERENCE: R=0.290137, C++=0.290133, diff=~4e-6 (floating-point precision)
+
+ALL VALUES NOW MATCH WITHIN FLOATING-POINT PRECISION!
+
+================================================================================
+DATE: Feb 2, 2025 (MAJOR FIX - FINAL)
+================================================================================
+
+### Problem
+C++ tau differed from R tau by ~1.4% (C++ 0.2941 vs R 0.2901)
+
+### Root Causes Found
+
+1. **Inner IRLS loop convergence check** (glmm.cpp ~line 455):
+   - C++ was initializing alpha comparison to zeros
+   - R compares against previous outer iteration's alpha (alpha0)
+   - Fixed by initializing alpha_outer_prev = beta_init and comparing correctly
+
+2. **Eta overwrite bug** (glmm.cpp line 715):
+   - C++ had line: `eta = (p > 0) ? (X * alpha + offset) : offset;`
+   - This OVERWROTE the correct eta from getCoefficients with wrong formula
+   - In mixed model, eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / W
+   - NOT simply X * alpha + offset
+   - Fixed by removing/commenting out line 715
+
+### Results After Fix
+- C++ tau = 0.2901327
+- R tau = 0.2901360
+- Difference: ~3e-6 (floating-point precision)
+- All iteration values match exactly
+
+### Files Modified
+- /code_copy/cpp_standalone/glmm.cpp
+  - Line ~455: Initialize alpha_outer_prev from beta_init
+  - Line ~715: Removed eta overwrite bug
+
+================================================================================
+DATE: Feb 1, 2025 (MAJOR FIX)
+PURPOSE: Add inner IRLS loop to converge alpha before tau update
+
+ROOT CAUSE IDENTIFIED:
+- R's Get_Coef function (lines 138-171 in SAIGE_fitGLMM_fast.R) has an INNER
+  IRLS loop that iterates to converge alpha:
+    for(i in 1:maxiter){
+        re.coef = getCoefficients(Y, X, W, tau, ...)
+        alpha = re.coef$alpha
+        eta = re.coef$eta + offset
+        # Update mu, W, Y based on new eta
+        mu = family$linkinv(eta)
+        mu.eta = family$mu.eta(eta)
+        Y = eta - offset + (y - mu)/mu.eta
+        W = sqrtW^2
+        if( max(abs(alpha - alpha0)/(abs(alpha)+abs(alpha0)+tol))< tol) break
+    }
+- C++ was only calling getCoefficients_cpp ONCE per tau update, missing the
+  inner loop to converge alpha
+
+FILES MODIFIED:
+1. cpp_standalone/glmm.cpp (lines ~450-491)
+   - Added inner IRLS loop inside the main tau iteration loop
+   - Loop structure:
+     1. irls_binary_build() to get W, Y from current eta
+     2. getCoefficients_cpp() to solve for alpha
+     3. Update eta from coef.eta + offset
+     4. Check alpha convergence
+     5. Repeat until converged
+
+RESULTS AFTER FIX:
+- BEFORE: C++ tau = 0.2957, R tau = 0.2901 (2.0% difference)
+- AFTER:  C++ tau = 0.2941, R tau = 0.2901 (1.4% difference)
+- Alpha values now nearly identical: R [2.5256, -0.7724, -0.4577]
+                                    C++ [2.5253, -0.7722, -0.4576]
+
+================================================================================
+ITERATION-BY-ITERATION COMPARISON (Feb 1, 2025)
+================================================================================
+
+Added iteration summary CSV output to both R and C++:
+- CPP_iteration_summary.csv
+- R_iteration_summary.csv
+
+### ITERATION 1 (tau=0): PERFECT MATCH
+| Metric   | R        | C++      | Diff    |
+|----------|----------|----------|---------|
+| YPAPY    | 86.1818  | 86.1818  | 0.00%   |
+| Trace    | 81.4551  | 81.4551  | 0.00%   |
+| Score    | 4.7268   | 4.7267   | 0.00%   |
+| tau_after| 0.2810   | 0.2810   | 0.00%   |
+
+### ITERATION 2 (tau=0.281): DIVERGENCE BEGINS
+| Metric   | R        | C++      | Diff    |
+|----------|----------|----------|---------|
+| YPAPY    | 78.10    | 77.36    | 0.95%   |
+| Trace    | 77.43    | 77.18    | 0.32%   |
+| Score    | 0.676    | 0.190    | 256%!   |
+| Dtau     | +0.045   | +0.013   | 3.5x    |
+| tau_after| 0.326    | 0.294    | 10.9%   |
+
+### ITERATION 3: OPPOSITE DIRECTIONS
+- R: Score=-0.35 (tau DECREASES)
+- C++: Score=+0.002 (tau INCREASES, converges)
+
+### FINAL RESULTS
+- R: tau=0.2901
+- C++: tau=0.2941
+- Difference: ~1.4%
+
+### ROOT CAUSE IDENTIFIED
+YPAPY diverges by ~0.7 when tau[1] becomes non-zero (0.281).
+YPAPY = PY' * K * PY = dot(PY, APY) where APY = getCrossprodMatAndKin(PY)
+The GRM multiplication behaves differently between R and C++ when tau[1] > 0.
+
+### NEXT STEP TO INVESTIGATE
+Compare getCrossprodMatAndKin() or getCrossprod() implementations:
+- File: SAIGE_step1_fast.cpp
+- Check sparse GRM matrix-vector multiplication
+- Check how tau[1] affects the Sigma matrix construction
+
+================================================================================
+DEBUGGING WORKFLOW
+================================================================================
+
+1. Add checkpoint in R code (output to /output/checkpoints/):
+   saveRDS(var, ".../output/checkpoints/R_CP1_var.rds")
+
+2. Add checkpoint in C++ code (output to /output/checkpoints/):
+   var.save(".../output/checkpoints/CPP_CP1_var.csv", arma::csv_ascii);
+
+3. Run BOTH independently, compare their outputs
+
+4. If values CANNOT match:
+   - Document in BYPASS CASES section above
+   - Implement R output → C++ read pattern
+   - Re-test to verify match
+
+================================================================================
+END OF INSTRUCTIONS
+================================================================================

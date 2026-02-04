@@ -1,0 +1,351 @@
+================================================================================
+SAIGE Sparse GRM Creation - Code Locations & Bug Fixes
+Date: January 28, 2026
+================================================================================
+
+SUMMARY
+================================================================================
+
+Testing R vs C++ sparse GRM creation revealed multiple bugs - ALL NOW FIXED:
+
+1. R BUG (FIXED): Uninitialized variable causing corrupted genotypes for sample 0
+2. C++ BUG 1 (FIXED): Genotype data not loaded before sparse GRM creation
+3. C++ BUG 2 (FIXED): Vector out-of-range - index mismatch (compacted vs original)
+4. C++ BUG 3 (FIXED): Kinship values all zero - values not stored during computation
+
+C++ sparse GRM now matches R sparse GRM (off-diagonal values differ by ~0.00001)
+
+================================================================================
+BUG #1: R UNINITIALIZED VARIABLE (FIXED)
+================================================================================
+
+File: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp
+Line: 465
+
+BEFORE (BUG):
+    unsigned char geno2;
+
+AFTER (FIXED):
+    unsigned char geno2 = 0;  // FIXED: Initialize to 0 to avoid garbage
+
+SYMPTOM:
+- Sparse GRM diagonal element [1,1] was 0.27 instead of ~1.0
+- Sample 0's genotypes were corrupted by garbage bits
+
+ROOT CAUSE:
+- geno2 holds genotypes for 4 samples (2 bits each)
+- Loop processes samples 0,1,2,3 then pushes geno2 and resets to 0
+- For samples 0-3, geno2 contained garbage before being set
+- setGenotype() only sets 2 bits, doesn't clear other 6 bits
+
+VERIFICATION:
+- Before fix: diagonal[0] = 0.2691805
+- After fix:  diagonal[0] = 1.0011426
+
+================================================================================
+BUG #2: C++ GENOTYPE NOT LOADED (FIXED)
+================================================================================
+
+File: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/main.cpp
+
+BEFORE (BUG):
+- Line 1097-1144: Sparse GRM build section
+- Line 1141-1144: Early exit if make_sparse_grm_only=true
+- Line 1168: init_global_geno() called AFTER sparse GRM section
+
+AFTER (FIXED):
+- Line 1096-1098: init_global_geno() moved BEFORE sparse GRM section
+- Line 1171: Original call commented out
+
+SYMPTOM:
+- stdGenoMultiMarkersMat.n_rows: 0
+- stdGenoMultiMarkersMat.n_cols: 0
+- Sparse GRM had n=0, nnz=0
+
+ROOT CAUSE:
+- When make_sparse_grm_only=true, program exits at line 1143
+- init_global_geno() at line 1168 was never reached
+- No genotype data loaded for sparse GRM creation
+
+================================================================================
+BUG #3: C++ VECTOR OUT-OF-RANGE (FIXED)
+================================================================================
+
+SYMPTOM:
+    libc++abi: terminating due to uncaught exception of type std::out_of_range: vector
+    [ERROR] i=0 >= vector.size()=0 at k=9308 indexOfVectorPointer=9650
+
+ROOT CAUSE:
+Index mismatch between compacted and original indices.
+- During loading: genotype data stored at COMPACTED indices (SNPIdx_new = 0,1,2,...)
+- In build_sparse_grm_in_place: subMarkerIndex used ORIGINAL indices
+- When accessing genoVecofPointers[9650], the vector was empty (never populated)
+
+FIX APPLIED (Line ~1960):
+BEFORE: { int k=0; for (int i=0;i<(int)keep.size();++i) if (keep[i]) sub[k++] = i; }
+AFTER:  for (int i = 0; i < nKeep; ++i) sub[i] = i;  // compacted indices
+
+================================================================================
+BUG #4: C++ KINSHIP VALUES ALL ZERO (FIXED)
+================================================================================
+
+SYMPTOM:
+After fixing Bug #3, sparse GRM created but off-diagonal values were all 0.0
+
+ROOT CAUSE:
+- findIndiceRelatedSample() computed kinship values but didn't store them
+- parallelcalsparseGRM() tried to recompute using m_OneSNP_Geno (not set up)
+
+FIX APPLIED:
+1. Added kinValueVecSparse vector to genoClass (line 101)
+2. Modified indicesRelatedSamples worker to store kinship values alongside pairs
+3. Modified build_sparse_grm_in_place to use stored values directly
+
+VERIFICATION:
+Off-diagonal kinship values now match R to ~0.00001 precision!
+
+================================================================================
+C++ SPARSE GRM CODE LOCATIONS
+================================================================================
+
+FILE: main.cpp
+--------------------------------------------------------------------------------
+Lines 1096-1098   | init_global_geno()              | Loads genotype data (MOVED HERE)
+Lines 1100-1147   | Sparse GRM section              | Main decision logic
+Line 1115         | build_sparse_grm_in_place()     | Triggers GRM creation
+Lines 1143-1146   | Early exit                      | Exit if make_sparse_grm_only=true
+
+FILE: SAIGE_step1_fast.cpp
+--------------------------------------------------------------------------------
+
+MAIN ORCHESTRATOR:
+Lines 1920-1959   | build_sparse_grm_in_place()     | Main function for sparse GRM
+  1923-1925       |   Set parameters                | MAF, missing rate, cutoff
+  1928            |   getQCdMarkerIndex()           | Get markers passing QC
+  1931            |   setSubMarkerIndex()           | Set marker indices
+  1934            |   Get_MultiMarkersBySample_StdGeno_Mat() | Compute std genotypes
+  1937            |   findIndiceRelatedSample()     | Find related pairs
+  1942            |   parallelcalsparseGRM()        | Compute kinship values
+  1958            |   setupSparseGRM()              | Store final GRM
+
+GENOTYPE MATRIX COMPUTATION:
+Lines 1433-1511   | Get_MultiMarkersBySample_StdGeno_Mat() | Fills stdGenoMultiMarkersMat
+  1456-1502       |   Loop                          | Process each marker
+  1480            |   Matrix write                  | (geno.stdGenoMultiMarkersMat)(k, ind)
+
+RELATED SAMPLE FINDING:
+Lines 2027-2056   | struct indicesRelatedSamples    | Parallel worker
+  2047            |   LIKELY CRASH POINT            | arma::dot() on matrix columns
+Lines 2079-2108   | findIndiceRelatedSample()       | Orchestrates parallel search
+  2101            |   parallelFor()                 | Triggers parallel computation
+
+KINSHIP CALCULATION:
+Lines 2169-2183   | parallelcalsparseGRM()          | Parallel kinship calculation
+
+MATRIX SETUP:
+Lines 6958-6963   | setSubMarkerIndex()             | Sizes stdGenoMultiMarkersMat
+  6962            |   .set_size()                   | Sets matrix dimensions
+Lines 1890-1917   | setupSparseGRM()                | Stores COO format
+
+================================================================================
+CALL CHAIN FOR SPARSE GRM CREATION
+================================================================================
+
+main.cpp
+  │
+  ├── Line 1098: init_global_geno(...)  [FIXED: moved here]
+  │
+  └── Line 1115: build_sparse_grm_in_place(rc, min_maf, max_miss)
+          │
+          ├── Line 1923: setminMAFforGRM()
+          ├── Line 1924: setmaxMissingRateforGRM()
+          ├── Line 1925: setRelatednessCutoff()
+          ├── Line 1928: getQCdMarkerIndex()
+          ├── Line 1931: setSubMarkerIndex(sub)
+          │       └── Line 6962: stdGenoMultiMarkersMat.set_size(nMarkers, nSamples)
+          │
+          ├── Line 1934: Get_MultiMarkersBySample_StdGeno_Mat()
+          │       └── Lines 1456-1502: Loop fills stdGenoMultiMarkersMat
+          │
+          ├── Line 1937: findIndiceRelatedSample()
+          │       ├── Line 2085: Create parallel worker
+          │       └── Line 2101: parallelFor(0, totalCombination, worker)
+          │               └── Line 2047: arma::dot() [CRASH HERE?]
+          │
+          ├── Line 1942: parallelcalsparseGRM(kin)
+          │       └── Lines 2169-2183: Parallel kinship accumulation
+          │
+          └── Line 1958: setupSparseGRM(n, loc, val)
+                  └── Lines 1890-1917: Store COO format
+
+================================================================================
+TEST FILES CREATED
+================================================================================
+
+R Testing:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/R_testing/
+    - create_sparse_grm_10k.R                    (test script)
+    - sparseGRM_10k_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
+    - R_sparseGRM_first5x5.csv
+
+C++ Testing:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/C_testing/
+    - config_create_sparse_grm_10k.yaml          (config file)
+    - read_sparse_grm_5x5.R                      (comparison script)
+
+================================================================================
+HOW TO RUN TESTS
+================================================================================
+
+COMPILE R:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE
+rm -rf /Users/francis/Library/R/arm64/4.4/library/00LOCK-SAIGE
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml R CMD INSTALL --preclean .
+
+RUN R SPARSE GRM:
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/R_testing/create_sparse_grm_10k.R
+
+COMPILE C++:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+make clean && make
+
+RUN C++ SPARSE GRM (now works):
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/C_testing/config_create_sparse_grm_10k.yaml
+
+================================================================================
+VERIFICATION RESULTS (AFTER FIXES)
+================================================================================
+
+R sparse GRM:
+- Dimensions: 1000 x 1000
+- Non-zeros: 6564 (stores both triangles)
+- Diagonal [1,1]: 1.0011426
+- Off-diagonal [1,3]: 0.4984502
+
+C++ sparse GRM:
+- Dimensions: 1000 x 1000
+- Non-zeros: 6698 (stores both triangles = 2*2849 pairs + 1000 diagonal)
+- Diagonal [1,1]: 1.0 (forced to 1.0)
+- Off-diagonal [1,3]: 0.4984497, [3,1]: 0.4984497 (symmetric)
+
+Off-diagonal kinship values match to ~0.00001 precision!
+Both [i,j] and [j,i] are now stored (symmetric matrix).
+
+Known difference:
+- C++ forces diagonal = 1.0; R computes actual diagonal from genotypes
+- nnz differs slightly because R uses random 2000 markers, C++ uses all 9650 QC-passing
+
+================================================================================
+KEY FILES MODIFIED THIS SESSION
+================================================================================
+
+1. /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp
+   - Line 465: Changed "unsigned char geno2;" to "unsigned char geno2 = 0;"
+
+2. /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/main.cpp
+   - Line 1096-1098: Added init_global_geno() call before sparse GRM section
+   - Line 1171: Commented out duplicate init_global_geno() call
+
+3. /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/SAIGE_step1_fast.cpp
+   - Line 101: Added kinValueVecSparse vector to genoClass
+   - Line ~1960: Changed subMarkerIndex to use compacted indices [0,1,2,...,nKeep-1]
+   - Lines 2077-2115: Modified indicesRelatedSamples worker to store kinship values
+   - Lines 2142-2149: Modified findIndiceRelatedSample to pass kinValueVecSparse
+   - Lines ~1992-2005: Store both triangles (i,j) and (j,i) for symmetric matrix
+   - Use stored kinship values instead of calling parallelcalsparseGRM
+
+================================================================================
+COVARIATE TESTING RESULTS (128k markers, sparse GRM)
+================================================================================
+
+Test comparing R vs C++ with different covariates using 128k marker dataset.
+
+DATA FILES:
+- Genotype: nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr (.bed/.bim/.fam)
+  Location: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/
+  Markers: 128,868 | Samples: 1000
+
+- Phenotype: pheno_1000samples.txt
+  Columns: y (binary outcome), x1 (continuous), x2 (binary), IID
+
+RESULTS:
+--------------------------------------------------------------------------------
+| Covariate | Type       | R tau[2]  | C++ tau[2] | Difference |
+|-----------|------------|-----------|------------|------------|
+| x1        | continuous | 0.2297    | 0.2352     | ~2.4%      |
+| x2        | binary     | 0.1389    | 0.1455     | ~4.8%      |
+--------------------------------------------------------------------------------
+
+Both covariates work correctly in R and C++. Small differences are expected due to:
+- Different random vectors for trace estimation
+- R uses 2000 random markers for sparse GRM; C++ uses all QC-passing markers
+
+TEST FILES:
+/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/covar_testing/
+  - config_128k_x1.yaml              (C++ config for x1 covariate)
+  - config_128k_x2.yaml              (C++ config for x2 covariate)
+  - run_R_128k_x1.R                  (R script for x1 covariate)
+  - run_R_128k_x2.R                  (R script for x2 covariate)
+
+================================================================================
+COMPLETE BUILD & RUN INSTRUCTIONS
+================================================================================
+
+=== R PACKAGE ===
+
+1. COMPILE R PACKAGE:
+   cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE
+   rm -rf /Users/francis/Library/R/arm64/4.4/library/00LOCK-SAIGE
+   ~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml R CMD INSTALL --preclean .
+
+2. RUN R WITH SPARSE GRM (example with x1 covariate):
+   ~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml \
+     Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/covar_testing/run_R_128k_x1.R
+
+=== C++ STANDALONE ===
+
+1. COMPILE C++:
+   cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+   make clean && make
+
+2. CREATE SPARSE GRM ONLY:
+   ./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/C_testing/config_create_sparse_grm_10k.yaml
+   (Config must have: make_sparse_grm_only: true)
+
+3. RUN WITH EXISTING SPARSE GRM (example with x1 covariate):
+   ./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_28_sparse_grm/covar_testing/config_128k_x1.yaml
+
+=== CONFIG FILE FORMAT (YAML) ===
+
+fit:
+  trait: binary
+  nthreads: 4
+  loco: false
+  use_sparse_grm_to_fit: true
+  use_sparse_grm_for_vr: false
+  min_maf_grm: 0.01
+  max_miss_grm: 0.15
+  relatedness_cutoff: 0.125
+  make_sparse_grm_only: false    # true = only create GRM, false = fit model
+  diag_one: false
+  tol: 0.02
+  traceCVcutoff: 0.0025
+
+design:
+  csv: <path_to_phenotype_file>
+  y_col: y
+  covar_cols: [x1]               # or [x2] or [x1, x2] or []
+  id_col: IID
+
+paths:
+  bed: <path_to_plink>.bed
+  bim: <path_to_plink>.bim
+  fam: <path_to_plink>.fam
+  out_prefix: <output_prefix>
+  sparse_grm: <path_to_sparse_grm>.mtx
+  sparse_grm_ids: <path_to_sparse_grm>.mtx.sampleIDs.txt
+
+================================================================================
+END OF HANDOFF NOTES
+================================================================================

@@ -1,0 +1,109 @@
+================================================================================
+SAIGE R vs C++ Verification Commands
+Date: January 27, 2026
+================================================================================
+
+SECTION 1: VERIFY RANDOM VECTORS SYNCHRONIZATION
+================================================================================
+
+# Check R seed (should be set_seed(3))
+grep -n "set_seed" /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp | head -5
+
+# Check C++ loads matching file (should be random_vectors_intseed3.csv)
+grep -n "load_vectors_from_csv" /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/SAIGE_step1_fast.cpp
+
+# Check random vectors file exists
+ls -la /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_21_traceCVcutoff_0001_seeds1to5/random_vectors_intseed3.csv
+
+================================================================================
+SECTION 2: CHECK MAF FILTER SETTINGS
+================================================================================
+
+# Check R test script MAF setting
+grep -i "minMAF\|min_maf" /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+
+# Check C++ config MAF setting
+grep "min_maf" /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+
+# View full C++ config
+cat /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+
+# View full R test script
+cat /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+
+================================================================================
+SECTION 3: RECOMPILE (if needed)
+================================================================================
+
+# Recompile R SAIGE
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE
+rm -rf /Users/francis/Library/R/arm64/4.4/library/00LOCK-SAIGE
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml R CMD INSTALL --preclean .
+
+# Recompile C++ SAIGE
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+make clean && make
+
+================================================================================
+SECTION 4: RUN SPARSE MATRIX TEST (no covariates, no QR)
+================================================================================
+
+# --- RUN R ---
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+
+# --- RUN C++ ---
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+rm -f /tmp/r_Au_vec_*.txt
+./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+
+================================================================================
+SECTION 5: EXTRACT AND COMPARE TAU VALUES
+================================================================================
+
+# From R output, look for:
+#   Tau:
+#   [1] 1.00000000 0.XXXXX
+# tau[2] = second number
+
+# From C++ output, look for:
+#   tau_after_update: [1, 0.XXXXX]
+# tau[2] = second number
+
+================================================================================
+SECTION 6: KEY FILE LOCATIONS
+================================================================================
+
+R Source Code:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp
+
+C++ Source Code:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/SAIGE_step1_fast.cpp
+
+R Test Script (sparse, no cov):
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+
+C++ Config (sparse, no cov):
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+
+Random Vectors File:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_21_traceCVcutoff_0001_seeds1to5/random_vectors_intseed3.csv
+
+Sparse GRM Files:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/sparseGRM_nocutoff_relatednessCutoff_0_110419_randomMarkersUsed.sparseGRM.mtx
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/sparseGRM_nocutoff_relatednessCutoff_0_110419_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
+
+================================================================================
+SECTION 7: WHAT TO CHECK IN OUTPUT
+================================================================================
+
+Both R and C++ should print similar values for:
+  - Number of markers after MAF filter (e.g., "XXX markers with MAF >= 0.01")
+  - Final tau[2] value (genetic variance component)
+  - Number of iterations to converge
+
+If marker counts differ -> MAF filter issue
+If tau[2] differs significantly -> Check random vectors or algorithm difference
+
+================================================================================
+END OF VERIFICATION COMMANDS
+================================================================================

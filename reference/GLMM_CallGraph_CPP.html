@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Complete Call Graph: C++ Standalone Binary Trait GLMM Fitting</title>
+    <style>
+        body { font-family: 'Courier New', monospace; font-size: 11px; margin: 20px; line-height: 1.6; }
+        h1 { font-size: 16px; border-bottom: 2px solid #333; padding-bottom: 5px; }
+        h2 { font-size: 14px; color: #c0392b; margin-top: 30px; }
+        .main-func { color: #2980b9; font-weight: bold; }
+        .core-func { color: #8e44ad; font-weight: bold; }
+        .helper-func { color: #27ae60; font-weight: bold; }
+        .comment { color: #7f8c8d; font-style: italic; }
+        .file { color: #e74c3c; }
+        .var { color: #d35400; }
+        .warning { color: #c0392b; font-weight: bold; background: #ffeaa7; padding: 2px 5px; }
+        pre { white-space: pre-wrap; }
+        table { border-collapse: collapse; margin: 10px 0; }
+        th, td { border: 1px solid #ccc; padding: 5px 10px; text-align: left; }
+        th { background: #f0f0f0; }
+        .diff { background: #fff3cd; }
+    </style>
+</head>
+<body>
+<h1>Complete Call Graph: C++ Standalone Binary Trait GLMM Fitting</h1>
+
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># ENTRY POINT: main() from command line</span>
+<span class="comment"># File: main.cpp</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="main-func">main</span>(argc, argv)                                      <span class="file">[main.cpp] Line 839</span>
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># CONFIGURATION LOADING (Lines 860-920)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── Parse command line with cxxopts
+│   ├── <span class="var">-c, --config</span> = YAML config file path
+│   ├── <span class="var">-d, --design</span> = design CSV path
+│   └── <span class="var">-o, --out</span> = output prefix
+│
+├── <span class="helper-func">load_cfg</span>(YAML file)                                   <span class="file">[main.cpp] Line 890</span>
+│   └── Returns: <span class="var">NullModelConfig</span> struct
+│
+├── <span class="helper-func">load_paths_v2</span>(cfg, res)                               <span class="file">[main.cpp] Line 895</span>
+│   └── Returns: <span class="var">NullModelPaths</span> struct (bed/bim/fam, sparse GRM paths)
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># DESIGN FILE LOADING (Lines 930-960)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── <span class="helper-func">load_design_csv</span>(design_csv, min_cov_ct, drop_ref, covar_names) <span class="file">[main.cpp] Line 634</span>
+│   ├── Read TSV/CSV with phenotype and covariates
+│   ├── <span class="helper-func">plan_categoricals</span>()                              <span class="file">[main.cpp] Line 556</span>
+│   │   └── One-hot encode categorical variables
+│   ├── <span class="helper-func">drop_low_count_binaries_in_place</span>()               <span class="file">[main.cpp] Line 609</span>
+│   └── Returns: <span class="var">Design</span> = {iids, y, X, pheno_col, covar_cols}
+│
+├── <span class="helper-func">add_intercept_if_missing</span>(design)                      <span class="file">[main.cpp] Line 963</span>
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># SEX FILTERING (Lines 956-975)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── If sex_col specified:
+│   ├── <span class="helper-func">read_column_from_csv</span>(design_csv, sex_col)        <span class="file">[main.cpp] Line 146</span>
+│   └── <span class="helper-func">apply_sex_filter_if_requested</span>()                 <span class="file">[preprocess_engine.cpp]</span>
+│       └── Filter to FemaleOnly or MaleOnly
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># GENOTYPE INITIALIZATION (Lines 1050-1100)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── <span class="helper-func">read_fam_iids</span>(fam_path)                               <span class="file">[main.cpp] Line 129</span>
+│   └── Returns: vector of sample IDs from .fam
+│
+├── <span class="helper-func">scan_bim_chr_ranges</span>(bim_path)                         <span class="file">[main.cpp] Line 168</span>
+│   └── Returns: <span class="var">chr_start_idx</span>, <span class="var">chr_end_idx</span> for LOCO
+│
+├── Compute sample intersection (design IIDs ∩ fam IIDs)
+│   └── <span class="var">design_take_rows</span>() to subset design matrix
+│
+├── <span class="core-func">init_global_geno</span>(bed, bim, fam, indicator, minMAF, maxMissing) <span class="file">[SAIGE_step1_fast.cpp]</span>
+│   ├── Read PLINK .bed/.bim/.fam files
+│   ├── Compute <span class="var">alleleFreqVec</span>
+│   ├── Compute <span class="var">invstdvVec</span> = 1/sqrt(2*p*(1-p))
+│   ├── Build <span class="var">genoVecofPointers</span>
+│   └── Set <span class="var">M</span>, <span class="var">N</span>, <span class="var">Nnomissing</span>
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># SPARSE GRM SETUP (Lines 1100-1145)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── If useSparseGRMtoFitNULL:
+│   ├── If sparse GRM file exists:
+│   │   ├── <span class="helper-func">load_matrix_market_coo</span>(path)                 <span class="file">[main.cpp] Line 423</span>
+│   │   └── <span class="core-func">setupSparseGRM</span>(n, locationMat, valueVec)    <span class="file">[SAIGE_step1_fast.cpp]</span>
+│   └── Else:
+│       ├── <span class="core-func">build_sparse_grm_in_place</span>(cutoff, n_random_markers) <span class="file">[main.cpp]</span>
+│       └── <span class="helper-func">write_matrix_market_coo</span>(path)                <span class="file">[main.cpp] Line 402</span>
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># INVERSE NORMALIZATION (Quantitative only)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── If quantitative & invNormalize:
+│   └── <span class="helper-func">probit</span>(rank_transform(y))                        <span class="file">[main.cpp] Line 483</span>
+│       └── <span class="warning">DIFF: Uses Acklam approximation, not R's qnorm()</span>
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># COVARIATE OFFSET (Lines 1020-1055)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── If isCovariateOffset:
+│   ├── <span class="helper-func">glm_gaussian</span>(y, X) or <span class="helper-func">glm_logistic</span>(y, X)   <span class="file">[null_model_engine.cpp] Lines 66-111</span>
+│   ├── <span class="var">covoffset</span> = X * beta
+│   └── Remove covariates from model (keep intercept only)
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># COVARIATE QR TRANSFORM (Lines 1055-1080)</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+├── If isCovariateTransform & hasCovariates:
+│   └── <span class="helper-func">qr_transform</span>(X)                                  <span class="file">[null_model_engine.cpp] Line 123</span>
+│       ├── Compute QR decomposition
+│       ├── Store R matrix for back-transform
+│       └── Replace X with Q matrix
+│
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+├── <span class="comment"># NULL MODEL FITTING</span>
+├── <span class="comment"># ─────────────────────────────────────────────────────────────────────────────</span>
+│
+└── <span class="main-func">saige::fit_null</span>(cfg, paths, design, ...)              <span class="file">[null_model_engine.cpp] Line 200</span>
+    │
+    ├── <span class="helper-func">register_default_solvers</span>()                         <span class="file">[null_model_engine.cpp] Line 180</span>
+    │   ├── Register "binary" → <span class="core-func">binary_glmm_solver</span>
+    │   └── Register "quantitative" → <span class="core-func">quant_glmm_solver</span>
+    │
+    ├── <span class="comment"># For Binary Traits:</span>
+    └── <span class="core-func">binary_glmm_solver</span>(y, X, cfg, paths)              <span class="file">[glmm.cpp] Line 150</span>
+        │
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        ├── <span class="comment"># INITIAL GLM FIT (no random effects)</span>
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        │
+        ├── <span class="helper-func">glm_logistic</span>(y, X, maxiter=25)                   <span class="file">[null_model_engine.cpp] Line 91</span>
+        │   ├── IRLS iteration
+        │   └── Returns: <span class="var">beta0</span>, <span class="var">eta0</span> = X * beta0
+        │
+        ├── Initialize: <span class="var">tau</span> = [1.0, 0.5]
+        │
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        ├── <span class="comment"># STEP 1: Initial coefficient estimation</span>
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        │
+        ├── Compute working response and weights:
+        │   ├── <span class="var">mu</span> = 1 / (1 + exp(-eta))
+        │   ├── <span class="var">W</span> = mu * (1 - mu)
+        │   └── <span class="var">Y</span> = eta + (y - mu) / W
+        │
+        ├── <span class="core-func">getCoefficients_cpp</span>(Y, X, W, tau, maxiterPCG, tolPCG) <span class="file">[SAIGE_step1_fast.cpp]</span>
+        │   │
+        │   ├── <span class="core-func">getPCG1ofSigmaAndVector</span>(W, tau, Y)           <span class="file">[SAIGE_step1_fast.cpp]</span>
+        │   │   └── Returns: <span class="var">Sigma_iY</span> = Σ⁻¹ × Y
+        │   │
+        │   ├── For each column of X:
+        │   │   └── <span class="core-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,i])
+        │   │       └── Returns: <span class="var">Sigma_iX</span>[:,i]
+        │   │
+        │   ├── <span class="var">cov</span> = (X' × Sigma_iX)⁻¹
+        │   ├── <span class="var">alpha</span> = cov × (Sigma_iX' × Y)
+        │   ├── <span class="var">eta</span> = Y - tau[0] × (Sigma_iY - Sigma_iX × alpha) / W
+        │   │
+        │   └── Returns: { Sigma_iY, Sigma_iX, cov, alpha, eta }
+        │
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        ├── <span class="comment"># STEP 2: Initial Score/Trace estimation</span>
+        ├── <span class="comment"># ─────────────────────────────────────────────────────────────────</span>
+        │
+        ├── <span class="core-func">getAIScore_cpp</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[SAIGE_step1_fast.cpp]</span>
+        │   │
+        │   ├── <span class="var">PY</span> = Sigma_iY - Sigma_iX × (cov × (Sigma_iX' × Y))
+        │   │
+        │   ├── <span class="core-func">getCrossprodMatAndKin</span>(PY)                     <span class="file">[SAIGE_step1_fast.cpp]</span>
+        │   │   ├── If sparse GRM: sparse matrix multiply
+        │   │   └── Else: <span class="core-func">parallelCrossProd</span>(PY)
+        │   │
+        │   ├── <span class="var">APY</span> = getCrossprodMatAndKin(PY)
+        │   ├── <span class="var">YPAPY</span> = PY' × APY
+        │   │
+        │   ├── <span class="core-func">GetTrace</span>(Sigma_iX, X, W, tau, cov, nrun, ...)  <span class="file">[SAIGE_step1_fast.cpp] Line 5478</span>
+        │   │   │
+        │   │   ├── <span class="warning">Load precomputed random vectors from CSV (if exists)</span>
+        │   │   │   └── <span class="helper-func">load_vectors_from_csv</span>()              <span class="file">[Line 5416]</span>
+        │   │   │
+        │   │   ├── For i = 1 to nrun:
+        │   │   │   ├── <span class="helper-func">rademacher_vec</span>(n) → <span class="var">uVec</span> ∈ {-1,+1}ⁿ
+        │   │   │   ├── <span class="core-func">getPCG1ofSigmaAndVector</span>(W, tau, uVec)
+        │   │   │   ├── Pu = Sigma_iu - Sigma_iX × (cov × (Sigma_iX' × u))
+        │   │   │   ├── Au = getCrossprodMatAndKin(uVec)
+        │   │   │   │
+        │   │   │   ├── <span class="warning">WRITE: cpp_Au_vec_[i].txt to grm_comparison/</span>
+        │   │   │   ├── <span class="warning">READ: /tmp/r_Au_vec_[i].txt for comparison</span>
+        │   │   │   │
+        │   │   │   └── tempVec[i] = Au' × Pu
+        │   │   │
+        │   │   ├── Check CV, increase nrun if needed
+        │   │   └── <span class="var">Trace</span> = mean(tempVec)
+        │   │
+        │   ├── PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY)
+        │   ├── PAPY = PAPY_1 - Sigma_iX × (cov × (Sigma_iX' × PAPY_1))
+        │   ├── <span class="var">AI</span> = APY' × PAPY
+        │   │
+        │   └── Returns: { YPAPY, Trace, PY, AI }
+        │
+        ├── Initial tau update: <span class="var">tau[1]</span> = max(0, tau0[1] + tau0[1]² × (YPAPY - Trace)/n)
+        │
+        ├── <span class="comment"># ═══════════════════════════════════════════════════════════════</span>
+        ├── <span class="comment"># MAIN ITERATION LOOP (AI-REML)</span>
+        ├── <span class="comment"># ═══════════════════════════════════════════════════════════════</span>
+        │
+        └── FOR i = 1 to maxiter:
+            │
+            ├── Update working response Y and weights W
+            │
+            ├── <span class="core-func">getCoefficients_cpp</span>(...)
+            │
+            ├── <span class="core-func">fitglmmaiRPCG_cpp</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, ...) <span class="file">[SAIGE_step1_fast.cpp]</span>
+            │   │
+            │   ├── <span class="core-func">getAIScore_cpp</span>(...)
+            │   │   ├── Compute PY, APY, YPAPY
+            │   │   ├── Compute Trace via Monte Carlo
+            │   │   └── Compute AI
+            │   │
+            │   ├── <span class="var">Score</span> = YPAPY - Trace
+            │   ├── <span class="var">Dtau</span> = Score / AI
+            │   ├── <span class="var">tau[1]</span> = tau[1] + Dtau
+            │   │
+            │   ├── If tau[1] < 0: apply step halving
+            │   ├── If tau < tol: set to 0
+            │   │
+            │   └── Returns: { tau }
+            │
+            ├── Convergence check:
+            │   └── max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol → BREAK
+            │
+            └── Update: tau0 = tau, alpha0 = alpha
+
+    <span class="comment"># After loop: final results</span>
+    └── Returns: <span class="var">FitNullResult</span> = { theta=tau, alpha, eta, mu, converged, ... }
+</pre>
+
+<h2>Key Structural Differences: C++ vs R</h2>
+
+<table>
+<tr><th>Aspect</th><th>R Version</th><th>C++ Standalone</th><th>Impact</th></tr>
+<tr class="diff">
+    <td><b>Entry Point</b></td>
+    <td>fitNULLGLMM() R function</td>
+    <td>main() with YAML config</td>
+    <td>Configuration method different</td>
+</tr>
+<tr class="diff">
+    <td><b>Inverse Normalization</b></td>
+    <td>R's qnorm()</td>
+    <td>Acklam probit approximation</td>
+    <td>May cause small numerical differences</td>
+</tr>
+<tr class="diff">
+    <td><b>Categorical Encoding</b></td>
+    <td>R's model.matrix()</td>
+    <td>Custom plan_categoricals()</td>
+    <td>Column ordering may differ</td>
+</tr>
+<tr class="diff">
+    <td><b>GLM Baseline</b></td>
+    <td>R's glm()</td>
+    <td>Custom IRLS implementation</td>
+    <td>Convergence may differ slightly</td>
+</tr>
+<tr class="diff">
+    <td><b>Perfect Separation</b></td>
+    <td>checkPerfectSep() called</td>
+    <td>NOT implemented</td>
+    <td>C++ may fail on edge cases</td>
+</tr>
+<tr class="diff">
+    <td><b>Random Vectors (GetTrace)</b></td>
+    <td>R's set.seed() + runif()</td>
+    <td>Preloaded from CSV OR mt19937</td>
+    <td>Must use same seed for comparison</td>
+</tr>
+<tr class="diff">
+    <td><b>Sparse GRM Construction</b></td>
+    <td>Uses getsubGRM() + gen_sp_v2()</td>
+    <td>build_sparse_grm_in_place()</td>
+    <td>Implementation differs</td>
+</tr>
+<tr>
+    <td>PCG Solver</td>
+    <td>getPCG1ofSigmaAndVector()</td>
+    <td>getPCG1ofSigmaAndVector()</td>
+    <td>Same algorithm</td>
+</tr>
+<tr>
+    <td>AI-REML Update</td>
+    <td>Score/AI Newton step</td>
+    <td>Score/AI Newton step</td>
+    <td>Same algorithm</td>
+</tr>
+</table>
+
+<h2>Hardcoded File Outputs in C++ (Need Modification)</h2>
+
+<table>
+<tr><th>Line</th><th>Output Path</th><th>Content</th></tr>
+<tr>
+    <td>670</td>
+    <td>/Users/francis/.../jan_14_comparison/cpp_stdgeno.txt</td>
+    <td>Debug: stdGeno values</td>
+</tr>
+<tr>
+    <td>678</td>
+    <td>/Users/francis/.../jan_14_comparison/cpp_sample0_cumsum.txt</td>
+    <td>Debug: sample0 cumsum</td>
+</tr>
+<tr>
+    <td>5494</td>
+    <td>/Users/francis/.../Jan_20_work_sparse_testing/random_vectors_seed10.csv</td>
+    <td>INPUT: preloaded random vectors</td>
+</tr>
+<tr>
+    <td>5546</td>
+    <td>/Users/francis/.../grm_comparison/cpp_Au_vec_[i].txt</td>
+    <td>Debug: Au vectors</td>
+</tr>
+<tr>
+    <td>5559</td>
+    <td>/tmp/r_Au_vec_[i].txt</td>
+    <td>INPUT: R's Au vectors for comparison</td>
+</tr>
+</table>
+
+<h2>Legend</h2>
+<p>
+<span class="main-func">Blue</span> = Main Entry Functions |
+<span class="core-func">Purple</span> = Core Computational Functions |
+<span class="helper-func">Green</span> = Helper Functions |
+<span class="var">Orange</span> = Variables |
+<span class="file">Red</span> = File Locations |
+<span class="warning">Yellow</span> = Differences/Warnings
+</p>
+
+</body>
+</html>

@@ -1,0 +1,229 @@
+================================================================================
+SAIGE Binary Trait GLMM Fitting - Complete Call Logic
+================================================================================
+
+ENTRY: fitNULLGLMM()
+    File: SAIGE/R/SAIGE_fitGLMM_fast.R:906
+
+    |
+    v
+
+glmmkin.ai_PCG_Rcpp_Binary()
+    File: SAIGE/R/SAIGE_fitGLMM_fast.R:241
+
+================================================================================
+STEP 1: Load Genotype Data
+================================================================================
+
+    setgeno(bedFile, bimFile, famFile, ...)
+        File: SAIGE_fitGLMM_fast.cpp (Rcpp export)
+
+        Actions:
+        - Read PLINK .bed/.bim/.fam files
+        - Compute allele frequencies -> alleleFreqVec
+        - Compute inverse std dev -> invstdvVec = 1/sqrt(2*p*(1-p))
+        - Store genotypes in genoVecofPointers
+        - Set M (markers), N (samples), Nnomissing
+
+================================================================================
+STEP 2: Initial Coefficient Estimation
+================================================================================
+
+    Initialize:
+        tau = [1, 0.5]      # variance components
+        alpha0 = fit0$coef  # from GLM without random effects
+        eta0 = fit0$linear.predictors
+
+    Get_Coef(y, X, tau, family, alpha0, eta0, ...)
+        File: SAIGE_fitGLMM_fast.R:117
+
+        Compute working response:
+            mu = family$linkinv(eta)
+            mu.eta = family$mu.eta(eta)
+            Y = eta - offset + (y - mu) / mu.eta
+            W = (mu.eta)^2 / variance(mu)    # For binary: W = mu*(1-mu)
+
+        |
+        v
+
+        getCoefficients(Y, X, W, tau, maxiterPCG, tolPCG)
+            File: SAIGE_fitGLMM_fast.cpp:5272 (Rcpp export)
+
+            Sigma_iY = getPCG1ofSigmaAndVector(W, tau, Y)
+                # Solves: Sigma * x = Y
+                # Returns: x = Sigma^(-1) * Y
+
+            For each column i of X:
+                Sigma_iX[:,i] = getPCG1ofSigmaAndVector(W, tau, X[:,i])
+
+            cov = inv(X' * Sigma_iX)
+            alpha = cov * (Sigma_iX' * Y)
+            eta = Y - tau[0] * (Sigma_iY - Sigma_iX * alpha) / W
+
+            Returns: {Sigma_iY, Sigma_iX, cov, alpha, eta}
+
+================================================================================
+STEP 3: Initial Score/Trace Estimation
+================================================================================
+
+    getAIScore(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...)
+        File: SAIGE_fitGLMM_fast.cpp:5384 (Rcpp export)
+
+        # Compute projection PY
+        PY = Sigma_iY - Sigma_iX * (cov * (Sigma_iX' * Y))
+
+        # Compute APY = K * PY / M
+        APY = getCrossprodMatAndKin(PY)
+            File: SAIGE_fitGLMM_fast.cpp:1733
+
+            If sparse GRM:
+                APY = sparseGRM * PY
+            Else:
+                APY = parallelCrossProd(PY)
+                    # For each marker k (parallel):
+                    #   col = stdGenoMultiMarkersMat.col(k)
+                    #   accumulate: col * (col' * PY)
+                    # Return: sum / numMarkers
+
+        # Compute YPAPY
+        YPAPY = PY' * APY
+
+        # Compute Trace via Monte Carlo
+        Trace = GetTrace(Sigma_iX, X, W, tau, cov, nrun, ...)
+            File: SAIGE_fitGLMM_fast.cpp:5218
+
+            For i = 1 to nrun:
+                u = random vector in {-1, +1}^n
+                Sigma_iu = getPCG1ofSigmaAndVector(W, tau, u)
+                Pu = Sigma_iu - Sigma_iX * (cov * (Sigma_iX' * u))
+                Au = getCrossprodMatAndKin(u)
+                tempVec[i] = Au' * Pu
+
+            If CV(tempVec) > traceCVcutoff:
+                Increase nrun, repeat
+
+            Trace = mean(tempVec)
+
+        # Compute AI (Average Information)
+        PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY)
+        PAPY = PAPY_1 - Sigma_iX * (cov * (Sigma_iX' * PAPY_1))
+        AI = APY' * PAPY
+
+        Returns: {YPAPY, Trace, PY, AI}
+
+    # Initial tau update
+    tau[2] = max(0, tau0[2] + tau0[2]^2 * (YPAPY - Trace) / n)
+
+================================================================================
+MAIN ITERATION LOOP (AI-REML)
+================================================================================
+
+    FOR i = 1 to maxiter:
+
+        # Update coefficients
+        Get_Coef(y, X, tau, family, alpha0, eta0, ...)
+            -> getCoefficients(...)
+            -> Returns: {Sigma_iY, Sigma_iX, cov, alpha, eta, Y, W}
+
+        # Update tau via AI-REML
+        fitglmmaiRPCG(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...)
+            File: SAIGE_fitGLMM_fast.cpp:5413 (Rcpp export)
+
+            re = getAIScore(...)
+                -> {YPAPY, Trace, PY, AI}
+
+            Score = YPAPY - Trace
+            Dtau = Score / AI
+            tau[2] = tau[2] + Dtau
+
+            # Step halving if tau < 0
+            While tau[2] < 0:
+                step = step * 0.5
+                tau[2] = tau0[2] + step * Dtau
+
+            # Threshold small values
+            If tau[i] < tol:
+                tau[i] = 0
+
+            Returns: {tau}
+
+        # Convergence check
+        If max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol:
+            BREAK
+
+        # Update for next iteration
+        tau0 = tau
+        alpha0 = alpha
+
+================================================================================
+FINAL OUTPUT
+================================================================================
+
+    After loop converges:
+
+    # Final coefficient update
+    Get_Coef(y, X, tau, family, alpha, eta, ...)
+
+    # Compute final mu, residuals
+    mu = family$linkinv(eta)
+    res = y - mu
+
+    Returns glmmResult:
+        theta = tau              # variance components
+        coefficients = alpha     # fixed effects
+        linear.predictors = eta  # X * alpha
+        fitted.values = mu       # predicted probabilities
+        Y = working response
+        residuals = res
+        cov = covariance matrix
+        converged = TRUE/FALSE
+
+================================================================================
+KEY FORMULAS
+================================================================================
+
+Sigma = W^(-1) + tau[2] * K           # Covariance (not formed explicitly)
+K = G * G' / M                         # GRM (standardized genotypes)
+W = mu * (1 - mu)                      # Working weights (binary)
+Y = eta + (y - mu) / mu'(eta)          # Working response
+
+PY = Sigma^(-1)*Y - Sigma^(-1)*X * (X'*Sigma^(-1)*X)^(-1) * X'*Sigma^(-1)*Y
+APY = K * PY / M
+YPAPY = PY' * APY
+Trace = Tr(P * K)    # via Monte Carlo
+Score = YPAPY - Trace
+AI = APY' * P * APY
+
+tau_new = max(0, tau + Score / AI)     # AI-REML update
+
+================================================================================
+PCG SOLVER LOGIC: getPCG1ofSigmaAndVector(W, tau, b)
+================================================================================
+
+    Solves: Sigma * x = b
+    Where:  Sigma = W^(-1) + tau[2] * K
+
+    Initialize:
+        x = 0
+        r = b
+        p = r
+
+    FOR iter = 1 to maxiterPCG:
+
+        # Compute Ap = Sigma * p
+        Ap = getCrossprod(p, W, tau)
+            = p / W + tau[2] * getCrossprodMatAndKin(p)
+            = p / W + tau[2] * K * p / M
+
+        alpha = (r' * r) / (p' * Ap)
+        x = x + alpha * p
+        r_new = r - alpha * Ap
+
+        If ||r_new|| < tolPCG:
+            BREAK
+
+        beta = (r_new' * r_new) / (r' * r)
+        p = r_new + beta * p
+        r = r_new
+
+    Returns: x = Sigma^(-1) * b

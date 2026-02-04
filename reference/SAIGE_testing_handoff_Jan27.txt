@@ -1,0 +1,247 @@
+================================================================================
+SAIGE R vs C++ Testing Handoff Notes
+Date: January 27-28, 2026
+================================================================================
+
+SUMMARY OF WORK DONE
+================================================================================
+
+We tested R SAIGE vs C++ SAIGE (standalone) implementations to compare tau[2]
+(genetic variance component) values in SPARSE and DENSE GRM modes, with and
+without covariates.
+
+PROBLEM FOUND: Results did not match between R and C++.
+
+ROOT CAUSE IDENTIFIED: The R code's GetTrace function (for binary traits) had
+set_seed() COMMENTED OUT, causing random behavior on each run.
+
+================================================================================
+C++ STANDALONE CODE LOCATION (FOR GITHUB)
+================================================================================
+
+The C++ standalone implementation is located at:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/
+
+Key source files:
+  - SAIGE_step1_fast.cpp  (GetTrace function, random vector loading)
+  - glmm.cpp              (GLMM solver, conservative update logic)
+  - main.cpp              (entry point, design matrix setup)
+  - saige_null.cpp        (null model fitting)
+  - saige_ai.cpp          (AI-REML algorithm)
+  - score.cpp             (score calculation)
+  - null_model_engine.cpp
+  - preprocess_engine.cpp
+  - variance_ratio_engine.cpp
+  - UTIL.cpp
+  - getMem.cpp
+  - saige_shims.cpp
+
+Build files:
+  - Makefile
+
+Output binary:
+  - saige-null
+
+================================================================================
+CHANGES MADE TO FILES
+================================================================================
+
+1. R CODE: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp
+
+   Line 5219 (GetTrace function for BINARY traits):
+   BEFORE: // set_seed(); // commented out for random behavior
+   AFTER:  set_seed(10);   [Updated Jan 28]
+
+   Line 5856 (GetTrace_q function for QUANTITATIVE traits):
+   Changed from: set_seed(3);
+   Changed to:   set_seed(0);
+
+2. C++ CODE: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/SAIGE_step1_fast.cpp
+
+   Line 5427:
+   Changed to: load_vectors_from_csv("/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_20_work_sparse_testing/random_vectors_seed10.csv");
+   [Updated Jan 28 to use seed 10]
+
+3. C++ CODE: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/main.cpp
+
+   Added debug output after line 941 to verify covariate count:
+   - Prints design.p (number of columns in X)
+   - Prints whether "INTERCEPT ONLY" or "covariates ARE present"
+
+4. NEW R TEST SCRIPT (Jan 28):
+   /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_dense_128k_withcov.R
+   - Dense GRM test with covariates x1, x2
+
+================================================================================
+HOW TO COMPILE
+================================================================================
+
+COMPILE R SAIGE:
+----------------
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE
+rm -rf /Users/francis/Library/R/arm64/4.4/library/00LOCK-SAIGE
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml R CMD INSTALL --preclean .
+
+COMPILE C++ SAIGE:
+------------------
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+make clean && make
+
+================================================================================
+HOW TO RUN TESTS
+================================================================================
+
+--- SPARSE GRM, No Covariates ---
+
+RUN R:
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+
+RUN C++:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+rm -f /tmp/r_Au_vec_*.txt
+./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+
+--- DENSE GRM, No Covariates ---
+
+RUN R:
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_dense_128k.R
+
+RUN C++:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+rm -f /tmp/r_Au_vec_*.txt
+./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_20_work_dense_testing/config_dense_128k_nocov.yaml
+
+--- DENSE GRM, With Covariates x1, x2 ---
+
+RUN R:
+~/.pixi/bin/pixi run --manifest-path=/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/pixi.toml Rscript /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_dense_128k_withcov.R
+
+RUN C++:
+cd /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code
+rm -f /tmp/r_Au_vec_*.txt
+./saige-null -c /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/testing_script/config_dense_withcov.yaml
+
+================================================================================
+KEY FILE LOCATIONS
+================================================================================
+
+R Source Code (C++ for R package):
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/src/SAIGE_fitGLMM_fast.cpp
+
+C++ Standalone Source Code:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_13_work/iteration_test/cpp_code/
+  Key files: SAIGE_step1_fast.cpp, glmm.cpp, main.cpp
+
+R Test Scripts:
+  Sparse, no cov:  jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_sparse_nocutoff.R
+  Dense, no cov:   jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_dense_128k.R
+  Dense, with cov: jan_14_comparison/Sparse_GRM_test_allmarkers/test_r_dense_128k_withcov.R
+
+C++ Config Files:
+  Sparse, no cov:  jan_14_comparison/Sparse_GRM_test_allmarkers/config_sparse_128k_nocov.yaml
+  Dense, no cov:   Jan_20_work_dense_testing/config_dense_128k_nocov.yaml
+  Dense, with cov: testing_script/config_dense_withcov.yaml
+
+Random Vectors Files:
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_20_work_sparse_testing/random_vectors_seed10.csv
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_20_work_dense_testing/random_vectors_dense_seed10.csv
+  /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_15_work/random_vectors_seed0.csv
+
+Sparse GRM Files:
+  jan_14_comparison/Sparse_GRM_test_allmarkers/sparseGRM_nocutoff_relatednessCutoff_0_110419_randomMarkersUsed.sparseGRM.mtx
+  jan_14_comparison/Sparse_GRM_test_allmarkers/sparseGRM_nocutoff_relatednessCutoff_0_110419_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
+
+================================================================================
+TEST RESULTS (Jan 28, 2026) - SEED 10
+================================================================================
+
+1. SPARSE GRM, No Covariates (Seed 10):
+   R tau[2]:   0.0944846
+   C++ tau[2]: 0.0844978
+   Difference: ~10.6%
+   Match: NO - significant difference
+
+2. DENSE GRM, No Covariates (Seed 10):
+   R tau[2]:   0.1074111
+   C++ tau[2]: 0.104062
+   Difference: ~3.1%
+   Match: CLOSE
+
+3. DENSE GRM, With Covariates x1, x2 (Seed 10):
+   R tau[2]:   0.286388
+   C++ tau[2]: 0.2868
+   Difference: ~0.15%
+   Match: EXCELLENT - nearly identical
+
+================================================================================
+OBSERVATIONS
+================================================================================
+
+1. Dense GRM with covariates gives the best match (~0.15% difference)
+2. Dense GRM without covariates is reasonably close (~3.1% difference)
+3. Sparse GRM has larger discrepancy (~10.6% difference)
+
+This suggests:
+- The covariate handling is well-synchronized between R and C++
+- Dense GRM computation is more closely aligned than sparse GRM
+- Sparse GRM may have additional differences in implementation
+
+================================================================================
+KNOWN DIFFERENCES BETWEEN R AND C++
+================================================================================
+
+1. CONSERVATIVE UPDATE LOCATION:
+   - R: Does conservative update BEFORE the loop (line 345 in R code)
+         tau[2] = max(0, tau0[2] + tau0[2]^2 * (re$YPAPY - re$Trace)/n)
+   - C++: Does conservative update at iteration 0 INSIDE the loop (glmm.cpp line 445-449)
+
+   These SHOULD produce the same result if seeds match.
+
+2. GetTrace SEED:
+   - R GetTrace (binary): set_seed(10)
+   - R GetTrace_q (quantitative): set_seed(0)
+   - C++: Loads pre-generated random vectors from CSV file (seed 10)
+
+3. RANDOM VECTOR GENERATION:
+   - R generates random vectors fresh each run with set_seed()
+   - C++ loads pre-generated random vectors from CSV file
+   - The CSV files may not be identical to R's on-the-fly generation
+
+================================================================================
+WHAT TO CHECK IN OUTPUT
+================================================================================
+
+From R output, look for:
+  Tau:
+  [1] 1.00000000 0.XXXXX
+  tau[2] = second number
+
+From C++ output, look for:
+  tau_after_update: [1, 0.XXXXX]
+  tau[2] = second number
+
+Both should also print:
+  - Number of markers after MAF filter (should be 111,305)
+  - Covariate debug showing "INTERCEPT ONLY" or covariate count
+
+================================================================================
+PREVIOUS TEST RESULTS (Jan 27, Seed 0)
+================================================================================
+
+Seed 0, Sparse GRM, No Covariates:
+  R tau[2]:   0.06512432
+  C++ tau[2]: 0.0612006
+  Difference: ~6%
+
+================================================================================
+POSSIBLE NEXT STEPS
+================================================================================
+
+1. Investigate why sparse GRM has larger differences than dense GRM
+2. Generate random vectors directly from R with set_seed(10) and save to CSV
+   to ensure C++ uses identical vectors
+3. Check sparse GRM matrix loading/handling differences
+
+================================================================================
+END OF HANDOFF NOTES
+================================================================================

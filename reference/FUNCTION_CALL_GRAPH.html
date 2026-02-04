@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAIGE Function Call Graph - R to C++ Mapping</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f5f5f5; padding: 20px; line-height: 1.6;
+        }
+        .container { max-width: 1800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-bottom: 20px; }
+        h2 { color: #34495e; margin-top: 30px; margin-bottom: 15px; border-left: 4px solid #3498db; padding-left: 10px; }
+        h3 { color: #2980b9; margin-top: 20px; margin-bottom: 10px; }
+
+        .call-tree { font-family: 'Courier New', monospace; font-size: 13px; background: #f8f9fa; padding: 20px; border-radius: 5px; overflow-x: auto; line-height: 1.8; }
+        .call-tree .r-func { color: #2980b9; font-weight: bold; }
+        .call-tree .cpp-func { color: #27ae60; font-weight: bold; }
+        .call-tree .rcpp-func { color: #8e44ad; font-weight: bold; }
+        .call-tree .comment { color: #7f8c8d; font-style: italic; }
+        .call-tree .line-num { color: #95a5a6; margin-right: 10px; }
+        .call-tree .file { color: #e74c3c; }
+        .call-tree .var { color: #d35400; }
+
+        .legend { display: flex; gap: 20px; margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-box { width: 20px; height: 20px; border-radius: 3px; }
+        .legend-r { background: #3498db; }
+        .legend-cpp { background: #27ae60; }
+        .legend-rcpp { background: #8e44ad; }
+        .legend-var { background: #d35400; }
+
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }
+        th { background: #3498db; color: white; padding: 10px; text-align: left; position: sticky; top: 0; }
+        td { padding: 8px 10px; border-bottom: 1px solid #ddd; vertical-align: top; }
+        tr:hover { background: #f9f9f9; }
+        .highlight { background: #fff3cd; }
+
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        .note { background: #e8f4fd; padding: 15px; border-left: 5px solid #3498db; margin: 20px 0; border-radius: 0 5px 5px 0; }
+
+        .svg-container { overflow-x: auto; margin: 20px 0; }
+        svg { background: #fafafa; border-radius: 5px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>SAIGE Function Call Graph - Complete R to C++ Mapping</h1>
+
+    <div class="legend">
+        <div class="legend-item"><div class="legend-box legend-r"></div><span>R Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-rcpp"></div><span>Rcpp Export (C++ callable from R)</span></div>
+        <div class="legend-item"><div class="legend-box legend-cpp"></div><span>Internal C++ Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-var"></div><span>Key Variable</span></div>
+    </div>
+
+    <h2>1. Complete Call Graph: Binary Trait GLMM Fitting</h2>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># ENTRY POINT: User calls fitNULLGLMM() from R</span>
+<span class="comment"># File: SAIGE/R/SAIGE_fitGLMM_fast.R</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="r-func">fitNULLGLMM</span>()                                          <span class="file">[R] Line 906</span>
+├── <span class="comment"># Input validation, phenotype/covariate processing</span>
+├── <span class="comment"># Call appropriate trait-specific function:</span>
+│
+├── <span class="r-func">glmmkin.ai_PCG_Rcpp_Binary</span>()                       <span class="file">[R] Line 241</span>  <span class="comment"># For binary traits</span>
+│   │
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   ├── <span class="comment"># STEP 1: Load genotype data</span>
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   │
+│   ├── <span class="rcpp-func">setgeno</span>(bedFile, bimFile, famFile, ...)             <span class="file">[Rcpp] Line ~780</span>
+│   │   └── <span class="cpp-func">genoClass::setGenotype()</span>                         <span class="file">[C++] internal</span>
+│   │       ├── Read PLINK .bed/.bim/.fam files
+│   │       ├── Compute allele frequencies: <span class="var">alleleFreqVec</span>
+│   │       ├── Compute inverse std dev: <span class="var">invstdvVec</span>
+│   │       ├── Build: <span class="var">genoVecofPointers</span> (genotype storage)
+│   │       └── Set: <span class="var">M</span>, <span class="var">N</span>, <span class="var">Nnomissing</span>
+│   │
+│   ├── <span class="comment"># LOCO chromosome index setup if needed</span>
+│   ├── <span class="rcpp-func">getQCdMarkerIndex</span>()                                  <span class="file">[Rcpp]</span>
+│   │
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   ├── <span class="comment"># STEP 2: Initial coefficient estimation</span>
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   │
+│   ├── Initialize: <span class="var">tau</span> = [1, 0.5], <span class="var">alpha0</span>, <span class="var">eta0</span>
+│   │
+│   ├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 117</span>
+│   │   │
+│   │   ├── Compute working response: <span class="var">Y</span> = eta - offset + (y - mu)/mu.eta
+│   │   ├── Compute weights: <span class="var">W</span> = sqrtW^2 where sqrtW = mu.eta/sqrt(variance(mu))
+│   │   │
+│   │   └── <span class="rcpp-func">getCoefficients</span>(Y, X, W, tau, maxiterPCG, tolPCG)  <span class="file">[Rcpp] Line 5272</span>
+│   │       │
+│   │       ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, Y, ...)       <span class="file">[C++] Line ~4500</span>
+│   │       │   ├── PCG iterative solver
+│   │       │   └── Returns: <span class="var">Sigma_iY</span> = Σ⁻¹ × Y
+│   │       │
+│   │       ├── For each column of X:
+│   │       │   └── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,i], ...)
+│   │       │       └── Returns: <span class="var">Sigma_iX</span>[:,i] = Σ⁻¹ × X[:,i]
+│   │       │
+│   │       ├── <span class="var">cov</span> = (X' × Sigma_iX)⁻¹
+│   │       ├── <span class="var">alpha</span> = cov × (Sigma_iX' × Y)
+│   │       ├── <span class="var">eta</span> = Y - tau[0] × (Sigma_iY - Sigma_iX × alpha) / W
+│   │       │
+│   │       └── Returns: { Sigma_iY, Sigma_iX, cov, alpha, eta }
+│   │
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   ├── <span class="comment"># STEP 3: Initial Score/Trace estimation</span>
+│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   │
+│   ├── <span class="rcpp-func">getAIScore</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5384</span>
+│   │   │
+│   │   ├── Compute projection: <span class="var">PY</span> = Sigma_iY - Sigma_iX × (cov × (Sigma_iX' × Y))
+│   │   │
+│   │   ├── <span class="rcpp-func">getCrossprodMatAndKin</span>(PY)                         <span class="file">[Rcpp] Line 1733</span>
+│   │   │   │
+│   │   │   ├── If using sparse GRM:
+│   │   │   │   └── Sparse matrix multiply: result × bVec
+│   │   │   │
+│   │   │   └── Else (full GRM):
+│   │   │       └── <span class="cpp-func">parallelCrossProd</span>(PY)                      <span class="file">[C++] Line ~1600</span>
+│   │   │           ├── For each marker k (parallel):
+│   │   │           │   ├── col = <span class="var">stdGenoMultiMarkersMat</span>.col(k)
+│   │   │           │   └── accumulate: col × (col' × PY)
+│   │   │           └── Normalize: result / <span class="var">Msub_MAFge_minMAFtoConstructGRM</span>
+│   │   │
+│   │   ├── <span class="var">APY</span> = getCrossprodMatAndKin(PY)  <span class="comment"># = K × PY / M</span>
+│   │   ├── <span class="var">YPAPY</span> = PY' × APY
+│   │   │
+│   │   ├── <span class="rcpp-func">GetTrace</span>(Sigma_iX, X, W, tau, cov, nrun, ...)      <span class="file">[Rcpp] Line 5218</span>
+│   │   │   ├── For i = 1 to nrun:
+│   │   │   │   ├── Generate random vector: u ~ {-1, +1}^n
+│   │   │   │   ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, u, ...)
+│   │   │   │   ├── Pu = Sigma_iu - Sigma_iX × (cov × (Sigma_iX' × u))
+│   │   │   │   ├── Au = getCrossprodMatAndKin(u)
+│   │   │   │   └── tempVec[i] = Au' × Pu
+│   │   │   ├── Check CV, increase nrun if needed
+│   │   │   └── <span class="var">Trace</span> = mean(tempVec)
+│   │   │
+│   │   ├── PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY, ...)
+│   │   ├── PAPY = PAPY_1 - Sigma_iX × (cov × (Sigma_iX' × PAPY_1))
+│   │   ├── <span class="var">AI</span> = APY' × PAPY
+│   │   │
+│   │   └── Returns: { YPAPY, Trace, PY, AI }
+│   │
+│   ├── Initial tau update: <span class="var">tau[2]</span> = max(0, tau0[2] + tau0[2]² × (YPAPY - Trace)/n)
+│   │
+│   ├── <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
+│   ├── <span class="comment"># MAIN ITERATION LOOP (AI-REML)</span>
+│   ├── <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
+│   │
+│   └── FOR i = 1 to maxiter:
+│       │
+│       ├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 361</span>
+│       │   └── <span class="rcpp-func">getCoefficients</span>(...)                           <span class="file">[Rcpp]</span>
+│       │
+│       ├── <span class="rcpp-func">fitglmmaiRPCG</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5413</span>
+│       │   │
+│       │   ├── <span class="rcpp-func">getAIScore</span>(...)                                <span class="file">[Rcpp]</span>
+│       │   │   ├── Compute PY, APY, YPAPY
+│       │   │   ├── Compute Trace via Monte Carlo
+│       │   │   └── Compute AI
+│       │   │
+│       │   ├── <span class="var">Score</span> = YPAPY - Trace
+│       │   ├── <span class="var">Dtau</span> = Score / AI
+│       │   ├── <span class="var">tau[2]</span> = tau[2] + Dtau
+│       │   │
+│       │   ├── If tau[2] < 0: apply step halving
+│       │   ├── If tau < tol: set to 0
+│       │   │
+│       │   └── Returns: { tau }
+│       │
+│       ├── Convergence check:
+│       │   └── max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol → BREAK
+│       │
+│       └── Update: tau0 = tau, alpha0 = alpha
+│
+│   <span class="comment"># After loop: final results</span>
+│   └── Returns: glmmResult = { theta=tau, coefficients=alpha, linear.predictors=eta,
+│                               fitted.values=mu, Y, residuals, cov, converged, ... }
+│
+└── <span class="r-func">glmmkin.ai_PCG_Rcpp_Quantitative</span>()                  <span class="file">[R] Line 525</span>  <span class="comment"># For quantitative traits</span>
+    └── <span class="comment">(Similar structure, uses fitglmmaiRPCG_q, getAIScore_q, GetTrace_q)</span>
+</pre>
+    </div>
+
+    <h2>2. PCG Solver Internals</h2>
+
+    <div class="call-tree">
+<pre>
+<span class="cpp-func">getPCG1ofSigmaAndVector</span>(wVec, tauVec, bVec, maxiterPCG, tolPCG)   <span class="file">[C++]</span>
+│
+├── <span class="comment"># Solves: Σ × x = b, where Σ = W⁻¹ + τ[2] × K</span>
+│
+├── Initialize: x = zeros, r = b, p = r
+│
+└── FOR iter = 1 to maxiterPCG:
+    │
+    ├── <span class="cpp-func">getCrossprod</span>(p, wVec, tauVec)                          <span class="file">[C++] Line ~3200</span>
+    │   │
+    │   ├── <span class="comment"># Computes: Σ × p = W⁻¹ × p + τ[2] × K × p</span>
+    │   │
+    │   ├── term1 = p / wVec                        <span class="comment"># W⁻¹ × p (element-wise)</span>
+    │   │
+    │   ├── <span class="rcpp-func">getCrossprodMatAndKin</span>(p)                          <span class="file">[Rcpp] Line 1733</span>
+    │   │   └── <span class="cpp-func">parallelCrossProd</span>(p)                          <span class="file">[C++]</span>
+    │   │       └── Returns: K × p / M
+    │   │
+    │   └── Returns: term1 + tauVec[2] × (K × p / M)
+    │
+    ├── alpha = (r' × r) / (p' × Ap)
+    ├── x = x + alpha × p
+    ├── r_new = r - alpha × Ap
+    │
+    ├── Check convergence: ||r_new|| < tolPCG → BREAK
+    │
+    ├── beta = (r_new' × r_new) / (r' × r)
+    ├── p = r_new + beta × p
+    └── r = r_new
+</pre>
+    </div>
+
+    <h2>3. Sparse GRM Creation</h2>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># Called from main.cpp in C++ standalone or from R wrapper</span>
+<span class="cpp-func">build_sparse_grm_in_place</span>(rc, min_maf, max_miss)             <span class="file">[C++] main.cpp Line ~1920</span>
+│
+├── <span class="rcpp-func">setminMAFforGRM</span>(min_maf)                                 <span class="file">[Rcpp]</span>
+├── <span class="rcpp-func">setmaxMissingRateforGRM</span>(max_miss)                        <span class="file">[Rcpp]</span>
+├── <span class="rcpp-func">setRelatednessCutoff</span>(cutoff)                             <span class="file">[Rcpp]</span>
+│
+├── <span class="rcpp-func">getQCdMarkerIndex</span>()                                      <span class="file">[Rcpp]</span>
+│   └── Returns: boolean vector of QC-passing markers
+│
+├── <span class="rcpp-func">setSubMarkerIndex</span>(subMarkerIndexRandom)                  <span class="file">[Rcpp] Line ~6950</span>
+│   └── Resize: <span class="var">stdGenoMultiMarkersMat</span>.set_size(nMarkers, nSamples)
+│
+├── <span class="rcpp-func">Get_MultiMarkersBySample_StdGeno_Mat</span>()                   <span class="file">[Rcpp] Line ~1433</span>
+│   │
+│   ├── FOR each marker k in subMarkerIndex:
+│   │   ├── Get genotype: <span class="cpp-func">genoClass::Get_OneSNP_Geno</span>(k)
+│   │   ├── Standardize: (geno - 2×freq) × invstd
+│   │   └── Store: <span class="var">stdGenoMultiMarkersMat</span>(k, :) = standardized genotype
+│   │
+│   └── Result: <span class="var">stdGenoMultiMarkersMat</span> is M × N matrix
+│
+├── <span class="rcpp-func">findIndiceRelatedSample</span>()                                <span class="file">[Rcpp] Line 1834</span>
+│   │
+│   ├── <span class="cpp-func">struct indicesRelatedSamples</span> (parallel worker)       <span class="file">[C++] Line 1782</span>
+│   │
+│   ├── FOR each pair (i, j) with i < j (parallelized):
+│   │   ├── kinValue = dot(<span class="var">stdGenoMultiMarkersMat</span>.col(i), <span class="var">stdGenoMultiMarkersMat</span>.col(j))
+│   │   ├── kinValue = kinValue / numMarkers
+│   │   └── IF kinValue >= relatednessCutoff:
+│   │       └── Store pair (i, j) in <span class="var">geno.indiceVec</span>
+│   │       └── Store kinValue in <span class="var">geno.kinValueVecSparse</span>   <span class="comment"># FIXED in Jan 28</span>
+│   │
+│   └── Result: <span class="var">indiceVec</span> = list of related pairs
+│
+├── <span class="comment"># Note: parallelcalsparseGRM() is now skipped - values stored during findIndiceRelatedSample</span>
+│
+└── <span class="rcpp-func">setupSparseGRM</span>(n, locationMat, valueVec)                 <span class="file">[Rcpp] Line ~1890</span>
+    ├── Store sparse GRM in COO format
+    ├── <span class="var">locationMat</span>: 2 × nnz matrix of (row, col) indices
+    ├── <span class="var">valueVec</span>: nnz vector of kinship values
+    └── <span class="var">dimNum</span>: matrix dimension
+</pre>
+    </div>
+
+    <h2>4. Key Data Structures</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Structure</th>
+                <th>Type</th>
+                <th>Location</th>
+                <th>Description</th>
+                <th>Key Members</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr class="highlight">
+                <td><code>genoClass</code></td>
+                <td>class</td>
+                <td>SAIGE_fitGLMM_fast.cpp:24</td>
+                <td>Main genotype data container</td>
+                <td>M, N, Nnomissing, alleleFreqVec, invstdvVec, stdGenoMultiMarkersMat, indiceVec, kinValueVecSparse</td>
+            </tr>
+            <tr>
+                <td><code>geno</code></td>
+                <td>genoClass instance</td>
+                <td>Global variable</td>
+                <td>Single global instance used by all functions</td>
+                <td>-</td>
+            </tr>
+            <tr>
+                <td><code>genoVecofPointers</code></td>
+                <td>vector of byte arrays</td>
+                <td>genoClass member</td>
+                <td>Chunked genotype storage (PLINK format)</td>
+                <td>Each array holds numMarkersofEachArray markers</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>stdGenoMultiMarkersMat</code></td>
+                <td>arma::fmat</td>
+                <td>genoClass member</td>
+                <td>Standardized genotype matrix (markers × samples)</td>
+                <td>Used by parallelCrossProd, findIndiceRelatedSample</td>
+            </tr>
+            <tr>
+                <td><code>indiceVec</code></td>
+                <td>vector&lt;pair&lt;int,int&gt;&gt;</td>
+                <td>genoClass member</td>
+                <td>Related sample pairs for sparse GRM</td>
+                <td>Populated by findIndiceRelatedSample</td>
+            </tr>
+            <tr>
+                <td><code>kinValueVecSparse</code></td>
+                <td>vector&lt;float&gt;</td>
+                <td>genoClass member</td>
+                <td>Kinship values for sparse GRM pairs</td>
+                <td>Added in Jan 28 fix</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>5. Mathematical Formulas</h2>
+
+    <div class="note">
+        <h3>GLMM Model:</h3>
+        <p><code>g(E[y|X,u]) = Xα + Zu</code> where <code>u ~ N(0, τ[2]×K)</code></p>
+        <p>For binary: <code>g(·) = logit</code>, for quantitative: <code>g(·) = identity</code></p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Variable</th>
+                <th>Formula</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Σ (Sigma)</td>
+                <td><code>Σ = W⁻¹ + τ[2] × K</code></td>
+                <td>Covariance matrix (not formed explicitly)</td>
+            </tr>
+            <tr>
+                <td>K (GRM)</td>
+                <td><code>K = G × G' / M</code></td>
+                <td>Genetic Relationship Matrix (standardized genotypes)</td>
+            </tr>
+            <tr>
+                <td>W (weights)</td>
+                <td><code>W = μ × (1 - μ)</code> for binary</td>
+                <td>IRLS working weights</td>
+            </tr>
+            <tr>
+                <td>Y (working response)</td>
+                <td><code>Y = η + (y - μ) / μ'(η)</code></td>
+                <td>Linearized response</td>
+            </tr>
+            <tr class="highlight">
+                <td>PY (projection)</td>
+                <td><code>PY = Σ⁻¹Y - Σ⁻¹X × (X'Σ⁻¹X)⁻¹ × X'Σ⁻¹Y</code></td>
+                <td>Projection onto null space of X</td>
+            </tr>
+            <tr class="highlight">
+                <td>APY</td>
+                <td><code>APY = K × PY / M</code></td>
+                <td>Key term for Score/AI</td>
+            </tr>
+            <tr>
+                <td>YPAPY</td>
+                <td><code>YPAPY = PY' × APY</code></td>
+                <td>Quadratic form for Score</td>
+            </tr>
+            <tr>
+                <td>Trace</td>
+                <td><code>Tr(P × K) ≈ (1/r) Σᵢ uᵢ' × K × P × uᵢ</code></td>
+                <td>Monte Carlo trace estimate</td>
+            </tr>
+            <tr>
+                <td>Score</td>
+                <td><code>Score = YPAPY - Trace</code></td>
+                <td>Gradient of restricted log-likelihood</td>
+            </tr>
+            <tr>
+                <td>AI</td>
+                <td><code>AI = APY' × P × APY</code></td>
+                <td>Average Information (Hessian approx)</td>
+            </tr>
+            <tr class="highlight">
+                <td>τ update</td>
+                <td><code>τ_new = max(0, τ + Score / AI)</code></td>
+                <td>AI-REML update (with step halving if needed)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>6. File Cross-Reference</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Function Category</th>
+                <th>R File</th>
+                <th>C++ File</th>
+                <th>C++ Standalone</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Entry point</td>
+                <td>SAIGE_fitGLMM_fast.R:906</td>
+                <td>-</td>
+                <td>main.cpp</td>
+            </tr>
+            <tr>
+                <td>GLMM fitting</td>
+                <td>SAIGE_fitGLMM_fast.R:241,525</td>
+                <td>SAIGE_fitGLMM_fast.cpp:5272,5413</td>
+                <td>glmm.cpp, null_model_engine.cpp</td>
+            </tr>
+            <tr>
+                <td>Genotype handling</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:24-800</td>
+                <td>SAIGE_step1_fast.cpp</td>
+            </tr>
+            <tr>
+                <td>PCG solver</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:~4500</td>
+                <td>SAIGE_step1_fast.cpp</td>
+            </tr>
+            <tr>
+                <td>GRM operations</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:1600-1850</td>
+                <td>SAIGE_step1_fast.cpp:1900-2100</td>
+            </tr>
+            <tr>
+                <td>Sparse GRM</td>
+                <td>SAIGE_createSparseGRM.R</td>
+                <td>SAIGE_fitGLMM_fast.cpp:1782-1917</td>
+                <td>SAIGE_step1_fast.cpp</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <hr style="margin: 40px 0;">
+    <p style="color: #888; font-size: 12px;">
+        Generated: January 30, 2026<br>
+        For R to C++ conversion comparison project<br>
+        Output directory: <code>/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/</code>
+    </p>
+</div>
+</body>
+</html>
