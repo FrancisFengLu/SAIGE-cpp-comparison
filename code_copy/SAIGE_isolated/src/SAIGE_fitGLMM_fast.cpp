@@ -5893,7 +5893,7 @@ arma::fvec  getSigma_G_Surv_new_LOCO(arma::fvec& wVec, arma::fvec& tauVec,arma::
 //This function needs the function getPCG1ofSigmaAndVector and function getCrossprodMatAndKin
 // [[Rcpp::export]]
 arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, arma::fvec& tauVec, arma::fmat& cov1,  int nrun, int maxiterPCG, float tolPCG, float traceCVcutoff){
-  	set_seed(0);
+  	set_seed(200);
   	arma::fmat Sigma_iXt = Sigma_iX.t();
   	int Nnomissing = geno.getNnomissing();
   	arma::fvec tempVec(nrun);
@@ -5957,7 +5957,7 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
     }
 
   // Save random vectors to bypass file for C++ to read
-  std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed0.csv";
+  std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed200.csv";
   std::ofstream outfile(bypass_path);
   if (outfile.is_open()) {
     cout << "=== SAVING RANDOM VECTORS (GetTrace_q) FOR C++ BYPASS ===" << endl;

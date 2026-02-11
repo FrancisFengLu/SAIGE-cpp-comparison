@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SAIGE Function Call Graph - R to C++ Mapping</title>
+    <title>SAIGE Function Call Graph - R to C++ Mapping (Binary & Quantitative)</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -24,6 +24,41 @@
         .call-tree .file { color: #e74c3c; }
         .call-tree .var { color: #d35400; }
 
+        /* Quantitative diff styling */
+        .quant-diff {
+            background: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #e65100;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .shared-badge {
+            background: #e8f5e9;
+            border: 1px solid #66bb6a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #2e7d32;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .quant-only {
+            background: #fce4ec;
+            border: 1px solid #ef9a9a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #c62828;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+
         .legend { display: flex; gap: 20px; margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; flex-wrap: wrap; }
         .legend-item { display: flex; align-items: center; gap: 8px; }
         .legend-box { width: 20px; height: 20px; border-radius: 3px; }
@@ -31,6 +66,8 @@
         .legend-cpp { background: #27ae60; }
         .legend-rcpp { background: #8e44ad; }
         .legend-var { background: #d35400; }
+        .legend-quant { background: #ff9800; }
+        .legend-shared { background: #4caf50; }
 
         table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }
         th { background: #3498db; color: white; padding: 10px; text-align: left; position: sticky; top: 0; }
@@ -38,25 +75,65 @@
         tr:hover { background: #f9f9f9; }
         .highlight { background: #fff3cd; }
 
+        /* Diff table styling */
+        .diff-table th { background: #e65100; }
+        .diff-table td.binary-col { background: #e3f2fd; }
+        .diff-table td.quant-col { background: #fff3e0; }
+
         code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
         .note { background: #e8f4fd; padding: 15px; border-left: 5px solid #3498db; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-quant { background: #fff3e0; padding: 15px; border-left: 5px solid #ff9800; margin: 20px 0; border-radius: 0 5px 5px 0; }
 
         .svg-container { overflow-x: auto; margin: 20px 0; }
         svg { background: #fafafa; border-radius: 5px; }
+
+        /* Side-by-side layout */
+        .side-by-side { display: flex; gap: 20px; margin: 20px 0; }
+        .side-by-side .panel { flex: 1; min-width: 0; }
+        .panel-binary { border: 2px solid #3498db; border-radius: 8px; padding: 15px; }
+        .panel-binary h3 { color: #2980b9; margin-top: 0; }
+        .panel-quant { border: 2px solid #ff9800; border-radius: 8px; padding: 15px; }
+        .panel-quant h3 { color: #e65100; margin-top: 0; }
+
+        .toc { background: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }
+        .toc a { color: #2980b9; text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+        .toc ul { list-style: none; padding-left: 20px; }
+        .toc > ul { padding-left: 0; }
+        .toc li { margin: 5px 0; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>SAIGE Function Call Graph - Complete R to C++ Mapping</h1>
+    <h1>SAIGE Function Call Graph - Complete R to C++ Mapping (Binary &amp; Quantitative)</h1>
+
+    <div class="toc">
+        <strong>Table of Contents</strong>
+        <ul>
+            <li>1. <a href="#section1">Complete Call Graphs: Binary &amp; Quantitative GLMM Fitting</a></li>
+            <li>2. <a href="#section2">PCG Solver Internals</a></li>
+            <li>3. <a href="#section3">Sparse GRM Creation</a></li>
+            <li>4. <a href="#section4">Key Data Structures</a></li>
+            <li>5. <a href="#section5">Mathematical Formulas (Binary &amp; Quantitative)</a></li>
+            <li>6. <a href="#section6">File Cross-Reference</a></li>
+            <li>7. <a href="#section7">Binary vs Quantitative Differences Summary</a></li>
+            <li>8. <a href="#section8">R vs C++ Verification Results (3 Covariate Configs)</a></li>
+        </ul>
+    </div>
 
     <div class="legend">
         <div class="legend-item"><div class="legend-box legend-r"></div><span>R Function</span></div>
         <div class="legend-item"><div class="legend-box legend-rcpp"></div><span>Rcpp Export (C++ callable from R)</span></div>
         <div class="legend-item"><div class="legend-box legend-cpp"></div><span>Internal C++ Function</span></div>
         <div class="legend-item"><div class="legend-box legend-var"></div><span>Key Variable</span></div>
+        <div class="legend-item"><div class="legend-box legend-quant"></div><span><span class="quant-diff">QUANT DIFF</span> Quantitative differs from Binary</span></div>
+        <div class="legend-item"><div class="legend-box legend-shared"></div><span><span class="shared-badge">SHARED</span> Same code path for both</span></div>
     </div>
 
-    <h2>1. Complete Call Graph: Binary Trait GLMM Fitting</h2>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section1">1. Complete Call Graphs: Binary &amp; Quantitative GLMM Fitting</h2>
+
+    <p>The unified call graph below shows both binary and quantitative paths. Orange <span class="quant-diff">QUANT DIFF</span> badges mark where the quantitative path diverges. Green <span class="shared-badge">SHARED</span> badges mark code shared by both.</p>
 
     <div class="call-tree">
 <pre>
@@ -69,137 +146,242 @@
 ├── <span class="comment"># Input validation, phenotype/covariate processing</span>
 ├── <span class="comment"># Call appropriate trait-specific function:</span>
 │
-├── <span class="r-func">glmmkin.ai_PCG_Rcpp_Binary</span>()                       <span class="file">[R] Line 241</span>  <span class="comment"># For binary traits</span>
-│   │
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   ├── <span class="comment"># STEP 1: Load genotype data</span>
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   │
-│   ├── <span class="rcpp-func">setgeno</span>(bedFile, bimFile, famFile, ...)             <span class="file">[Rcpp] Line ~780</span>
-│   │   └── <span class="cpp-func">genoClass::setGenotype()</span>                         <span class="file">[C++] internal</span>
-│   │       ├── Read PLINK .bed/.bim/.fam files
-│   │       ├── Compute allele frequencies: <span class="var">alleleFreqVec</span>
-│   │       ├── Compute inverse std dev: <span class="var">invstdvVec</span>
-│   │       ├── Build: <span class="var">genoVecofPointers</span> (genotype storage)
-│   │       └── Set: <span class="var">M</span>, <span class="var">N</span>, <span class="var">Nnomissing</span>
-│   │
-│   ├── <span class="comment"># LOCO chromosome index setup if needed</span>
-│   ├── <span class="rcpp-func">getQCdMarkerIndex</span>()                                  <span class="file">[Rcpp]</span>
-│   │
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   ├── <span class="comment"># STEP 2: Initial coefficient estimation</span>
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   │
-│   ├── Initialize: <span class="var">tau</span> = [1, 0.5], <span class="var">alpha0</span>, <span class="var">eta0</span>
-│   │
-│   ├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 117</span>
-│   │   │
-│   │   ├── Compute working response: <span class="var">Y</span> = eta - offset + (y - mu)/mu.eta
-│   │   ├── Compute weights: <span class="var">W</span> = sqrtW^2 where sqrtW = mu.eta/sqrt(variance(mu))
-│   │   │
-│   │   └── <span class="rcpp-func">getCoefficients</span>(Y, X, W, tau, maxiterPCG, tolPCG)  <span class="file">[Rcpp] Line 5272</span>
-│   │       │
-│   │       ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, Y, ...)       <span class="file">[C++] Line ~4500</span>
-│   │       │   ├── PCG iterative solver
-│   │       │   └── Returns: <span class="var">Sigma_iY</span> = Σ⁻¹ × Y
-│   │       │
-│   │       ├── For each column of X:
-│   │       │   └── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,i], ...)
-│   │       │       └── Returns: <span class="var">Sigma_iX</span>[:,i] = Σ⁻¹ × X[:,i]
-│   │       │
-│   │       ├── <span class="var">cov</span> = (X' × Sigma_iX)⁻¹
-│   │       ├── <span class="var">alpha</span> = cov × (Sigma_iX' × Y)
-│   │       ├── <span class="var">eta</span> = Y - tau[0] × (Sigma_iY - Sigma_iX × alpha) / W
-│   │       │
-│   │       └── Returns: { Sigma_iY, Sigma_iX, cov, alpha, eta }
-│   │
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   ├── <span class="comment"># STEP 3: Initial Score/Trace estimation</span>
-│   ├── <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
-│   │
-│   ├── <span class="rcpp-func">getAIScore</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5384</span>
-│   │   │
-│   │   ├── Compute projection: <span class="var">PY</span> = Sigma_iY - Sigma_iX × (cov × (Sigma_iX' × Y))
-│   │   │
-│   │   ├── <span class="rcpp-func">getCrossprodMatAndKin</span>(PY)                         <span class="file">[Rcpp] Line 1733</span>
-│   │   │   │
-│   │   │   ├── If using sparse GRM:
-│   │   │   │   └── Sparse matrix multiply: result × bVec
-│   │   │   │
-│   │   │   └── Else (full GRM):
-│   │   │       └── <span class="cpp-func">parallelCrossProd</span>(PY)                      <span class="file">[C++] Line ~1600</span>
-│   │   │           ├── For each marker k (parallel):
-│   │   │           │   ├── col = <span class="var">stdGenoMultiMarkersMat</span>.col(k)
-│   │   │           │   └── accumulate: col × (col' × PY)
-│   │   │           └── Normalize: result / <span class="var">Msub_MAFge_minMAFtoConstructGRM</span>
-│   │   │
-│   │   ├── <span class="var">APY</span> = getCrossprodMatAndKin(PY)  <span class="comment"># = K × PY / M</span>
-│   │   ├── <span class="var">YPAPY</span> = PY' × APY
-│   │   │
-│   │   ├── <span class="rcpp-func">GetTrace</span>(Sigma_iX, X, W, tau, cov, nrun, ...)      <span class="file">[Rcpp] Line 5218</span>
-│   │   │   ├── For i = 1 to nrun:
-│   │   │   │   ├── Generate random vector: u ~ {-1, +1}^n
-│   │   │   │   ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, u, ...)
-│   │   │   │   ├── Pu = Sigma_iu - Sigma_iX × (cov × (Sigma_iX' × u))
-│   │   │   │   ├── Au = getCrossprodMatAndKin(u)
-│   │   │   │   └── tempVec[i] = Au' × Pu
-│   │   │   ├── Check CV, increase nrun if needed
-│   │   │   └── <span class="var">Trace</span> = mean(tempVec)
-│   │   │
-│   │   ├── PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY, ...)
-│   │   ├── PAPY = PAPY_1 - Sigma_iX × (cov × (Sigma_iX' × PAPY_1))
-│   │   ├── <span class="var">AI</span> = APY' × PAPY
-│   │   │
-│   │   └── Returns: { YPAPY, Trace, PY, AI }
-│   │
-│   ├── Initial tau update: <span class="var">tau[2]</span> = max(0, tau0[2] + tau0[2]² × (YPAPY - Trace)/n)
-│   │
-│   ├── <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
-│   ├── <span class="comment"># MAIN ITERATION LOOP (AI-REML)</span>
-│   ├── <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
-│   │
-│   └── FOR i = 1 to maxiter:
-│       │
-│       ├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 361</span>
-│       │   └── <span class="rcpp-func">getCoefficients</span>(...)                           <span class="file">[Rcpp]</span>
-│       │
-│       ├── <span class="rcpp-func">fitglmmaiRPCG</span>(Y, X, W, tau, Sigma_iY, Sigma_iX, cov, nrun, ...) <span class="file">[Rcpp] Line 5413</span>
-│       │   │
-│       │   ├── <span class="rcpp-func">getAIScore</span>(...)                                <span class="file">[Rcpp]</span>
-│       │   │   ├── Compute PY, APY, YPAPY
-│       │   │   ├── Compute Trace via Monte Carlo
-│       │   │   └── Compute AI
-│       │   │
-│       │   ├── <span class="var">Score</span> = YPAPY - Trace
-│       │   ├── <span class="var">Dtau</span> = Score / AI
-│       │   ├── <span class="var">tau[2]</span> = tau[2] + Dtau
-│       │   │
-│       │   ├── If tau[2] < 0: apply step halving
-│       │   ├── If tau < tol: set to 0
-│       │   │
-│       │   └── Returns: { tau }
-│       │
-│       ├── Convergence check:
-│       │   └── max(|tau - tau0| / (|tau| + |tau0| + tol)) < tol → BREAK
-│       │
-│       └── Update: tau0 = tau, alpha0 = alpha
+├──── <strong>BINARY:</strong> <span class="r-func">glmmkin.ai_PCG_Rcpp_Binary</span>()               <span class="file">[R] Line 241</span>
+├──── <strong>QUANT:</strong>  <span class="r-func">glmmkin.ai_PCG_Rcpp_Quantitative</span>()          <span class="file">[R] Line 525</span>  <span class="quant-diff">QUANT DIFF</span> <span class="comment">Different entry functions</span>
 │
-│   <span class="comment"># After loop: final results</span>
-│   └── Returns: glmmResult = { theta=tau, coefficients=alpha, linear.predictors=eta,
-│                               fitted.values=mu, Y, residuals, cov, converged, ... }
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   <span class="comment"># STEP 1: Load genotype data (identical for both)</span>
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
 │
-└── <span class="r-func">glmmkin.ai_PCG_Rcpp_Quantitative</span>()                  <span class="file">[R] Line 525</span>  <span class="comment"># For quantitative traits</span>
-    └── <span class="comment">(Similar structure, uses fitglmmaiRPCG_q, getAIScore_q, GetTrace_q)</span>
+├── <span class="rcpp-func">setgeno</span>(bedFile, bimFile, famFile, ...)             <span class="file">[Rcpp] Line ~780</span>  <span class="shared-badge">SHARED</span>
+│   └── <span class="cpp-func">genoClass::setGenotype()</span>                         <span class="file">[C++] internal</span>
+│       ├── Read PLINK .bed/.bim/.fam files
+│       ├── Compute allele frequencies: <span class="var">alleleFreqVec</span>
+│       ├── Compute inverse std dev: <span class="var">invstdvVec</span>
+│       ├── Build: <span class="var">genoVecofPointers</span> (genotype storage)
+│       └── Set: <span class="var">M</span>, <span class="var">N</span>, <span class="var">Nnomissing</span>
+│
+├── <span class="comment"># LOCO chromosome index setup if needed</span>
+├── <span class="rcpp-func">getQCdMarkerIndex</span>()                                  <span class="file">[Rcpp]</span>  <span class="shared-badge">SHARED</span>
+│
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   <span class="comment"># STEP 2: Initialize tau &amp; compute initial coefficients</span>
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│
+├── Initialize: <span class="var">tau</span> = [1, 0]                              <span class="quant-diff">QUANT DIFF</span>
+│   <span class="comment">#   Binary:  tau = [1, 0.5], tau[0]=1 FIXED throughout</span>
+│   <span class="comment">#   Quant:   tau = [1, 0],   tau[0] is FREE (estimated)</span>
+│
+├── IRLS build step                                        <span class="quant-diff">QUANT DIFF</span>
+│   <span class="comment">#   Binary:  irls_binary_build: W = mu*(1-mu), logit link</span>
+│   <span class="comment">#   Quant:   irls_gaussian_build: W = 1, identity link</span>
+│
+├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 117</span>  <span class="shared-badge">SHARED</span>
+│   │   <span class="comment"># Same function for both — family param controls behavior</span>
+│   │
+│   ├── Compute working response: <span class="var">Y</span> = eta - offset + (y - mu)/mu.eta
+│   ├── Compute weights: <span class="var">W</span> = sqrtW^2 where sqrtW = mu.eta/sqrt(variance(mu))
+│   │   <span class="comment">#   Binary:  W = mu*(1-mu)</span>
+│   │   <span class="comment">#   Quant:   W = 1  (identity link, Gaussian variance)</span>
+│   │
+│   └── <span class="rcpp-func">getCoefficients</span>(Y, X, W, tau, maxiterPCG, tolPCG)  <span class="file">[Rcpp] Line 5272</span>  <span class="shared-badge">SHARED</span>
+│       │
+│       ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, Y, ...)       <span class="file">[C++] Line ~4500</span>
+│       │   ├── PCG iterative solver
+│       │   └── Returns: <span class="var">Sigma_iY</span> = Σ⁻¹ × Y
+│       │
+│       ├── For each column of X:
+│       │   └── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,i], ...)
+│       │       └── Returns: <span class="var">Sigma_iX</span>[:,i] = Σ⁻¹ × X[:,i]
+│       │
+│       ├── <span class="var">cov</span> = (X' × Sigma_iX)⁻¹
+│       ├── <span class="var">alpha</span> = cov × (Sigma_iX' × Y)
+│       ├── <span class="var">eta</span> = Y - tau[0] × (Sigma_iY - Sigma_iX × alpha) / W
+│       │
+│       └── Returns: { Sigma_iY, Sigma_iX, cov, alpha, eta }
+│
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│   <span class="comment"># STEP 3: Initial Score/Trace estimation</span>
+│   <span class="comment"># ─────────────────────────────────────────────────────────────────────</span>
+│
+├── <strong>BINARY:</strong>  <span class="rcpp-func">getAIScore</span>(Y, X, W, tau, ...)                    <span class="file">[Rcpp] Line 5384</span>
+├── <strong>QUANT:</strong>   <span class="rcpp-func">getAIScore_q</span>(Y, X, W, tau, ...)                  <span class="file">[Rcpp]</span>  <span class="quant-diff">QUANT DIFF</span> <span class="comment">Key structural difference</span>
+│   │
+│   ├── Compute projection: <span class="var">PY</span> = Sigma_iY - Sigma_iX × (cov × (Sigma_iX' × Y))  <span class="shared-badge">SHARED</span>
+│   │
+│   ├── <span class="rcpp-func">getCrossprodMatAndKin</span>(PY)                         <span class="file">[Rcpp] Line 1733</span>  <span class="shared-badge">SHARED</span>
+│   │   └── Returns: <span class="var">APY</span> = K × PY
+│   │
+│   ├── <span class="var">YPAPY</span> = PY' × APY                                  <span class="shared-badge">SHARED</span>
+│   │
+│   ├── <span class="comment"># ── Quantitative-only: compute identity component ──</span>
+│   ├── <span class="var">A0PY</span> = PY                                            <span class="quant-only">QUANT ONLY</span> <span class="comment">A0 = I (identity component)</span>
+│   ├── <span class="var">YPA0PY</span> = dot(PY, A0PY) = dot(PY, PY)                <span class="quant-only">QUANT ONLY</span>
+│   │
+│   ├── <strong>BINARY:</strong>  <span class="rcpp-func">GetTrace</span>(... seed=10)                       <span class="file">[Rcpp] Line 5218</span>
+│   ├── <strong>QUANT:</strong>   <span class="rcpp-func">GetTrace_q</span>(... seed=0)                     <span class="file">[Rcpp]</span>  <span class="quant-diff">QUANT DIFF</span>
+│   │   │   <span class="comment"># Binary:  seed 10, returns scalar Trace</span>
+│   │   │   <span class="comment"># Quant:   seed 0,  returns fvec(2) — [tr(P×I), tr(P×K)]</span>
+│   │   │
+│   │   ├── For i = 1 to nrun:
+│   │   │   ├── Generate random vector: u ~ {-1, +1}^n
+│   │   │   ├── <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, u, ...)
+│   │   │   ├── Pu = Sigma_iu - Sigma_iX × (cov × (Sigma_iX' × u))
+│   │   │   ├── Au = getCrossprodMatAndKin(u)               <span class="comment"># K × u</span>
+│   │   │   ├── <strong>Binary:</strong>  tempVec[i] = Au' × Pu             <span class="comment"># scalar</span>
+│   │   │   ├── <strong>Quant:</strong>   tempVec0[i] = u' × Pu              <span class="quant-only">QUANT ONLY</span> <span class="comment">trace of P×I</span>
+│   │   │   └── <strong>Quant:</strong>   tempVec1[i] = Au' × Pu             <span class="comment"># trace of P×K</span>
+│   │   │
+│   │   ├── <strong>Binary:</strong>  <span class="var">Trace</span> = mean(tempVec)               <span class="comment"># scalar</span>
+│   │   └── <strong>Quant:</strong>   <span class="var">Trace</span> = [mean(tempVec0), mean(tempVec1)]  <span class="quant-diff">QUANT DIFF</span> <span class="comment">2-element vector</span>
+│   │
+│   ├── PAPY_1 = getPCG1ofSigmaAndVector(W, tau, APY, ...)  <span class="shared-badge">SHARED</span>
+│   ├── PAPY = PAPY_1 - Sigma_iX × (cov × (Sigma_iX' × PAPY_1))
+│   │
+│   ├── <span class="comment"># ── AI matrix construction ──</span>                        <span class="quant-diff">QUANT DIFF</span>
+│   ├── <strong>Binary:</strong>  <span class="var">AI</span> = APY' × PAPY                       <span class="comment"># scalar</span>
+│   ├── <strong>Quant:</strong>   PA0PY = getPCG1ofSigmaAndVector(W, tau, A0PY=PY, ...)  <span class="quant-only">QUANT ONLY</span>
+│   │            PA0PY = PA0PY_1 - Sigma_iX × (cov × (Sigma_iX' × PA0PY_1))
+│   │            <span class="var">AI</span> = 2×2 matrix:                          <span class="quant-diff">QUANT DIFF</span> <span class="comment">2×2 vs scalar</span>
+│   │              AI[0,0] = A0PY' × PA0PY = PY' × PA0PY
+│   │              AI[0,1] = A0PY' × PAPY  = PY' × PAPY
+│   │              AI[1,0] = APY'  × PA0PY
+│   │              AI[1,1] = APY'  × PAPY
+│   │
+│   └── <strong>Binary:</strong>  Returns: { YPAPY, Trace, PY, AI }         <span class="comment"># scalar AI, scalar Trace</span>
+│       <strong>Quant:</strong>   Returns: { YPAPY, YPA0PY, Trace(2), PY, AI(2×2) }  <span class="quant-diff">QUANT DIFF</span>
+│
+├── Initial tau update (conservative, iteration 0):        <span class="quant-diff">QUANT DIFF</span>
+│   <span class="comment">#   Binary:  Dtau = tau[1]² × (YPAPY - Trace) / n</span>
+│   <span class="comment">#            tau[1] = tau[1] + Dtau</span>
+│   <span class="comment">#   Quant:   Dtau[i] = tau[i]² × score[i] / n   for each i ∈ {0,1}</span>
+│   <span class="comment">#            tau[0] = tau[0] + Dtau[0]</span>
+│   <span class="comment">#            tau[1] = tau[1] + Dtau[1]</span>
+│
+│   <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
+│   <span class="comment"># MAIN ITERATION LOOP (AI-REML)</span>
+│   <span class="comment"># ═══════════════════════════════════════════════════════════════════════</span>
+│
+└── FOR i = 1 to maxiter:
+    │
+    ├── <span class="r-func">Get_Coef</span>(y, X, tau, family, alpha0, eta0, ...)    <span class="file">[R] Line 361</span>  <span class="shared-badge">SHARED</span>
+    │   └── <span class="rcpp-func">getCoefficients</span>(...)                           <span class="file">[Rcpp]</span>
+    │
+    ├── <strong>BINARY:</strong>  <span class="rcpp-func">fitglmmaiRPCG</span>(Y, X, W, tau, ...)             <span class="file">[Rcpp] Line 5413</span>
+    ├── <strong>QUANT:</strong>   <span class="rcpp-func">fitglmmaiRPCG_q</span>(Y, X, W, tau, ...)           <span class="file">[Rcpp]</span>  <span class="quant-diff">QUANT DIFF</span> <span class="comment">Different wrapper names</span>
+    │   │
+    │   ├── <strong>BINARY:</strong>  <span class="rcpp-func">getAIScore</span>(...)                        <span class="file">[Rcpp]</span>
+    │   ├── <strong>QUANT:</strong>   <span class="rcpp-func">getAIScore_q</span>(...)                      <span class="file">[Rcpp]</span>  <span class="quant-diff">QUANT DIFF</span>
+    │   │   ├── Compute PY, APY, YPAPY
+    │   │   ├── <strong>Quant also:</strong> A0PY, YPA0PY                    <span class="quant-only">QUANT ONLY</span>
+    │   │   ├── Compute Trace via Monte Carlo
+    │   │   └── Compute AI
+    │   │
+    │   ├── Score computation:                                <span class="quant-diff">QUANT DIFF</span>
+    │   │   <span class="comment">#   Binary:  Score = YPAPY - Trace                  (scalar)</span>
+    │   │   <span class="comment">#   Quant:   scores = [YPA0PY - Trace[0],            (2-element)</span>
+    │   │   <span class="comment">#                       YPAPY  - Trace[1]]</span>
+    │   │
+    │   ├── AI solve:                                         <span class="quant-diff">QUANT DIFF</span>
+    │   │   <span class="comment">#   Binary:  Dtau = Score / AI                       (scalar division)</span>
+    │   │   <span class="comment">#   Quant:   delta = solve(AI_2×2, scores_2)         (2×2 linear system)</span>
+    │   │
+    │   ├── Tau update:                                       <span class="quant-diff">QUANT DIFF</span>
+    │   │   <span class="comment">#   Binary:  Only tau[1] updated;  tau[0] = 1 always</span>
+    │   │   <span class="comment">#   Quant:   Both tau[0] and tau[1] updated</span>
+    │   │
+    │   ├── Step halving (if tau goes negative):              <span class="quant-diff">QUANT DIFF</span>
+    │   │   <span class="comment">#   Binary:  while tau[1] &lt; 0  →  halve Dtau</span>
+    │   │   <span class="comment">#   Quant:   while tau[0] &lt; 0 OR tau[1] &lt; 0  →  halve delta</span>
+    │   │
+    │   └── Returns: { tau }
+    │
+    ├── Convergence check:                                    <span class="shared-badge">SHARED</span>
+    │   └── max(|tau - tau0| / (|tau| + |tau0| + tol)) &lt; tol → BREAK
+    │
+    └── Update: tau0 = tau, alpha0 = alpha
+
+<span class="comment"># After loop: final results</span>
+└── Returns: glmmResult = { theta=tau, coefficients=alpha, linear.predictors=eta,
+                            fitted.values=mu, Y, residuals, cov, converged, ... }
 </pre>
     </div>
 
-    <h2>2. PCG Solver Internals</h2>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2>1b. Side-by-Side: Key Divergence Points</h2>
+
+    <div class="side-by-side">
+        <div class="panel panel-binary">
+            <h3>Binary Trait Path</h3>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="r-func">glmmkin.ai_PCG_Rcpp_Binary</span>()
+│
+├── tau = [<strong>1</strong>, 0.5]  <span class="comment"># tau[0]=1 FIXED</span>
+├── W = mu*(1-mu)      <span class="comment"># logit link</span>
+│
+├── <span class="rcpp-func">getAIScore</span>()
+│   ├── PY, APY, YPAPY  <span class="comment"># scalars</span>
+│   ├── <span class="rcpp-func">GetTrace</span>(seed=10) → <strong>scalar</strong>
+│   ├── AI = APY'×PAPY   <span class="comment"># scalar</span>
+│   └── Returns scalar AI, scalar Trace
+│
+├── Score = YPAPY - Trace  <span class="comment"># 1 score</span>
+├── Dtau = Score / AI      <span class="comment"># scalar div</span>
+├── tau[1] += Dtau         <span class="comment"># only tau[1]</span>
+│
+├── <span class="rcpp-func">fitglmmaiRPCG</span>()
+│   ├── Step halving: while tau[1] &lt; 0
+│   └── Conservative: Dtau = tau[1]²×score/n
+│
+└── <span class="comment">1 variance component estimated</span>
+</pre>
+            </div>
+        </div>
+
+        <div class="panel panel-quant">
+            <h3>Quantitative Trait Path</h3>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="r-func">glmmkin.ai_PCG_Rcpp_Quantitative</span>()
+│
+├── tau = [<strong>1</strong>, 0]    <span class="comment"># tau[0] is FREE</span>
+├── W = 1              <span class="comment"># identity link</span>
+│
+├── <span class="rcpp-func">getAIScore_q</span>()
+│   ├── PY, APY, YPAPY
+│   ├── <strong>A0PY = PY</strong>           <span class="quant-only">QUANT ONLY</span>
+│   ├── <strong>YPA0PY = dot(PY,PY)</strong> <span class="quant-only">QUANT ONLY</span>
+│   ├── <span class="rcpp-func">GetTrace_q</span>(seed=0) → <strong>fvec(2)</strong>
+│   ├── AI = <strong>2×2 matrix</strong>
+│   └── Returns 2×2 AI, 2-elem Trace
+│
+├── scores = [YPA0PY-Tr[0],  <span class="comment"># 2 scores</span>
+│             YPAPY -Tr[1]]
+├── delta = solve(AI, scores) <span class="comment"># 2×2 solve</span>
+├── tau[0] += delta[0]        <span class="comment"># BOTH updated</span>
+├── tau[1] += delta[1]
+│
+├── <span class="rcpp-func">fitglmmaiRPCG_q</span>()
+│   ├── Step halving: while tau[0]&lt;0 OR tau[1]&lt;0
+│   └── Conservative: Dtau[i] = tau[i]²×score[i]/n
+│
+└── <span class="comment">2 variance components estimated</span>
+</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section2">2. PCG Solver Internals</h2>
 
     <div class="call-tree">
 <pre>
-<span class="cpp-func">getPCG1ofSigmaAndVector</span>(wVec, tauVec, bVec, maxiterPCG, tolPCG)   <span class="file">[C++]</span>
+<span class="cpp-func">getPCG1ofSigmaAndVector</span>(wVec, tauVec, bVec, maxiterPCG, tolPCG)   <span class="file">[C++]</span>  <span class="shared-badge">SHARED</span>
 │
-├── <span class="comment"># Solves: Σ × x = b, where Σ = W⁻¹ + τ[2] × K</span>
+├── <span class="comment"># Solves: Σ × x = b</span>
+│   <span class="comment"># Binary:  Σ = W⁻¹ + τ[1] × K    (W = mu*(1-mu))</span>
+│   <span class="comment"># Quant:   Σ = τ[0]×I + τ[1] × K  (W = 1, so W⁻¹ = I, scaled by τ[0])</span>
 │
 ├── Initialize: x = zeros, r = b, p = r
 │
@@ -207,21 +389,21 @@
     │
     ├── <span class="cpp-func">getCrossprod</span>(p, wVec, tauVec)                          <span class="file">[C++] Line ~3200</span>
     │   │
-    │   ├── <span class="comment"># Computes: Σ × p = W⁻¹ × p + τ[2] × K × p</span>
+    │   ├── <span class="comment"># Computes: Σ × p = (tau[0]/W) × p + τ[1] × K × p</span>
     │   │
-    │   ├── term1 = p / wVec                        <span class="comment"># W⁻¹ × p (element-wise)</span>
+    │   ├── term1 = tau[0] × p / wVec               <span class="comment"># tau[0]/W × p (element-wise)</span>
     │   │
     │   ├── <span class="rcpp-func">getCrossprodMatAndKin</span>(p)                          <span class="file">[Rcpp] Line 1733</span>
     │   │   └── <span class="cpp-func">parallelCrossProd</span>(p)                          <span class="file">[C++]</span>
     │   │       └── Returns: K × p / M
     │   │
-    │   └── Returns: term1 + tauVec[2] × (K × p / M)
+    │   └── Returns: term1 + tauVec[1] × (K × p / M)
     │
     ├── alpha = (r' × r) / (p' × Ap)
     ├── x = x + alpha × p
     ├── r_new = r - alpha × Ap
     │
-    ├── Check convergence: ||r_new|| < tolPCG → BREAK
+    ├── Check convergence: ||r_new|| &lt; tolPCG → BREAK
     │
     ├── beta = (r_new' × r_new) / (r' × r)
     ├── p = r_new + beta × p
@@ -229,12 +411,14 @@
 </pre>
     </div>
 
-    <h2>3. Sparse GRM Creation</h2>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section3">3. Sparse GRM Creation</h2>
 
     <div class="call-tree">
 <pre>
 <span class="comment"># Called from main.cpp in C++ standalone or from R wrapper</span>
-<span class="cpp-func">build_sparse_grm_in_place</span>(rc, min_maf, max_miss)             <span class="file">[C++] main.cpp Line ~1920</span>
+<span class="comment"># Identical for binary and quantitative — GRM is trait-independent</span>
+<span class="cpp-func">build_sparse_grm_in_place</span>(rc, min_maf, max_miss)             <span class="file">[C++] main.cpp Line ~1920</span>  <span class="shared-badge">SHARED</span>
 │
 ├── <span class="rcpp-func">setminMAFforGRM</span>(min_maf)                                 <span class="file">[Rcpp]</span>
 ├── <span class="rcpp-func">setmaxMissingRateforGRM</span>(max_miss)                        <span class="file">[Rcpp]</span>
@@ -259,7 +443,7 @@
 │   │
 │   ├── <span class="cpp-func">struct indicesRelatedSamples</span> (parallel worker)       <span class="file">[C++] Line 1782</span>
 │   │
-│   ├── FOR each pair (i, j) with i < j (parallelized):
+│   ├── FOR each pair (i, j) with i &lt; j (parallelized):
 │   │   ├── kinValue = dot(<span class="var">stdGenoMultiMarkersMat</span>.col(i), <span class="var">stdGenoMultiMarkersMat</span>.col(j))
 │   │   ├── kinValue = kinValue / numMarkers
 │   │   └── IF kinValue >= relatednessCutoff:
@@ -278,7 +462,8 @@
 </pre>
     </div>
 
-    <h2>4. Key Data Structures</h2>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section4">4. Key Data Structures</h2>
 
     <table>
         <thead>
@@ -336,13 +521,23 @@
         </tbody>
     </table>
 
-    <h2>5. Mathematical Formulas</h2>
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section5">5. Mathematical Formulas (Binary &amp; Quantitative)</h2>
 
     <div class="note">
         <h3>GLMM Model:</h3>
-        <p><code>g(E[y|X,u]) = Xα + Zu</code> where <code>u ~ N(0, τ[2]×K)</code></p>
+        <p><code>g(E[y|X,u]) = Xα + Zu</code> where <code>u ~ N(0, τ[1]×K)</code></p>
         <p>For binary: <code>g(·) = logit</code>, for quantitative: <code>g(·) = identity</code></p>
     </div>
+
+    <div class="note-quant">
+        <h3>Key Structural Difference:</h3>
+        <p><strong>Binary:</strong> Estimates 1 variance component — <code>τ[1]</code> (genetic variance). <code>τ[0] = 1</code> is fixed.</p>
+        <p><strong>Quantitative:</strong> Estimates 2 variance components — <code>τ[0]</code> (residual variance) and <code>τ[1]</code> (genetic variance). Both are free.</p>
+        <p>This means all Score/AI/update computations are <strong>2-dimensional</strong> for quantitative vs <strong>scalar</strong> for binary.</p>
+    </div>
+
+    <h3>5a. Shared Formulas</h3>
 
     <table>
         <thead>
@@ -354,24 +549,9 @@
         </thead>
         <tbody>
             <tr>
-                <td>Σ (Sigma)</td>
-                <td><code>Σ = W⁻¹ + τ[2] × K</code></td>
-                <td>Covariance matrix (not formed explicitly)</td>
-            </tr>
-            <tr>
                 <td>K (GRM)</td>
                 <td><code>K = G × G' / M</code></td>
                 <td>Genetic Relationship Matrix (standardized genotypes)</td>
-            </tr>
-            <tr>
-                <td>W (weights)</td>
-                <td><code>W = μ × (1 - μ)</code> for binary</td>
-                <td>IRLS working weights</td>
-            </tr>
-            <tr>
-                <td>Y (working response)</td>
-                <td><code>Y = η + (y - μ) / μ'(η)</code></td>
-                <td>Linearized response</td>
             </tr>
             <tr class="highlight">
                 <td>PY (projection)</td>
@@ -381,45 +561,145 @@
             <tr class="highlight">
                 <td>APY</td>
                 <td><code>APY = K × PY / M</code></td>
-                <td>Key term for Score/AI</td>
+                <td>GRM component applied to projected Y</td>
             </tr>
             <tr>
                 <td>YPAPY</td>
                 <td><code>YPAPY = PY' × APY</code></td>
-                <td>Quadratic form for Score</td>
-            </tr>
-            <tr>
-                <td>Trace</td>
-                <td><code>Tr(P × K) ≈ (1/r) Σᵢ uᵢ' × K × P × uᵢ</code></td>
-                <td>Monte Carlo trace estimate</td>
-            </tr>
-            <tr>
-                <td>Score</td>
-                <td><code>Score = YPAPY - Trace</code></td>
-                <td>Gradient of restricted log-likelihood</td>
-            </tr>
-            <tr>
-                <td>AI</td>
-                <td><code>AI = APY' × P × APY</code></td>
-                <td>Average Information (Hessian approx)</td>
-            </tr>
-            <tr class="highlight">
-                <td>τ update</td>
-                <td><code>τ_new = max(0, τ + Score / AI)</code></td>
-                <td>AI-REML update (with step halving if needed)</td>
+                <td>Quadratic form for Score (genetic component)</td>
             </tr>
         </tbody>
     </table>
 
-    <h2>6. File Cross-Reference</h2>
+    <h3>5b. Binary-Specific Formulas</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Variable</th>
+                <th>Formula</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>W (weights)</td>
+                <td><code>W = μ × (1 - μ)</code></td>
+                <td>IRLS weights from logistic link</td>
+            </tr>
+            <tr>
+                <td>Σ (Sigma)</td>
+                <td><code>Σ = W⁻¹ + τ[1] × K</code></td>
+                <td>Covariance matrix (τ[0]=1 absorbed into W⁻¹)</td>
+            </tr>
+            <tr>
+                <td>Y (working response)</td>
+                <td><code>Y = η + (y - μ) / (μ × (1 - μ))</code></td>
+                <td>Linearized response (logit link)</td>
+            </tr>
+            <tr>
+                <td>Trace</td>
+                <td><code>Tr(P × K) ≈ (1/r) Σᵢ uᵢ' × K × P × uᵢ</code></td>
+                <td>Monte Carlo trace estimate (scalar)</td>
+            </tr>
+            <tr>
+                <td>Score</td>
+                <td><code>Score = YPAPY - Trace</code></td>
+                <td>Gradient of restricted log-likelihood (scalar)</td>
+            </tr>
+            <tr>
+                <td>AI</td>
+                <td><code>AI = APY' × P × APY</code></td>
+                <td>Average Information (scalar)</td>
+            </tr>
+            <tr class="highlight">
+                <td>τ update</td>
+                <td><code>τ[1]_new = max(0, τ[1] + Score / AI)</code></td>
+                <td>AI-REML update (with step halving if τ[1] &lt; 0)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5c. Quantitative-Specific Formulas <span class="quant-diff">QUANT DIFF</span></h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Variable</th>
+                <th>Formula</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>W (weights)</td>
+                <td><code>W = 1</code></td>
+                <td>Identity link, Gaussian variance → constant weight</td>
+            </tr>
+            <tr>
+                <td>Σ (Sigma)</td>
+                <td><code>Σ = τ[0] × I + τ[1] × K</code></td>
+                <td>Both τ[0] and τ[1] are free parameters</td>
+            </tr>
+            <tr>
+                <td>Y (working response)</td>
+                <td><code>Y = y</code></td>
+                <td>Identity link → no transformation needed</td>
+            </tr>
+            <tr>
+                <td>A0PY</td>
+                <td><code>A0PY = I × PY = PY</code></td>
+                <td>Identity component (for τ[0] estimation)</td>
+            </tr>
+            <tr>
+                <td>YPA0PY</td>
+                <td><code>YPA0PY = PY' × PY = ‖PY‖²</code></td>
+                <td>Quadratic form for residual variance score</td>
+            </tr>
+            <tr>
+                <td>Trace (2-element)</td>
+                <td><code>Trace[0] = Tr(P × I) ≈ (1/r) Σᵢ uᵢ' × P × uᵢ</code><br>
+                    <code>Trace[1] = Tr(P × K) ≈ (1/r) Σᵢ uᵢ' × K × P × uᵢ</code></td>
+                <td>Monte Carlo trace estimates (2-element vector)</td>
+            </tr>
+            <tr>
+                <td>Score (2-element)</td>
+                <td><code>scores[0] = YPA0PY - Trace[0]</code><br>
+                    <code>scores[1] = YPAPY - Trace[1]</code></td>
+                <td>Gradient vector (2 components)</td>
+            </tr>
+            <tr>
+                <td>AI (2×2 matrix)</td>
+                <td><code>AI = [ A0PY'×PA0PY   A0PY'×PAPY  ]</code><br>
+                    <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[ APY'×PA0PY    APY'×PAPY   ]</code></td>
+                <td>Average Information matrix (2×2)</td>
+            </tr>
+            <tr class="highlight">
+                <td>τ update (2D)</td>
+                <td><code>delta = solve(AI, scores)</code><br>
+                    <code>τ_new = τ + delta</code><br>
+                    <code>If τ[0] &lt; 0 or τ[1] &lt; 0: halve delta</code></td>
+                <td>2D AI-REML update with step halving on both</td>
+            </tr>
+            <tr>
+                <td>Conservative (iter 0)</td>
+                <td><code>Δτ[i] = τ[i]² × scores[i] / n</code> for each i</td>
+                <td>Safe first-iteration update (2D version)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section6">6. File Cross-Reference</h2>
 
     <table>
         <thead>
             <tr>
                 <th>Function Category</th>
                 <th>R File</th>
-                <th>C++ File</th>
+                <th>C++ File (Rcpp)</th>
                 <th>C++ Standalone</th>
+                <th>Binary / Quant</th>
             </tr>
         </thead>
         <tbody>
@@ -428,43 +708,321 @@
                 <td>SAIGE_fitGLMM_fast.R:906</td>
                 <td>-</td>
                 <td>main.cpp</td>
+                <td><span class="shared-badge">SHARED</span></td>
             </tr>
             <tr>
-                <td>GLMM fitting</td>
-                <td>SAIGE_fitGLMM_fast.R:241,525</td>
+                <td>Binary GLMM fitting</td>
+                <td>SAIGE_fitGLMM_fast.R:241</td>
                 <td>SAIGE_fitGLMM_fast.cpp:5272,5413</td>
-                <td>glmm.cpp, null_model_engine.cpp</td>
+                <td>glmm.cpp (<code>binary_glmm_solver</code>)</td>
+                <td>Binary only</td>
+            </tr>
+            <tr>
+                <td>Quantitative GLMM fitting</td>
+                <td>SAIGE_fitGLMM_fast.R:525</td>
+                <td>SAIGE_fitGLMM_fast.cpp (<code>fitglmmaiRPCG_q</code>)</td>
+                <td>glmm.cpp (<code>quant_glmm_solver</code>)</td>
+                <td><span class="quant-diff">QUANT</span></td>
+            </tr>
+            <tr>
+                <td>Get_Coef / getCoefficients</td>
+                <td>SAIGE_fitGLMM_fast.R:117</td>
+                <td>SAIGE_fitGLMM_fast.cpp:5272</td>
+                <td>saige_ai.cpp (<code>getCoefficients_cpp</code>)</td>
+                <td><span class="shared-badge">SHARED</span></td>
+            </tr>
+            <tr>
+                <td>getAIScore (binary)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:5384</td>
+                <td>saige_ai.cpp (<code>getAIScore_cpp</code>)</td>
+                <td>Binary only</td>
+            </tr>
+            <tr>
+                <td>getAIScore_q (quant)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp (<code>getAIScore_q</code>)</td>
+                <td>saige_ai.cpp (<code>getAIScore_q_cpp</code>)</td>
+                <td><span class="quant-diff">QUANT</span></td>
+            </tr>
+            <tr>
+                <td>GetTrace (binary)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:5218</td>
+                <td>SAIGE_step1_fast.cpp</td>
+                <td>Binary only</td>
+            </tr>
+            <tr>
+                <td>GetTrace_q (quant)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp (<code>GetTrace_q</code>)</td>
+                <td>SAIGE_step1_fast.cpp (<code>GetTrace_q</code>)</td>
+                <td><span class="quant-diff">QUANT</span></td>
+            </tr>
+            <tr>
+                <td>fitglmmaiRPCG (binary)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp:5413</td>
+                <td>glmm.cpp (inside <code>binary_glmm_solver</code>)</td>
+                <td>Binary only</td>
+            </tr>
+            <tr>
+                <td>fitglmmaiRPCG_q (quant)</td>
+                <td>-</td>
+                <td>SAIGE_fitGLMM_fast.cpp (<code>fitglmmaiRPCG_q</code>)</td>
+                <td>glmm.cpp (inside <code>quant_glmm_solver</code>)</td>
+                <td><span class="quant-diff">QUANT</span></td>
             </tr>
             <tr>
                 <td>Genotype handling</td>
                 <td>-</td>
                 <td>SAIGE_fitGLMM_fast.cpp:24-800</td>
                 <td>SAIGE_step1_fast.cpp</td>
+                <td><span class="shared-badge">SHARED</span></td>
             </tr>
             <tr>
                 <td>PCG solver</td>
                 <td>-</td>
                 <td>SAIGE_fitGLMM_fast.cpp:~4500</td>
                 <td>SAIGE_step1_fast.cpp</td>
+                <td><span class="shared-badge">SHARED</span></td>
             </tr>
             <tr>
                 <td>GRM operations</td>
                 <td>-</td>
                 <td>SAIGE_fitGLMM_fast.cpp:1600-1850</td>
                 <td>SAIGE_step1_fast.cpp:1900-2100</td>
+                <td><span class="shared-badge">SHARED</span></td>
             </tr>
             <tr>
                 <td>Sparse GRM</td>
                 <td>SAIGE_createSparseGRM.R</td>
                 <td>SAIGE_fitGLMM_fast.cpp:1782-1917</td>
                 <td>SAIGE_step1_fast.cpp</td>
+                <td><span class="shared-badge">SHARED</span></td>
             </tr>
         </tbody>
     </table>
 
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section7">7. Binary vs Quantitative Differences Summary</h2>
+
+    <p>Complete reference of all locations where binary and quantitative trait code paths diverge.</p>
+
+    <table class="diff-table">
+        <thead>
+            <tr>
+                <th>Location in Graph</th>
+                <th>Binary</th>
+                <th>Quantitative</th>
+                <th>Annotation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Top-level function</strong></td>
+                <td class="binary-col"><code>glmmkin.ai_PCG_Rcpp_Binary</code></td>
+                <td class="quant-col"><code>glmmkin.ai_PCG_Rcpp_Quantitative</code></td>
+                <td>Different entry functions</td>
+            </tr>
+            <tr>
+                <td><strong>Initial tau</strong></td>
+                <td class="binary-col"><code>tau = [1, 0.5]</code><br>tau[0]=1 fixed throughout</td>
+                <td class="quant-col"><code>tau = [1, 0]</code><br>tau[0] is free (estimated)</td>
+                <td>tau[0] free in quant; different initial tau[1]</td>
+            </tr>
+            <tr>
+                <td><strong>IRLS build</strong></td>
+                <td class="binary-col"><code>irls_binary_build</code><br>W = mu*(1-mu), logit link</td>
+                <td class="quant-col"><code>irls_gaussian_build</code><br>W = 1, identity link</td>
+                <td>Different GLM family</td>
+            </tr>
+            <tr>
+                <td><strong>Get_Coef</strong></td>
+                <td class="binary-col" colspan="2" style="text-align: center; background: #e8f5e9;"><span class="shared-badge">SHARED</span> — same function, family parameter controls behavior</td>
+                <td>Shared code path</td>
+            </tr>
+            <tr>
+                <td><strong>getCoefficients / PCG</strong></td>
+                <td class="binary-col" colspan="2" style="text-align: center; background: #e8f5e9;"><span class="shared-badge">SHARED</span></td>
+                <td>Shared code path</td>
+            </tr>
+            <tr>
+                <td><strong>AI Score function</strong></td>
+                <td class="binary-col"><code>getAIScore</code><br>→ scalar AI, scalar Trace</td>
+                <td class="quant-col"><code>getAIScore_q</code><br>→ 2×2 AI, 2-element Trace</td>
+                <td>Key structural difference</td>
+            </tr>
+            <tr>
+                <td><strong>GetTrace</strong></td>
+                <td class="binary-col"><code>GetTrace</code><br>seed=10, returns float</td>
+                <td class="quant-col"><code>GetTrace_q</code><br>seed=0, returns fvec(2)</td>
+                <td>Different seed + return type</td>
+            </tr>
+            <tr>
+                <td><strong>A0PY computation</strong></td>
+                <td class="binary-col"><em>Not computed</em></td>
+                <td class="quant-col"><code>A0PY = PY</code><br>(identity component)</td>
+                <td>Quant-only (for τ[0] estimation)</td>
+            </tr>
+            <tr>
+                <td><strong>YPA0PY</strong></td>
+                <td class="binary-col"><em>Not computed</em></td>
+                <td class="quant-col"><code>YPA0PY = dot(PY, A0PY)</code></td>
+                <td>Quant-only</td>
+            </tr>
+            <tr>
+                <td><strong>Score</strong></td>
+                <td class="binary-col">1 score:<br><code>YPAPY - Trace</code></td>
+                <td class="quant-col">2 scores:<br><code>[YPA0PY - Trace[0],<br>&nbsp;YPAPY - Trace[1]]</code></td>
+                <td>Scalar vs 2-element vector</td>
+            </tr>
+            <tr>
+                <td><strong>AI solve</strong></td>
+                <td class="binary-col"><code>Dtau = Score / AI</code><br>(scalar division)</td>
+                <td class="quant-col"><code>delta = solve(AI_2×2, scores_2)</code><br>(2×2 linear system)</td>
+                <td>Scalar vs matrix solve</td>
+            </tr>
+            <tr>
+                <td><strong>Tau update</strong></td>
+                <td class="binary-col">Only tau[1] updated<br>tau[0] = 1 always</td>
+                <td class="quant-col">Both tau[0] and tau[1] updated</td>
+                <td>1 vs 2 free parameters</td>
+            </tr>
+            <tr>
+                <td><strong>Step halving</strong></td>
+                <td class="binary-col"><code>while tau[1] &lt; 0</code></td>
+                <td class="quant-col"><code>while tau[0] &lt; 0 OR tau[1] &lt; 0</code></td>
+                <td>Both components checked</td>
+            </tr>
+            <tr>
+                <td><strong>Conservative (iter 0)</strong></td>
+                <td class="binary-col"><code>Dtau = tau[1]² × score / n</code></td>
+                <td class="quant-col"><code>Dtau[i] = tau[i]² × score[i] / n</code><br>for each i ∈ {0, 1}</td>
+                <td>2D version</td>
+            </tr>
+            <tr>
+                <td><strong>Wrapper function</strong></td>
+                <td class="binary-col"><code>fitglmmaiRPCG</code></td>
+                <td class="quant-col"><code>fitglmmaiRPCG_q</code></td>
+                <td>Different wrapper names</td>
+            </tr>
+            <tr>
+                <td><strong>C++ standalone solver</strong></td>
+                <td class="binary-col"><code>binary_glmm_solver</code></td>
+                <td class="quant-col"><code>quant_glmm_solver</code></td>
+                <td>Different top-level C++ functions</td>
+            </tr>
+            <tr>
+                <td><strong>Random vector bypass</strong></td>
+                <td class="binary-col"><code>random_vectors_seed10.csv</code></td>
+                <td class="quant-col"><code>random_vectors_seed0.csv</code></td>
+                <td>Different bypass files (different seeds)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section8">8. R vs C++ Verification Results (3 Covariate Configs)</h2>
+
+    <p>All configurations tested with sparse GRM, random vector bypass ON. Test data: 1000 samples, 128k markers.</p>
+
+    <h3>8a. Binary Trait (tau[0] = 1 fixed)</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Covariates</th>
+                <th>R tau[1]</th>
+                <th>C++ tau[1]</th>
+                <th>Difference</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>x1 + x2</code> (intercept + 2 covariates)</td>
+                <td>0.2901</td>
+                <td>0.2901</td>
+                <td>~1e-4</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+            <tr>
+                <td><code>x1</code> only (intercept + 1 covariate)</td>
+                <td>0.2279</td>
+                <td>0.2279</td>
+                <td>~1e-5</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+            <tr>
+                <td>None (intercept only)</td>
+                <td>0.0912</td>
+                <td>0.0912</td>
+                <td>~1e-6</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>8b. Quantitative Trait (tau[0] and tau[1] both free)</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Covariates</th>
+                <th>R tau[0]</th>
+                <th>R tau[1]</th>
+                <th>C++ tau[0]</th>
+                <th>C++ tau[1]</th>
+                <th>tau[1] diff</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>x1 + x2</code></td>
+                <td>0.2109</td>
+                <td>0.4745</td>
+                <td>0.2109</td>
+                <td>0.4745</td>
+                <td>~1e-6</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+            <tr>
+                <td><code>x1</code> only</td>
+                <td>0.2926</td>
+                <td>0.4500</td>
+                <td>0.2926</td>
+                <td>0.4500</td>
+                <td>~2e-5</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+            <tr>
+                <td>None</td>
+                <td>0.5818</td>
+                <td>0.4149</td>
+                <td>0.5818</td>
+                <td>0.4149</td>
+                <td>~0</td>
+                <td><span class="shared-badge">MATCH</span></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="note-quant">
+        <h3>Observations:</h3>
+        <ul style="margin-top: 8px; padding-left: 20px;">
+            <li><strong>All differences within float32 precision</strong> (&lt;1e-4). Both R and C++ use <code>arma::fvec</code>/<code>arma::fmat</code> (32-bit) internally.</li>
+            <li><strong>Binary tau[1] decreases</strong> as covariates are removed (0.29 → 0.23 → 0.09), because covariates that correlate with the trait absorb variance otherwise attributed to the kinship component.</li>
+            <li><strong>Quantitative tau[0] increases</strong> as covariates are removed (0.21 → 0.29 → 0.58), as unexplained residual variance grows without covariate adjustment.</li>
+            <li><strong>x1-only config</strong> verified the <code>hasCovariate</code> QR gating fix — binary with exactly 1 non-intercept covariate correctly skips QR transform.</li>
+        </ul>
+    </div>
+
     <hr style="margin: 40px 0;">
     <p style="color: #888; font-size: 12px;">
-        Generated: January 30, 2026<br>
+        Generated: February 4, 2026<br>
+        Updated with binary vs quantitative trait annotations and verification results<br>
         For R to C++ conversion comparison project<br>
         Output directory: <code>/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/</code>
     </p>

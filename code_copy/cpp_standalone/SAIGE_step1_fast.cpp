@@ -6352,7 +6352,7 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
   static bool load_attempted_q = false;
   if (!load_attempted_q) {
     load_attempted_q = true;
-    std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed0.csv";
+    std::string bypass_path = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed200.csv";
     std::cout << "=== RANDOM VECTOR BYPASS CHECK (GetTrace_q) ===" << std::endl;
     std::cout << "Looking for: " << bypass_path << std::endl;
 
@@ -6363,7 +6363,7 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
       std::cout << "FILE EXISTS - attempting to load..." << std::endl;
       load_vectors_from_csv(bypass_path);
       if (use_preloaded_vectors) {
-        std::cout << "SUCCESS: Loaded " << preloaded_vectors.size() << " random vectors from R bypass file (seed0)" << std::endl;
+        std::cout << "SUCCESS: Loaded " << preloaded_vectors.size() << " random vectors from R bypass file (seed200)" << std::endl;
       } else {
         std::cout << "FAILED: Could not parse random vectors from file" << std::endl;
       }

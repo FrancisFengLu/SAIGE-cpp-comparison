@@ -421,6 +421,10 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
 
 
     // --- Debug print: dimensions + first few entries ---
+    std::cout << std::setprecision(10);
+    std::cout << "[QR fingerprint] X(0,0)=" << X(0,0) << " X(0,1)=" << X(0,1) << " X(0,2)=" << X(0,2)
+              << " X(1,0)=" << X(1,0) << " X(1,1)=" << X(1,1) << " X(1,2)=" << X(1,2) << std::endl;
+    std::cout << std::setprecision(6);  // restore default
     std::cout << "[design] after covariate QR transform: "
               << X.rows() << " x " << X.cols() << "\n";
 
