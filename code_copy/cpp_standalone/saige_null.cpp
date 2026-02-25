@@ -8,6 +8,7 @@
 #include "preprocess_engine.hpp"
 #include "null_model_engine.hpp"
 #include "variance_ratio_engine.hpp"
+#include "variance_ratio_compute.hpp"
 #include "SAIGE_step1_fast.hpp"
 #include <filesystem>
 #include <stdexcept>
@@ -32,40 +33,8 @@ static inline Paths sanitize_paths_(Paths paths) {
   return paths;
 }
 
-static void neutral_vr_runner(const Paths& paths,
-                              const FitNullConfig& cfg,
-                              const LocoRanges& chr,
-                              const FitNullResult& fit,
-                              const Design& design,
-                              std::string& out_vr_path,
-                              std::string& out_marker_results_path)
-{
-  (void)chr; (void)fit; (void)design;
-
-  // Decide output path
-  std::string vr_out = paths.out_prefix_vr.empty()
-                         ? (paths.out_prefix + ".variance_ratio.tsv")
-                         : (paths.out_prefix_vr + ".variance_ratio.tsv");
-
-  std::ofstream ofs(vr_out);
-  // Header expected by VR validation
-  ofs << "MAC_Lower\tMAC_Upper\tVarianceRatio\n";
-
-  // Make a couple of bins with VR=1.0
-  int lo  = cfg.vr_min_mac > 0 ? cfg.vr_min_mac : 1;
-  int mid = std::max(lo, lo * 4 - 1);
-  int hi  = std::max(mid + 1, (cfg.vr_max_mac > 0 ? cfg.vr_max_mac : mid + 10));
-
-  ofs << lo     << '\t' << mid     << '\t' << 1.0 << '\n';
-  ofs << mid+1  << '\t' << hi      << '\t' << 1.0 << '\n';
-  ofs.close();
-
-  out_vr_path = vr_out;
-  out_marker_results_path.clear();
-}
-
-static inline void register_default_vr() {
-  saige::register_vr_runner(&neutral_vr_runner);
+static inline void register_real_vr() {
+  saige::register_vr_runner(&saige::compute_variance_ratio);
 }
 
 FitNullResult fit_null(const FitNullConfig& cfg_in,
@@ -87,7 +56,7 @@ FitNullResult fit_null(const FitNullConfig& cfg_in,
   // --- Fit the null model (and LOCO offsets if hook is registered) ---
   NullModelEngine nme(paths, prep.cfg, prep.chr);
 
-  register_default_vr();
+  register_real_vr();
   FitNullResult fit = nme.run(prep.design);
 
   // debug

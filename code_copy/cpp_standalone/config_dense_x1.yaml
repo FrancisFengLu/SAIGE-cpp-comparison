@@ -1,0 +1,29 @@
+# Test config for SAIGE-null C++ standalone
+# Dense GRM (no sparse) with only x1 covariate
+paths:
+  plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_dense_x1_output
+  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_dense_x1_vr
+  sparse_grm: ""
+  sparse_grm_ids: ""
+  overwrite_varratio: true
+
+design:
+  csv: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone/design_dense_x1.csv
+  covar_cols:
+    - x1
+
+fit:
+  trait: quantitative
+  loco: false
+  nthreads: 1
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  num_markers_for_vr: 30
+  use_sparse_grm_to_fit: false
+  use_pcg_with_sparse_grm: false
+  relatedness_cutoff: 0.125
+  overwrite_vr: true

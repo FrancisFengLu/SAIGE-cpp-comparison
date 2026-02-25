@@ -225,6 +225,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("vr_max_mac")) c.vr_max_mac = get("vr_max_mac").as<int>();
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
+  if (get("overwrite_vr")) c.overwrite_vr = get("overwrite_vr").as<bool>();
   return c;
 }
 

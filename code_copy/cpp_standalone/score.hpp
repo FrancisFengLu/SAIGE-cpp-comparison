@@ -59,4 +59,12 @@ ScoreNullSurv  build_score_null_survival(const arma::fmat& X1,
                                          const arma::fvec& y,
                                          const arma::fvec& mu);
 
+// ---------- Conversion to serializable pack ----------
+struct ScoreNullPack;  // forward decl (defined in saige_null.hpp)
+ScoreNullPack to_pack(const ScoreNull& sn,
+                       const arma::fmat& X_orig,
+                       const arma::fvec& y_vec,
+                       const arma::fvec& mu_vec,
+                       const std::string& trait);
+
 } // namespace saige

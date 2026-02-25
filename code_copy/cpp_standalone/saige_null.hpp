@@ -97,13 +97,27 @@ struct Design {
   std::vector<std::string> iid;   // length n, order must match rows
 };
 
-// Minimal score-null payload for SPA / downstream score tests
+// Score-null payload for Step 2 (matches R's obj.noK)
 struct ScoreNullPack {
   int n{0}, p{0};
-  std::vector<double> V;        // length n  (mu*(1-mu) for binary; 1/tau0 for quant)
-  std::vector<double> S_a;      // length p  (colSums(X ⊙ residuals))
-  std::vector<double> XVX;      // p x p row-major
-  std::vector<double> XVX_inv;  // p x p row-major
+  std::string trait_type;         // "binary" | "quantitative" | "survival"
+
+  // N-length vectors
+  std::vector<double> V;          // mu*(1-mu) for binary; 1/tau0 for quant
+  std::vector<double> mu;         // fitted values
+  std::vector<double> res;        // residuals (y - mu)
+  std::vector<double> y;          // phenotype
+
+  // p-length vectors
+  std::vector<double> S_a;        // colSums(X ⊙ residuals)
+
+  // Matrices (row-major flat arrays)
+  std::vector<double> XV;         // p x n
+  std::vector<double> XVX;        // p x p
+  std::vector<double> XVX_inv;    // p x p
+  std::vector<double> XXVX_inv;   // n x p
+  std::vector<double> XVX_inv_XV; // n x p
+  std::vector<double> X;          // n x p (design matrix)
 };
 
 struct FitNullResult {

@@ -346,5 +346,82 @@ With both bypasses active and usePCGwithSparseGRM=TRUE:
 | Random Vectors  | ACTIVE | random_vectors_30.csv          | Trace estimation vectors   |
 
 ================================================================================
+SESSION: Feb 10, 2025 - VARIANCE RATIO COMPUTATION + OUTPUT EXPANSION
+================================================================================
+
+### Variance Ratio (VR) Computation Implemented
+
+Previously, VR was a stub writing VR=1.0 placeholders. Now replaced with real
+computation matching R's extractVarianceRatio() algorithm.
+
+**Files created:**
+- variance_ratio_compute.cpp — Real VR computation loop
+- variance_ratio_compute.hpp — Declaration
+
+**Files modified:**
+- saige_null.hpp — Expanded ScoreNullPack (added mu, res, y, XV, XVX, etc.)
+- score.cpp/hpp — Added to_pack() conversion (arma::fmat → std::vector<double>)
+- null_model_engine.cpp — Populates obj_noK, saves 11 .arma binary files
+- saige_null.cpp — Registers real VR runner instead of stub
+- SAIGE_step1_fast.hpp — Added declarations for getSigma_X, getSigma_G, getMACVec, etc.
+- main.cpp — Added overwrite_vr config parsing
+
+### Bug Found: W vector for quantitative traits
+
+VR computation was passing W = 1/tau[0] (score-test V) to the PCG solver instead
+of W = 1.0 (Gaussian IRLS working weights). This inflated Sigma diagonal and
+produced VR ~1.82 instead of ~1.22. Fixed by setting W.fill(1.0f) for quantitative.
+
+### .arma Binary Output for Step 2
+
+11 Armadillo binary files now saved after GLMM fitting:
+mu.arma, res.arma, y.arma, V.arma, S_a.arma, X.arma, XV.arma,
+XVX.arma, XVX_inv.arma, XXVX_inv.arma, XVX_inv_XV.arma
+
+### VR Marker Bypass Added
+
+*** IMPORTANT: use_r_vr_bypass in variance_ratio_compute.cpp is currently TRUE ***
+*** Must be set to FALSE after testing is complete ***
+
+Similar to the random vector bypass for trace estimation. R outputs which marker
+indices it uses for VR to: /output/bypass/vr_marker_indices.csv
+C++ reads those indices when use_r_vr_bypass = true (local bool in function).
+
+R modification: SAIGE_isolated/R/SAIGE_fitGLMM_fast.R (extractVarianceRatio function)
+- Accumulates marker indices, writes CSV after loop
+
+### VR Marker Index Mapping Fix
+
+Initial bypass still showed ~1% diff. Root cause: R's VR markers use a separate
+filtered genotype array (genoVecofPointers_forVarRatio) with own sequential
+indexing. The bypass CSV was writing VR-array indices, but C++ (with
+geno.isVarRatio=false) reads from the main PLINK array.
+
+Fix:
+- R: Added orig_plink_index column to bypass CSV (0-based PLINK BIM index)
+- C++: Added findMainArrayIdx() in SAIGE_step1_fast.cpp for reverse lookup
+- C++ bypass reader now uses orig_plink_index instead of geno_ind
+
+After fix: VR match is 0.000038% (effectively identical).
+
+### 4-Configuration Validation Results (with marker bypass)
+
+| Config         | R VR   | C++ VR | VR Diff |
+|----------------|--------|--------|---------|
+| Dense + x1     | 1.115  | 1.111  | 0.45%   |
+| Dense + x1+x2  | 1.230  | 1.224  | 0.55%   |
+| Sparse + x1    | 1.107  | 1.107  | 0.00%   |
+| Sparse + x1+x2 | 1.219  | 1.219  | 0.00%   |
+
+Sparse GRM configs match exactly (0.00%). Dense GRM configs show ~0.5%
+difference due to float32 PCG solver accumulation (both R and C++ use
+arma::fvec/fmat). All well within the <1% acceptable threshold.
+
+### New HTML Documentation Created
+
+- reference/VARIANCE_RATIO_COMPUTATION.html — VR algorithm, call graph, variables
+- reference/SCORENULLPACK_AND_ARMA_OUTPUT.html — ScoreNullPack fields, .arma format
+
+================================================================================
 END OF SESSION NOTES
 ================================================================================

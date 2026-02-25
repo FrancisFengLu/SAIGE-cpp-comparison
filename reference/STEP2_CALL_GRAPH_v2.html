@@ -1,0 +1,1393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAIGE Step 2 Call Graph — Association Testing (Marker &amp; Region) v2</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f5f5f5; padding: 20px; line-height: 1.6;
+        }
+        .container { max-width: 1800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-bottom: 20px; }
+        h2 { color: #34495e; margin-top: 30px; margin-bottom: 15px; border-left: 4px solid #3498db; padding-left: 10px; }
+        h3 { color: #2980b9; margin-top: 20px; margin-bottom: 10px; }
+
+        .call-tree { font-family: 'Courier New', monospace; font-size: 13px; background: #f8f9fa; padding: 20px; border-radius: 5px; overflow-x: auto; line-height: 1.8; }
+        .call-tree .r-func { color: #2980b9; font-weight: bold; }
+        .call-tree .cpp-func { color: #27ae60; font-weight: bold; }
+        .call-tree .rcpp-func { color: #8e44ad; font-weight: bold; }
+        .call-tree .comment { color: #7f8c8d; font-style: italic; }
+        .call-tree .line-num { color: #95a5a6; margin-right: 10px; }
+        .call-tree .file { color: #e74c3c; }
+        .call-tree .var { color: #d35400; }
+
+        .quant-diff {
+            background: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #e65100;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .shared-badge {
+            background: #e8f5e9;
+            border: 1px solid #66bb6a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #2e7d32;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .quant-only {
+            background: #fce4ec;
+            border: 1px solid #ef9a9a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #c62828;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .binary-only {
+            background: #e3f2fd;
+            border: 1px solid #64b5f6;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #1565c0;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .survival-only {
+            background: #f3e5f5;
+            border: 1px solid #ba68c8;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #6a1b9a;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+
+        .legend { display: flex; gap: 20px; margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-box { width: 20px; height: 20px; border-radius: 3px; }
+        .legend-r { background: #3498db; }
+        .legend-cpp { background: #27ae60; }
+        .legend-rcpp { background: #8e44ad; }
+        .legend-var { background: #d35400; }
+        .legend-quant { background: #ff9800; }
+        .legend-shared { background: #4caf50; }
+        .legend-binary { background: #64b5f6; }
+        .legend-survival { background: #ba68c8; }
+
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }
+        th { background: #3498db; color: white; padding: 10px; text-align: left; position: sticky; top: 0; }
+        td { padding: 8px 10px; border-bottom: 1px solid #ddd; vertical-align: top; }
+        tr:hover { background: #f9f9f9; }
+        .highlight { background: #fff3cd; }
+
+        .diff-table th { background: #e65100; }
+        .diff-table td.binary-col { background: #e3f2fd; }
+        .diff-table td.quant-col { background: #fff3e0; }
+        .diff-table td.surv-col { background: #f3e5f5; }
+
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        .note { background: #e8f4fd; padding: 15px; border-left: 5px solid #3498db; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-quant { background: #fff3e0; padding: 15px; border-left: 5px solid #ff9800; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-important { background: #fce4ec; padding: 15px; border-left: 5px solid #e53935; margin: 20px 0; border-radius: 0 5px 5px 0; }
+
+        .side-by-side { display: flex; gap: 20px; margin: 20px 0; }
+        .side-by-side .panel { flex: 1; min-width: 0; }
+        .panel-a { border: 2px solid #3498db; border-radius: 8px; padding: 15px; }
+        .panel-a h3 { color: #2980b9; margin-top: 0; }
+        .panel-b { border: 2px solid #27ae60; border-radius: 8px; padding: 15px; }
+        .panel-b h3 { color: #27ae60; margin-top: 0; }
+        .panel-c { border: 2px solid #8e44ad; border-radius: 8px; padding: 15px; }
+        .panel-c h3 { color: #8e44ad; margin-top: 0; }
+
+        .toc { background: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }
+        .toc a { color: #2980b9; text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+        .toc ul { list-style: none; padding-left: 20px; }
+        .toc > ul { padding-left: 0; }
+        .toc li { margin: 5px 0; }
+
+        .formula-block { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0; font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.8; overflow-x: auto; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>SAIGE Step 2 Call Graph &mdash; Association Testing (Marker-Level &amp; Region-Level)</h1>
+
+    <p>This document covers <strong>Step 2</strong> of SAIGE: the association testing phase that uses the null model from Step 1 to compute per-variant and per-region p-values. It documents both marker-level (single-variant) and region-level (gene-based) testing pipelines, including SPA, Firth correction, SKAT/Burden/SKAT-O, and trait-specific differences.</p>
+
+    <p style="margin-top: 10px; color: #555; font-style: italic;">Version 2 &mdash; Updated Feb 2025 with 7 additional sections: ER Test, Conditional Analysis, URV Collapsing, LDmat, Annotation/Group File, Output Formats, Genotype Readers</p>
+
+    <div class="toc">
+        <strong>Table of Contents</strong>
+        <ul>
+            <li>1. <a href="#section1">Marker-Level (Single-Variant) Testing Call Graph</a></li>
+            <li>2. <a href="#section2">Region-Level (Gene-Based) Testing Call Graph</a></li>
+            <li>3. <a href="#section3">Score Test Variants (Detail)</a></li>
+            <li>4. <a href="#section4">SPA Internals</a></li>
+            <li>5. <a href="#section5">Variance Ratio (Step 1 &rarr; Step 2 Bridge)</a></li>
+            <li>6. <a href="#section6">Mathematical Formulas</a></li>
+            <li>7. <a href="#section7">File Cross-Reference</a></li>
+            <li>8. <a href="#section8">Binary vs Quantitative vs Survival Differences (Step 2)</a></li>
+            <li>9. <a href="#section9">Efficient Resampling (ER) for Rare Binary Variants</a></li>
+            <li>10. <a href="#section10">Conditional Analysis</a></li>
+            <li>11. <a href="#section11">Ultra-Rare Variant (URV) Collapsing</a></li>
+            <li>12. <a href="#section12">LDmat Computation</a></li>
+            <li>13. <a href="#section13">Annotation Filtering &amp; Group File Parsing</a></li>
+            <li>14. <a href="#section14">Output File Formats</a></li>
+            <li>15. <a href="#section15">Genotype Reader Details</a></li>
+        </ul>
+    </div>
+
+    <div class="legend">
+        <div class="legend-item"><div class="legend-box legend-r"></div><span>R Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-rcpp"></div><span>Rcpp Export (C++ callable from R)</span></div>
+        <div class="legend-item"><div class="legend-box legend-cpp"></div><span>Internal C++ Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-var"></div><span>Key Variable</span></div>
+        <div class="legend-item"><div class="legend-box legend-quant"></div><span><span class="quant-diff">QUANT DIFF</span> Quantitative differs</span></div>
+        <div class="legend-item"><div class="legend-box legend-binary"></div><span><span class="binary-only">BINARY ONLY</span> Binary-specific</span></div>
+        <div class="legend-item"><div class="legend-box legend-survival"></div><span><span class="survival-only">SURVIVAL</span> Survival-specific</span></div>
+        <div class="legend-item"><div class="legend-box legend-shared"></div><span><span class="shared-badge">SHARED</span> Same code path</span></div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section1">1. Marker-Level (Single-Variant) Testing Call Graph</h2>
+
+    <p>Entry point <code>SPAGMMATtest()</code> through to per-marker p-value computation. Orange <span class="quant-diff">QUANT DIFF</span> badges mark where quantitative differs. Blue <span class="binary-only">BINARY ONLY</span> badges mark binary/survival-specific steps skipped for quantitative traits.</p>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># ENTRY POINT: User calls SPAGMMATtest() from R</span>
+<span class="comment"># File: SAIGE/R/SAIGE_Test_main.R</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="r-func">SPAGMMATtest</span>()                                             <span class="file">[R: SAIGE_Test_main.R:62]</span>
+&#9500;&#9472;&#9472; <span class="r-func">ReadModel</span>(GMMATmodelFile)                               <span class="file">[R: readInGLMM.R]</span>
+&#9474;   &#9492;&#9472;&#9472; Load null model: mu, Y, residuals, X, alpha, tau, etc.
+&#9474;
+&#9500;&#9472;&#9472; <span class="r-func">Get_Variance_Ratio</span>(...)                                  <span class="file">[R]</span>
+&#9474;   &#9492;&#9472;&#9472; Load variance ratio(s) by MAC category from Step 1
+&#9474;
+&#9500;&#9472;&#9472; <span class="rcpp-func">setSAIGEobjInCPP</span>(...)                                   <span class="file">[Rcpp: Main.cpp]</span>
+&#9474;   &#9492;&#9472;&#9472; <span class="cpp-func">SAIGEClass constructor</span>                              <span class="file">[C++: SAIGE_test.cpp:25]</span>
+&#9474;       &#9500;&#9472;&#9472; Store: <span class="var">m_mu</span>, <span class="var">m_mu2</span>, <span class="var">m_res</span>, <span class="var">m_X</span>, <span class="var">m_XVX</span>, <span class="var">m_tauvec</span>
+&#9474;       &#9500;&#9472;&#9472; <strong>Binary:</strong>   <span class="var">m_mu2</span> = mu*(1-mu)                   <span class="binary-only">BINARY</span>
+&#9474;       &#9500;&#9472;&#9472; <strong>Quant:</strong>    <span class="var">m_mu2</span> = 1/tau[0]  <span class="comment">(constant)</span>         <span class="quant-diff">QUANT DIFF</span>
+&#9474;       &#9492;&#9472;&#9472; <strong>Survival:</strong> <span class="var">m_mu2</span> = mu                              <span class="survival-only">SURVIVAL</span>
+&#9474;
+&#9492;&#9472;&#9472; <span class="r-func">SAIGE.Marker</span>(...)                                        <span class="file">[R: SAIGE_SPATest_Marker.R:1]</span>
+    &#9492;&#9472;&#9472; while(is_marker_test) loop:
+        &#9492;&#9472;&#9472; <span class="rcpp-func">mainMarkerInCPP</span>(...)                             <span class="file">[Rcpp: Main.cpp:219]</span>
+            &#9492;&#9472;&#9472; For each marker i in chunk:
+                &#9474;
+                &#9500;&#9472;&#9472; <span class="cpp-func">Unified_getOneMarker</span>()                     <span class="file">[C++]</span>  <span class="shared-badge">SHARED</span>
+                &#9474;   &#9492;&#9472;&#9472; Load genotype vector <span class="var">GVec</span> from dosage/BGEN/VCF/PLINK
+                &#9474;
+                &#9500;&#9472;&#9472; <span class="comment">QC: filter by MAF, MAC, missing rate</span>
+                &#9474;
+                &#9500;&#9472;&#9472; <span class="cpp-func">assignVarianceRatio</span>(MAC)                    <span class="file">[C++]</span>
+                &#9474;   &#9492;&#9472;&#9472; Select variance ratio by MAC bin (low MAC &#8594; sparse GRM ratio)
+                &#9474;
+                &#9500;&#9472;&#9472; <span class="cpp-func">Unified_getMarkerPval</span>(...)                  <span class="file">[C++: SAIGE_test.cpp]</span>
+                &#9474;   &#9474;
+                &#9474;   &#9500;&#9472;&#9472; <strong>STEP 1: Score Test</strong> (one of 3 paths)       <span class="shared-badge">SHARED</span>
+                &#9474;   &#9474;   &#9500;&#9472;&#9472; Path A: <span class="cpp-func">scoreTestFast_noadjCov</span>()   <span class="comment">[no sparse GRM, no covariates]</span>
+                &#9474;   &#9474;   &#9500;&#9472;&#9472; Path B: <span class="cpp-func">scoreTest</span>()                <span class="comment">[sparse GRM]</span>
+                &#9474;   &#9474;   &#9492;&#9472;&#9472; Path C: <span class="cpp-func">scoreTestFast</span>()            <span class="comment">[no sparse GRM, with covariates]</span>
+                &#9474;   &#9474;
+                &#9474;   &#9474;   Core computation (all paths):
+                &#9474;   &#9474;     <span class="var">g_tilde</span> = G - X*(X'VX)&#8315;&#185;*X'V*G              <span class="comment">(adjusted genotype)</span>
+                &#9474;   &#9474;     <span class="var">S</span>       = dot(g_tilde, residuals) / tau[0]    <span class="comment">(score statistic)</span>
+                &#9474;   &#9474;     <span class="var">var2</span>    = g_tilde' * diag(mu2) * g_tilde       <span class="comment">(unadjusted variance)</span>
+                &#9474;   &#9474;     <span class="var">var1</span>    = var2 * varRatioVal                    <span class="comment">(adjusted variance)</span>
+                &#9474;   &#9474;     <span class="var">T_stat</span>  = S / sqrt(var1)                        <span class="comment">(test statistic)</span>
+                &#9474;   &#9474;     <span class="var">pval_norm</span> = P(chi2_1 &gt; T_stat&#178;)                <span class="comment">(normal approx p-value)</span>
+                &#9474;   &#9474;
+                &#9474;   &#9500;&#9472;&#9472; <strong>STEP 2: SPA</strong> (binary/survival only, if |T| &gt; SPA_cutoff)  <span class="binary-only">BINARY</span> <span class="survival-only">SURVIVAL</span>
+                &#9474;   &#9474;   &#9500;&#9472;&#9472; Compute: <span class="var">m1</span> = dot(mu, g_tilde)
+                &#9474;   &#9474;   &#9500;&#9472;&#9472;          <span class="var">q</span>  = T/sqrt(var1/var2) + m1
+                &#9474;   &#9474;   &#9500;&#9472;&#9472; <span class="cpp-func">SPA_fast</span>() or <span class="cpp-func">SPA</span>()               <span class="file">[C++: SPA.cpp]</span>
+                &#9474;   &#9474;   &#9474;   &#9500;&#9472;&#9472; <span class="cpp-func">getroot_K1_Binom</span>()                <span class="file">[C++: SPA_binary.cpp:70]</span>
+                &#9474;   &#9474;   &#9474;   &#9474;   &#9492;&#9472;&#9472; Newton-Raphson: find zeta where K'(zeta)=q
+                &#9474;   &#9474;   &#9474;   &#9492;&#9472;&#9472; <span class="cpp-func">Get_Saddle_Prob_Binom</span>()           <span class="file">[C++: SPA_binary.cpp:146]</span>
+                &#9474;   &#9474;   &#9474;       &#9492;&#9472;&#9472; Lugannani-Rice formula &rarr; pval
+                &#9474;   &#9474;   &#9492;&#9472;&#9472; Combine: pval = |p_upper| + |p_lower|
+                &#9474;   &#9474;   <span class="comment"># Quantitative: SKIPS this step entirely</span>     <span class="quant-diff">QUANT: NO SPA</span>
+                &#9474;   &#9474;
+                &#9474;   &#9500;&#9472;&#9472; <strong>STEP 3: Firth correction</strong> (binary only, if p &lt; pCutoff)  <span class="binary-only">BINARY ONLY</span>
+                &#9474;   &#9474;   &#9492;&#9472;&#9472; <span class="cpp-func">fast_logistf_fit_simple</span>()              <span class="file">[C++/R]</span>
+                &#9474;   &#9474;   <span class="comment"># Quantitative &amp; Survival: SKIP Firth</span>
+                &#9474;   &#9474;
+                &#9474;   &#9492;&#9472;&#9472; Output: <span class="var">Beta</span>, <span class="var">seBeta</span>, <span class="var">pval</span>, <span class="var">Tstat</span>, <span class="var">var1</span>
+                &#9474;
+                &#9492;&#9472;&#9472; Store results &rarr; output file
+</pre>
+    </div>
+
+    <h3>1b. Trait-Specific Differences at Marker Level</h3>
+
+    <table class="diff-table">
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Binary</th>
+                <th>Quantitative</th>
+                <th>Survival</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Variance weight mu2</strong></td>
+                <td class="binary-col"><code>mu*(1-mu)</code></td>
+                <td class="quant-col"><code>1/tau[0]</code> (constant)</td>
+                <td class="surv-col"><code>mu</code></td>
+            </tr>
+            <tr>
+                <td><strong>SPA test</strong></td>
+                <td class="binary-col">Yes</td>
+                <td class="quant-col"><strong>No</strong></td>
+                <td class="surv-col">Yes</td>
+            </tr>
+            <tr>
+                <td><strong>Firth correction</strong></td>
+                <td class="binary-col">Yes (optional)</td>
+                <td class="quant-col"><strong>No</strong></td>
+                <td class="surv-col">No</td>
+            </tr>
+            <tr>
+                <td><strong>Efficient Resampling</strong></td>
+                <td class="binary-col">Yes (low MAC)</td>
+                <td class="quant-col"><strong>No</strong></td>
+                <td class="surv-col">No</td>
+            </tr>
+            <tr>
+                <td><strong>Score variance formula</strong></td>
+                <td class="binary-col"><code>dot(mu2, g_tilde&sup2;)</code></td>
+                <td class="quant-col"><code>Z'XVX*Z*tau[0] + g'g - 2B'g</code></td>
+                <td class="surv-col"><code>dot(mu, g_tilde&sup2;)</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section2">2. Region-Level (Gene-Based) Testing Call Graph</h2>
+
+    <p>Full pipeline from group file parsing through SKAT/Burden/SKAT-O computation to CCT combination across annotation strata.</p>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># REGION-LEVEL TESTING: Gene-based tests (SKAT, Burden, SKAT-O)</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="r-func">SPAGMMATtest</span>()                                             <span class="file">[R: SAIGE_Test_main.R:62]</span>
+&#9500;&#9472;&#9472; <span class="comment">(same setup as marker-level: ReadModel, Get_Variance_Ratio, setSAIGEobjInCPP)</span>
+&#9474;
+&#9492;&#9472;&#9472; <span class="r-func">SAIGE.Region</span>(...)                                        <span class="file">[R: SAIGE_SPATest_Region.R:103]</span>
+    &#9500;&#9472;&#9472; <span class="r-func">checkGroupFile</span>(groupFile)                              <span class="file">[R]</span>
+    &#9474;   &#9492;&#9472;&#9472; Validate group file format (gene &rarr; variants + annotations + weights)
+    &#9474;
+    &#9492;&#9472;&#9472; For each region (gene):
+        &#9474;
+        &#9500;&#9472;&#9472; <span class="r-func">SAIGE.getRegionList_new</span>(...)                       <span class="file">[R: SPATest_Region.R:1315]</span>
+        &#9474;   &#9500;&#9472;&#9472; Parse group file: gene &rarr; variants + annotations + weights
+        &#9474;   &#9500;&#9472;&#9472; Merge with markerInfo (CHR, POS, genoIndex)
+        &#9474;   &#9492;&#9472;&#9472; Build <span class="var">annoIndicatorMat</span> (variants &times; anno-MAF strata)
+        &#9474;
+        &#9500;&#9472;&#9472; <span class="rcpp-func">mainRegionInCPP</span>(...)                              <span class="file">[Rcpp: Main.cpp:1032]</span>
+        &#9474;   &#9492;&#9472;&#9472; For each marker in region:
+        &#9474;       &#9500;&#9472;&#9472; <span class="cpp-func">Unified_getOneMarker</span>()                     <span class="file">[C++]</span>
+        &#9474;       &#9474;   &#9492;&#9472;&#9472; Load genotype
+        &#9474;       &#9500;&#9472;&#9472; <span class="cpp-func">getadjGFast</span>() &rarr; <span class="var">g_tilde</span>                 <span class="file">[C++]</span>
+        &#9474;       &#9474;   &#9492;&#9472;&#9472; Compute adjusted genotype
+        &#9474;       &#9500;&#9472;&#9472; <span class="cpp-func">scoreTest</span>() &rarr; T-stat, var                <span class="file">[C++]</span>
+        &#9474;       &#9474;   &#9492;&#9472;&#9472; Single-variant score test
+        &#9474;       &#9500;&#9472;&#9472; Single-variant SPA (if binary/survival)       <span class="binary-only">BINARY</span> <span class="survival-only">SURVIVAL</span>
+        &#9474;       &#9474;   <span class="comment"># Quantitative: skips SPA</span>                    <span class="quant-diff">QUANT: NO SPA</span>
+        &#9474;       &#9492;&#9472;&#9472; Accumulate into <span class="var">VarMat</span>, <span class="var">TstatVec</span>
+        &#9474;
+        &#9474;   Output: <span class="var">VarMat</span>, <span class="var">TstatVec_flip</span>, <span class="var">annoMAFIndicatorMat</span>, <span class="var">gyVec</span>, <span class="var">genoSumMat</span>
+        &#9474;
+        &#9500;&#9472;&#9472; <strong>Weight computation:</strong>                                  <span class="file">[R]</span>
+        &#9474;   <span class="var">AnnoWeights</span> = dbeta(MAF, 1, 25)                     <span class="comment"># Beta(1,25) weighting</span>
+        &#9474;   <span class="var">wStatVec</span>    = TstatVec * AnnoWeights                 <span class="comment"># weighted scores</span>
+        &#9474;   <span class="var">wadjVarSMat</span> = VarMat * (AnnoWeights &otimes; AnnoWeights')  <span class="comment"># weighted Phi</span>
+        &#9474;
+        &#9500;&#9472;&#9472; For each annotation-MAF stratum:
+        &#9474;   &#9474;
+        &#9474;   &#9500;&#9472;&#9472; (Binary/Survival only) <strong>Phi adjustment:</strong>         <span class="binary-only">BINARY</span> <span class="survival-only">SURVIVAL</span>
+        &#9474;   &#9474;   &#9500;&#9472;&#9472; <span class="r-func">get_newPhi_scaleFactor_traitType</span>()        <span class="file">[R: Region_Func.R:275]</span>
+        &#9474;   &#9474;   &#9474;   &#9500;&#9472;&#9472; Burden SPA p-value
+        &#9474;   &#9474;   &#9474;   &#9492;&#9472;&#9472; <span class="r-func">SPA_ER_kernel_related_Phiadj_fast_new</span>()  <span class="file">[R: Region_Func.R:190]</span>
+        &#9474;   &#9474;   &#9474;       &#9492;&#9472;&#9472; Scale Phi matrix based on SPA-adjusted burden variance
+        &#9474;   &#9474;   &#9492;&#9472;&#9472; Adjusted: <span class="var">Phi_ccadj</span>, <span class="var">scaleFactor</span>
+        &#9474;   &#9474;   <span class="comment"># Quantitative: uses Phi directly (no SPA adjustment)</span>  <span class="quant-diff">QUANT: DIRECT</span>
+        &#9474;   &#9474;
+        &#9474;   &#9492;&#9472;&#9472; <span class="r-func">get_SKAT_pvalue</span>(Score, Phi, r.corr)            <span class="file">[R: Region_Func.R:320]</span>
+        &#9474;       &#9492;&#9472;&#9472; <span class="r-func">SKAT:::Met_SKAT_Get_Pvalue</span>()                <span class="file">[R: SKAT package]</span>
+        &#9474;           &#9500;&#9472;&#9472; <strong>SKAT</strong> p-value   (rho=0): Q = sum(Score_i&sup2;)       &rarr; Davies method
+        &#9474;           &#9500;&#9472;&#9472; <strong>Burden</strong> p-value (rho=1): Q = (sum(Score_i))&sup2;     &rarr; chi-square
+        &#9474;           &#9492;&#9472;&#9472; <strong>SKAT-O</strong> p-value: optimize rho in [0,1]
+        &#9474;
+        &#9500;&#9472;&#9472; If multiple strata &rarr; <strong>CCT combination:</strong>
+        &#9474;   &#9492;&#9472;&#9472; <span class="r-func">get_CCT_pvalue</span>(pval_vector)                    <span class="file">[R: CCT_modified.R:19]</span>
+        &#9474;       &#9492;&#9472;&#9472; CCT() = 1 - pcauchy(sum(w * tan((0.5 - p) * &pi;)))
+        &#9474;
+        &#9492;&#9472;&#9472; Output: <span class="var">Pvalue_SKATO</span>, <span class="var">Pvalue_Burden</span>, <span class="var">Pvalue_SKAT</span>, <span class="var">BETA_Burden</span>, <span class="var">SE_Burden</span>
+</pre>
+    </div>
+
+    <div class="note">
+        <h3>Region-Level Pipeline Summary</h3>
+        <p>For each gene/region: (1) Load all variants from group file, (2) Compute per-variant score statistics and variance matrix in C++, (3) Apply Beta(1,25) weights, (4) For binary/survival: adjust Phi via SPA, (5) Run SKAT/Burden/SKAT-O per annotation-MAF stratum, (6) Combine strata p-values via Cauchy Combination Test (CCT).</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section3">3. Score Test Variants (Detail)</h2>
+
+    <p>Three score test paths exist depending on whether a sparse GRM is used and whether covariates are present. All compute the same quantities but differ in how the variance is calculated.</p>
+
+    <div class="side-by-side">
+        <div class="panel panel-a">
+            <h3>Path A: scoreTestFast_noadjCov()</h3>
+            <p style="margin-bottom: 10px; font-size: 12px; color: #666;">No sparse GRM, no covariates (fastest)</p>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="cpp-func">scoreTestFast_noadjCov</span>()
+<span class="file">[C++: SAIGE_test.cpp]</span>
+
+<span class="comment"># No covariate adjustment needed</span>
+<span class="var">g_tilde</span> = G  <span class="comment">(raw genotype)</span>
+
+<span class="comment"># Score</span>
+<span class="var">S</span> = dot(G, res) / tau[0]
+
+<span class="comment"># Variance (simplest path)</span>
+<span class="var">var2</span> = dot(mu2, G&sup2;)
+<span class="var">var1</span> = var2 * varRatio
+
+<span class="comment"># Test statistic</span>
+<span class="var">T</span> = S / sqrt(var1)
+<span class="var">pval</span> = pchisq(T&sup2;, df=1, lower=F)
+</pre>
+            </div>
+        </div>
+
+        <div class="panel panel-b">
+            <h3>Path B: scoreTest()</h3>
+            <p style="margin-bottom: 10px; font-size: 12px; color: #666;">With sparse GRM (uses PCG solve for variance)</p>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="cpp-func">scoreTest</span>()
+<span class="file">[C++: SAIGE_test.cpp:135]</span>
+
+<span class="comment"># Covariate adjustment</span>
+<span class="var">g_tilde</span> = G - X*(X'VX)&#8315;&#185;*X'*V*G
+
+<span class="comment"># Score</span>
+<span class="var">S</span> = dot(g_tilde, res) / tau[0]
+
+<span class="comment"># Variance (PCG solve path)</span>
+<span class="comment"># Uses sparse GRM in Sigma</span>
+<span class="var">var2</span> = g_tilde' * diag(mu2) * g_tilde
+<span class="var">var1</span> = var2 * varRatio
+
+<span class="comment"># Test statistic</span>
+<span class="var">T</span> = S / sqrt(var1)
+<span class="var">pval</span> = pchisq(T&sup2;, df=1, lower=F)
+</pre>
+            </div>
+        </div>
+
+        <div class="panel panel-c">
+            <h3>Path C: scoreTestFast()</h3>
+            <p style="margin-bottom: 10px; font-size: 12px; color: #666;">No sparse GRM, with covariates</p>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="cpp-func">scoreTestFast</span>()
+<span class="file">[C++: SAIGE_test.cpp:226]</span>
+
+<span class="comment"># Covariate adjustment</span>
+<span class="var">g_tilde</span> = G - X*(X'VX)&#8315;&#185;*X'*V*G
+
+<span class="comment"># Score</span>
+<span class="var">S</span> = dot(g_tilde, res) / tau[0]
+
+<span class="comment"># Variance (fast path)</span>
+<span class="comment"># No sparse GRM, closed form</span>
+<span class="var">var2</span> = g_tilde' * diag(mu2) * g_tilde
+<span class="var">var1</span> = var2 * varRatio
+
+<span class="comment"># Test statistic</span>
+<span class="var">T</span> = S / sqrt(var1)
+<span class="var">pval</span> = pchisq(T&sup2;, df=1, lower=F)
+</pre>
+            </div>
+        </div>
+    </div>
+
+    <div class="note">
+        <h3>Path Selection Logic</h3>
+        <p><code>if (!is_sparse_GRM &amp;&amp; !has_covariates)</code> &rarr; Path A (fastest)<br>
+           <code>if (is_sparse_GRM)</code> &rarr; Path B (most general)<br>
+           <code>if (!is_sparse_GRM &amp;&amp; has_covariates)</code> &rarr; Path C</p>
+        <p>All three paths produce the same score statistic S. They differ in how <code>g_tilde</code> and the variance are computed. Path A skips the covariate projection entirely. Path B uses the sparse GRM in the variance computation. Path C uses the closed-form variance without a sparse GRM.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section4">4. SPA Internals</h2>
+
+    <p>Saddlepoint Approximation (SPA) is used for binary and survival traits when the normal approximation is unreliable (|T| &gt; SPA_cutoff, typically 2). <span class="quant-diff">Quantitative traits skip SPA entirely.</span></p>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># SPA_fast: Saddlepoint Approximation (fast version)</span>
+<span class="comment"># Called when |T_stat| &gt; SPA_cutoff (default: 2)</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="cpp-func">SPA_fast</span>(mu, g, q, qinv, gNA, gNB, muNA, muNB, NAmu, NAsigma)  <span class="file">[C++: SPA.cpp:116]</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="comment"># &#9472;&#9472;&#9472; Upper tail &#9472;&#9472;&#9472;</span>
+&#9500;&#9472;&#9472; <span class="cpp-func">getroot_K1_fast_Binom</span>(init=0, mu, g, q, ...)    <span class="file">[C++: SPA_binary.cpp:70]</span>
+&#9474;   &#9474;
+&#9474;   &#9474;   <span class="comment"># Newton-Raphson: find zeta where K'(zeta) = q</span>
+&#9474;   &#9474;   <span class="comment"># Cumulant generating function derivatives:</span>
+&#9474;   &#9474;
+&#9474;   &#9500;&#9472;&#9472; K1(t) = sum( mu*g / ((1-mu)*exp(-g*t) + mu) ) - q
+&#9474;   &#9500;&#9472;&#9472; K2(t) = sum( mu*(1-mu)*g&sup2;*exp(-g*t) / ((1-mu)*exp(-g*t) + mu)&sup2; )
+&#9474;   &#9474;
+&#9474;   &#9492;&#9472;&#9472; Iterate: <span class="var">t_new</span> = t - K1(t)/K2(t)
+&#9474;       <span class="comment"># Until |K1(t)| &lt; tolerance or max iterations</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="cpp-func">Get_Saddle_Prob_fast_Binom</span>(zeta, mu, g, q, ...)  <span class="file">[C++: SPA_binary.cpp:146]</span>
+&#9474;   &#9474;
+&#9474;   &#9474;   <span class="comment"># Lugannani-Rice saddlepoint approximation:</span>
+&#9474;   &#9474;
+&#9474;   &#9500;&#9472;&#9472; K(z)  = sum( log(1 - mu + mu*exp(z*g)) )
+&#9474;   &#9500;&#9472;&#9472; <span class="var">w</span>     = sign(z) * sqrt( 2*(z*q - K(z)) )
+&#9474;   &#9500;&#9472;&#9472; <span class="var">v</span>     = z * sqrt( K2(z) )
+&#9474;   &#9500;&#9472;&#9472; <span class="var">Z_test</span> = w + (1/w)*log(v/w)
+&#9474;   &#9492;&#9472;&#9472; <span class="var">pval</span>   = P(Z &gt; Z_test)   <span class="comment">(Lugannani-Rice formula)</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="comment"># &#9472;&#9472;&#9472; Lower tail &#9472;&#9472;&#9472;</span>
+&#9500;&#9472;&#9472; <span class="cpp-func">getroot_K1_fast_Binom</span>(init=0, mu, g, qinv, ...)
+&#9474;   &#9492;&#9472;&#9472; <span class="comment">(same as above but with qinv = -q)</span>
+&#9500;&#9472;&#9472; <span class="cpp-func">Get_Saddle_Prob_fast_Binom</span>(zeta_inv, mu, g, qinv, ...)
+&#9474;
+&#9492;&#9472;&#9472; Combine: <span class="var">pval</span> = |p_upper| + |p_lower|
+</pre>
+    </div>
+
+    <div class="note-quant">
+        <h3>SPA applicability by trait type:</h3>
+        <ul style="margin-top: 8px; padding-left: 20px;">
+            <li><strong>Binary:</strong> Uses SPA with Binomial CGF. K(t) = sum(log(1-mu+mu*exp(g*t)))</li>
+            <li><strong>Survival:</strong> Uses SPA with Poisson-like CGF. Similar structure but different mu interpretation.</li>
+            <li><strong>Quantitative:</strong> Does <strong>not</strong> use SPA. The normal approximation is accurate for continuous traits, so the chi-square p-value from the score test is used directly.</li>
+        </ul>
+    </div>
+
+    <h3>4b. SPA (non-fast version)</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="cpp-func">SPA</span>(mu, g, q, qinv, ...)                                     <span class="file">[C++: SPA.cpp:20]</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="comment"># Same logic as SPA_fast but without the "fast" optimizations</span>
+&#9500;&#9472;&#9472; <span class="comment"># Used when SPA_fast fails to converge</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="cpp-func">getroot_K1_Binom</span>(init, mu, g, q, ...)            <span class="file">[C++: SPA_binary.cpp:70]</span>
+&#9500;&#9472;&#9472; <span class="cpp-func">Get_Saddle_Prob_Binom</span>(zeta, mu, g, q, ...)       <span class="file">[C++: SPA_binary.cpp:146]</span>
+&#9474;
+&#9500;&#9472;&#9472; <span class="cpp-func">getroot_K1_Binom</span>(init, mu, g, qinv, ...)
+&#9500;&#9472;&#9472; <span class="cpp-func">Get_Saddle_Prob_Binom</span>(zeta_inv, mu, g, qinv, ...)
+&#9474;
+&#9492;&#9472;&#9472; Combine: <span class="var">pval</span> = |p_upper| + |p_lower|
+</pre>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section5">5. Variance Ratio (Step 1 &rarr; Step 2 Bridge)</h2>
+
+    <p>The variance ratio is the key approximation that makes Step 2 fast. It bridges the expensive full-GRM computation from Step 1 with the fast score test in Step 2.</p>
+
+    <div class="note-important">
+        <h3>Core Idea</h3>
+        <p><strong>Step 1</strong> computes variance using the full GRM (N&times;N matrix, expensive).<br>
+           <strong>Step 2</strong> approximates: <code>var_adjusted = var_score &times; varRatio</code><br>
+           The variance ratio corrects the score test variance (which ignores genetic relatedness) to approximate the full-model variance.</p>
+    </div>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># VARIANCE RATIO: How Step 1 calibrates Step 2</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<strong>Step 1 (Null Model Fitting):</strong>
+&#9500;&#9472;&#9472; Fits GLMM using full GRM: <span class="var">Sigma</span> = tau[0]*W&#8315;&#185; + tau[1]*K
+&#9500;&#9472;&#9472; For a subset of random markers:
+&#9474;   &#9500;&#9472;&#9472; Compute score test variance WITH full GRM &rarr; <span class="var">var_full</span>
+&#9474;   &#9500;&#9472;&#9472; Compute score test variance WITHOUT GRM   &rarr; <span class="var">var_approx</span>
+&#9474;   &#9492;&#9472;&#9472; <span class="var">varRatio</span> = var_full / var_approx
+&#9500;&#9472;&#9472; Average over random markers
+&#9500;&#9472;&#9472; Multiple ratios by MAC category:
+&#9474;   &#9500;&#9472;&#9472; High MAC (&ge; 20):  uses dense GRM ratio
+&#9474;   &#9492;&#9472;&#9472; Low MAC  (&lt; 20):   uses sparse GRM ratio  <span class="comment">(more accurate for rare variants)</span>
+&#9492;&#9472;&#9472; Save to model file
+
+<strong>Step 2 (Association Testing):</strong>
+&#9500;&#9472;&#9472; Load <span class="var">varRatio</span> from model file
+&#9500;&#9472;&#9472; <span class="cpp-func">assignVarianceRatio</span>(MAC)
+&#9474;   &#9492;&#9472;&#9472; Select ratio by MAC bin
+&#9500;&#9472;&#9472; For each marker:
+&#9474;   &#9500;&#9472;&#9472; <span class="var">var2</span> = g_tilde' * diag(mu2) * g_tilde   <span class="comment">(unadjusted, no GRM)</span>
+&#9474;   &#9500;&#9472;&#9472; <span class="var">var1</span> = var2 * <span class="var">varRatio</span>                    <span class="comment">(adjusted, approximates full GRM)</span>
+&#9474;   &#9492;&#9472;&#9472; <span class="var">T</span>    = S / sqrt(var1)
+&#9492;&#9472;&#9472; The variance ratio makes Step 2 O(N) per marker instead of O(N&sup2;)
+</pre>
+    </div>
+
+    <div class="note">
+        <h3>Why multiple variance ratios?</h3>
+        <p>For rare variants (low MAC), the variance ratio estimated from common markers may not be accurate. SAIGE estimates separate variance ratios for different MAC bins. The sparse GRM variance ratio is used for low-MAC variants because the sparse GRM better captures the relatedness structure relevant to rare variants.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section6">6. Mathematical Formulas</h2>
+
+    <h3>6a. Marker-Level Formulas</h3>
+
+    <div class="formula-block">
+<strong>Score statistic:</strong>
+  S = g_tilde' &times; res / tau[0]
+
+<strong>Adjusted genotype:</strong>
+  g_tilde = G - X &times; (X'VX)&#8315;&#185; &times; X' &times; V &times; G
+
+<strong>Variance (unadjusted):</strong>
+  var2 = g_tilde' &times; diag(mu2) &times; g_tilde
+
+<strong>Variance (adjusted by variance ratio):</strong>
+  var1 = var2 &times; varRatio
+
+<strong>Test statistic:</strong>
+  T = S / sqrt(var1)
+
+<strong>Effect size estimate:</strong>
+  Beta  = S / var1
+  SE    = |Beta / T|
+
+<strong>Normal approximation p-value:</strong>
+  pval = P(chi&sup2;_1 &gt; T&sup2;)
+    </div>
+
+    <h3>6b. Region-Level Formulas</h3>
+
+    <div class="formula-block">
+<strong>Weights (Beta density):</strong>
+  w(MAF) = Beta(MAF; 1, 25) = 25 &times; (1 - MAF)&sup2;&sup4;
+
+<strong>SKAT statistic (rho = 0):</strong>
+  Q_SKAT = sum( w_i&sup2; &times; S_i&sup2; )
+  p-value via Davies method (mixture of chi-squares)
+
+<strong>Burden statistic (rho = 1):</strong>
+  Q_Burden = ( sum(w_i &times; S_i) )&sup2; / sum(Phi)
+  p-value via chi-square distribution
+
+<strong>SKAT-O statistic (optimize rho):</strong>
+  Q(rho) = (1 - rho) &times; Q_SKAT + rho &times; Q_Burden
+  Optimize rho in [0, 1] for minimum p-value
+
+<strong>Cauchy Combination Test (CCT):</strong>
+  T_CCT = sum( w_j &times; tan((0.5 - p_j) &times; &pi;) )
+  p_CCT = 1 - F_Cauchy(T_CCT)
+  <span class="comment">Used to combine p-values across annotation-MAF strata</span>
+
+<strong>Burden effect size:</strong>
+  BETA_Burden = sum(w_i &times; S_i) / sum(Phi)
+  SE_Burden   = sqrt(1 / sum(Phi))
+    </div>
+
+    <h3>6c. SPA Formulas (Binomial CGF)</h3>
+
+    <div class="formula-block">
+<strong>Cumulant Generating Function (Binomial):</strong>
+  K(t)  = sum( log(1 - mu + mu &times; exp(g &times; t)) )
+  K'(t) = sum( mu &times; g / ((1-mu) &times; exp(-g&times;t) + mu) )
+  K''(t)= sum( mu &times; (1-mu) &times; g&sup2; &times; exp(-g&times;t) / ((1-mu) &times; exp(-g&times;t) + mu)&sup2; )
+
+<strong>Newton-Raphson root finding:</strong>
+  Find zeta such that K'(zeta) = q
+  Iterate: zeta_new = zeta - K'(zeta) / K''(zeta)
+
+<strong>Lugannani-Rice formula:</strong>
+  w = sign(zeta) &times; sqrt( 2 &times; (zeta &times; q - K(zeta)) )
+  v = zeta &times; sqrt( K''(zeta) )
+  Z_test = w + (1/w) &times; log(v/w)
+  p = P(Z &gt; Z_test)
+
+<strong>Two-sided p-value:</strong>
+  pval = |p_upper(q)| + |p_lower(q_inv)|
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section7">7. File Cross-Reference</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Function</th>
+                <th>R File</th>
+                <th>C++ File</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr class="highlight">
+                <td><code>SPAGMMATtest</code></td>
+                <td>SAIGE_Test_main.R:62</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>SAIGE.Marker</code></td>
+                <td>SAIGE_SPATest_Marker.R:1</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>SAIGE.Region</code></td>
+                <td>SAIGE_SPATest_Region.R:103</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>mainMarkerInCPP</code></td>
+                <td>&mdash;</td>
+                <td>Main.cpp:219</td>
+            </tr>
+            <tr>
+                <td><code>mainRegionInCPP</code></td>
+                <td>&mdash;</td>
+                <td>Main.cpp:1032</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>SAIGEClass</code> (constructor)</td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp:25, SAIGE_test.hpp</td>
+            </tr>
+            <tr>
+                <td><code>scoreTest</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp:135</td>
+            </tr>
+            <tr>
+                <td><code>scoreTestFast</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp:226</td>
+            </tr>
+            <tr>
+                <td><code>scoreTestFast_noadjCov</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp:309</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>Unified_getMarkerPval</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp:449</td>
+            </tr>
+            <tr>
+                <td><code>SPA</code></td>
+                <td>&mdash;</td>
+                <td>SPA.cpp:20</td>
+            </tr>
+            <tr>
+                <td><code>SPA_fast</code></td>
+                <td>&mdash;</td>
+                <td>SPA.cpp:116</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>getroot_K1_Binom</code></td>
+                <td>&mdash;</td>
+                <td>SPA_binary.cpp:70</td>
+            </tr>
+            <tr>
+                <td><code>Get_Saddle_Prob_Binom</code></td>
+                <td>&mdash;</td>
+                <td>SPA_binary.cpp:146</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>CCT</code></td>
+                <td>CCT_modified.R:19</td>
+                <td>CCT.cpp:1</td>
+            </tr>
+            <tr>
+                <td><code>get_SKAT_pvalue</code></td>
+                <td>SPATest_Region_Func.R:320</td>
+                <td>&mdash; (calls SKAT R pkg)</td>
+            </tr>
+            <tr>
+                <td><code>Phi adjustment</code></td>
+                <td>SPATest_Region_Func.R:190, 275</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>ReadModel</code></td>
+                <td>readInGLMM.R</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>fast_logistf_fit_simple</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp (Firth)</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>SKATExactBin_Work</code></td>
+                <td>&mdash;</td>
+                <td>ER_binary_func.cpp:185</td>
+            </tr>
+            <tr>
+                <td><code>HyperGeo</code></td>
+                <td>&mdash;</td>
+                <td>Binary_HyperGeo.cpp:37</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>assignConditionFactors</code></td>
+                <td>&mdash;</td>
+                <td>SAIGE_test.cpp</td>
+            </tr>
+            <tr>
+                <td><code>LDmatRegionInCPP</code></td>
+                <td>&mdash;</td>
+                <td>LDmat.cpp</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>readGroupFile</code></td>
+                <td>SAIGE_SPATest_Region_Func.R:3</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>checkGroupFile</code></td>
+                <td>SAIGE_SPATest_Region_Func.R:73</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>Unified_getOneMarker</code></td>
+                <td>&mdash;</td>
+                <td>Main.cpp</td>
+            </tr>
+            <tr>
+                <td><code>PlinkClass::getOneMarker</code></td>
+                <td>&mdash;</td>
+                <td>PLINK.cpp</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section8">8. Binary vs Quantitative vs Survival Differences (Step 2)</h2>
+
+    <p>Complete reference of all locations where binary, quantitative, and survival trait code paths diverge in Step 2.</p>
+
+    <table class="diff-table">
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Binary</th>
+                <th>Quantitative</th>
+                <th>Survival</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Variance weight mu2</strong></td>
+                <td class="binary-col"><code>mu * (1 - mu)</code><br>Binomial variance function</td>
+                <td class="quant-col"><code>1 / tau[0]</code><br>Constant (Gaussian)</td>
+                <td class="surv-col"><code>mu</code><br>Poisson-like variance</td>
+            </tr>
+            <tr>
+                <td><strong>SPA test</strong></td>
+                <td class="binary-col">Yes &mdash; Binomial CGF<br><code>K(t) = sum(log(1-mu+mu*exp(g*t)))</code></td>
+                <td class="quant-col"><strong>No</strong><br>Normal approx is accurate</td>
+                <td class="surv-col">Yes &mdash; Poisson-like CGF</td>
+            </tr>
+            <tr>
+                <td><strong>Firth correction</strong></td>
+                <td class="binary-col">Yes (optional)<br>Penalized logistic regression<br>when p &lt; pCutoff</td>
+                <td class="quant-col"><strong>No</strong></td>
+                <td class="surv-col">No</td>
+            </tr>
+            <tr>
+                <td><strong>Efficient Resampling</strong></td>
+                <td class="binary-col">Yes (for low MAC)<br>ER test for rare variants</td>
+                <td class="quant-col"><strong>No</strong></td>
+                <td class="surv-col">No</td>
+            </tr>
+            <tr>
+                <td><strong>Region Phi adjustment</strong></td>
+                <td class="binary-col">SPA-based<br><code>SPA_ER_kernel_related_Phiadj</code></td>
+                <td class="quant-col"><strong>Direct</strong><br>Uses Phi as-is</td>
+                <td class="surv-col">SPA-based<br><code>SPA_ER_kernel_related_Phiadj</code></td>
+            </tr>
+            <tr>
+                <td><strong>Score variance</strong></td>
+                <td class="binary-col">Binomial:<br><code>dot(mu*(1-mu), g_tilde&sup2;)</code></td>
+                <td class="quant-col">Gaussian:<br><code>Z'XVX*Z*tau[0] + g'g - 2B'g</code></td>
+                <td class="surv-col">Poisson-like:<br><code>dot(mu, g_tilde&sup2;)</code></td>
+            </tr>
+            <tr>
+                <td><strong>p-value computation</strong></td>
+                <td class="binary-col">Score &rarr; SPA &rarr; Firth<br>(3-stage pipeline)</td>
+                <td class="quant-col">Score only<br>(1-stage)</td>
+                <td class="surv-col">Score &rarr; SPA<br>(2-stage pipeline)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="note">
+        <h3>Why no SPA for quantitative traits?</h3>
+        <p>The score test statistic for quantitative traits follows a chi-square distribution under the null because the residuals are approximately normally distributed. SPA is needed for binary traits because the Binomial distribution of case-control outcomes causes the score statistic distribution to deviate from chi-square, especially for rare variants with unbalanced case-control counts.</p>
+    </div>
+
+    <div class="note-quant">
+        <h3>Why no Firth for quantitative traits?</h3>
+        <p>Firth's penalized likelihood is a correction for separation in logistic regression (when a variant perfectly predicts case/control status). This problem does not arise in linear regression (quantitative traits), where the likelihood is always well-defined regardless of the genotype distribution.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section9">9. Efficient Resampling (ER) for Rare Binary Variants <span class="binary-only">BINARY ONLY</span></h2>
+
+    <p>ER computes exact p-values via hypergeometric distribution for binary trait variants with MAC &le; <code>max_MAC_use_ER</code> (default 4).</p>
+
+    <h3>Trigger (Main.cpp:518)</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># Decision point for ER vs SPA/normal path</span>
+if((<span class="var">traitType</span> == "binary" &amp;&amp; <span class="var">MAC</span> &gt; <span class="var">g_MACCutoffforER</span>) || <span class="var">traitType</span> != "binary")
+  &rarr; SPA/normal path
+else &rarr; ER exact test
+</pre>
+    </div>
+
+    <h3>Call Hierarchy</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="rcpp-func">mainMarkerInCPP</span>()                                          <span class="file">[Main.cpp:219]</span>
+&#9492;&#9472;&#9472; <span class="cpp-func">Unified_getMarkerPval</span>(..., t_isER=true)                <span class="file">[Main.cpp:1323]</span>
+    &#9492;&#9472;&#9472; <span class="cpp-func">SAIGEClass::getMarkerPval</span>(..., t_isER=true)         <span class="file">[SAIGE_test.cpp:449]</span>
+        &#9492;&#9472;&#9472; <span class="cpp-func">SKATExactBin_Work</span>()                              <span class="file">[ER_binary_func.cpp:185]</span>
+            &#9500;&#9472;&#9472; <span class="cpp-func">SKATExactBin_ComputProb_New</span>()                <span class="file">[ER_binary_func.cpp:106]</span>
+            &#9474;   &#9492;&#9472;&#9472; <span class="cpp-func">SKATExactBin_ComputeProb_Group</span>()         <span class="file">[ER_binary_func.cpp:22]</span>
+            &#9474;       &#9500;&#9472;&#9472; Stratify variants into 10 AF bins      <span class="comment">[line 44-63]</span>
+            &#9474;       &#9492;&#9472;&#9472; <span class="cpp-func">GetProb_new</span>()                          <span class="file">[ER_binary_func.cpp:14]</span>
+            &#9474;           &#9492;&#9472;&#9472; <span class="cpp-func">HyperGeo.Run</span>()                    <span class="file">[Binary_HyperGeo.cpp:37]</span>
+            &#9474;               &#9500;&#9472;&#9472; <span class="cpp-func">HyperGeo::Recursive</span>()         <span class="file">[line 108]</span>
+            &#9474;               &#9492;&#9472;&#9472; <span class="cpp-func">HyperGeo::Get_lprob</span>()         <span class="file">[line 133]</span>
+            &#9492;&#9472;&#9472; <span class="cpp-func">SKAT_Exact</span>() &mdash; exact p-value from enumerated distribution
+</pre>
+    </div>
+
+    <div class="note">
+        <h3>Key Data Structures</h3>
+        <p>The <code>HyperGeo</code> class has members: <span class="var">m_ngroup</span> (10), <span class="var">m_ncase</span>, <span class="var">m_group</span>, <span class="var">m_lweight</span>, <span class="var">m_kprob</span>.</p>
+        <p><strong>Algorithm:</strong> Stratify into 10 AF bins &rarr; odds ratio weights &rarr; recursive hypergeometric enumeration &rarr; exact p-value.</p>
+    </div>
+
+    <div class="note-quant">
+        <h3>Source Files</h3>
+        <p><code>ER_binary_func.cpp</code> (278 lines), <code>Binary_HyperGeo.cpp</code> (195 lines), <code>Binary_HyperGeo.hpp</code> (57 lines)</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section10">10. Conditional Analysis</h2>
+
+    <p>Tests a marker while controlling for conditioning variants. Produces marginal AND conditional results.</p>
+
+    <h3>Setup</h3>
+    <p>R parameter: <code>condition="chr3:101651171:C:T,chr3:101651186:G:A"</code></p>
+
+    <h3>Key SAIGEClass Members (SAIGE_test.hpp)</h3>
+    <p><span class="var">m_isCondition</span>, <span class="var">m_numMarker_cond</span>, <span class="var">m_condition_genoIndex</span>, <span class="var">m_P2Mat_cond</span>, <span class="var">m_VarInvMat_cond</span>, <span class="var">m_VarMat_cond</span>, <span class="var">m_Tstat_cond</span>, <span class="var">m_G1tilde_P_G2tilde</span></p>
+
+    <h3>Call Hierarchy</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># CONDITIONAL ANALYSIS: Setup phase</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="r-func">SPAGMMATtest</span>()                                             <span class="file">[R: SAIGE_Test_main.R:62]</span>
+&#9492;&#9472;&#9472; <span class="rcpp-func">setSAIGEobjInCPP</span>(..., condition="...")                  <span class="file">[Main.cpp:180]</span>
+    &#9492;&#9472;&#9472; <span class="cpp-func">SAIGEClass</span> stores <span class="var">m_condition_genoIndex</span>             <span class="file">[SAIGE_test.cpp:94-97]</span>
+
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># CONDITIONAL ANALYSIS: Per-marker computation</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="cpp-func">getMarkerPval</span>(..., t_isCondition=true)                      <span class="file">[SAIGE_test.cpp:700-914]</span>
+&#9500;&#9472;&#9472; <strong>Marginal:</strong> <span class="var">S</span>, <span class="var">var1</span>, <span class="var">pval</span> (normal path)
+&#9500;&#9472;&#9472; <strong>Projection:</strong> <span class="var">G1tilde_P_G2tilde</span> = sqrt(VR) * gtilde' * P2Mat_cond
+&#9500;&#9472;&#9472; <strong>Conditional score:</strong> <span class="var">S_c</span> = S - (G1P2 * VarInv_cond * Tstat_cond)
+&#9500;&#9472;&#9472; <strong>Conditional var:</strong> <span class="var">var_c</span> = var1 - (G1P2 * VarInv_cond * G1P2')
+&#9492;&#9472;&#9472; Apply SPA to conditional stats if binary + significant   <span class="binary-only">BINARY</span>
+</pre>
+    </div>
+
+    <div class="note">
+        <h3>Output</h3>
+        <p>Both marginal (<span class="var">Beta</span>, <span class="var">SE</span>, <span class="var">pval</span>) AND conditional (<span class="var">Beta_cond</span>, <span class="var">SE_cond</span>, <span class="var">pval_cond</span>)</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section11">11. Ultra-Rare Variant (URV) Collapsing</h2>
+
+    <p>In region tests, variants with MAC &le; <code>MACCutoff_to_CollapseUltraRare</code> (default 10) are collapsed into pseudo-markers per (annotation, MAF) stratum.</p>
+
+    <h3>Trigger (Main.cpp:1299)</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># Decision point for regular rare vs ultra-rare</span>
+if(<span class="var">MAC</span> &gt; <span class="var">g_region_minMAC_cutoff</span>) &rarr; <span class="var">indicatorVec[i]</span> = 1  <span class="comment">(regular rare)</span>
+else                             &rarr; <span class="var">indicatorVec[i]</span> = 2  <span class="comment">(ultra-rare)</span>
+</pre>
+    </div>
+
+    <h3>Data Structures</h3>
+    <p><span class="var">genoURMat</span> (n &times; q_anno_maf), <span class="var">genoURMat_noweights</span>, <span class="var">NumUltraRare_GroupVec</span></p>
+
+    <h3>Algorithm</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># URV COLLAPSING: 5-step algorithm within mainRegionInCPP</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<strong>Step 1:</strong> Regular rare (MAC &gt; threshold):
+    score test individually, accumulate <span class="var">P1Mat</span>/<span class="var">P2Mat</span>
+
+<strong>Step 2:</strong> Ultra-rare (MAC &le; threshold):
+    collapse by max: <span class="var">genoURMat</span>(i, jm) = max(current, weight * G(i))
+
+<strong>Step 3:</strong> After all variants:
+    treat each <span class="var">genoURMat</span> column as pseudo-marker
+
+<strong>Step 4:</strong> Run score test on pseudo-markers                  <span class="comment">[lines 1527-1620]</span>
+
+<strong>Step 5:</strong> Output as "UR:jm" markers
+</pre>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section12">12. LDmat Computation</h2>
+
+    <p>Computes variant-variant LD (Phi) matrices within regions for downstream analysis.</p>
+
+    <div class="note">
+        <h3>Source Files</h3>
+        <p><code>LDmat.cpp</code> (580 lines), <code>LDmat.hpp</code> (53 lines)</p>
+    </div>
+
+    <h3>Function Signature</h3>
+    <p><code>LDmatRegionInCPP(genoType, genoIndex_prev, genoIndex, annoIndicatorMat, outputFile, n, isImputation, annoStringVec, regionName)</code></p>
+
+    <h3>Algorithm</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># LDmat: Variant-variant LD matrix computation</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="rcpp-func">LDmatRegionInCPP</span>(...)                                      <span class="file">[LDmat.cpp]</span>
+&#9474;
+&#9500;&#9472;&#9472; <strong>Step 1:</strong> Load all markers in region
+&#9500;&#9472;&#9472; <strong>Step 2:</strong> QC filter (MAF, MAC, missing, info)
+&#9500;&#9472;&#9472; <strong>Step 3:</strong> Compute <span class="var">g_tilde</span> for each marker
+&#9500;&#9472;&#9472; <strong>Step 4:</strong> Build Phi:
+&#9474;   <span class="var">Phi[i,j]</span> = g_tilde_i' * diag(mu2) * g_tilde_j
+&#9492;&#9472;&#9472; <strong>Step 5:</strong> Save output files:
+    &#9500;&#9472;&#9472; {prefix}_LDmat_{region}.bin   <span class="comment">(Armadillo binary)</span>
+    &#9492;&#9472;&#9472; {prefix}_LDmat_{region}.txt   <span class="comment">(marker info)</span>
+</pre>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section13">13. Annotation Filtering &amp; Group File Parsing</h2>
+
+    <h3>Group File Format (3 lines per gene)</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># Each gene has 2-3 lines: variants, annotations, and optional weights</span>
+GENE1  var     chr1:100:A:G  chr1:200:C:T  chr1:300:G:A
+GENE1  anno    lof           lof            missense
+GENE1  weight  1.5           1.0            0.8          <span class="comment">(optional)</span>
+</pre>
+    </div>
+
+    <h3>Parsing</h3>
+    <p><span class="r-func">readGroupFile</span>() <span class="file">[SAIGE_SPATest_Region_Func.R:3-62]</span>, <span class="r-func">checkGroupFile</span>() <span class="file">[lines 73-156]</span></p>
+
+    <h3>Annotation Indicator Matrix</h3>
+    <p><span class="r-func">SAIGE.getRegionList_new</span>() <span class="file">[SAIGE_SPATest_Region.R:1315-1500]</span> builds <span class="var">annoIndicatorMat</span> (q_markers &times; q_annotations)</p>
+
+    <h3>Annotation-MAF Stratification (Main.cpp:1378-1410)</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># ANNOTATION-MAF STRATIFICATION: Building the indicator matrix</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+For each marker, annotation, MAF stratum:
+&#9500;&#9472;&#9472; Compute stratum index: <span class="var">jm</span> = j &times; q_maf + m
+&#9500;&#9472;&#9472; Set indicator: <span class="var">annoMAFIndicatorMat[i, jm]</span> = 1
+&#9492;&#9472;&#9472; Accumulate: <span class="var">genoSumMat[:, jm]</span> += weight * genotype
+</pre>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section14">14. Output File Formats</h2>
+
+    <h3>Marker-Level Output Columns</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Column</th>
+                <th>Description</th>
+                <th>Scope</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>CHROM</code></td>
+                <td>Chromosome</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>POS</code></td>
+                <td>Position</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>MarkerID</code></td>
+                <td>Marker identifier</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>Ref</code></td>
+                <td>Reference allele</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>Alt</code></td>
+                <td>Alternate allele</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>AC</code></td>
+                <td>Allele count</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>AF</code></td>
+                <td>Allele frequency</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>ImputationInfo</code></td>
+                <td>Imputation quality (info score)</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>N</code></td>
+                <td>Sample size</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>Beta</code></td>
+                <td>Effect size estimate</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>SE</code></td>
+                <td>Standard error of Beta</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>Tstat</code></td>
+                <td>Test statistic</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>pval</code></td>
+                <td>P-value (SPA-corrected if applicable)</td>
+                <td>All traits</td>
+            </tr>
+            <tr>
+                <td><code>pval_noSPA</code></td>
+                <td>P-value from normal approximation</td>
+                <td>All traits</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>AF_case</code></td>
+                <td>Allele frequency in cases</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>AF_ctrl</code></td>
+                <td>Allele frequency in controls</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>N_case</code></td>
+                <td>Number of cases</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>N_ctrl</code></td>
+                <td>Number of controls</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr>
+                <td><code>Beta_cond</code></td>
+                <td>Conditional effect size</td>
+                <td>Conditional only</td>
+            </tr>
+            <tr>
+                <td><code>SE_cond</code></td>
+                <td>Conditional standard error</td>
+                <td>Conditional only</td>
+            </tr>
+            <tr>
+                <td><code>Tstat_cond</code></td>
+                <td>Conditional test statistic</td>
+                <td>Conditional only</td>
+            </tr>
+            <tr>
+                <td><code>pval_cond</code></td>
+                <td>Conditional p-value</td>
+                <td>Conditional only</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>homN_Allele2_cases</code></td>
+                <td>Homozygous Alt count in cases</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>hetN_Allele2_cases</code></td>
+                <td>Heterozygous count in cases</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>homN_Allele2_ctrls</code></td>
+                <td>Homozygous Alt count in controls</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>hetN_Allele2_ctrls</code></td>
+                <td>Heterozygous count in controls</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Region-Level Output Columns</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Column</th>
+                <th>Description</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Region</code></td>
+                <td>Gene/region name</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>Annotation</code></td>
+                <td>Annotation category</td>
+                <td>"Cauchy" for CCT row</td>
+            </tr>
+            <tr>
+                <td><code>MaxMAF_strata</code></td>
+                <td>Maximum MAF stratum</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>pval_SKATO</code></td>
+                <td>SKAT-O p-value</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>Beta_Burden</code></td>
+                <td>Burden test effect size</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>SE_Burden</code></td>
+                <td>Burden test standard error</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>pval_Burden</code></td>
+                <td>Burden test p-value</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>pval_SKAT</code></td>
+                <td>SKAT p-value</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>MAC</code></td>
+                <td>Minor allele count (total)</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>MAC_case</code></td>
+                <td>MAC in cases</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr class="highlight">
+                <td><code>MAC_ctrl</code></td>
+                <td>MAC in controls</td>
+                <td><span class="binary-only">BINARY ONLY</span></td>
+            </tr>
+            <tr>
+                <td><code>N_rare</code></td>
+                <td>Number of rare variants included</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>N_ultra_rare</code></td>
+                <td>Number of ultra-rare variants collapsed</td>
+                <td>&mdash;</td>
+            </tr>
+            <tr>
+                <td><code>*_cond</code></td>
+                <td>Conditional versions of above statistics</td>
+                <td>Conditional only</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="note">
+        <h3>CCT Row</h3>
+        <p>The CCT row has <code>Region</code>=gene name and <code>Annotation</code>="Cauchy". It combines p-values across all annotation-MAF strata using the Cauchy Combination Test.</p>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════ -->
+    <h2 id="section15">15. Genotype Reader Details</h2>
+
+    <h3>Supported Formats</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Format</th>
+                <th>Class</th>
+                <th>Files</th>
+                <th>Key Feature</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>PLINK 1.0</td>
+                <td><code>PlinkClass</code></td>
+                <td>PLINK.cpp/hpp</td>
+                <td>2-bit packed binary (.bed/.bim/.fam)</td>
+            </tr>
+            <tr>
+                <td>BGEN v1.2</td>
+                <td><code>BgenClass</code></td>
+                <td>BGEN.cpp/hpp</td>
+                <td>Probabilistic dosages, imputation info</td>
+            </tr>
+            <tr>
+                <td>VCF/BCF</td>
+                <td><code>VcfClass</code></td>
+                <td>VCF.cpp/hpp</td>
+                <td>DS or GT fields</td>
+            </tr>
+            <tr>
+                <td>PLINK 2.0</td>
+                <td><code>PgenClass</code></td>
+                <td>PGEN.cpp/hpp</td>
+                <td>Compressed binary, phased genotypes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Unified Dispatcher</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+<span class="comment"># GENOTYPE READER: Unified dispatcher routes to format-specific reader</span>
+<span class="comment"># ═══════════════════════════════════════════════════════════════════════════════</span>
+
+<span class="cpp-func">Unified_getOneMarker</span>(genoType, gIndex, ..., GVec)           <span class="file">[Main.cpp]</span>
+&#9500;&#9472;&#9472; if "PLINK": <span class="var">ptr_gPLINKobj</span>-&gt;<span class="cpp-func">getOneMarker</span>(...)
+&#9500;&#9472;&#9472; if "BGEN":  <span class="var">ptr_gBGENobj</span>-&gt;<span class="cpp-func">getOneMarker</span>(...)
+&#9500;&#9472;&#9472; if "VCF":   <span class="var">ptr_gVCFobj</span>-&gt;<span class="cpp-func">getOneMarker</span>(...)
+&#9492;&#9472;&#9472; if "PGEN":  <span class="var">ptr_gPGENobj</span>-&gt;<span class="cpp-func">getOneMarker</span>(...)
+</pre>
+    </div>
+
+    <h3>PlinkClass Details</h3>
+
+    <div class="note">
+        <h3>PLINK 2-bit Encoding</h3>
+        <p>Each genotype is stored in 2 bits within packed bytes:</p>
+        <ul style="margin-top: 8px; padding-left: 20px;">
+            <li><code>0x3</code> (11) = HOM_REF</li>
+            <li><code>0x2</code> (10) = HET</li>
+            <li><code>0x0</code> (00) = HOM_ALT</li>
+            <li><code>0x1</code> (01) = MISSING</li>
+        </ul>
+        <p style="margin-top: 8px;"><code>getOneMarker()</code> decodes packed bytes, computes AF/counts/missing, imputes missing values (mean/bestguess/minor).</p>
+    </div>
+
+    <h3>Global Pointers (Main.cpp:35-40)</h3>
+    <p><span class="var">ptr_gPLINKobj</span>, <span class="var">ptr_gBGENobj</span>, <span class="var">ptr_gVCFobj</span>, <span class="var">ptr_gPGENobj</span>, <span class="var">ptr_gSAIGEobj</span></p>
+
+    <hr style="margin: 40px 0;">
+    <p style="color: #888; font-size: 12px;">
+        Version 2 &mdash; Updated February 2025<br>
+        SAIGE Step 2 (Association Testing) call graph documentation<br>
+        Covers marker-level, region-level, SPA, score test variants, and trait-specific differences<br>
+        Covers ER test, conditional analysis, URV collapsing, LDmat, annotation/group file, output formats, genotype readers<br>
+        For R to C++ conversion comparison project<br>
+        Output directory: <code>/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/</code>
+    </p>
+</div>
+</body>
+</html>

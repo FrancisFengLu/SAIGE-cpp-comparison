@@ -52,10 +52,22 @@ int getNRowStdGenoMultiMarkersMat();
 
 // Variance ratio functions
 bool getIsVarRatioGeno();
-void setminMAC_VarianceRatio(arma::fvec t_cateVarRatioMinMACVecExclude, 
+void setminMAC_VarianceRatio(arma::fvec t_cateVarRatioMinMACVecExclude,
                              arma::fvec t_cateVarRatioMaxMACVecInclude);
-void setminMAC_VarianceRatio(float t_minMACVarRatio, float t_maxMACVarRatio, 
+void setminMAC_VarianceRatio(float t_minMACVarRatio, float t_maxMACVarRatio,
                              bool t_isVarianceRatioinGeno);
+
+// MAC and marker index vectors for variance ratio
+arma::ivec getMACVec();
+int findMainArrayIdx(int origPlinkIdx);
+arma::ivec getMACVec_forVarRatio();
+arma::ivec getIndexVec_forVarRatio();
+
+// Sigma solvers (PCG-based)
+arma::fmat getSigma_X(arma::fvec& wVec, arma::fvec& tauVec,
+                      arma::fmat& Xmat, int maxiterPCG, float tolPCG);
+arma::fvec getSigma_G(arma::fvec& wVec, arma::fvec& tauVec,
+                      arma::fvec& Gvec, int maxiterPCG, float tolPCG);
 
 // Multi-marker genotype functions
 void Get_MultiMarkersBySample_StdGeno_Mat();

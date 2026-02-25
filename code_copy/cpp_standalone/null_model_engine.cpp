@@ -10,9 +10,11 @@
 
 #include "null_model_engine.hpp"
 #include "saige_null.hpp"
+#include "score.hpp"
 
 #include <Eigen/Dense>
 #include <Eigen/QR>
+#include <armadillo>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -422,11 +424,14 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
 
     // --- Debug print: dimensions + first few entries ---
     std::cout << std::setprecision(10);
-    std::cout << "[QR fingerprint] X(0,0)=" << X(0,0) << " X(0,1)=" << X(0,1) << " X(0,2)=" << X(0,2)
-              << " X(1,0)=" << X(1,0) << " X(1,1)=" << X(1,1) << " X(1,2)=" << X(1,2) << std::endl;
+    std::cout << "[QR fingerprint] X(0,0)=" << X(0,0) << " X(0,1)=" << X(0,1);
+    if (X.cols() > 2) std::cout << " X(0,2)=" << X(0,2);
+    std::cout << " X(1,0)=" << X(1,0) << " X(1,1)=" << X(1,1);
+    if (X.cols() > 2) std::cout << " X(1,2)=" << X(1,2);
+    std::cout << std::endl;
     std::cout << std::setprecision(6);  // restore default
     std::cout << "[design] after covariate QR transform: "
-              << X.rows() << " x " << X.cols() << "\n";
+              << X.rows() << " x " << X.cols() << std::endl;
 
     int max_rows = std::min<int>(5, X.rows());
     int max_cols = std::min<int>(8, X.cols());
@@ -656,6 +661,89 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
   } catch (...) {
     // Non-fatal: leave path set; upstream can decide how to handle
     log("Warning: failed to write model JSON; continuing.");
+  }
+
+  // --- Build obj_noK (ScoreNullPack) for Step 2 and save .arma binary files ---
+  try {
+    const int n_s = design_in.n;
+    const int p_s = design_in.p;
+
+    // Build arma matrices from design
+    arma::fmat X_arma(n_s, p_s);
+    for (int i = 0; i < n_s; ++i)
+      for (int j = 0; j < p_s; ++j)
+        X_arma(i, j) = static_cast<float>(design_in.X[i * p_s + j]);
+
+    arma::fvec y_arma(n_s);
+    for (int i = 0; i < n_s; ++i)
+      y_arma(i) = static_cast<float>(design_in.y[i]);
+
+    // Reconstruct mu from X*alpha + offset via link function
+    arma::fvec alpha_arma(p_s);
+    for (int i = 0; i < p_s; ++i)
+      alpha_arma(i) = static_cast<float>(out.alpha[i]);
+
+    arma::fvec eta_arma = X_arma * alpha_arma;
+    if (!out.offset.empty()) {
+      for (int i = 0; i < n_s; ++i)
+        eta_arma(i) += static_cast<float>(out.offset[i]);
+    }
+
+    arma::fvec mu_arma(n_s);
+    if (is_binary) {
+      for (int i = 0; i < n_s; ++i) {
+        float e = std::exp(eta_arma(i));
+        mu_arma(i) = e / (1.0f + e);
+      }
+    } else {
+      mu_arma = eta_arma;
+    }
+
+    // Build ScoreNull
+    ScoreNull sn;
+    if (is_binary) {
+      sn = build_score_null_binary(X_arma, y_arma, mu_arma);
+    } else {
+      float tau0 = static_cast<float>(out.theta[0]);
+      sn = build_score_null_quant(X_arma, y_arma, mu_arma, 1.0f / tau0);
+    }
+
+    // Convert to pack
+    out.obj_noK = to_pack(sn, X_arma, y_arma, mu_arma, cfg_.trait);
+    log("obj_noK (ScoreNullPack) populated");
+
+    // --- Save .arma binary files for Step 2 ---
+    std::string prefix = paths_.out_prefix;
+    ensure_parent_dir(prefix + ".mu.arma");
+
+    // Convert to double-precision arma vectors/matrices for saving
+    arma::vec mu_d = arma::conv_to<arma::vec>::from(mu_arma);
+    arma::vec res_d = arma::conv_to<arma::vec>::from(sn.res);
+    arma::vec y_d = arma::conv_to<arma::vec>::from(y_arma);
+    arma::vec V_d = arma::conv_to<arma::vec>::from(sn.V);
+    arma::vec S_a_d = arma::conv_to<arma::vec>::from(sn.S_a);
+    arma::mat X_d = arma::conv_to<arma::mat>::from(X_arma);
+    arma::mat XV_d = arma::conv_to<arma::mat>::from(sn.XV);
+    arma::mat XVX_d = arma::conv_to<arma::mat>::from(sn.XVX);
+    arma::mat XVX_inv_d = arma::conv_to<arma::mat>::from(sn.XVX_inv);
+    arma::mat XXVX_inv_d = arma::conv_to<arma::mat>::from(sn.XXVX_inv);
+    arma::mat XVX_inv_XV_d = arma::conv_to<arma::mat>::from(sn.XVX_inv_XV);
+
+    mu_d.save(prefix + ".mu.arma", arma::arma_binary);
+    res_d.save(prefix + ".res.arma", arma::arma_binary);
+    y_d.save(prefix + ".y.arma", arma::arma_binary);
+    V_d.save(prefix + ".V.arma", arma::arma_binary);
+    S_a_d.save(prefix + ".S_a.arma", arma::arma_binary);
+    X_d.save(prefix + ".X.arma", arma::arma_binary);
+    XV_d.save(prefix + ".XV.arma", arma::arma_binary);
+    XVX_d.save(prefix + ".XVX.arma", arma::arma_binary);
+    XVX_inv_d.save(prefix + ".XVX_inv.arma", arma::arma_binary);
+    XXVX_inv_d.save(prefix + ".XXVX_inv.arma", arma::arma_binary);
+    XVX_inv_XV_d.save(prefix + ".XVX_inv_XV.arma", arma::arma_binary);
+
+    log("Saved .arma binary files for Step 2: mu, res, y, V, S_a, X, XV, XVX, XVX_inv, XXVX_inv, XVX_inv_XV");
+  } catch (const std::exception& e) {
+    log(std::string("Warning: failed to build obj_noK / save .arma files: ") + e.what());
   }
 
   return out;

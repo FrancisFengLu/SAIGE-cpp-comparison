@@ -131,6 +131,33 @@ Ported binary trait C++ code to support quantitative traits. See `code_copy/cpp_
 
 Added `hasCovariate` logic to `null_model_engine.cpp` to match R's QR transform gating. Binary trait with exactly 1 non-intercept covariate now correctly skips QR (matching R). Verified across 3 covariate configs: x1+x2, x1 only, none — all tau values match R.
 
+## Variance Ratio Computation (Feb 10, 2025)
+
+Implemented real VR computation replacing the VR=1.0 stub. Algorithm: for each randomly selected marker, compute var_exact (via PCG solve) / var_approx (from null model), average across markers.
+
+**Status:** COMPLETE — Sparse GRM configs match exactly (0.00%), dense GRM configs ~0.5% difference (root cause unknown).
+
+| Config | R VR | C++ VR | Diff |
+|--------|------|--------|------|
+| Dense + x1 | 1.115 | 1.111 | 0.45% |
+| Dense + x1+x2 | 1.230 | 1.224 | 0.55% |
+| Sparse + x1 | 1.107 | 1.107 | 0.00% |
+| Sparse + x1+x2 | 1.219 | 1.219 | 0.00% |
+
+**NOTE:** The ~0.5% difference in dense GRM configs is NOT fully explained. The root cause needs further investigation — it may be caused by a deeper issue beyond simple float32 accumulation. TODO: dig into this later.
+
+### Bypass: VR Marker Indices
+- **File:** `output/bypass/vr_marker_indices.csv` (CSV: snp_index, geno_ind, mac, var1, var2null, ratio, orig_plink_index)
+- **Reason:** R and C++ RNG select different random markers for VR estimation
+- **Toggle:** `bool use_r_vr_bypass = true;` in `variance_ratio_compute.cpp` (~line 55)
+- **IMPORTANT:** `use_r_vr_bypass` is currently **TRUE** for testing. **Must be set to FALSE** after VR comparison testing is complete.
+- R generates this file in `extractVarianceRatio()` (SAIGE_isolated/R/SAIGE_fitGLMM_fast.R); C++ reads it if bypass is true and file exists.
+- **Index mapping:** R's VR markers use a separate filtered genotype array with own indexing. The `orig_plink_index` column provides the 0-based PLINK BIM index for correct lookup in C++.
+
+### .arma Binary Output for Step 2
+After GLMM fitting, 11 Armadillo binary files are saved for Step 2 to load:
+`mu.arma`, `res.arma`, `y.arma`, `V.arma`, `S_a.arma`, `X.arma`, `XV.arma`, `XVX.arma`, `XVX_inv.arma`, `XXVX_inv.arma`, `XVX_inv_XV.arma`
+
 ## Rules for AI Agents
 
 1. **Read AI_INSTRUCTIONS.txt and SESSION_NOTES.txt** for full context before making changes

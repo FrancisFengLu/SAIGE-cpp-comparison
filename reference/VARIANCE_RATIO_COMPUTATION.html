@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SAIGE Variance Ratio Computation - Algorithm Documentation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f5f5f5; padding: 20px; line-height: 1.6;
+        }
+        .container { max-width: 1800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-bottom: 20px; }
+        h2 { color: #34495e; margin-top: 30px; margin-bottom: 15px; border-left: 4px solid #3498db; padding-left: 10px; }
+        h3 { color: #2980b9; margin-top: 20px; margin-bottom: 10px; }
+
+        .call-tree { font-family: 'Courier New', monospace; font-size: 13px; background: #f8f9fa; padding: 20px; border-radius: 5px; overflow-x: auto; line-height: 1.8; }
+        .call-tree .r-func { color: #2980b9; font-weight: bold; }
+        .call-tree .cpp-func { color: #27ae60; font-weight: bold; }
+        .call-tree .rcpp-func { color: #8e44ad; font-weight: bold; }
+        .call-tree .comment { color: #7f8c8d; font-style: italic; }
+        .call-tree .line-num { color: #95a5a6; margin-right: 10px; }
+        .call-tree .file { color: #e74c3c; }
+        .call-tree .var { color: #d35400; }
+
+        .quant-diff {
+            background: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #e65100;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .shared-badge {
+            background: #e8f5e9;
+            border: 1px solid #66bb6a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #2e7d32;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .quant-only {
+            background: #fce4ec;
+            border: 1px solid #ef9a9a;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #c62828;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+        .bypass-badge {
+            background: #e8eaf6;
+            border: 1px solid #7986cb;
+            border-radius: 3px;
+            padding: 1px 6px;
+            font-size: 0.85em;
+            color: #283593;
+            font-weight: bold;
+            font-style: normal;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        }
+
+        .legend { display: flex; gap: 20px; margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-box { width: 20px; height: 20px; border-radius: 3px; }
+        .legend-r { background: #3498db; }
+        .legend-cpp { background: #27ae60; }
+        .legend-rcpp { background: #8e44ad; }
+        .legend-var { background: #d35400; }
+        .legend-quant { background: #ff9800; }
+        .legend-shared { background: #4caf50; }
+        .legend-bypass { background: #5c6bc0; }
+
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 13px; }
+        th { background: #3498db; color: white; padding: 10px; text-align: left; position: sticky; top: 0; }
+        td { padding: 8px 10px; border-bottom: 1px solid #ddd; vertical-align: top; }
+        tr:hover { background: #f9f9f9; }
+        .highlight { background: #fff3cd; }
+
+        .diff-table th { background: #e65100; }
+        .diff-table td.binary-col { background: #e3f2fd; }
+        .diff-table td.quant-col { background: #fff3e0; }
+
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; font-size: 0.9em; }
+        .note { background: #e8f4fd; padding: 15px; border-left: 5px solid #3498db; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-quant { background: #fff3e0; padding: 15px; border-left: 5px solid #ff9800; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-warn { background: #fff5f5; padding: 15px; border-left: 5px solid #e74c3c; margin: 20px 0; border-radius: 0 5px 5px 0; }
+        .note-bypass { background: #e8eaf6; padding: 15px; border-left: 5px solid #5c6bc0; margin: 20px 0; border-radius: 0 5px 5px 0; }
+
+        .side-by-side { display: flex; gap: 20px; margin: 20px 0; }
+        .side-by-side .panel { flex: 1; min-width: 0; }
+        .panel-binary { border: 2px solid #3498db; border-radius: 8px; padding: 15px; }
+        .panel-binary h3 { color: #2980b9; margin-top: 0; }
+        .panel-quant { border: 2px solid #ff9800; border-radius: 8px; padding: 15px; }
+        .panel-quant h3 { color: #e65100; margin-top: 0; }
+
+        .toc { background: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }
+        .toc a { color: #2980b9; text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+        .toc ul { list-style: none; padding-left: 20px; }
+        .toc > ul { padding-left: 0; }
+        .toc li { margin: 5px 0; }
+
+        .formula-box { background: #fafafa; border: 1px solid #ddd; padding: 15px; border-radius: 5px; margin: 15px 0; font-family: 'Courier New', monospace; font-size: 13px; line-height: 2; }
+        .step-num { display: inline-block; background: #3498db; color: white; width: 28px; height: 28px; border-radius: 50%; text-align: center; line-height: 28px; font-weight: bold; font-size: 14px; margin-right: 8px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>SAIGE Variance Ratio Computation - Algorithm Documentation</h1>
+
+    <div class="toc">
+        <strong>Table of Contents</strong>
+        <ul>
+            <li>1. <a href="#section1">Purpose and Overview</a></li>
+            <li>2. <a href="#section2">Algorithm Steps (Detailed)</a></li>
+            <li>3. <a href="#section3">Call Graph</a></li>
+            <li>4. <a href="#section4">Key Variables Reference</a></li>
+            <li>5. <a href="#section5">Binary vs Quantitative Differences</a></li>
+            <li>6. <a href="#section6">Output Format</a></li>
+            <li>7. <a href="#section7">R vs C++ Comparison Notes (RNG Bypass)</a></li>
+            <li>8. <a href="#section8">File Locations</a></li>
+        </ul>
+    </div>
+
+    <div class="legend">
+        <div class="legend-item"><div class="legend-box legend-r"></div><span>R Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-rcpp"></div><span>Rcpp Export (C++ callable from R)</span></div>
+        <div class="legend-item"><div class="legend-box legend-cpp"></div><span>Internal C++ Function</span></div>
+        <div class="legend-item"><div class="legend-box legend-var"></div><span>Key Variable</span></div>
+        <div class="legend-item"><div class="legend-box legend-quant"></div><span><span class="quant-diff">QUANT DIFF</span> Quantitative differs from Binary</span></div>
+        <div class="legend-item"><div class="legend-box legend-bypass"></div><span><span class="bypass-badge">BYPASS</span> Requires RNG bypass for R/C++ match</span></div>
+    </div>
+
+    <!-- ======================================================================= -->
+    <h2 id="section1">1. Purpose and Overview</h2>
+
+    <div class="note">
+        <h3>What is the Variance Ratio?</h3>
+        <p>The variance ratio calibrates the score test variance used in Step 2 (association testing).
+        It is the ratio of the <strong>exact variance</strong> (computed via the full mixed model covariance Sigma)
+        to the <strong>approximate variance</strong> (computed using only fixed-effect weights).</p>
+        <p style="margin-top: 10px;"><code>ratio = var_exact / var_approx</code></p>
+        <p style="margin-top: 10px;">This ratio is computed for a set of randomly selected markers from the genotype file,
+        then averaged. The averaged ratio is used in Step 2 to correct the score test statistic for
+        the additional variance introduced by the random genetic effect.</p>
+    </div>
+
+    <div class="formula-box">
+        <strong>Core Formula:</strong><br><br>
+        For each randomly selected marker with (adjusted, normalized) genotype vector g:<br><br>
+        &nbsp;&nbsp;var1 (exact)  = (G' * Sigma_iG - G' * Sigma_iX * (X' * Sigma_iX)^{-1} * X' * Sigma_iG) / AC<br>
+        &nbsp;&nbsp;var2 (approx) = <strong>Binary:</strong> sum(mu*(1-mu) * g^2) &nbsp; | &nbsp; <strong>Quant:</strong> sum(g^2)<br><br>
+        &nbsp;&nbsp;ratio = var1 / var2<br><br>
+        Where: G = covariate-adjusted genotype, g = G / sqrt(AC), AC = allele count
+    </div>
+
+    <!-- ======================================================================= -->
+    <h2 id="section2">2. Algorithm Steps (Detailed)</h2>
+
+    <h3>2a. Preliminary Computations</h3>
+
+    <p>Before iterating over markers, several quantities are precomputed from the null model fit (Step 1 output).</p>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># STEP 0: Compute prerequisite matrices from null model</span>
+<span class="comment"># ===============================================================================</span>
+
+<span class="step-num">0</span> Compute working weights: <span class="var">W</span>                         <span class="quant-diff">QUANT DIFF</span>
+   <strong>Binary:</strong>   W[i] = mu[i] * (1 - mu[i])             <span class="comment"># logistic variance function</span>
+   <strong>Quant:</strong>    W[i] = 1.0                              <span class="comment"># identity link, constant weight</span>
+
+<span class="step-num">1</span> Compute <span class="var">Sigma_iX</span> via PCG: <span class="rcpp-func">getSigma_X</span>(W, tau, X)     <span class="shared-badge">SHARED</span>
+   <span class="comment"># For each column j of design matrix X (j = 0..p-1):</span>
+   <span class="comment">#   Sigma_iX[:,j] = getPCG1ofSigmaAndVector(W, tau, X[:,j])</span>
+   <span class="comment"># Result: Sigma_iX is N x p matrix = Sigma^{-1} * X</span>
+
+   Also precompute:
+   <span class="var">XV</span>         = (X .* V)'                              <span class="comment"># p x N, where V = W for binary, 1/tau[0] for quant</span>
+   <span class="var">XVX</span>        = X' * V * X                              <span class="comment"># p x p</span>
+   <span class="var">XVX_inv</span>    = inv(XVX)                                <span class="comment"># p x p</span>
+   <span class="var">XXVX_inv</span>   = X * XVX_inv                             <span class="comment"># N x p</span>
+</pre>
+    </div>
+
+    <h3>2b. Per-Marker Computation</h3>
+
+    <p>For each of <code>nRandomMarkers</code> randomly selected markers (default: 30), compute a variance ratio.</p>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># MAIN LOOP: For each randomly selected marker k</span>
+<span class="comment"># ===============================================================================</span>
+
+FOR k = 1 to nRandomMarkers:
+
+  <span class="step-num">a</span> <strong>Get raw genotype G0, flip to minor allele</strong>
+     │
+     ├── Read genotype vector: <span class="var">G0</span> = raw genotype for marker k     <span class="comment"># length N</span>
+     ├── Compute allele count: <span class="var">AC</span> = sum(G0)
+     ├── If AC > N:                                                <span class="comment"># flip to minor allele</span>
+     │   ├── G0 = 2 - G0
+     │   └── AC = 2*N - AC
+     └── Skip marker if AC == 0 (monomorphic)
+
+  <span class="step-num">b</span> <strong>Covariate-adjust: remove X-space component from genotype</strong>
+     │
+     ├── <span class="var">G</span> = G0 - XXVX_inv * (XV * G0)
+     │   <span class="comment"># This projects G0 onto the space orthogonal to X</span>
+     │   <span class="comment"># Equivalent to: G = G0 - X * (X'VX)^{-1} * X'V * G0</span>
+     │   <span class="comment"># In R code: G = G0 - obj.glmm.fit$XXVX_inv %*% (obj.glmm.fit$XV %*% G0)</span>
+     │
+     └── <span class="comment"># G now has no component in the column space of X</span>
+
+  <span class="step-num">c</span> <strong>Normalize by allele count</strong>
+     │
+     └── <span class="var">g</span> = G / sqrt(AC)
+
+  <span class="step-num">d</span> <strong>PCG solve for exact variance numerator</strong>
+     │
+     ├── <span class="var">Sigma_iG</span> = <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, G)
+     │   <span class="comment"># Solves: Sigma * x = G  where Sigma = tau[0]/W + tau[1]*K</span>
+     │
+     └── <span class="comment"># This is the expensive step -- one PCG solve per marker</span>
+
+  <span class="step-num">e</span> <strong>Compute var1 (exact variance)</strong>
+     │
+     ├── numerator = G' * Sigma_iG
+     │             - G' * Sigma_iX * (X' * Sigma_iX)^{-1} * X' * Sigma_iG
+     │
+     │   <span class="comment"># Expanded with precomputed quantities:</span>
+     │   <span class="comment">#   term1 = dot(G, Sigma_iG)</span>
+     │   <span class="comment">#   term2 = G' * Sigma_iX * inv(X' * Sigma_iX) * X' * Sigma_iG</span>
+     │   <span class="comment">#   numerator = term1 - term2</span>
+     │
+     └── <span class="var">var1</span> = numerator / AC
+
+  <span class="step-num">f</span> <strong>Compute var2 (approximate variance)</strong>                  <span class="quant-diff">QUANT DIFF</span>
+     │
+     ├── <strong>Binary:</strong>   <span class="var">var2</span> = sum(mu * (1-mu) * g^2)
+     │   <span class="comment"># = sum(W * g^2)  where W = mu*(1-mu)</span>
+     │
+     └── <strong>Quant:</strong>    <span class="var">var2</span> = sum(g^2)
+         <span class="comment"># = sum(1.0 * g^2)  since W = 1 for quantitative</span>
+
+  <span class="step-num">g</span> <strong>Compute ratio</strong>
+     │
+     └── <span class="var">ratio[k]</span> = var1 / var2
+</pre>
+    </div>
+
+    <h3>2c. Averaging and Quality Control</h3>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># POST-LOOP: Average ratios and check quality</span>
+<span class="comment"># ===============================================================================</span>
+
+<span class="step-num">4</span> <strong>Compute average and coefficient of variation (CV)</strong>
+   │
+   ├── <span class="var">mean_ratio</span> = mean(ratio[1..K])
+   ├── <span class="var">sd_ratio</span>   = sd(ratio[1..K])
+   ├── <span class="var">CV</span>         = sd_ratio / mean_ratio
+   │
+   ├── IF CV > threshold (default 0.001):
+   │   ├── <span class="comment"># Variance ratios are too variable</span>
+   │   ├── <span class="comment"># Add 10 more randomly selected markers and recompute</span>
+   │   ├── nRandomMarkers += 10
+   │   └── GOTO main loop for the additional markers
+   │
+   └── Final output: <span class="var">mean_ratio</span>
+
+<span class="comment"># The CV check ensures the ratio estimate is stable.</span>
+<span class="comment"># In practice, ratios are typically very consistent (CV &lt;&lt; 0.001)</span>
+<span class="comment"># for well-behaved datasets.</span>
+</pre>
+    </div>
+
+    <!-- ======================================================================= -->
+    <h2 id="section3">3. Call Graph</h2>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># ===============================================================================</span>
+<span class="comment"># ENTRY: Called after GLMM fitting completes (Step 1 post-processing)</span>
+<span class="comment"># R: SAIGE_fitGLMM_fast.R lines 2569-2956</span>
+<span class="comment"># C++: variance_ratio_compute.cpp</span>
+<span class="comment"># ===============================================================================</span>
+
+<span class="r-func">fitNULLGLMM</span>()                                              <span class="file">[R] Line 906</span>
+├── <span class="comment"># ... GLMM fitting (Step 1) completes ...</span>
+├── <span class="comment"># ... build obj.glmm.fit with mu, X, XV, XVX_inv, etc. ...</span>
+│
+└── <span class="comment"># Variance ratio computation begins</span>
+    │
+    ├── Select random markers: <span class="var">markerIndexVec</span>                <span class="file">[R] ~Line 2640</span>
+    │   └── <span class="comment"># nRandomMarkers random indices (default 30) from QC-passing markers</span>
+    │
+    ├── Precompute: <span class="var">Sigma_iX</span>                                  <span class="file">[R] ~Line 2700</span>
+    │   └── <span class="rcpp-func">getSigma_X</span>(W, tau, X)
+    │       └── FOR each column j: <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, X[:,j])
+    │
+    ├── FOR each random marker k:                              <span class="file">[R] ~Line 2750</span>
+    │   │
+    │   ├── <span class="rcpp-func">Get_OneSNP_Geno</span>(k)                               <span class="file">[Rcpp]</span>
+    │   │   └── Returns: raw genotype vector G0
+    │   │
+    │   ├── Flip to minor allele if needed
+    │   │   ├── AC = sum(G0)
+    │   │   └── if AC > N: G0 = 2 - G0, AC = 2N - AC
+    │   │
+    │   ├── Covariate-adjust:
+    │   │   └── G = G0 - <span class="var">XXVX_inv</span> * (<span class="var">XV</span> * G0)
+    │   │
+    │   ├── Normalize: g = G / sqrt(AC)
+    │   │
+    │   ├── PCG solve:
+    │   │   └── <span class="var">Sigma_iG</span> = <span class="cpp-func">getPCG1ofSigmaAndVector</span>(W, tau, G)
+    │   │
+    │   ├── Compute var1:                                      <span class="shared-badge">SHARED</span>
+    │   │   ├── t1 = dot(G, Sigma_iG)
+    │   │   ├── t2 = G' * Sigma_iX * inv(X'*Sigma_iX) * X' * Sigma_iG
+    │   │   └── var1 = (t1 - t2) / AC
+    │   │
+    │   ├── Compute var2:                                      <span class="quant-diff">QUANT DIFF</span>
+    │   │   ├── <strong>Binary:</strong>  var2 = sum(mu*(1-mu) * g^2)
+    │   │   └── <strong>Quant:</strong>   var2 = sum(g^2)
+    │   │
+    │   └── ratio[k] = var1 / var2
+    │
+    ├── Average: mean_ratio = mean(ratio)
+    ├── CV check: if sd/mean > 0.001, add 10 more markers
+    │
+    └── Output: write ratio to file                            <span class="file">[R] ~Line 2900</span>
+</pre>
+    </div>
+
+    <!-- ======================================================================= -->
+    <h2 id="section4">4. Key Variables Reference</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Variable</th>
+                <th>Dimensions</th>
+                <th>Type</th>
+                <th>Description</th>
+                <th>Computed From</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr class="highlight">
+                <td><code>W</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Working weights</td>
+                <td>Binary: mu*(1-mu), Quant: 1.0</td>
+            </tr>
+            <tr>
+                <td><code>tau</code></td>
+                <td>2</td>
+                <td>vector</td>
+                <td>Variance components from Step 1</td>
+                <td>GLMM fitting output</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>mu</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Fitted values (fixed effects only)</td>
+                <td>Binary: expit(X*alpha), Quant: X*alpha + offset</td>
+            </tr>
+            <tr>
+                <td><code>X</code></td>
+                <td>N x p</td>
+                <td>matrix</td>
+                <td>Design matrix (intercept + covariates)</td>
+                <td>Input data</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>Sigma_iX</code></td>
+                <td>N x p</td>
+                <td>matrix</td>
+                <td>Sigma^{-1} * X</td>
+                <td>PCG solve for each column of X</td>
+            </tr>
+            <tr>
+                <td><code>XV</code></td>
+                <td>p x N</td>
+                <td>matrix</td>
+                <td>(X .* V)' transposed</td>
+                <td>X and V (working weights or 1/tau[0])</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>XVX_inv</code></td>
+                <td>p x p</td>
+                <td>matrix</td>
+                <td>(X' * V * X)^{-1}</td>
+                <td>X, V</td>
+            </tr>
+            <tr>
+                <td><code>XXVX_inv</code></td>
+                <td>N x p</td>
+                <td>matrix</td>
+                <td>X * (X'VX)^{-1}</td>
+                <td>X, XVX_inv</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>G0</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Raw genotype for one marker</td>
+                <td>PLINK .bed file</td>
+            </tr>
+            <tr>
+                <td><code>AC</code></td>
+                <td>1</td>
+                <td>scalar</td>
+                <td>Allele count (minor allele)</td>
+                <td>sum(G0) after flip</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>G</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Covariate-adjusted genotype</td>
+                <td>G0 - XXVX_inv * (XV * G0)</td>
+            </tr>
+            <tr>
+                <td><code>g</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Normalized genotype</td>
+                <td>G / sqrt(AC)</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>Sigma_iG</code></td>
+                <td>N</td>
+                <td>vector</td>
+                <td>Sigma^{-1} * G</td>
+                <td>PCG solve</td>
+            </tr>
+            <tr>
+                <td><code>var1</code></td>
+                <td>1</td>
+                <td>scalar</td>
+                <td>Exact variance (from full mixed model)</td>
+                <td>See formula in Step e</td>
+            </tr>
+            <tr class="highlight">
+                <td><code>var2</code></td>
+                <td>1</td>
+                <td>scalar</td>
+                <td>Approximate variance (fixed-effects only)</td>
+                <td>Binary: sum(W*g^2), Quant: sum(g^2)</td>
+            </tr>
+            <tr>
+                <td><code>ratio</code></td>
+                <td>1</td>
+                <td>scalar</td>
+                <td>Variance ratio for one marker</td>
+                <td>var1 / var2</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ======================================================================= -->
+    <h2 id="section5">5. Binary vs Quantitative Differences</h2>
+
+    <table class="diff-table">
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Binary</th>
+                <th>Quantitative</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>W (weights)</strong></td>
+                <td class="binary-col"><code>W = mu * (1 - mu)</code></td>
+                <td class="quant-col"><code>W = 1.0</code> (vector of ones)</td>
+            </tr>
+            <tr>
+                <td><strong>Sigma</strong></td>
+                <td class="binary-col"><code>W^{-1} + tau[1]*K</code><br>(tau[0]=1 absorbed)</td>
+                <td class="quant-col"><code>tau[0]*I + tau[1]*K</code><br>(both tau components free)</td>
+            </tr>
+            <tr>
+                <td><strong>var2 formula</strong></td>
+                <td class="binary-col"><code>sum(mu*(1-mu) * g^2)</code></td>
+                <td class="quant-col"><code>sum(g^2)</code></td>
+            </tr>
+            <tr>
+                <td><strong>V in XV, XVX</strong></td>
+                <td class="binary-col"><code>V = W = mu*(1-mu)</code></td>
+                <td class="quant-col"><code>V = 1/tau[0]</code></td>
+            </tr>
+            <tr>
+                <td><strong>R function</strong></td>
+                <td class="binary-col">Inside <code>fitNULLGLMM</code> binary path<br>(lines ~2569-2800)</td>
+                <td class="quant-col">Inside <code>fitNULLGLMM</code> quantitative path<br>(lines ~2800-2956)</td>
+            </tr>
+            <tr>
+                <td><strong>Expected ratio range</strong></td>
+                <td class="binary-col">Typically 0.5 -- 1.0<br>(depends on heritability)</td>
+                <td class="quant-col">Typically 0.3 -- 1.0<br>(depends on heritability)</td>
+            </tr>
+            <tr>
+                <td><strong>Marker selection RNG</strong></td>
+                <td class="binary-col" colspan="2" style="text-align: center; background: #e8f5e9;"><span class="shared-badge">SHARED</span> -- same random marker selection logic</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="side-by-side">
+        <div class="panel panel-binary">
+            <h3>Binary: var2 Computation</h3>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="comment"># Binary approximate variance</span>
+<span class="comment"># Uses logistic variance function as weights</span>
+
+g = G / sqrt(AC)
+<span class="var">var2</span> = sum( mu*(1-mu) * g^2 )
+
+<span class="comment"># Equivalently:</span>
+<span class="comment"># var2 = sum( W * (G/sqrt(AC))^2 )</span>
+<span class="comment"># var2 = (1/AC) * sum( W * G^2 )</span>
+<span class="comment"># var2 = (1/AC) * G' * diag(W) * G</span>
+</pre>
+            </div>
+        </div>
+
+        <div class="panel panel-quant">
+            <h3>Quantitative: var2 Computation</h3>
+            <div class="call-tree" style="font-size: 12px;">
+<pre>
+<span class="comment"># Quantitative approximate variance</span>
+<span class="comment"># Weights are all 1.0 (identity link)</span>
+
+g = G / sqrt(AC)
+<span class="var">var2</span> = sum( g^2 )
+
+<span class="comment"># Equivalently:</span>
+<span class="comment"># var2 = sum( (G/sqrt(AC))^2 )</span>
+<span class="comment"># var2 = (1/AC) * sum( G^2 )</span>
+<span class="comment"># var2 = (1/AC) * G' * G</span>
+</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======================================================================= -->
+    <h2 id="section6">6. Output Format</h2>
+
+    <div class="note">
+        <h3>Tab-Separated Output</h3>
+        <p>The variance ratio is written to the output file in a tab-separated format with three columns:</p>
+    </div>
+
+    <div class="call-tree">
+<pre>
+<span class="comment"># Output file format (tab-separated, appended to model output)</span>
+<span class="comment"># Column 1: value     -- the computed ratio or related quantity</span>
+<span class="comment"># Column 2: type      -- "ratio" or "N" or other metadata type</span>
+<span class="comment"># Column 3: category  -- "varianceRatio" or other category label</span>
+
+<span class="comment"># Example output lines:</span>
+0.8234567    ratio    varianceRatio
+1000         N        varianceRatio
+
+<span class="comment"># For binary traits with categories (e.g., MAC groups), multiple ratio lines</span>
+<span class="comment"># may be output, one per category.</span>
+</pre>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Field</th>
+                <th>Type</th>
+                <th>Description</th>
+                <th>Example</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>value</code></td>
+                <td>numeric</td>
+                <td>The variance ratio (mean of per-marker ratios)</td>
+                <td><code>0.8234567</code></td>
+            </tr>
+            <tr>
+                <td><code>type</code></td>
+                <td>string</td>
+                <td>Identifier: "ratio" for the variance ratio value, "N" for sample count</td>
+                <td><code>ratio</code></td>
+            </tr>
+            <tr>
+                <td><code>category</code></td>
+                <td>string</td>
+                <td>Category label, always "varianceRatio" for this computation</td>
+                <td><code>varianceRatio</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ======================================================================= -->
+    <h2 id="section7">7. R vs C++ Comparison Notes (RNG Bypass)</h2>
+
+    <div class="note-warn">
+        <h3>Critical: Different RNG Produces Different Random Markers</h3>
+        <p>R and C++ use fundamentally different random number generators. This means the <strong>set of randomly
+        selected markers</strong> will differ between R and C++, even with the same seed. Since the variance ratio
+        is computed over randomly selected markers, different marker sets produce different (but statistically
+        equivalent) ratio estimates.</p>
+        <p style="margin-top: 10px;">This is analogous to the random vector bypass needed for trace estimation in the GLMM fitting loop.</p>
+    </div>
+
+    <div class="note-bypass">
+        <h3>Bypass Strategy for Exact R/C++ Match</h3>
+        <p>To achieve exact numerical comparison between R and C++, a bypass mechanism is needed:</p>
+        <ul style="margin-top: 8px; padding-left: 20px;">
+            <li><strong>R exports</strong> the list of randomly selected marker indices to a bypass file</li>
+            <li><strong>C++ reads</strong> the same marker indices from the bypass file</li>
+            <li>This ensures both implementations compute ratios for the <strong>identical set of markers</strong></li>
+            <li>The PCG solver and matrix operations are deterministic, so given the same markers, results will match</li>
+        </ul>
+        <p style="margin-top: 10px;">Without the bypass, differences of ~1-5% in the mean ratio are expected and acceptable, since the
+        ratio estimate is inherently stochastic (depends on which markers are randomly selected).</p>
+    </div>
+
+    <h3>7a. What Needs to Match vs What Can Differ</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>Deterministic?</th>
+                <th>R/C++ Match Without Bypass?</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Random marker selection</td>
+                <td>No (RNG-dependent)</td>
+                <td>No</td>
+                <td>Different RNG algorithms</td>
+            </tr>
+            <tr class="highlight">
+                <td>PCG solver (Sigma_iG)</td>
+                <td>Yes (given same input)</td>
+                <td>Yes</td>
+                <td>Both use same algorithm</td>
+            </tr>
+            <tr>
+                <td>Covariate adjustment (G)</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Matrix arithmetic is deterministic</td>
+            </tr>
+            <tr class="highlight">
+                <td>var1 computation</td>
+                <td>Yes (given same marker)</td>
+                <td>Yes</td>
+                <td>Dot products, matrix multiplies</td>
+            </tr>
+            <tr>
+                <td>var2 computation</td>
+                <td>Yes (given same marker)</td>
+                <td>Yes</td>
+                <td>Weighted sum of squares</td>
+            </tr>
+            <tr class="highlight">
+                <td>Per-marker ratio</td>
+                <td>Yes (given same marker)</td>
+                <td>Yes (with bypass)</td>
+                <td>Same marker gives same ratio</td>
+            </tr>
+            <tr>
+                <td>Mean ratio</td>
+                <td>No (depends on marker set)</td>
+                <td>No (without bypass)</td>
+                <td>Different markers, different mean</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ======================================================================= -->
+    <h2 id="section8">8. File Locations</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>R File</th>
+                <th>Line Range</th>
+                <th>C++ Standalone File</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr class="highlight">
+                <td><strong>Main variance ratio loop</strong></td>
+                <td><code>SAIGE_fitGLMM_fast.R</code></td>
+                <td>2569 -- 2956</td>
+                <td><code>variance_ratio_compute.cpp</code></td>
+                <td>Entry point for entire computation</td>
+            </tr>
+            <tr>
+                <td>Random marker selection</td>
+                <td><code>SAIGE_fitGLMM_fast.R</code></td>
+                <td>~2640</td>
+                <td><code>variance_ratio_compute.cpp</code></td>
+                <td>Uses R's sample() / C++ equivalent</td>
+            </tr>
+            <tr class="highlight">
+                <td>Sigma_iX precomputation</td>
+                <td><code>SAIGE_fitGLMM_fast.R</code></td>
+                <td>~2700</td>
+                <td><code>variance_ratio_compute.cpp</code></td>
+                <td>Calls getSigma_X / PCG loop</td>
+            </tr>
+            <tr>
+                <td>Genotype retrieval</td>
+                <td>Rcpp: <code>SAIGE_fitGLMM_fast.cpp</code></td>
+                <td>Get_OneSNP_Geno</td>
+                <td><code>SAIGE_step1_fast.cpp</code></td>
+                <td>Reads from PLINK .bed</td>
+            </tr>
+            <tr class="highlight">
+                <td>PCG solver</td>
+                <td>Rcpp: <code>SAIGE_fitGLMM_fast.cpp</code></td>
+                <td>~4500</td>
+                <td><code>SAIGE_step1_fast.cpp</code></td>
+                <td>getPCG1ofSigmaAndVector</td>
+            </tr>
+            <tr>
+                <td>GRM cross-product (K*v)</td>
+                <td>Rcpp: <code>SAIGE_fitGLMM_fast.cpp</code></td>
+                <td>~1733</td>
+                <td><code>SAIGE_step1_fast.cpp</code></td>
+                <td>getCrossprodMatAndKin</td>
+            </tr>
+            <tr class="highlight">
+                <td>Output writing</td>
+                <td><code>SAIGE_fitGLMM_fast.R</code></td>
+                <td>~2900</td>
+                <td><code>variance_ratio_compute.cpp</code></td>
+                <td>Tab-separated format</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="note">
+        <h3>R Code Reference (SAIGE_fitGLMM_fast.R:2569-2956)</h3>
+        <p>The R implementation lives inside <code>fitNULLGLMM()</code> after the GLMM fitting loop completes.
+        It uses the fitted null model object (<code>obj.glmm.fit</code>) which contains <code>mu</code>, <code>tau</code>,
+        <code>X</code>, <code>XV</code>, <code>XVX_inv</code>, <code>XXVX_inv</code>, and other precomputed quantities.</p>
+        <p style="margin-top: 10px;">The C++ standalone implementation in <code>variance_ratio_compute.cpp</code> receives these
+        quantities from the Step 1 output (either via the ScoreNullPack structure or loaded from .arma binary files).</p>
+    </div>
+
+    <hr style="margin: 40px 0;">
+    <p style="color: #888; font-size: 12px;">
+        Generated: February 10, 2026<br>
+        Variance Ratio Computation algorithm documentation for SAIGE R-to-C++ comparison project<br>
+        Output directory: <code>/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/</code>
+    </p>
+</div>
+</body>
+</html>

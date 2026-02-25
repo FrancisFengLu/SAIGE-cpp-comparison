@@ -3074,6 +3074,16 @@ extractVarianceRatio = function(obj.glmm.null,
   Nnomissing = length(mu)
   varRatioTable = NULL
 
+  ## BYPASS: accumulate VR marker info for C++ standalone
+  bypass_vr_snp_index <- c()
+  bypass_vr_geno_ind <- c()
+  bypass_vr_mac <- c()
+  bypass_vr_var1 <- c()
+  bypass_vr_var2null <- c()
+  bypass_vr_ratio <- c()
+  bypass_vr_orig_plink_index <- c()
+
+
 
   for(k in 1:length(listOfMarkersForVarRatio)){
     if(cateVarRatioIndexVec[k] == 1){
@@ -3183,6 +3193,14 @@ extractVarianceRatio = function(obj.glmm.null,
     }
 
     varRatio_NULL_vec = c(varRatio_NULL_vec, var1/var2null)
+    ## BYPASS: record this marker's info
+    bypass_vr_snp_index <- c(bypass_vr_snp_index, i - 1)  # 0-based index
+    bypass_vr_orig_plink_index <- c(bypass_vr_orig_plink_index, Indexvector_forVarRatio[i])  # 0-based plink marker index
+    bypass_vr_geno_ind <- c(bypass_vr_geno_ind, genoInd)
+    bypass_vr_mac <- c(bypass_vr_mac, (MACdata$MACvector)[macdata_i])
+    bypass_vr_var1 <- c(bypass_vr_var1, as.numeric(var1))
+    bypass_vr_var2null <- c(bypass_vr_var2null, as.numeric(var2null))
+    bypass_vr_ratio <- c(bypass_vr_ratio, as.numeric(var1/var2null))
     varRatio_NULL_noXadj_vec <- c(varRatio_NULL_noXadj_vec, var1 / var2null_noXadj)
     #indexInMarkerList = indexInMarkerList + 1
     numTestedMarker = numTestedMarker + 1
@@ -3238,6 +3256,22 @@ varRatioTable = rbind(varRatioTable, c(1, "null_noXadj", k))
   }
 
 } #for(k in 1:length(listOfMarkersForVarRatio)){
+
+  ## BYPASS: write VR marker info to CSV
+  dir.create("/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass", recursive=TRUE, showWarnings=FALSE)
+  bypass_vr_df <- data.frame(
+    snp_index = bypass_vr_snp_index,
+    geno_ind = bypass_vr_geno_ind,
+    mac = bypass_vr_mac,
+    var1 = bypass_vr_var1,
+    var2null = bypass_vr_var2null,
+    ratio = bypass_vr_ratio,
+    orig_plink_index = bypass_vr_orig_plink_index
+  )
+  write.csv(bypass_vr_df, "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/vr_marker_indices.csv", row.names=FALSE)
+  cat("BYPASS: wrote VR marker info to /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/vr_marker_indices.csv\n")
+  cat("BYPASS: ", nrow(bypass_vr_df), " markers recorded\n")
+
   write.table(varRatioTable, varRatioOutFile, quote=F, col.names=F, row.names=F)
   data = read.table(varRatioOutFile, header=F)
   print(data)

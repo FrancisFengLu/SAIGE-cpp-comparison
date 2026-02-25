@@ -90,6 +90,7 @@ public:
 
 	std::vector<int>	MACVec0; //for variance ratio based on different MAC categories
 	arma::ivec	MACVec;
+	std::vector<int>	origPlinkIdx0;  // mapping: main array index -> original plink marker index
 	arma::ivec	subMarkerIndex; //for sparse GRM
 	arma::fmat      stdGenoMultiMarkersMat;	
 	std::vector<float> stdGenoforSamples; //for sparse GRM
@@ -977,6 +978,7 @@ public:
 				numberofMarkerswithMAFge_minMAFtoConstructGRM = numberofMarkerswithMAFge_minMAFtoConstructGRM + 1;
 		
 				MACVec0.push_back(mac);	
+				origPlinkIdx0.push_back(i);  // store plink index for this main-array marker
 				MarkerswithMAFge_minMAFtoConstructGRM_indVec.push_back(true);
 				SNPIdx_new = SNPIdx_new + 1;
 			}else{
@@ -1359,6 +1361,14 @@ arma::ivec getMACVec(){
         return(geno.MACVec);
 }
 
+// Find main-array index for a given original plink marker index.
+// Returns -1 if not found (marker was filtered out or stored in VR array).
+int findMainArrayIdx(int origPlinkIdx){
+    for (size_t j = 0; j < geno.origPlinkIdx0.size(); ++j) {
+        if (geno.origPlinkIdx0[j] == origPlinkIdx) return static_cast<int>(j);
+    }
+    return -1;
+}
 
 
 // R CONNECTION: Returns minor allele counts for variance ratio calculation markers to R functions

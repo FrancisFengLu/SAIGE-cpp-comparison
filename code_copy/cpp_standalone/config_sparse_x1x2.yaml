@@ -1,10 +1,9 @@
 # Test config for SAIGE-null C++ standalone
-# Updated to use 128k marker dataset (128868 markers, 1000 samples)
-# Using sparse GRM for consistent comparison with R
+# Sparse GRM with x1+x2 covariates (same as config_test.yaml but different output prefix)
 paths:
   plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
-  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_output
-  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_test_vr
+  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_sparse_x1x2_output
+  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_sparse_x1x2_vr
   sparse_grm: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
   sparse_grm_ids: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
   overwrite_varratio: true
@@ -25,7 +24,7 @@ fit:
   maxiterPCG: 500
   nrun: 30
   num_markers_for_vr: 30
-  use_sparse_grm_to_fit: true  # false = dense GRM (PCG with full kinship), true = sparse GRM
-  use_pcg_with_sparse_grm: false  # false = direct solve (R default), true = PCG (only relevant when sparse)
+  use_sparse_grm_to_fit: true
+  use_pcg_with_sparse_grm: false
   relatedness_cutoff: 0.125
   overwrite_vr: true

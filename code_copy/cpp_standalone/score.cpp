@@ -1,4 +1,5 @@
 #include "score.hpp"
+#include "saige_null.hpp"
 #include "SAIGE_step1_fast.hpp"
 namespace saige {
 
@@ -97,6 +98,44 @@ ScoreNullSurv build_score_null_survival(const arma::fmat& X1,
   out.S_a.set_size(out.X1_fg.n_cols);
   for (arma::uword j = 0; j < out.X1_fg.n_cols; ++j) out.S_a(j) = arma::sum(out.X1_fg.col(j) % out.res);
   return out;
+}
+
+// ===== Convert ScoreNull → ScoreNullPack for serialization =====
+ScoreNullPack to_pack(const ScoreNull& sn,
+                       const arma::fmat& X_orig,
+                       const arma::fvec& y_vec,
+                       const arma::fvec& mu_vec,
+                       const std::string& trait)
+{
+  ScoreNullPack pk;
+  pk.n = sn.V.n_elem;
+  pk.p = sn.S_a.n_elem;
+  pk.trait_type = trait;
+
+  // N-length vectors (float → double)
+  pk.V   = arma::conv_to<std::vector<double>>::from(arma::conv_to<arma::vec>::from(sn.V));
+  pk.mu  = arma::conv_to<std::vector<double>>::from(arma::conv_to<arma::vec>::from(mu_vec));
+  pk.res = arma::conv_to<std::vector<double>>::from(arma::conv_to<arma::vec>::from(sn.res));
+  pk.y   = arma::conv_to<std::vector<double>>::from(arma::conv_to<arma::vec>::from(y_vec));
+
+  // p-length vector
+  pk.S_a = arma::conv_to<std::vector<double>>::from(arma::conv_to<arma::vec>::from(sn.S_a));
+
+  // Flatten matrices row-major (arma is col-major, so transpose first)
+  auto flatten = [](const arma::fmat& m) -> std::vector<double> {
+    arma::mat md = arma::conv_to<arma::mat>::from(m);
+    arma::mat mt = md.t();  // row-major = transpose of col-major
+    return arma::conv_to<std::vector<double>>::from(arma::vectorise(mt));
+  };
+
+  pk.XV         = flatten(sn.XV);
+  pk.XVX        = flatten(sn.XVX);
+  pk.XVX_inv    = flatten(sn.XVX_inv);
+  pk.XXVX_inv   = flatten(sn.XXVX_inv);
+  pk.XVX_inv_XV = flatten(sn.XVX_inv_XV);
+  pk.X          = flatten(X_orig);
+
+  return pk;
 }
 
 } // namespace saige
