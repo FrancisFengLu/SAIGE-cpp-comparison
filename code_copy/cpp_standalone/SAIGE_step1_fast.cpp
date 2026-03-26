@@ -1,5 +1,6 @@
 #define ARMA_USE_SUPERLU 1
 #include <RcppArmadillo.h>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -1014,7 +1015,6 @@ public:
 		//	cout << M << " markers with MAF >= " << minMAFtoConstructGRM << endl;
 		//}
 
-		
 		int numofGenoArray_old = numofGenoArray;
 		if(numberofMarkerswithMAFge_minMAFtoConstructGRM % numMarkersofEachArray == 0){
                         numofGenoArray = numberofMarkerswithMAFge_minMAFtoConstructGRM / numMarkersofEachArray;
@@ -2367,7 +2367,7 @@ arma::fvec Get_OneSNP_StdGeno(int SNPIdx)
 //Sigma = tau[1] * diag(1/W) + tau[2] * kins 
 // INTERNAL: Compute diagonal elements of sigma matrix
 arma::fvec getDiagOfSigma(arma::fvec& wVec, arma::fvec& tauVec){
-  
+  fprintf(stderr, "[DBG1b] getDiagOfSigma enter\n"); fflush(stderr);
 	int Nnomissing = geno.getNnomissing();
 	//int M = geno.getM();
 	int MminMAF = geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
@@ -3971,27 +3971,14 @@ arma::vec gen_spsolve_v3(arma::vec & yvec){
 
 arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yvec){
 
-//    double wall0in = get_wall_time();
-// double cpu0in  = get_cpu_time();
-
+    fprintf(stderr, "[DBG2] spsolve_v4 enter dimNum=%d\n", dimNum); fflush(stderr);
     arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
-//double wall1in = get_wall_time();
-// double cpu1in  = get_cpu_time();
-// cout << "Wall Time in gen_spsolve_v4 = " << wall1in - wall0in << endl;
-// cout << "CPU Time  in gen_spsolve_v4 = " << cpu1in - cpu0in  << endl;
 
     arma::sp_mat result = gen_sp_Sigma(wVec, tauVec);
+    fprintf(stderr, "[DBG3] gen_sp_Sigma done nnz=%llu\n", (unsigned long long)result.n_nonzero); fflush(stderr);
 
-//double wall2in = get_wall_time();
-// double cpu2in  = get_cpu_time();
-// cout << "Wall Time in gen_spsolve_v4 = " << wall2in - wall1in << endl;
-// cout << "CPU Time  in gen_spsolve_v4 = " << cpu2in - cpu1in  << endl;
-
-//    std::cout << "yvec.n_elem: " << yvec.n_elem << std::endl;
-//    std::cout << "yvec2.n_elem: " << yvec2.n_elem << std::endl;
-//    std::cout << "result.n_rows: " << result.n_rows << std::endl;
-//    std::cout << "result.n_cols: " << result.n_cols << std::endl;
     arma::vec x = arma::spsolve(result, yvec2);
+    fprintf(stderr, "[DBG4] spsolve done\n"); fflush(stderr);
 
 //double wall3in = get_wall_time();
 // double cpu3in  = get_cpu_time();
@@ -4050,6 +4037,10 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& wVec,
                                    const arma::fvec& bVec,
                                    int maxiterPCG, float tolPCG)
 {
+    { const char _m[] = "[DBG1] PCG ENTER\n"; write(2, _m, sizeof(_m)-1); }
+    fprintf(stderr, "[DBG1] PCG ENTER sparse=%d pcg=%d n=%zu\n",
+            (int)isUseSparseSigmaforModelFitting, (int)isUsePCGwithSparseSigma,
+            (size_t)bVec.n_elem); fflush(stderr);
     const arma::uword n = bVec.n_elem;
     if (n == 0) throw std::invalid_argument("PCG: bVec is empty");
     if (wVec.n_elem != n) throw std::invalid_argument("PCG: wVec.len != bVec.len");

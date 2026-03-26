@@ -52,7 +52,8 @@ void compute_variance_ratio(const Paths& paths,
 
     // VR marker bypass: when true, read marker indices from R's output
     // Set to true for testing exact match with R, then set back to false
-    bool use_r_vr_bypass = true;
+    // ===== Step 6: VR bypass disabled for production (was true for R-comparison testing) =====
+    bool use_r_vr_bypass = false;
 
     const int n = design.n;
     const int p = design.p;
@@ -179,6 +180,23 @@ void compute_variance_ratio(const Paths& paths,
     }
 
     std::cout << "[VR] Available markers for VR: " << numAvailMarkers << "\n";
+
+    // ===== Step 8: No markers found for VR (R line 3021) =====
+    // R: stop("No markers were found for variance ratio estimation...")
+    if (numAvailMarkers == 0) {
+      throw std::runtime_error(
+          "ERROR: No markers were found for variance ratio estimation. "
+          "Please make sure there are markers with MAC >= "
+          + std::to_string(cfg.vr_min_mac) + " in the plink file.");
+    }
+
+    // ===== Step 9: Insufficient markers for VR (R lines 3055-3063) =====
+    // R: if(length(listOfMarkersForVarRatio[[k]]) < numMarkers) stop(...)
+    if (numAvailMarkers < numMarkers_default) {
+      std::cerr << "[warning] Only " << numAvailMarkers
+                << " markers available for variance ratio estimation, but "
+                << numMarkers_default << " requested. Using all available markers.\n";
+    }
 
     // --- VR marker bypass: read marker indices from R's output ---
     // When use_r_vr_bypass is true, we read the exact marker order from R

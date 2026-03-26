@@ -1,0 +1,41 @@
+==56956== Callgrind, a call-graph generating cache profiler
+==56956== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==56956== Using Valgrind-3.26.0 and LibVEX; rerun with -h for copyright info
+==56956== Command: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/saige-null -c /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/config_ukb_ldl.yaml
+==56956== 
+--56956-- warning: L3 cache found, using its data for the LL simulation.
+==56956== For interactive control, run 'callgrind_control -h'.
+[load_paths] synthesizing from plinkFile/plinkfile
+==56956== brk segment overflow in thread #1: can't grow to 0x49fa000
+==56956== (see section Limitations in user manual)
+==56956== NOTE: further instances of this message will not be shown
+==56956== 
+==56956== Process terminating with default action of signal 15 (SIGTERM)
+==56956==    at 0x8236D71: ??? (in /usr/lib/x86_64-linux-gnu/libc.so.6)
+==56956==    by 0x82397EC: pthread_cond_wait (in /usr/lib/x86_64-linux-gnu/libc.so.6)
+==56956==    by 0x4F7AC6B: blas_thread_server (in /data/home/seokhojeong/.local/share/mamba/envs/saige-build/lib/libopenblasp-r0.3.31.so)
+==56956==    by 0x823AAA3: ??? (in /usr/lib/x86_64-linux-gnu/libc.so.6)
+==56956==    by 0x82C7A63: clone (in /usr/lib/x86_64-linux-gnu/libc.so.6)
+==56956== 
+==56956== Events    : Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+==56956== Collected : 1046095598850 80714726615 105328256132 19067 162532181 2580986322 8563 155197 1905050 246420446562 8357794226 31148793 1748054
+==56956== 
+==56956== I   refs:      1,046,095,598,850
+==56956== I1  misses:               19,067
+==56956== LLi misses:                8,563
+==56956== I1  miss rate:              0.00%
+==56956== LLi miss rate:              0.00%
+==56956== 
+==56956== D   refs:        186,042,982,747  ( 80,714,726,615 rd + 105,328,256,132 wr)
+==56956== D1  misses:        2,743,518,503  (    162,532,181 rd +   2,580,986,322 wr)
+==56956== LLd misses:            2,060,247  (        155,197 rd +       1,905,050 wr)
+==56956== D1  miss rate:               1.5% (            0.2%   +             2.5%  )
+==56956== LLd miss rate:               0.0% (            0.0%   +             0.0%  )
+==56956== 
+==56956== LL refs:           2,743,537,570  (    162,551,248 rd +   2,580,986,322 wr)
+==56956== LL misses:             2,068,810  (        163,760 rd +       1,905,050 wr)
+==56956== LL miss rate:                0.0% (            0.0%   +             0.0%  )
+==56956== 
+==56956== Branches:        246,451,595,355  (246,420,446,562 cond +      31,148,793 ind)
+==56956== Mispredicts:       8,359,542,280  (  8,357,794,226 cond +       1,748,054 ind)
+==56956== Mispred rate:                3.4% (            3.4%     +             5.6%   )

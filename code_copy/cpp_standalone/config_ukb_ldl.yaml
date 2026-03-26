@@ -1,0 +1,43 @@
+# Config for UKB LDL cholesterol (f.30780.0.0) Step 1 null model
+# Mirrors: step1_fitNULLGLMM.R --traitType=quantitative --invNormalize=TRUE --LOCO=FALSE
+# Phenotype: f.30780.0.0 (LDL direct, mmol/L), 1000 random white-British (39 missing LDL dropped at load time)
+# Covariates: Sex (categorical: Female/Male), Age, Batch, PC1-PC4
+# Dense GRM from LD-pruned UKB array (408,970 samples x 340,447 SNPs)
+# FAM overridden with mapped IDs (original plink fam has negative placeholder IDs)
+paths:
+  plinkFile: /media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned
+  fam: /media/leelabsg-storage0/seokho/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.mapped.fam
+  out_prefix: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_dense_output
+  out_prefix_vr: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_dense_vr
+  sparse_grm: ""
+  sparse_grm_ids: ""
+  overwrite_varratio: true
+
+design:
+  csv: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/Basic_trait_with_PheCode_table_ICD10_081123_whites_batches_famFiltered_random1000.tsv
+  iid_col: eid
+  y_col:   f.30780.0.0
+  covar_cols:
+    - Sex
+    - Age
+    - Batch
+    - PC1
+    - PC2
+    - PC3
+    - PC4
+
+fit:
+  trait: quantitative
+  inv_normalize: true
+  loco: false
+  nthreads: 1
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  num_markers_for_vr: 30
+  use_sparse_grm_to_fit: false
+  use_pcg_with_sparse_grm: false
+  relatedness_cutoff: 0.125
+  overwrite_vr: true

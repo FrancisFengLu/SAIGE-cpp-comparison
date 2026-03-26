@@ -67,8 +67,17 @@ struct FitNullConfig {
   std::string female_code{"1"};     // matches your R defaults
   std::string male_code{"0"};
 
-  bool        overwrite_vr{false}; 
+  bool        overwrite_vr{false};
 
+  // Categorical covariate column names (must be subset of covar_cols)
+  std::vector<std::string> q_covar_cols;
+
+  // Skip model fitting (load pre-existing model file)
+  bool skip_model_fitting{false};
+  std::string model_file;   // path to pre-existing .rda/.json model (when skip_model_fitting=true)
+
+  // Dry-run: validate inputs only, no genotype loading or solver
+  bool dry_run{false};
 };
 
 struct Paths {
@@ -129,6 +138,8 @@ struct FitNullResult {
   // Flags
   bool loco{false};
   bool lowmem_loco{false};
+  bool converged{false};       // Step 13: true if solver converged before maxiter
+  int  iterations{0};          // number of outer iterations run
 
   // Artifacts (paths); may be empty if not written
   std::string model_rda_path;     // main model artifact path (json/rds/etc.)

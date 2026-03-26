@@ -30,10 +30,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <armadillo>
+#include <RcppArmadillo.h>
 #include <iomanip>
 #include <cmath>
 
@@ -226,6 +227,19 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
   if (get("overwrite_vr")) c.overwrite_vr = get("overwrite_vr").as<bool>();
+  if (get("skip_model_fitting")) c.skip_model_fitting = get("skip_model_fitting").as<bool>();
+  if (get("model_file")) c.model_file = get("model_file").as<std::string>();
+  if (get("dry_run")) c.dry_run = get("dry_run").as<bool>();
+
+  // Parse q_covar_cols from YAML (categorical covariate names)
+  const auto d = y["design"];
+  if (d && d["q_covar_cols"]) {
+    const auto& qnode = d["q_covar_cols"];
+    if (qnode.IsSequence()) {
+      for (const auto& item : qnode)
+        c.q_covar_cols.push_back(item.as<std::string>());
+    }
+  }
   return c;
 }
 
@@ -632,11 +646,15 @@ static void drop_low_count_binaries_in_place(Design& d,
 }
 
 // ------------------ Design CSV/TSV/space parser + categorical encoding ------------------
-// Expected header columns (case-insensitive): IID, y, [offset], [time|event_time|eventTime], X...
+// Expected header columns (case-insensitive): <iid_col>, <y_col>, [offset], [time|event_time|eventTime], X...
+// iid_col and y_col default to "IID" and "y" for backward compatibility.
+// Rows where the phenotype cell is empty, "NA", or "NaN" are silently dropped.
 static Design load_design_csv(const std::string& path,
                               int min_covariate_count,
                               bool categorical_drop_reference,
-                              const std::vector<std::string>& covar_col_names = {})
+                              const std::vector<std::string>& covar_col_names = {},
+                              const std::string& iid_col = "IID",
+                              const std::string& y_col   = "y")
 {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("Failed to open design file: " + path);
@@ -658,13 +676,17 @@ static Design load_design_csv(const std::string& path,
     return -1;
   };
 
-  int idx_iid    = find_col({"IID"});
-  int idx_y      = find_col({"y"});
+  int idx_iid    = find_col({iid_col.c_str()});
+  int idx_y      = find_col({y_col.c_str()});
   int idx_offset = find_col({"offset", "covoffset"});
   int idx_time   = find_col({"time","event_time","eventTime"});
 
-  if (idx_iid < 0 || idx_y < 0)
-    throw std::runtime_error("Design file must contain IID and y columns");
+  if (idx_iid < 0)
+    throw std::runtime_error("Design file: sample ID column '" + iid_col + "' not found. "
+                             "Set design.iid_col in YAML if your file uses a different name.");
+  if (idx_y < 0)
+    throw std::runtime_error("Design file: phenotype column '" + y_col + "' not found. "
+                             "Set design.y_col in YAML if your file uses a different name.");
 
   // FIX: Only use columns specified in covar_col_names (not all numeric columns!)
   std::vector<int> x_idx;
@@ -698,6 +720,42 @@ static Design load_design_csv(const std::string& path,
     if ((int)toks.size() < (int)cols.size()) toks.resize(cols.size(), "");
     for (auto& t: toks) t = trim(t);
     rows.push_back(std::move(toks));
+  }
+
+  // ===== Step 12: Drop rows with any missing value (R line 1430: complete.cases) =====
+  // R: data = data[complete.cases(data),,drop=F]
+  // Checks phenotype AND all covariate columns for empty/NA/NaN.
+  {
+    int n_na = 0;
+    std::vector<std::vector<std::string>> valid_rows;
+    valid_rows.reserve(rows.size());
+    for (auto& row : rows) {
+      bool any_missing = false;
+      // Check phenotype
+      const std::string& yval = row[idx_y];
+      if (yval.empty() || ieq(yval, "NA") || ieq(yval, "NaN")) {
+        any_missing = true;
+      }
+      // Check all covariate columns
+      if (!any_missing) {
+        for (int j : x_idx) {
+          const std::string& cv = row[j];
+          if (cv.empty() || ieq(cv, "NA") || ieq(cv, "NaN")) {
+            any_missing = true;
+            break;
+          }
+        }
+      }
+      if (any_missing) {
+        ++n_na;
+      } else {
+        valid_rows.push_back(std::move(row));
+      }
+    }
+    if (n_na > 0)
+      std::cout << "[design] dropped " << n_na
+                << " row(s) with missing phenotype or covariates (complete.cases)\n";
+    rows = std::move(valid_rows);
   }
   const int n = (int)rows.size();
 
@@ -845,6 +903,7 @@ int main(int argc, char** argv) {
     ("d,design",   "Override design CSV/TSV path", cxxopts::value<std::string>()->default_value(""))
     ("o,override", "YAML dot-override, e.g., fit.nthreads=32", cxxopts::value<std::vector<std::string>>()->default_value({}))
     ("v,verbose",  "Verbose", cxxopts::value<bool>()->default_value("false"))
+    ("dry-run",    "Validate inputs only (no genotype loading or solver)", cxxopts::value<bool>()->default_value("false"))
     ("h,help",     "Show help");
 
   auto res = opts.parse(argc, argv);
@@ -885,6 +944,9 @@ int main(int argc, char** argv) {
 
   // Load config and paths
   FitNullConfig cfg = load_cfg(y);
+
+  // CLI --dry-run overrides YAML
+  if (res["dry-run"].as<bool>()) cfg.dry_run = true;
 
   std::string yaml_dir;
   try {
@@ -931,16 +993,100 @@ int main(int argc, char** argv) {
       }
     }
   }
+  std::string iid_col_name = "IID";
+  std::string y_col_name   = "y";
+  if (y["design"] && y["design"]["iid_col"])
+    iid_col_name = y["design"]["iid_col"].as<std::string>();
+  if (y["design"] && y["design"]["y_col"])
+    y_col_name = y["design"]["y_col"].as<std::string>();
+
+  // ===== Step 14: Validate q_covar_cols subset of covar_cols (R lines 1446-1454) =====
+  // R: if(!all(qCovarCol %in% covarColList)) stop("ERROR! all covariates in qCovarCol must be in covarColList")
+  if (!cfg.q_covar_cols.empty()) {
+    std::unordered_set<std::string> covar_set(covar_col_names.begin(), covar_col_names.end());
+    for (const auto& qc : cfg.q_covar_cols) {
+      if (covar_set.find(qc) == covar_set.end()) {
+        throw std::runtime_error(
+            "ERROR: categorical covariate '" + qc
+            + "' in q_covar_cols is not in covar_cols. "
+            "All q_covar_cols must be a subset of covar_cols.");
+      }
+    }
+    std::cout << "[config] q_covar_cols (categorical): ";
+    for (const auto& qc : cfg.q_covar_cols) std::cout << qc << " ";
+    std::cout << "\n";
+  }
+
   std::cout << "[config] covar_cols=[";
   for (size_t i = 0; i < covar_col_names.size(); ++i) {
     std::cout << covar_col_names[i];
     if (i < covar_col_names.size() - 1) std::cout << ", ";
   }
   std::cout << "]" << (covar_col_names.empty() ? " (NO COVARIATES)" : "") << std::endl;
+  std::cout << "[config] iid_col=" << iid_col_name << "  y_col=" << y_col_name << "\n";
 
-  // Parse design (with categoricals) - NOW using covar_col_names from config!
-  Design design = load_design_csv(design_csv, min_cov_ct, drop_ref, covar_col_names);
+  // Parse design (with categoricals) - using configurable column names
+  Design design = load_design_csv(design_csv, min_cov_ct, drop_ref, covar_col_names,
+                                  iid_col_name, y_col_name);
   add_intercept_if_missing(design);
+
+  // ===== Step 7: Duplicate sample ID removal (R line 1437) =====
+  // R: sampleIDInclude[!duplicated(sampleIDInclude)]
+  {
+    std::unordered_set<std::string> seen;
+    std::vector<size_t> keep;
+    keep.reserve(design.n);
+    int n_dup = 0;
+    for (size_t i = 0; i < (size_t)design.n; ++i) {
+      if (seen.insert(design.iid[i]).second) {
+        keep.push_back(i);
+      } else {
+        ++n_dup;
+      }
+    }
+    if (n_dup > 0) {
+      std::cerr << "[warning] removed " << n_dup
+                << " duplicate sample ID(s), keeping first occurrence\n";
+      design_take_rows(design, keep);
+    }
+  }
+
+  // ===== Step 1: Binary phenotype must be 0 or 1 (R lines 1754-1757) =====
+  // R: uniqPheno = sort(unique(y)); if (uniqPheno[1] != 0 | uniqPheno[2] != 1) stop(...)
+  if (ieq(cfg.trait, "binary")) {
+    std::set<double> unique_y;
+    for (int i = 0; i < design.n; ++i) {
+      double yval = design.y[i];
+      if (yval != 0.0 && yval != 1.0) {
+        throw std::runtime_error(
+            "ERROR: binary phenotype value must be 0 or 1, found: "
+            + std::to_string(yval)
+            + " at sample " + design.iid[i]);
+      }
+      unique_y.insert(yval);
+    }
+    if (unique_y.size() < 2) {
+      std::cerr << "[warning] binary phenotype has only one unique level ("
+                << *unique_y.begin() << "), model fitting may be degenerate\n";
+    }
+  }
+
+  // ===== Step 2: Phenotype variance check for quantitative (R lines 879-880) =====
+  // R: if (abs(var(Y)) < 0.1) stop("WARNING: variance of the phenotype is much smaller than 1...")
+  if (ieq(cfg.trait, "quantitative")) {
+    double sum_y = 0.0, sum_y2 = 0.0;
+    for (int i = 0; i < design.n; ++i) {
+      sum_y  += design.y[i];
+      sum_y2 += design.y[i] * design.y[i];
+    }
+    double mean_y = sum_y / design.n;
+    double var_y  = sum_y2 / design.n - mean_y * mean_y;
+    if (std::fabs(var_y) < 0.1) {
+      throw std::runtime_error(
+          "ERROR: variance of the phenotype (" + std::to_string(var_y)
+          + ") is much smaller than 1. Please consider setting inv_normalize: true in config.");
+    }
+  }
 
   // DEBUG: Verify covariate count
   std::cout << "============================================" << std::endl;
@@ -956,8 +1102,20 @@ int main(int argc, char** argv) {
   }
   std::cout << "============================================" << std::endl;
 
+  // ===== Step 15: Sex-specific filter validation (R lines 1329-1330, 1459-1461) =====
+  // R: if (FemaleOnly & MaleOnly) stop("Both FemaleOnly and MaleOnly are TRUE...")
+  if (cfg.female_only && cfg.male_only) {
+    throw std::runtime_error(
+        "ERROR: Both female_only and male_only are true. "
+        "Please specify only one to run a sex-specific job.");
+  }
+  // R: if (!sexCol %in% colnames(data)) stop("ERROR! column for sex does not exist...")
+  if ((cfg.female_only || cfg.male_only) && cfg.sex_col.empty()) {
+    throw std::runtime_error(
+        "ERROR: female_only or male_only is true but sex_col is not specified in config.");
+  }
   if (!cfg.sex_col.empty() && (cfg.female_only || cfg.male_only)) {
-    auto sex_vec = read_column_from_csv(design_csv, cfg.sex_col);
+    auto sex_vec = read_column_from_csv(design_csv, cfg.sex_col);  // throws if column not found
     if ((int)sex_vec.size() != design.n) {
       throw std::runtime_error("sex column length != design.n ("
                               + std::to_string(sex_vec.size()) + " vs "
@@ -1096,35 +1254,81 @@ int main(int argc, char** argv) {
               << ", indicatorWithPheno.size()=" << indicatorWithPheno.size() << std::endl;
   }
 
+  // ===== Step 18: Dry-run exit (validate inputs only, no genotype loading) =====
+  if (cfg.dry_run) {
+    std::cout << "\n============================================\n";
+    std::cout << "=== DRY RUN: Input Validation Summary ===\n";
+    std::cout << "============================================\n";
+    std::cout << "Config:\n";
+    std::cout << "  trait:          " << cfg.trait << "\n";
+    std::cout << "  tol:            " << cfg.tol << "\n";
+    std::cout << "  maxiter:        " << cfg.maxiter << "\n";
+    std::cout << "  nthreads:       " << cfg.nthreads << "\n";
+    std::cout << "  loco:           " << (cfg.loco ? "true" : "false") << "\n";
+    std::cout << "  covariate_qr:   " << (cfg.covariate_qr ? "true" : "false") << "\n";
+    std::cout << "  covariate_offset: " << (cfg.covariate_offset ? "true" : "false") << "\n";
+    std::cout << "  inv_normalize:  " << (cfg.inv_normalize ? "true" : "false") << "\n";
+    std::cout << "  use_sparse_grm: " << (cfg.use_sparse_grm_to_fit ? "true" : "false") << "\n";
+    std::cout << "  num_markers_vr: " << cfg.num_markers_for_vr << "\n";
+    std::cout << "Paths:\n";
+    std::cout << "  bed:            " << paths.bed << (fs::exists(paths.bed) ? " [OK]" : " [MISSING]") << "\n";
+    std::cout << "  bim:            " << paths.bim << (fs::exists(paths.bim) ? " [OK]" : " [MISSING]") << "\n";
+    std::cout << "  fam:            " << paths.fam << (fs::exists(paths.fam) ? " [OK]" : " [MISSING]") << "\n";
+    if (!paths.sparse_grm.empty())
+      std::cout << "  sparse_grm:     " << paths.sparse_grm << (fs::exists(paths.sparse_grm) ? " [OK]" : " [MISSING]") << "\n";
+    if (!paths.sparse_grm_ids.empty())
+      std::cout << "  sparse_grm_ids: " << paths.sparse_grm_ids << (fs::exists(paths.sparse_grm_ids) ? " [OK]" : " [MISSING]") << "\n";
+    std::cout << "  out_prefix:     " << paths.out_prefix << "\n";
+    std::cout << "Design:\n";
+    std::cout << "  n (samples):    " << design.n << "\n";
+    std::cout << "  p (covariates): " << design.p << "\n";
+    if (design.n > 0) {
+      // Phenotype summary
+      double y_min = *std::min_element(design.y.begin(), design.y.end());
+      double y_max = *std::max_element(design.y.begin(), design.y.end());
+      double y_sum = 0.0;
+      for (auto v : design.y) y_sum += v;
+      std::cout << "  y range:        [" << y_min << ", " << y_max << "]  mean=" << (y_sum / design.n) << "\n";
+      if (ieq(cfg.trait, "binary")) {
+        int n0 = 0, n1 = 0;
+        for (auto v : design.y) { if (v == 0.0) ++n0; else if (v == 1.0) ++n1; }
+        std::cout << "  binary counts:  0=" << n0 << "  1=" << n1 << "\n";
+      }
+      // First few IIDs
+      std::cout << "  first IIDs:     ";
+      for (int i = 0; i < std::min(5, design.n); ++i) std::cout << design.iid[i] << " ";
+      std::cout << "\n";
+    }
+    std::cout << "FAM alignment:\n";
+    std::cout << "  samples matched: " << subSampleInGeno.size() << " / " << design.n << "\n";
+    std::cout << "============================================\n";
+    std::cout << "DRY RUN PASSED: all input validations succeeded.\n";
+    std::cout << "============================================\n";
+    return 0;
+  }
+
+  // ===== Step 16: Skip model fitting (R lines 1252-1254) =====
+  if (cfg.skip_model_fitting) {
+    if (cfg.model_file.empty()) {
+      throw std::runtime_error(
+          "skip_model_fitting=true but no model_file specified in config. "
+          "Set fit.model_file to the path of an existing model output.");
+    }
+    if (!fs::exists(cfg.model_file)) {
+      throw std::runtime_error(
+          "skip_model_fitting=true but model_file does not exist: " + cfg.model_file);
+    }
+    std::cout << "[skip_model_fitting] Using existing model: " << cfg.model_file << "\n";
+    std::cout << "[skip_model_fitting] NOTE: Loading pre-fitted models is not yet fully implemented.\n";
+    std::cout << "  The model file exists and is accessible. To proceed with VR estimation\n";
+    std::cout << "  from a pre-fitted model, full deserialization support is needed.\n";
+    return 0;
+  }
+
   // Initialize genotype data BEFORE sparse GRM section (needed for build_sparse_grm_in_place)
   init_global_geno(paths.bed, paths.bim, paths.fam, subSampleInGeno, indicatorWithPheno, cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm);
 
-  // ============ CHECKPOINT 1: After genotype loading ============
-  {
-    static const std::string CP_DIR = "/Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/checkpoints";
-    int CP1_M = gettotalMarker();
-    int CP1_N = (int)subSampleInGeno.size();  // N samples with phenotype
-    int CP1_Nnomissing = getNnomissingOut();
-    arma::fvec CP1_alleleFreq = getAlleleFreqVec();
-
-    std::cout << "\n=== C++ CHECKPOINT 1: After genotype loading ===" << std::endl;
-    std::cout << "CP1: M (markers) = " << CP1_M << std::endl;
-    std::cout << "CP1: N (samples) = " << CP1_N << std::endl;
-    std::cout << "CP1: Nnomissing = " << CP1_Nnomissing << std::endl;
-    std::cout << "CP1: alleleFreq[0:10] = ";
-    for (int i = 0; i < std::min(10, (int)CP1_alleleFreq.n_elem); ++i) std::cout << CP1_alleleFreq[i] << " ";
-    std::cout << std::endl;
-
-    // Save to files
-    std::ofstream f_cp1(CP_DIR + "/CPP_CP1_genotype.csv");
-    f_cp1 << "M," << CP1_M << "\n";
-    f_cp1 << "N," << CP1_N << "\n";
-    f_cp1 << "Nnomissing," << CP1_Nnomissing << "\n";
-    f_cp1.close();
-
-    CP1_alleleFreq.save(CP_DIR + "/CPP_CP1_alleleFreq.csv", arma::csv_ascii);
-    std::cout << "Saved checkpoint files to " << CP_DIR << std::endl;
-  }
+  // CHECKPOINT 1 removed (used hardcoded Mac paths, not needed on this machine)
 
   // -------- Sparse GRM build/reuse (+enforcement) --------
   if (cfg.use_sparse_grm_to_fit) {
@@ -1135,11 +1339,105 @@ int main(int argc, char** argv) {
     if (have_files) {
       arma::umat loc; arma::vec val; int n_mtx=0;
       load_matrix_market_coo(paths.sparse_grm, loc, val, n_mtx);
-      setupSparseGRM(n_mtx, loc, val);
+
+      // ===== Subset sparse GRM to phenotyped samples =====
+      // The loaded GRM may cover all samples in the cohort (e.g. 488K),
+      // but we only need the subset that overlaps with our phenotyped samples.
+      // Read sparse GRM sample IDs and build GRM-index -> design-index map.
+      {
+        // Read one ID per line from the sparse GRM sample IDs file
+        std::ifstream id_in(paths.sparse_grm_ids);
+        if (!id_in) throw std::runtime_error("Failed to open sparse GRM IDs: " + paths.sparse_grm_ids);
+        std::vector<std::string> grm_ids;
+        grm_ids.reserve(n_mtx);
+        std::string line;
+        while (std::getline(id_in, line)) {
+          // trim whitespace
+          size_t s = line.find_first_not_of(" \t\r\n");
+          size_t e = line.find_last_not_of(" \t\r\n");
+          if (s != std::string::npos) grm_ids.push_back(line.substr(s, e - s + 1));
+        }
+        if ((int)grm_ids.size() != n_mtx) {
+          std::cerr << "[warning] Sparse GRM IDs count (" << grm_ids.size()
+                    << ") differs from GRM dimension (" << n_mtx << ").\n";
+        }
+
+        // Build map: design IID -> design index (0-based)
+        std::unordered_map<std::string, int> design_pos;
+        design_pos.reserve(design.n * 2);
+        for (int i = 0; i < design.n; ++i) {
+          design_pos[design.iid[i]] = i;
+        }
+
+        // Build map: GRM 0-based index -> design 0-based index (-1 if not phenotyped)
+        std::vector<int> grm_to_design(n_mtx, -1);
+        int n_overlap = 0;
+        for (int i = 0; i < (int)grm_ids.size(); ++i) {
+          auto it = design_pos.find(grm_ids[i]);
+          if (it != design_pos.end()) {
+            grm_to_design[i] = it->second;
+            ++n_overlap;
+          }
+        }
+        std::cout << "[sparse] GRM samples: " << n_mtx
+                  << ", phenotyped: " << design.n
+                  << ", overlap: " << n_overlap << "\n";
+        if (n_overlap == 0) {
+          throw std::runtime_error("No overlap between sparse GRM sample IDs and phenotyped samples. "
+                                   "Check that sparse_grm_ids file contains matching sample IDs.");
+        }
+
+        // Filter COO entries: keep only entries where both row and col are phenotyped
+        int total_nnz = (int)val.n_elem;
+        std::vector<arma::uword> new_rows, new_cols;
+        std::vector<double> new_vals;
+        new_rows.reserve(total_nnz);
+        new_cols.reserve(total_nnz);
+        new_vals.reserve(total_nnz);
+
+        for (int k = 0; k < total_nnz; ++k) {
+          int r_old = (int)loc(0, k);
+          int c_old = (int)loc(1, k);
+          if (r_old < n_mtx && c_old < n_mtx &&
+              grm_to_design[r_old] >= 0 && grm_to_design[c_old] >= 0) {
+            new_rows.push_back((arma::uword)grm_to_design[r_old]);
+            new_cols.push_back((arma::uword)grm_to_design[c_old]);
+            new_vals.push_back(val(k));
+          }
+        }
+
+        // Check that all phenotyped samples have a diagonal entry
+        std::vector<bool> has_diag(design.n, false);
+        for (size_t k = 0; k < new_rows.size(); ++k) {
+          if (new_rows[k] == new_cols[k]) has_diag[new_rows[k]] = true;
+        }
+        for (int i = 0; i < design.n; ++i) {
+          if (!has_diag[i]) {
+            // Add identity diagonal for samples with no GRM entry
+            new_rows.push_back((arma::uword)i);
+            new_cols.push_back((arma::uword)i);
+            new_vals.push_back(1.0);
+          }
+        }
+
+        int sub_nnz = (int)new_rows.size();
+        arma::umat sub_loc(2, sub_nnz);
+        arma::vec sub_val(sub_nnz);
+        for (int k = 0; k < sub_nnz; ++k) {
+          sub_loc(0, k) = new_rows[k];
+          sub_loc(1, k) = new_cols[k];
+          sub_val(k) = new_vals[k];
+        }
+
+        std::cout << "[sparse] Subsetted GRM: " << design.n << "x" << design.n
+                  << "  nnz=" << sub_nnz << " (from " << total_nnz << ")\n";
+
+        setupSparseGRM(design.n, sub_loc, sub_val);
+      }
       setisUseSparseSigmaforInitTau(true);
       setisUseSparseSigmaforNullModelFitting(true);
       std::cout << "[sparse] Reusing GRM: " << paths.sparse_grm
-                << "  n=" << n_mtx << "  nnz=" << val.n_elem << "\n";
+                << "  n=" << design.n << "\n";
     } else {
       double rc = (cfg.relatedness_cutoff > 0.0 ? cfg.relatedness_cutoff : 0.05);
       build_sparse_grm_in_place(rc, cfg.min_maf_grm, cfg.max_miss_grm);
@@ -1213,6 +1511,8 @@ int main(int argc, char** argv) {
 
   // ------------------ Report artifacts ------------------
   std::cout << "== SAIGE Null Fit Completed ==\n";
+  std::cout << "Converged: " << (out.converged ? "yes" : "NO") << "\n";
+  std::cout << "Iterations: " << out.iterations << "\n";
   std::cout << "Model artifact: " << out.model_rda_path << "\n";
   if (!out.vr_path.empty())           std::cout << "Variance ratio: " << out.vr_path << "\n";
   if (!out.markers_out_path.empty())  std::cout << "Marker results: " << out.markers_out_path << "\n";

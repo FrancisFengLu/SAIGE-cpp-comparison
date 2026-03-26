@@ -1,0 +1,35 @@
+Warning messages:
+1: replacing previous import ‘data.table::first’ by ‘dplyr::first’ when loading ‘SAIGE’ 
+2: replacing previous import ‘data.table::last’ by ‘dplyr::last’ when loading ‘SAIGE’ 
+3: replacing previous import ‘data.table::between’ by ‘dplyr::between’ when loading ‘SAIGE’ 
+Loading required package: optparse
+Warning: Your system is mis-configured: ‘/var/db/timezone/localtime’ is not a symlink
+Warning: ‘/var/db/timezone/localtime’ is not identical to any known timezone file
+Error in lm.fit(x, y, offset = offset, singular.ok = singular.ok, ...) : 
+  0 (non-NA) cases
+Calls: fitNULLGLMM -> Covariate_Transform -> lm -> lm.fit
+Execution halted
+Command exited with non-zero status 1
+	Command being timed: "docker run --rm -v /media/leelabsg-storage0:/media/leelabsg-storage0 wzhou88/saige:1.5.0.2 step1_fitNULLGLMM.R --plinkFile=/media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned --famFile=/media/leelabsg-storage0/seokho/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.mapped.fam --phenoFile=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/Basic_trait_with_PheCode_table_ICD10_081123_whites_batches_famFiltered_random1000_withIID.tsv --phenoCol=f.30780.0.0 --covarColList=Sex,Age,Batch,PC1,PC2,PC3,PC4 --qCovarCol=Sex --sampleIDColinphenoFile=IID --traitType=quantitative --invNormalize=TRUE --outputPrefix=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/benchmark_results/ukb_ldl_sparse_timed/r/saige_out --nThreads=1 --LOCO=FALSE --minMAFforGRM=0.01 --skipModelFitting=FALSE --tol=0.02 --tolPCG=1e-5 --maxiterPCG=500 --maxiter=20 --traceCVcutoff=0.0025 --isCovariateOffset=FALSE --isDiagofKinSetAsOne=TRUE --useSparseGRMtoFitNULL=TRUE --usePCGwithSparseGRM=FALSE --sparseGRMFile=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/UKB_sparseGRM_relatednessCutoff_0.05_5000_randomMarkersUsed.sparseGRM.mtx --sparseGRMSampleIDFile=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/UKB_sparseGRM_relatednessCutoff_0.05_5000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt --IsOverwriteVarianceRatioFile=TRUE"
+	User time (seconds): 0.03
+	System time (seconds): 0.03
+	Percent of CPU this job got: 1%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:05.52
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 26624
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3322
+	Voluntary context switches: 1098
+	Involuntary context switches: 1
+	Swaps: 0
+	File system inputs: 160
+	File system outputs: 24
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

@@ -1,0 +1,30 @@
+Warning messages:
+1: replacing previous import ‘data.table::first’ by ‘dplyr::first’ when loading ‘SAIGE’ 
+2: replacing previous import ‘data.table::last’ by ‘dplyr::last’ when loading ‘SAIGE’ 
+3: replacing previous import ‘data.table::between’ by ‘dplyr::between’ when loading ‘SAIGE’ 
+Loading required package: optparse
+Warning: Your system is mis-configured: ‘/var/db/timezone/localtime’ is not a symlink
+Warning: ‘/var/db/timezone/localtime’ is not identical to any known timezone file
+	Command being timed: "docker run --rm -v /media/leelabsg-storage0:/media/leelabsg-storage0 wzhou88/saige:1.5.0.2 step1_fitNULLGLMM.R --plinkFile=/media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr --phenoFile=/media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/pheno_1000samples.txt_withdosages_withBothTraitTypes.txt --phenoCol=y_quantitative --covarColList=x1 --sampleIDColinphenoFile=IID --traitType=quantitative --outputPrefix=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/benchmark_results/sparse_x1_nocache/r/saige_out --nThreads=1 --LOCO=FALSE --minMAFforGRM=0.01 --skipModelFitting=FALSE --tol=0.02 --tolPCG=1e-5 --maxiterPCG=500 --maxiter=20 --traceCVcutoff=0.0025 --isCovariateOffset=FALSE --isDiagofKinSetAsOne=TRUE --useSparseGRMtoFitNULL=TRUE --usePCGwithSparseGRM=FALSE --sparseGRMFile=/media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx --sparseGRMSampleIDFile=/media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt --IsOverwriteVarianceRatioFile=TRUE"
+	User time (seconds): 0.04
+	System time (seconds): 0.05
+	Percent of CPU this job got: 1%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:06.44
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 24576
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3385
+	Voluntary context switches: 1945
+	Involuntary context switches: 8
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 72
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

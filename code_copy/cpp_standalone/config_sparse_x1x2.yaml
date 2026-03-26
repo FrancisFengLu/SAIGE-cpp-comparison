@@ -1,15 +1,15 @@
 # Test config for SAIGE-null C++ standalone
 # Sparse GRM with x1+x2 covariates (same as config_test.yaml but different output prefix)
 paths:
-  plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/SAIGE_isolated/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
-  out_prefix: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_sparse_x1x2_output
-  out_prefix_vr: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/cpp_sparse_x1x2_vr
-  sparse_grm: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
-  sparse_grm_ids: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
+  plinkFile: /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  out_prefix: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/cpp_sparse_x1x2_output
+  out_prefix_vr: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/cpp_sparse_x1x2_vr
+  sparse_grm: /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx
+  sparse_grm_ids: /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/output/sparseGRM_relatednessCutoff_0.125_2000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt
   overwrite_varratio: true
 
 design:
-  csv: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/code_copy/cpp_standalone/design_test.csv
+  csv: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone/design_test.csv
   covar_cols:
     - x1
     - x2

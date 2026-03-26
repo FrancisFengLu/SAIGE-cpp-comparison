@@ -1,0 +1,214 @@
+R version 4.4.3 (2025-02-28)
+Platform: x86_64-conda-linux-gnu
+Running under: Ubuntu 20.04.4 LTS
+
+Matrix products: default
+BLAS/LAPACK: /app/.pixi/envs/default/lib/libopenblasp-r0.3.30.so;  LAPACK version 3.12.0
+
+locale:
+ [1] LC_CTYPE=C.UTF-8       LC_NUMERIC=C           LC_TIME=C.UTF-8       
+ [4] LC_COLLATE=C.UTF-8     LC_MONETARY=C.UTF-8    LC_MESSAGES=C.UTF-8   
+ [7] LC_PAPER=C.UTF-8       LC_NAME=C              LC_ADDRESS=C          
+[10] LC_TELEPHONE=C         LC_MEASUREMENT=C.UTF-8 LC_IDENTIFICATION=C   
+
+time zone: NA
+tzcode source: system (glibc)
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] optparse_1.7.5 SAIGE_1.5.0.2 
+
+loaded via a namespace (and not attached):
+ [1] R6_2.6.1           tidyselect_1.2.1   Matrix_1.7-3       lattice_0.22-7    
+ [5] magrittr_2.0.3     splines_4.4.3      getopt_1.20.4      glue_1.8.0        
+ [9] tibble_3.3.0       pkgconfig_2.0.3    RcppParallel_5.1.9 dplyr_1.1.4       
+[13] generics_0.1.4     lifecycle_1.0.4    cli_3.6.5          grid_4.4.3        
+[17] vctrs_0.6.5        data.table_1.17.8  compiler_4.4.3     pillar_1.11.0     
+[21] survival_3.8-3     Rcpp_1.1.0         rlang_1.1.6       
+$plinkFile
+[1] "/media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned"
+
+$bedFile
+[1] ""
+
+$bimFile
+[1] ""
+
+$famFile
+[1] "/media/leelabsg-storage0/seokho/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.mapped.fam"
+
+$phenoFile
+[1] "/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/Basic_trait_with_PheCode_table_ICD10_081123_whites_batches_famFiltered_random1000_withIID.tsv"
+
+$phenoCol
+[1] "f.30780.0.0"
+
+$traitType
+[1] "quantitative"
+
+$eventTimeCol
+[1] ""
+
+$pcgforUhatforSurvAnalysis
+[1] FALSE
+
+$invNormalize
+[1] TRUE
+
+$covarColList
+[1] "Sex,Age,Batch,PC1,PC2,PC3,PC4"
+
+$qCovarColList
+[1] "Sex"
+
+$sampleIDColinphenoFile
+[1] "IID"
+
+$tol
+[1] 0.02
+
+$maxiter
+[1] 20
+
+$tolPCG
+[1] 1e-05
+
+$maxiterPCG
+[1] 500
+
+$nThreads
+[1] 1
+
+$SPAcutoff
+[1] 2
+
+$numRandomMarkerforVarianceRatio
+[1] 30
+
+$skipModelFitting
+[1] FALSE
+
+$skipVarianceRatioEstimation
+[1] FALSE
+
+$memoryChunk
+[1] 2
+
+$tauInit
+[1] "0,0"
+
+$LOCO
+[1] FALSE
+
+$isLowMemLOCO
+[1] FALSE
+
+$traceCVcutoff
+[1] 0.0025
+
+$nrun
+[1] 30
+
+$ratioCVcutoff
+[1] 0.001
+
+$outputPrefix
+[1] "/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/benchmark_results/ukb_ldl_sparse_timed/r/saige_out"
+
+$outputPrefix_varRatio
+[1] ""
+
+$IsOverwriteVarianceRatioFile
+[1] TRUE
+
+$sparseGRMFile
+[1] "/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/UKB_sparseGRM_relatednessCutoff_0.05_5000_randomMarkersUsed.sparseGRM.mtx"
+
+$sparseGRMSampleIDFile
+[1] "/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/UKB_sparseGRM_relatednessCutoff_0.05_5000_randomMarkersUsed.sparseGRM.mtx.sampleIDs.txt"
+
+$isCateVarianceRatio
+[1] FALSE
+
+$relatednessCutoff
+[1] 0
+
+$cateVarRatioMinMACVecExclude
+[1] "10,20.5"
+
+$cateVarRatioMaxMACVecInclude
+[1] "20.5"
+
+$isCovariateTransform
+[1] TRUE
+
+$isDiagofKinSetAsOne
+[1] TRUE
+
+$useSparseGRMtoFitNULL
+[1] TRUE
+
+$usePCGwithSparseGRM
+[1] FALSE
+
+$useSparseGRMforVarRatio
+[1] FALSE
+
+$minMAFforGRM
+[1] 0.01
+
+$maxMissingRateforGRM
+[1] 0.15
+
+$minCovariateCount
+[1] -1
+
+$includeNonautoMarkersforVarRatio
+[1] FALSE
+
+$FemaleOnly
+[1] FALSE
+
+$MaleOnly
+[1] FALSE
+
+$sexCol
+[1] ""
+
+$FemaleCode
+[1] "1"
+
+$MaleCode
+[1] "0"
+
+$isCovariateOffset
+[1] FALSE
+
+$SampleIDIncludeFile
+[1] ""
+
+$help
+[1] FALSE
+
+tauInit  is  0 0 
+cateVarRatioMinMACVecExclude  is  10 20.5 
+cateVarRatioMaxMACVecInclude  is  20.5 
+The variance ratio file  /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/benchmark_results/ukb_ldl_sparse_timed/r/saige_out.varianceRatio.txt  already exists. IsOverwriteVarianceRatioFile=TRUE so the file will be overwritten
+sparse GRM will be used to fit the NULL model and nThreads is set to 1
+Leave-one-chromosome-out is not applied
+408970  samples have genotypes
+Sex are categorical covariates
+formula is  f.30780.0.0~Sex+Age+Batch+PC1+PC2+PC3+PC4 
+961  samples have non-missing phenotypes
+488377  samples are in the sparse GRM
+0  samples who have non-missing phenotypes are also in the sparse GRM
+408970  samples in geno file do not have phenotypes
+0  samples will be used for analysis
+Perform the inverse nomalization for  f.30780.0.0 
+ [1] IID          X.Intercept. SexMale      Age          Batch       
+ [6] PC1          PC2          PC3          PC4          f.30780.0.0 
+[11] IndexPheno   IndexGeno   
+<0 rows> (or 0-length row.names)
+qr transformation has been performed on covariates

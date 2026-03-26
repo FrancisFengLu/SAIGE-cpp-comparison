@@ -1,0 +1,527 @@
+[load_paths] synthesizing from plinkFile/plinkfile
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[SHIM] PCG enter
+[SHIM] w.n=961 tau.n=2 v.n=961
+[SHIM] copies done, calling global PCG
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[NullModelEngine] glmm solver Called
+[NullModelEngine] obj_noK (ScoreNullPack) populated
+[NullModelEngine] Saved .arma binary files for Step 2: mu, res, y, V, S_a, X, XV, XVX, XVX_inv, XXVX_inv, XVX_inv_XV
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+[DBG1] PCG ENTER
+[DBG1] PCG ENTER sparse=1 pcg=0 n=961
+[DBG2] spsolve_v4 enter dimNum=961
+[DBG3] gen_sp_Sigma done nnz=961
+[DBG4] spsolve done
+	Command being timed: "./saige-null -c config_ukb_ldl_sparse.yaml"
+	User time (seconds): 740.71
+	System time (seconds): 17.28
+	Percent of CPU this job got: 101%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 12:27.99
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 13979052
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 19
+	Minor (reclaiming a frame) page faults: 4098193
+	Voluntary context switches: 571
+	Involuntary context switches: 1681
+	Swaps: 0
+	File system inputs: 382880
+	File system outputs: 824
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

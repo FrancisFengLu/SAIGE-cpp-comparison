@@ -1,0 +1,11 @@
+==71515== Callgrind, a call-graph generating cache profiler
+==71515== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==71515== Using Valgrind-3.26.0 and LibVEX; rerun with -h for copyright info
+==71515== Command: ./saige-null -c config_ukb_ldl_sparse.yaml
+==71515== 
+--71515-- warning: L3 cache found, using its data for the LL simulation.
+==71515== For interactive control, run 'callgrind_control -h'.
+[load_paths] synthesizing from plinkFile/plinkfile
+==71515== brk segment overflow in thread #1: can't grow to 0x49fa000
+==71515== (see section Limitations in user manual)
+==71515== NOTE: further instances of this message will not be shown

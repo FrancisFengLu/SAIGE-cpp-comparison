@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <string>
 
@@ -119,7 +120,9 @@ static void stash_score_null_into(FitNullResult& out,
 // Call this from main() AFTER fit_null(...) if you want files on disk.
 // It writes baseline obj_noK and, if populated, a "loco" array with per-chr packs.
 static void export_score_null_json(const Paths& paths, const FitNullResult& res) {
-  const std::string out_path = paths.out_prefix + ".obj_noK.json";
+  // Ensure model directory exists
+  std::filesystem::create_directories(paths.out_prefix);
+  const std::string out_path = paths.out_prefix + "/obj_noK.json";
   std::ofstream os(out_path, std::ios::out | std::ios::trunc);
   if (!os) return;
 
@@ -718,6 +721,14 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
     // eta = (p > 0) ? (X * alpha + offset) : offset;  // BUG - REMOVED
 
     tau_prev = tau;  tau[1] = static_cast<float>(tau1_new);
+
+    // ===== Step 3: Tau break-on-zero, binary (R line 639) =====
+    // R: if(tau[2] == 0) break
+    if (tau[1] <= 0.0f) {
+      std::cout << "[binary_glmm] tau[1] <= 0 after update, stopping early.\n";
+      break;
+    }
+
     // Use R-style convergence: max(abs(tau - tau0)/(abs(tau) + abs(tau0) + tol)) < tol
     double rc_tau   = rel_change_R_style(tau, tau_prev, tol_coef);
     // R only checks tau for convergence in binary case (alpha already converged in Get_Coef)
@@ -806,6 +817,8 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
         out.theta = {static_cast<double>(tau[0]), static_cast<double>(tau[1])};
         out.offset = offset_in;
         stash_score_null_into(out, sn, n, p);
+        out.converged = false;  // debug early exit, not converged
+        out.iterations = it + 1;
         return out;
       }
     }
@@ -844,6 +857,9 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
       out.offset = offset_in;
 
       stash_score_null_into(out, sn, n, p);
+      // ===== Step 13: converged flag (R line 668) =====
+      out.converged = true;
+      out.iterations = it + 1;
       export_score_null_json(paths, out);
       std::cout << "=== CONVERGED at iteration " << it << " ===" << std::endl;
 
@@ -874,6 +890,18 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
       return out;
     }
 
+    // ===== Step 5: Max tau upper-bound warning + break (R lines 643-646) =====
+    // R: if(max(tau) > tol^(-2)) { warning("Large variance estimate..."); i = maxiter; break }
+    {
+      double tau_max_val = static_cast<double>(*std::max_element(tau.begin(), tau.end()));
+      double tau_upper = 1.0 / (tol_coef * tol_coef);
+      if (tau_max_val > tau_upper) {
+        std::cerr << "[warning] Large variance estimate (" << tau_max_val
+                  << " > " << tau_upper << "), model not converged.\n";
+        break;
+      }
+    }
+
     alpha_prev = alpha;
   }
 
@@ -890,7 +918,9 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
   out.offset = offset_in;
 
   stash_score_null_into(out, sn, n, p);
-  // export_score_null_json(paths, out);
+  // ===== Step 13: converged flag (R line 668) =====
+  out.converged = false;
+  out.iterations = maxiter;
 
   // ============ CHECKPOINT 6: Final results (max iterations reached) ============
   std::cout << "\n=== C++ CHECKPOINT 6: Final results (MAX ITERATIONS) ===" << std::endl;
@@ -1102,6 +1132,14 @@ FitNullResult quant_glmm_solver(const Paths& paths,
     tau_prev = tau;
     tau = tau_new;
 
+    // ===== Step 4: Tau break-on-zero, quantitative (R line 941) =====
+    // R: if(tau[1]<=0 | tau[2] <= 0) break
+    if (tau[0] <= 0.0f || tau[1] <= 0.0f) {
+      std::cout << "[quant_glmm] tau[0]=" << tau[0] << " tau[1]=" << tau[1]
+                << " <= 0, stopping early.\n";
+      break;
+    }
+
     // R-style convergence: max(abs(tau - tau0)/(abs(tau) + abs(tau0) + tol)) < tol
     double rc_tau = rel_change_R_style(tau, tau_prev, tol_coef);
 
@@ -1140,6 +1178,9 @@ FitNullResult quant_glmm_solver(const Paths& paths,
       out.offset = offset_in;
 
       stash_score_null_into(out, sn, n, p);
+      // ===== Step 13: converged flag (R line 974) =====
+      out.converged = true;
+      out.iterations = it + 1;
       export_score_null_json(paths, out);
 
       std::cout << "=== CONVERGED at iteration " << it << " ===" << std::endl;
@@ -1156,6 +1197,18 @@ FitNullResult quant_glmm_solver(const Paths& paths,
       }
 
       return out;
+    }
+
+    // ===== Step 5: Max tau upper-bound warning + break (R lines 947-950) =====
+    // R: if(max(tau) > tol^(-2)) { warning("Large variance estimate..."); i = maxiter; break }
+    {
+      double tau_max_val = static_cast<double>(*std::max_element(tau.begin(), tau.end()));
+      double tau_upper = 1.0 / (tol_coef * tol_coef);
+      if (tau_max_val > tau_upper) {
+        std::cerr << "[warning] Large variance estimate (" << tau_max_val
+                  << " > " << tau_upper << "), model not converged.\n";
+        break;
+      }
     }
 
     alpha_prev = coef.alpha;
@@ -1175,6 +1228,9 @@ FitNullResult quant_glmm_solver(const Paths& paths,
   out.offset = offset_in;
 
   stash_score_null_into(out, sn, n, p);
+  // ===== Step 13: converged flag (R line 974) =====
+  out.converged = false;
+  out.iterations = maxiter;
 
   std::cout << "\n=== MAX ITERATIONS REACHED ===" << std::endl;
   std::cout << "Final tau: [" << tau[0] << ", " << tau[1] << "]" << std::endl;

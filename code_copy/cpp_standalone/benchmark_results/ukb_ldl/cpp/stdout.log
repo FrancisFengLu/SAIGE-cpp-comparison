@@ -1,0 +1,47 @@
+plink_prefix: /media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned
+[config] covar_cols=[Sex, Age, Batch, PC1, PC2, PC3, PC4]
+[config] iid_col=eid  y_col=f.30780.0.0
+[design] Using specified covariates: Sex Age Batch PC1 PC2 PC3 PC4 
+[design] dropped 39 row(s) with missing phenotype or covariates (complete.cases)
+[design] added intercept column, new p=8
+============================================
+[DEBUG COVARIATE CHECK]
+  design.p (number of columns in X) = 8
+  design.n (number of samples) = 961
+  design.X.size() = 7688
+  Expected X size (n*p) = 7688
+  => WARNING: p > 1, covariates ARE present!
+============================================
+[design] after sex filter: n=961
+PATH/media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.bed
+[design] inverse-normalized phenotype
+[FAM] N_fam=408970, design.n=961, indicatorWithPheno.size()=408970
+[DEBUG init_global_geno] minMAFforGRM: 0.01, maxMissRateforGRM: 0.15, setKinDiagtoOne: 1
+nbyte: 102243
+nbyte: 241
+reserve: 82728624
+
+M: 340447, N: 408970
+setgeno mark1
+setgeno mark2
+Nnomissing (sample count for MAF): 961
+Marker 0: freq=0.0364204, maf=0.0364204, missRate=0.0437045, passQC=1
+Marker 1: freq=0.000520291, maf=0.000520291, missRate=0.00104058, passQC=0
+Marker 2: freq=0.0301769, maf=0.0301769, missRate=0, passQC=1
+Marker 3: freq=0.213319, maf=0.213319, missRate=0.00832466, passQC=1
+Marker 4: freq=0.000520291, maf=0.000520291, missRate=0.00520291, passQC=0
+Marker 5: freq=0.0057232, maf=0.0057232, missRate=0, passQC=0
+Marker 6: freq=0.024974, maf=0.024974, missRate=0.0145682, passQC=1
+Marker 7: freq=0.414152, maf=0.414152, missRate=0.00312175, passQC=1
+Marker 8: freq=0.168574, maf=0.168574, missRate=0.00104058, passQC=1
+Marker 9: freq=0.0260146, maf=0.0260146, missRate=0.00104058, passQC=1
+Marker 10: freq=0.0296566, maf=0.0296566, missRate=0.00104058, passQC=1
+Marker 11: freq=0.0343392, maf=0.0343392, missRate=0.00208117, passQC=1
+Marker 12: freq=0, maf=0, missRate=0, passQC=0
+Marker 13: freq=0.00728408, maf=0.00728408, missRate=0, passQC=0
+Marker 14: freq=0.000520291, maf=0.000520291, missRate=0, passQC=0
+Marker 15: freq=0.000520291, maf=0.000520291, missRate=0, passQC=0
+Marker 16: freq=0, maf=0, missRate=0.00104058, passQC=0
+Marker 17: freq=0, maf=0, missRate=0, passQC=0
+Marker 18: freq=0, maf=0, missRate=0.00104058, passQC=0
+Marker 19: freq=0.00260146, maf=0.00260146, missRate=0.00104058, passQC=0

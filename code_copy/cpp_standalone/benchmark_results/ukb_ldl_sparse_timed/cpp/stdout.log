@@ -1,0 +1,241 @@
+plink_prefix: /media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned
+[config] covar_cols=[Sex, Age, Batch, PC1, PC2, PC3, PC4]
+[config] iid_col=eid  y_col=f.30780.0.0
+[design] Using specified covariates: Sex Age Batch PC1 PC2 PC3 PC4 
+[design] dropped 39 row(s) with missing phenotype or covariates (complete.cases)
+[design] added intercept column, new p=8
+============================================
+[DEBUG COVARIATE CHECK]
+  design.p (number of columns in X) = 8
+  design.n (number of samples) = 961
+  design.X.size() = 7688
+  Expected X size (n*p) = 7688
+  => WARNING: p > 1, covariates ARE present!
+============================================
+[design] after sex filter: n=961
+PATH/media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.bed
+[design] inverse-normalized phenotype
+[FAM] N_fam=408970, design.n=961, indicatorWithPheno.size()=408970
+[DEBUG init_global_geno] minMAFforGRM: 0.01, maxMissRateforGRM: 0.15, setKinDiagtoOne: 1
+nbyte: 102243
+nbyte: 241
+reserve: 82728624
+
+M: 340447, N: 408970
+setgeno mark1
+setgeno mark2
+Nnomissing (sample count for MAF): 961
+Marker 0: freq=0.0364204, maf=0.0364204, missRate=0.0437045, passQC=1
+Marker 1: freq=0.000520291, maf=0.000520291, missRate=0.00104058, passQC=0
+Marker 2: freq=0.0301769, maf=0.0301769, missRate=0, passQC=1
+Marker 3: freq=0.213319, maf=0.213319, missRate=0.00832466, passQC=1
+Marker 4: freq=0.000520291, maf=0.000520291, missRate=0.00520291, passQC=0
+Marker 5: freq=0.0057232, maf=0.0057232, missRate=0, passQC=0
+Marker 6: freq=0.024974, maf=0.024974, missRate=0.0145682, passQC=1
+Marker 7: freq=0.414152, maf=0.414152, missRate=0.00312175, passQC=1
+Marker 8: freq=0.168574, maf=0.168574, missRate=0.00104058, passQC=1
+Marker 9: freq=0.0260146, maf=0.0260146, missRate=0.00104058, passQC=1
+Marker 10: freq=0.0296566, maf=0.0296566, missRate=0.00104058, passQC=1
+Marker 11: freq=0.0343392, maf=0.0343392, missRate=0.00208117, passQC=1
+Marker 12: freq=0, maf=0, missRate=0, passQC=0
+Marker 13: freq=0.00728408, maf=0.00728408, missRate=0, passQC=0
+Marker 14: freq=0.000520291, maf=0.000520291, missRate=0, passQC=0
+Marker 15: freq=0.000520291, maf=0.000520291, missRate=0, passQC=0
+Marker 16: freq=0, maf=0, missRate=0.00104058, passQC=0
+Marker 17: freq=0, maf=0, missRate=0, passQC=0
+Marker 18: freq=0, maf=0, missRate=0.00104058, passQC=0
+Marker 19: freq=0.00260146, maf=0.00260146, missRate=0.00104058, passQC=0
+248404 markers with MAF >= 0.01 and missing rate <= 0.15
+[load_matrix_market] Detected SYMMETRIC MatrixMarket format
+[load_matrix_market] Expanded 221670771 entries to 442853165 for symmetric matrix
+[sparse] GRM samples: 488377, phenotyped: 961, overlap: 961
+[sparse] Subsetted GRM: 961x961  nnz=963 (from 442853165)
+2 locationMat.n_rows 
+963 locationMat.n_cols 
+963 valueVec.n_elem 
+[sparse] Reusing GRM: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/UKB_sparseGRM_relatednessCutoff_0.05_5000_randomMarkersUsed.sparseGRM.mtx  n=961
+[sparse] use_pcg_with_sparse_grm=false (direct sparse solve, R default)
+[QR fingerprint] X(0,0)=1 X(0,1)=1 X(0,2)=69 X(1,0)=1 X(1,1)=1 X(1,2)=69
+[design] after covariate QR transform: 961 x 8
+      col0	col1	col2	col3	col4	col5	col6	col7	
+row0 1.0000	1.0000	69.0000	0.0000	-12.4835	4.9620	-3.5054	2.0120	
+row1 1.0000	1.0000	69.0000	0.0000	-12.4500	4.4085	-1.1075	2.2285	
+row2 1.0000	0.0000	45.0000	0.0000	-10.2764	3.3149	-2.0388	-1.2938	
+row3 1.0000	0.0000	65.0000	0.0000	-9.3628	0.2910	0.0853	1.4025	
+row4 1.0000	0.0000	65.0000	0.0000	-10.4625	1.6923	-3.8935	0.3713	
+... (961 rows total)
+[QR] Updated design_in.X to use transformed X (961 x 8)
+
+===== C++ Initial GLM Coefficients =====
+covariate_qr: true
+glm.beta (QR space): [0.3571, -0.1565, 0.0016, 0.0155, 0.0283, -0.0135, 0.0083, 0.0246]
+beta_cov (original space): [0.3571, -0.1565, 0.0016, 0.0155, 0.0283, -0.0135, 0.0083, 0.0246]
+glm.eta[0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176
+glm.mu[0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176
+==========================================
+
+
+===== C++ Quantitative GLMM Solver Initial Values =====
+tau: [1.0000, 0.0000]
+beta_init: [0.3571, -0.1565, 0.0016, 0.0155, 0.0283, -0.0135, 0.0083, 0.0246]
+eta[0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176
+y[0:5]: -1.6711 -1.4364 -0.6704 -0.7407 -0.6934
+n=961, p=8
+==========================================
+
+
+======================================================================
+=== C++ QUANT OUTER ITERATION 0 START ===
+tau at start: [1.0000, 0.0000]
+======================================================================
+
+--- Inner IRLS iteration 0 ---
+After irls_gaussian_build:
+  W[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000
+  Y[0:5]: -1.6711 -1.4364 -0.6704 -0.7407 -0.6934
+  |Y|: 30.9790, |W|: 31.0000
+ENTRY_getCoefficients_cpp_CALLED
+getCoefficients_cpp call #1 |Y|=30.9790 |W|=31.0000 tau=[1.0000,0.0000]
+
+===== C++ getCoefficients_cpp INPUT (call #1) =====
+Yvec size: 961, |Yvec|: 30.9790
+Xmat size: 961x8
+wVec size: 961, |wVec|: 31.0000
+tauVec: [1.0000, 0.0000]
+Yvec[0:5]: -1.6711 -1.4364 -0.6704 -0.7407 -0.6934
+wVec[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000
+============================================
+[DEBUG] About to call getPCG1ofSigmaAndVector for Y...
+[DEBUG] getPCG1ofSigmaAndVector for Y done
+[DEBUG] getPCG for X col 0...
+[DEBUG] getPCG for X col 1...
+[DEBUG] getPCG for X col 2...
+[DEBUG] getPCG for X col 3...
+[DEBUG] getPCG for X col 4...
+[DEBUG] getPCG for X col 5...
+[DEBUG] getPCG for X col 6...
+[DEBUG] getPCG for X col 7...
+[DEBUG] All Sigma_iX done
+[DEBUG] cov done
+[DEBUG] alpha done
+[DEBUG] eta done, returning from getCoefficients_cpp
+After getCoefficients_cpp:
+  alpha: [0.3571, -0.1565, 0.0016, 0.0155, 0.0283, -0.0135, 0.0083, 0.0246]
+  coef.eta[0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176
+  eta after update [0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176
+  rc_alpha (vs alpha0_outer): 0.0000 (tol=0.0200)
+  [Inner IRLS] CONVERGED after 1 iterations
+
+--- Final IRLS build after inner loop ---
+Final W[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000
+Final Y[0:5]: -1.6711 -1.4364 -0.6704 -0.7407 -0.6934
+Final |Y|: 30.9790, |W|: 31.0000
+[DEBUG-Q] PY computed, |PY|=30.7726
+[DEBUG-Q] APY computed, |APY|=30.5238
+[DEBUG-Q] About to call GetTrace_q...
+=== Entering GetTrace_q ===
+=== RANDOM VECTOR BYPASS CHECK (GetTrace_q) ===
+Looking for: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Jan_30_comparison/output/bypass/random_vectors_seed200.csv
+FILE NOT FOUND - will use C++ random generation
+To enable bypass: Run R version first to generate this file
+================================================
+GetTrace_q: Trace[0] (identity) = 952.5587, Trace[1] (kinship) = 945.3255
+[DEBUG-Q] GetTrace_q done
+
+========== C++ QUANT ITERATION 0 ==========
+tau_before: [1.0000, 0.0000]
+YPA0PY: 946.9536
+YPAPY: 939.1815
+Trace: [952.5587, 945.3255]
+Score: [-5.6051, -6.1440]
+AI:
+  [946.9536, 939.1815]
+  [939.1815, 931.6976]
+[CONSERVATIVE] Dtau: [-0.0058, -0.0000]
+[quant_glmm] tau[0]=0.9942 tau[1]=0.0000 <= 0, stopping early.
+ENTRY_getCoefficients_cpp_CALLED
+getCoefficients_cpp call #2 |Y|=30.9790 |W|=31.0000 tau=[0.9942,0.0000]
+
+===== C++ getCoefficients_cpp INPUT (call #2) =====
+Yvec size: 961, |Yvec|: 30.9790
+Xmat size: 961x8
+wVec size: 961, |wVec|: 31.0000
+tauVec: [0.9942, 0.0000]
+Yvec[0:5]: -1.6711 -1.4364 -0.6704 -0.7407 -0.6934
+wVec[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000
+============================================
+[DEBUG] About to call getPCG1ofSigmaAndVector for Y...
+[DEBUG] getPCG1ofSigmaAndVector for Y done
+[DEBUG] getPCG for X col 0...
+[DEBUG] getPCG for X col 1...
+[DEBUG] getPCG for X col 2...
+[DEBUG] getPCG for X col 3...
+[DEBUG] getPCG for X col 4...
+[DEBUG] getPCG for X col 5...
+[DEBUG] getPCG for X col 6...
+[DEBUG] getPCG for X col 7...
+[DEBUG] All Sigma_iX done
+[DEBUG] cov done
+[DEBUG] alpha done
+[DEBUG] eta done, returning from getCoefficients_cpp
+
+=== MAX ITERATIONS REACHED ===
+Final tau: [0.9942, 0.0000]
+Iterations: 20
+NullModelEngine Called
+VarianceRatioEngine Called
+
+===== Variance Ratio Computation =====
+[VR] tau = [0.9942, 0.0000]
+[VR] mu[0:5]: -0.0903 -0.0566 0.0437 0.2262 0.1176 
+[VR] W[0:5]: 1.0000 1.0000 1.0000 1.0000 1.0000 
+[VR] Sigma_iX computed: 961 x 8
+[VR] ScoreNull built. XV: 8x961, XXVX_inv: 961x8
+[VR] isVarRatioGeno: 0
+[VR] Available markers for VR: 248404
+[VR] Nnomissing: 961
+[VR] Marker 10/30: AC=31.0000 AF=0.0161 var1=0.9662 var2=0.9606 ratio=1.0059
+[VR] Marker 20/30: AC=22.0000 AF=0.0114 var1=0.9737 var2=0.9680 ratio=1.0059
+[VR] Marker 30/30: AC=60.0000 AF=0.0312 var1=0.9370 var2=0.9315 ratio=1.0059
+[VR] CV for variance ratio estimate using 30 markers is 0.0000 <= 0.0010
+[VR] Final varRatio_null: 1.0059 (using 30 markers)
+[VR] Final varRatio_null_noXadj: 0.9994
+[VR] Wrote variance ratios to: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_vr.varianceRatio.txt
+[VR] Wrote marker results to: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_vr.30markers.SAIGE.results.txt
+===== Variance Ratio Complete =====
+
+DEBUG: Sample 0 final cumsum = 248398.7188
+DEBUG: Wrote stdGeno to /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/jan_14_comparison/cpp_stdgeno.txt
+
+=== DEBUG GRM Diagonal ===
+MminMAF (number of markers): 248404
+Sample 1: raw=248398.7188, normalized=1.0000
+Sample 2: raw=246600.1562, normalized=0.9927
+Sample 3: raw=246535.4375, normalized=0.9925
+Sample 4: raw=245103.3594, normalized=0.9867
+Sample 5: raw=246569.7812, normalized=0.9926
+
+=== DEBUG: ptrsubSampleInGeno for samples 1-5 ===
+subSampleInGeno size: 961
+Sample 1 -> FAM index 124174
+Sample 2 -> FAM index 135844
+Sample 3 -> FAM index 355635
+Sample 4 -> FAM index 360041
+Sample 5 -> FAM index 220226
+
+=== DEBUG: Samples 1-5 genotype distributions ===
+Sample 1: 0=195483, 1=43918, 2=9003
+Sample 2: 0=195440, 1=44090, 2=8874
+Sample 3: 0=195140, 1=44437, 2=8827
+Sample 4: 0=195726, 1=43804, 2=8874
+Sample 5: 0=195579, 1=43707, 2=9118
+=========================
+
+GRM diagonal output: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_output.grm_diag.txt (961 values)
+== SAIGE Null Fit Completed ==
+Converged: NO
+Iterations: 20
+Model artifact: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_output.nullmodel.json
+Variance ratio: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_vr.varianceRatio.txt
+Marker results: /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/ukb_ldl_sparse_vr.30markers.SAIGE.results.txt
+LOCO: off  LowMem: no

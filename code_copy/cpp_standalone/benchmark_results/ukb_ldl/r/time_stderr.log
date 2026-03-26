@@ -1,0 +1,76 @@
+Unable to find image 'wzhou88/saige:1.5.0.2' locally
+1.5.0.2: Pulling from wzhou88/saige
+d7bfe07ed847: Pulling fs layer
+e26a22f9b9b6: Pulling fs layer
+1122dc6eced1: Pulling fs layer
+70e31a996a35: Pulling fs layer
+384fb2101864: Pulling fs layer
+70e31a996a35: Waiting
+e63d85e4532d: Pulling fs layer
+9337f046cad6: Pulling fs layer
+384fb2101864: Waiting
+e63d85e4532d: Waiting
+feaefc96b35c: Pulling fs layer
+feaefc96b35c: Waiting
+1122dc6eced1: Verifying Checksum
+1122dc6eced1: Download complete
+e26a22f9b9b6: Verifying Checksum
+e26a22f9b9b6: Download complete
+d7bfe07ed847: Verifying Checksum
+d7bfe07ed847: Download complete
+e63d85e4532d: Verifying Checksum
+e63d85e4532d: Download complete
+d7bfe07ed847: Pull complete
+e26a22f9b9b6: Pull complete
+1122dc6eced1: Pull complete
+9337f046cad6: Verifying Checksum
+9337f046cad6: Download complete
+feaefc96b35c: Verifying Checksum
+feaefc96b35c: Download complete
+70e31a996a35: Verifying Checksum
+70e31a996a35: Download complete
+70e31a996a35: Pull complete
+384fb2101864: Verifying Checksum
+384fb2101864: Download complete
+384fb2101864: Pull complete
+e63d85e4532d: Pull complete
+9337f046cad6: Pull complete
+feaefc96b35c: Pull complete
+Digest: sha256:5b8f6e76a7fd0a9c1347ba91e370fb3310c6e2077be3005e1fa29157193fb29c
+Status: Downloaded newer image for wzhou88/saige:1.5.0.2
+Warning messages:
+1: replacing previous import ‘data.table::first’ by ‘dplyr::first’ when loading ‘SAIGE’ 
+2: replacing previous import ‘data.table::last’ by ‘dplyr::last’ when loading ‘SAIGE’ 
+3: replacing previous import ‘data.table::between’ by ‘dplyr::between’ when loading ‘SAIGE’ 
+Loading required package: optparse
+Warning: Your system is mis-configured: ‘/var/db/timezone/localtime’ is not a symlink
+Warning: ‘/var/db/timezone/localtime’ is not identical to any known timezone file
+Usage: /usr/local/bin/step1_fitNULLGLMM.R [options]
+
+/usr/local/bin/step1_fitNULLGLMM.R: error: Error in getopt(spec = spec, opt = args) : 
+  long flag "numMarkersForVarRatio" is invalid
+
+Command exited with non-zero status 1
+	Command being timed: "docker run --rm -v /media/leelabsg-storage0:/media/leelabsg-storage0 wzhou88/saige:1.5.0.2 step1_fitNULLGLMM.R --plinkFile=/media/leelabsg-storage0/DATA/UKBB/cal/pruned/output/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned --famFile=/media/leelabsg-storage0/seokho/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.mapped.fam --phenoFile=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/ukb_exp/Basic_trait_with_PheCode_table_ICD10_081123_whites_batches_famFiltered_random1000.tsv --phenoCol=f.30780.0.0 --covarColList=Sex,Age,Batch,PC1,PC2,PC3,PC4 --qCovarCol=Sex --sampleIDColinphenoFile=eid --traitType=quantitative --invNormalize=TRUE --outputPrefix=/media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone_update/benchmark_results/ukb_ldl/r/saige_out --nThreads=1 --LOCO=FALSE --minMAFforGRM=0.01 --skipModelFitting=FALSE --tol=0.02 --tolPCG=1e-5 --maxiterPCG=500 --maxiter=20 --traceCVcutoff=0.0025 --isCovariateOffset=FALSE --isDiagofKinSetAsOne=TRUE --numMarkersForVarRatio=30 --IsOverwriteVarianceRatioFile=TRUE"
+	User time (seconds): 0.08
+	System time (seconds): 0.11
+	Percent of CPU this job got: 0%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:18.97
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 24576
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 155
+	Minor (reclaiming a frame) page faults: 3389
+	Voluntary context switches: 3541
+	Involuntary context switches: 3
+	Swaps: 0
+	File system inputs: 48744
+	File system outputs: 48
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

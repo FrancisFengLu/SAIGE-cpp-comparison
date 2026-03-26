@@ -318,7 +318,7 @@ static void ensure_parent_dir(const std::string& out_path) {
 }
 
 static std::string default_model_path(const std::string& prefix) {
-  return prefix + ".nullmodel.json"; // JSON stub; replace with your serializer
+  return prefix + "/nullmodel.json"; // directory-based: prefix is the model directory
 }
 
 FitNullResult NullModelEngine::run(const Design& design_in_const) {
@@ -713,8 +713,9 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
     log("obj_noK (ScoreNullPack) populated");
 
     // --- Save .arma binary files for Step 2 ---
-    std::string prefix = paths_.out_prefix;
-    ensure_parent_dir(prefix + ".mu.arma");
+    std::string model_dir = paths_.out_prefix;
+    // Create the model directory if it doesn't exist
+    fs::create_directories(model_dir);
 
     // Convert to double-precision arma vectors/matrices for saving
     arma::vec mu_d = arma::conv_to<arma::vec>::from(mu_arma);
@@ -729,17 +730,17 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
     arma::mat XXVX_inv_d = arma::conv_to<arma::mat>::from(sn.XXVX_inv);
     arma::mat XVX_inv_XV_d = arma::conv_to<arma::mat>::from(sn.XVX_inv_XV);
 
-    mu_d.save(prefix + ".mu.arma", arma::arma_binary);
-    res_d.save(prefix + ".res.arma", arma::arma_binary);
-    y_d.save(prefix + ".y.arma", arma::arma_binary);
-    V_d.save(prefix + ".V.arma", arma::arma_binary);
-    S_a_d.save(prefix + ".S_a.arma", arma::arma_binary);
-    X_d.save(prefix + ".X.arma", arma::arma_binary);
-    XV_d.save(prefix + ".XV.arma", arma::arma_binary);
-    XVX_d.save(prefix + ".XVX.arma", arma::arma_binary);
-    XVX_inv_d.save(prefix + ".XVX_inv.arma", arma::arma_binary);
-    XXVX_inv_d.save(prefix + ".XXVX_inv.arma", arma::arma_binary);
-    XVX_inv_XV_d.save(prefix + ".XVX_inv_XV.arma", arma::arma_binary);
+    mu_d.save(model_dir + "/mu.arma", arma::arma_binary);
+    res_d.save(model_dir + "/res.arma", arma::arma_binary);
+    y_d.save(model_dir + "/y.arma", arma::arma_binary);
+    V_d.save(model_dir + "/V.arma", arma::arma_binary);
+    S_a_d.save(model_dir + "/S_a.arma", arma::arma_binary);
+    X_d.save(model_dir + "/X.arma", arma::arma_binary);
+    XV_d.save(model_dir + "/XV.arma", arma::arma_binary);
+    XVX_d.save(model_dir + "/XVX.arma", arma::arma_binary);
+    XVX_inv_d.save(model_dir + "/XVX_inv.arma", arma::arma_binary);
+    XXVX_inv_d.save(model_dir + "/XXVX_inv.arma", arma::arma_binary);
+    XVX_inv_XV_d.save(model_dir + "/XVX_inv_XV.arma", arma::arma_binary);
 
     log("Saved .arma binary files for Step 2: mu, res, y, V, S_a, X, XV, XVX, XVX_inv, XXVX_inv, XVX_inv_XV");
   } catch (const std::exception& e) {
