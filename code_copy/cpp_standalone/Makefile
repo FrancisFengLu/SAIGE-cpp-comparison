@@ -1,4 +1,11 @@
-CXX      ?= clang++
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+  CXX ?= clang++
+else
+  CXX ?= g++
+endif
+
 CXXFLAGS ?= -std=c++17 -O3 -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=0 -MMD -MP
 
 RSCRIPT      := $(shell command -v Rscript 2>/dev/null)
@@ -9,6 +16,7 @@ ifeq ($(strip $(RSCRIPT)),)
   RCPP_INC     :=
   RCPPARM_INC  :=
   RCPPARAL_INC :=
+  RCPPEIG_INC  :=
 else
   R_HOME       := $(shell "$(RSCRIPT)" -e 'cat(R.home())')
   RCPP_INC     := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="Rcpp"))')
@@ -29,7 +37,15 @@ else
   YAML_LIBS   := $(shell "$(PKG_CONFIG)" --libs yaml-cpp 2>/dev/null)
 endif
 
-INCLUDES := -I/usr/local/include -I/usr/include/eigen3 -I/opt/homebrew/opt/boost/include -I/opt/homebrew/include -I/opt/homebrew/var/homebrew/tmp/.cellar/eigen/5.0.1/include/eigen3
+ifeq ($(UNAME_S),Darwin)
+  INCLUDES := -I/usr/local/include \
+              -I/opt/homebrew/opt/boost/include \
+              -I/opt/homebrew/include \
+              -I/opt/homebrew/opt/eigen/include/eigen3
+else
+  INCLUDES := -I/usr/local/include \
+              -I/usr/include/eigen3
+endif
 
 ifneq ($(strip $(R_HOME)),)
   INCLUDES += -I"$(R_HOME)/include"
@@ -54,7 +70,21 @@ ifneq ($(strip $(ARMA_CFLAGS)),)
   INCLUDES += $(ARMA_CFLAGS)
 endif
 
-LIBS := -lyaml-cpp -larmadillo -L/opt/homebrew/opt/openblas/lib -lopenblas -llapack -L/opt/homebrew/opt/superlu/lib -lsuperlu -L/opt/homebrew/opt/tbb/lib -ltbb
+ifeq ($(UNAME_S),Darwin)
+  LIBS := -lyaml-cpp \
+          -larmadillo \
+          -L/opt/homebrew/opt/openblas/lib -lopenblas \
+          -llapack \
+          -L/opt/homebrew/opt/superlu/lib -lsuperlu \
+          -L/opt/homebrew/opt/tbb/lib -ltbb
+else
+  LIBS := -lyaml-cpp \
+          -larmadillo \
+          -lopenblas \
+          -llapack \
+          -lsuperlu \
+          -ltbb
+endif
 
 ifneq ($(strip $(YAML_LIBS)),)
   LIBS += $(YAML_LIBS)

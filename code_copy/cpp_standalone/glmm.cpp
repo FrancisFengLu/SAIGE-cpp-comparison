@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <string>
+#include <filesystem>
 
 namespace saige {
 
@@ -119,7 +120,9 @@ static void stash_score_null_into(FitNullResult& out,
 // Call this from main() AFTER fit_null(...) if you want files on disk.
 // It writes baseline obj_noK and, if populated, a "loco" array with per-chr packs.
 static void export_score_null_json(const Paths& paths, const FitNullResult& res) {
-  const std::string out_path = paths.out_prefix + ".obj_noK.json";
+  // Ensure model directory exists
+  std::filesystem::create_directories(paths.out_prefix);
+  const std::string out_path = paths.out_prefix + "/obj_noK.json";
   std::ofstream os(out_path, std::ios::out | std::ios::trunc);
   if (!os) return;
 
