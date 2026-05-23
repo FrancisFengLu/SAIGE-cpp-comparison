@@ -1,0 +1,40 @@
+# SAIGE Step 2 Standalone - Region/Gene-Based Testing Configuration
+# ==================================================================
+# Quantitative trait region-based test (BURDEN/SKAT/SKAT-O)
+# for comparison with R SAIGE output.
+#
+# Uses null model extracted from SAIGE's example_quantitative.rda
+# and the same genotype file.
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_quantitative.varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_compare_region_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: false
+
+# Region/gene-based testing parameters
+groupFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/group_region_test_cpp.txt
+annotationList:
+  - "lof"
+  - "missense;lof"
+maxMAFList:
+  - 0.0001
+  - 0.001
+  - 0.01
+
+# SKAT-O (r_corr=0) produces BURDEN, SKAT, and SKAT-O p-values
+r_corr: 0
+MACCutoff_to_CollapseUltraRare: 10
+markers_per_chunk_in_groupTest: 100
+groups_per_chunk: 100
+weights_beta:
+  - 1
+  - 25
+isSingleInGroupTest: true
+isOutputMarkerList: false

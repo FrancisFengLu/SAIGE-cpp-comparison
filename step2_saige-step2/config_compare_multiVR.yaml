@@ -1,0 +1,30 @@
+# SAIGE Step 2 Standalone - Multi-Category VR Test Configuration
+# ==============================================================
+# Test 8: Multiple variance ratio categories
+#
+# Uses the same null model as config_compare.yaml but with a
+# multi-category VR file (2 "null" rows with different VR values).
+#
+# VR categories:
+#   VR[0] = 1.15000000000000 for MAC in (10.5, 20.5]  (low-MAC category)
+#   VR[1] = 1.22420115246319 for MAC in (20.5, 1000]  (high-MAC category)
+#   Fallback: MAC <= 10.5 uses VR[0]
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/multiVR_varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_multiVR_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Multi-category VR boundaries (must match R's defaults)
+# R defaults: cateVarRatioMinMACVecExclude = c(10.5, 20.5)
+#             cateVarRatioMaxMACVecInclude = c(20.5, N)
+# R appends N=1000 to cateVarRatioMaxMACVecInclude
+cateVarRatioMinMACVecExclude: [10.5, 20.5]
+cateVarRatioMaxMACVecInclude: [20.5, 1000]

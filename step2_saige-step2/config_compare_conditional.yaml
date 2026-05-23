@@ -1,0 +1,25 @@
+# SAIGE Step 2 Standalone - Conditional Analysis Configuration
+# ==============================================================
+# Uses null model extracted from SAIGE's example_quantitative.rda
+# so that C++ results can be directly compared with R SAIGE output.
+#
+# Conditioning on markers: rs1e+05, rs8, rs9
+# These are common markers with good allele frequencies in chr 1.
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_quantitative.varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_compare_conditional_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Conditional analysis: condition on these markers (rsIDs from .bim column 2)
+condition:
+  - "rs1e+05"
+  - "rs8"
+  - "rs9"

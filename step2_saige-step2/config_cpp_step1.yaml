@@ -1,0 +1,19 @@
+# SAIGE Step 2 Standalone - C++ Step 1 Model Configuration
+# ========================================================
+# Uses null model from C++ Step 1 (sparse GRM, x1+x2 covariates, no LOCO)
+# to test the pure C++ pipeline: C++ Step 1 -> C++ Step 2
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_cpp_step1
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_cpp_step1/varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_step1_to_step2_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Checkpoints
+checkpointDir: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/Cpp_step1_to_step2

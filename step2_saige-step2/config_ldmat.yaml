@@ -1,0 +1,35 @@
+# SAIGE Step 2 Standalone - LD Matrix Generation Configuration
+# =============================================================
+# Generates LD (G^T * G) matrices for each region in the group file.
+# This mode does NOT run association testing -- it only computes
+# the genotype covariance (LD) matrix for meta-analysis purposes.
+#
+# Uses the same quantitative null model and PLINK files as Test 1/3.
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_quantitative.varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/ldmat_test
+
+# Match R SPAGMMATtest parameters
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+
+# Region configuration (required for LDmat mode)
+groupFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/group_region_test_cpp.txt
+annotationList:
+  - "lof"
+  - "missense;lof"
+
+# LD Matrix mode
+isLDMatrix: true
+ldmat_maxMAF: 0.5
+
+# These are used by the region chunk reader but not for association
+maxMAFList:
+  - 0.0001
+  - 0.001
+  - 0.01
+groups_per_chunk: 100

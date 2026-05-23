@@ -1,0 +1,32 @@
+# Usage example — SAIGE Step-1 (null model) on the bundled extdata test set.
+# Data: 1000 samples, 128868 markers (extdata), quantitative trait, dense GRM.
+# Produces a null model + a single variance ratio for Step-2 single-variant testing.
+# Run:  ./step1_saige-null/saige-null -c examples/step1_quant_extdata.yaml
+paths:
+  plinkFile:     /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+  out_prefix:    /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/examples/output/step1_quant_null
+  out_prefix_vr: /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/examples/output/step1_quant_vr
+  sparse_grm:     ""
+  sparse_grm_ids: ""
+  overwrite_varratio: true
+
+design:
+  csv: /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/step1_saige-null/design_test.csv
+  covar_cols:
+    - x1
+    - x2
+
+fit:
+  trait: quantitative
+  loco: false
+  nthreads: 1
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  num_markers_for_vr: 30
+  use_sparse_grm_to_fit: false      # dense GRM fit -> single variance ratio
+  use_pcg_with_sparse_grm: false
+  relatedness_cutoff: 0.125
+  overwrite_vr: true

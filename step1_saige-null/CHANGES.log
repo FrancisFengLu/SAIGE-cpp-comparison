@@ -1,0 +1,115 @@
+================================================================================
+CHANGES LOG — cpp_standalone build fixes
+Date: 2026-03-10
+================================================================================
+
+--- ISSUE: Build / link errors after moving to mamba env (saige-build) ---
+
+1. Eigen/Dense not found
+   File: Makefile
+   Change: Added CONDA_PREFIX/include/eigen3 to INCLUDES.
+     ifneq ($(strip $(CONDA_PREFIX)),)
+       INCLUDES += -I"$(CONDA_PREFIX)/include/eigen3"
+     endif
+   Reason: System path /usr/include/eigen3 does not exist; Eigen lives in
+           the mamba env at $CONDA_PREFIX/include/eigen3.
+
+2. undefined reference to pthread_create
+   File: Makefile
+   Change: Added -lpthread to LIBS.
+   Reason: TBB/RcppParallel pulls in pthreads; must link explicitly.
+
+3. undefined references to RcppParallel::tbbParallelFor / tbbParallelReduceImpl
+   File: Makefile
+   Change: Query RcppParallel libs dir from R and link the .so directly.
+     RCPPARAL_LIB := $(shell Rscript -e 'cat(system.file("libs", package="RcppParallel"))')
+     ...
+     ifneq ($(strip $(RCPPARAL_LIB)),)
+       LIBS += "$(RCPPARAL_LIB)/RcppParallel.so"
+     endif
+   Reason: The library is RcppParallel.so (not libRcppParallel.so), so -lRcppParallel
+           does not work; must link by full path. Initial attempt placed the
+           LIBS += line before LIBS :=, so the assignment was overwritten; fixed
+           by moving the line to after the LIBS := definition.
+
+4. undefined symbol: R_getVarEx at runtime
+   File: Makefile
+   Change: Added -Wl,-rpath to embed the R lib dir in the binary's rpath.
+     LIBS += -L"$(R_HOME)/lib" -lR -Wl,-rpath,"$(R_HOME)/lib"
+   Reason: libR.so was found at link time but not at runtime because
+           $R_HOME/lib is not in the system LD_LIBRARY_PATH.
+
+--- ISSUE: Segmentation fault on first run ---
+
+Root cause: getAlleleFreqVec() (in SAIGE_step1_fast.cpp) copies geno.alleleFreqVec
+(111305 floats) via a heap allocation. This allocation triggered a crash
+immediately after the 128,868 individual `new vector<unsigned char>` allocations
+made in setGenoObj(), likely due to heap fragmentation / corruption detection.
+The crash happened inside the CHECKPOINT 1 block in main.cpp, which was dead
+debug code using hardcoded Mac paths that served no purpose on this machine.
+
+Diagnosis method: Added temporary std::cerr prints at each step in
+setGenoObj() and in the checkpoint block. Narrowed crash to getAlleleFreqVec()
+call in CHECKPOINT 1.
+
+5. Segfault in CHECKPOINT 1 block
+   File: main.cpp (~line 1102)
+   Change: Removed the entire CHECKPOINT 1 block (after genotype loading).
+     Replaced with a single comment:
+       // CHECKPOINT 1 removed (used hardcoded Mac paths, not needed on this machine)
+   Reason: The block called getAlleleFreqVec() which copies geno.alleleFreqVec
+           and crashed. The block also wrote output to /Users/francis/... paths
+           that don't exist here. It was purely debug code with no functional role.
+
+--- CONFIG FILE UPDATES ---
+
+6. All 5 YAML configs updated with local paths
+   Files: config_test.yaml, config_sparse_x1.yaml, config_sparse_x1x2.yaml,
+          config_dense_x1.yaml, config_dense_x1x2.yaml
+   Changes:
+     plinkFile:     /Users/francis/.../extdata/input/nfam_...
+                 -> /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/nfam_...
+     sparse_grm:    /Users/francis/.../SAIGE/extdata/output/sparseGRM_...
+                 -> /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/output/sparseGRM_...
+     sparse_grm_ids: same pattern
+     out_prefix:    /Users/francis/.../output/...
+                 -> /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/output/...
+     design csv:    /Users/francis/.../cpp_standalone/design_*.csv
+                 -> /media/leelabsg-storage0/seokho/SAIGE-cpp-comparison/code_copy/cpp_standalone/design_*.csv
+
+--- ISSUE: Segfault in quantitative GLMM solver (getPCG1ofSigmaAndVector) ---
+Date: 2026-03-10
+
+Root cause: Armadillo ABI mismatch between translation units on Linux/conda.
+The original code was written on macOS where Homebrew's system armadillo and
+RcppArmadillo's bundled armadillo happen to be the same file (same include path).
+On Linux/conda, the system armadillo (/envs/saige-build/include/armadillo) and
+RcppArmadillo's bundled armadillo (.../RcppArmadillo/include/current/armadillo)
+are different files with different include guards. Headers using <armadillo> got
+the system version; files using <RcppArmadillo.h> got the bundled version.
+Although both are v15.2.3 with identical struct layouts, the two template
+instantiations have different ARMA_EXTRA_MAT_PROTO / ARMA_DONT_USE_WRAPPER
+defines, causing undefined behavior when arma::fvec objects cross the TU
+boundary through the shim. Observed: [SHIM] w.n=1 tau.n=1 v.n=1 instead of
+correct sizes, leading to segfault inside gen_spsolve_v4 / arma::spsolve.
+
+Also found separately: -O3 optimization causes a SuperLU crash (arma::spsolve
+via dgssv). ASAN build at -O1 completed successfully, confirming optimizer bug.
+
+7. Segfault: Armadillo ABI mismatch (Linux/conda platform fix)
+   Files: saige_ai.hpp, saige_shims.hpp, score.hpp,
+          glmm.cpp, null_model_engine.cpp, main.cpp
+   Change: Replaced all `#include <armadillo>` with `#include <RcppArmadillo.h>`
+     so every TU uses the same RcppArmadillo-bundled armadillo headers.
+   Reason: On macOS (original platform), <armadillo> and <RcppArmadillo.h>
+     resolve to the same armadillo. On Linux/conda they are different files,
+     causing ABI-incompatible arma::fvec objects across TU boundaries.
+
+8. Segfault: -O3 optimization crashes SuperLU inside arma::spsolve
+   File: Makefile
+   Change: CXXFLAGS -O3 -> -O2
+     CXXFLAGS ?= -std=c++17 -O2 -DARMA_64BIT_WORD=1 ...
+   Reason: At -O3 the SuperLU dgssv call inside arma::spsolve crashes.
+     Confirmed by ASAN build at -O1 completing without error. -O2 is stable.
+
+================================================================================

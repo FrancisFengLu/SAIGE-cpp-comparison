@@ -1,0 +1,20 @@
+# SAIGE Step 2 Standalone - VCF Test Configuration
+# ================================================
+# Same null model as config_compare.yaml, but reads from VCF instead of PLINK.
+# Output should match PLINK results exactly (same genotypes, same test statistics).
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_quantitative.varianceRatio.txt
+
+# VCF input
+genoType: vcf
+vcfFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/test_genotypes.vcf.gz
+vcfField: GT
+
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_vcf_results.txt
+
+# Match PLINK test parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+isMoreOutput: true
