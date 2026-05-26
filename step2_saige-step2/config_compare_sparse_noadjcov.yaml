@@ -1,0 +1,33 @@
+# SAIGE Step 2 Standalone - Sparse GRM + noadjCov Comparison Configuration
+# =========================================================================
+# Uses null model extracted from SAIGE's example_quantitative_sparseGRM.rda
+# so that C++ results can be directly compared with R SAIGE output.
+#
+# This model was fitted with sparseGRM and LOCO=FALSE.
+# The scoreTestFast_noadjCov path is triggered for the fast pass when
+# isnoadjCov=true, skipping covariate adjustment in the variance calculation.
+# Re-evaluation for p < pval_cutoff_for_fastTest uses the standard path.
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda_sparse
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/varianceRatio_sparse_noadjcov.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_compare_sparse_noadjcov_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Enable noadjCov (no covariate adjustment in fast score test)
+isnoadjCov: true
+
+# Dosage zeroing for rare variants (R defaults)
+dosage_zerod_cutoff: 0.2
+dosage_zerod_MAC_cutoff: 10
+
+# MAC category thresholds for variance ratio
+# R defaults: cateVarRatioMinMACVecExclude = c(10.5, 20.5)
+#             cateVarRatioMaxMACVecInclude = c(20.5, N)
+# These are now auto-applied for single-VR label format files.

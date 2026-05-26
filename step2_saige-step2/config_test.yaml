@@ -1,0 +1,54 @@
+# SAIGE Step 2 Standalone - Test Configuration
+# ==============================================
+#
+# Required parameters:
+#   modelFile:          Directory containing Step 1 .arma output files and nullmodel.json
+#   varianceRatioFile:  Path to varianceRatio.txt from Step 1
+#   plinkFile:          PLINK prefix (without .bed/.bim/.fam)
+#   outputFile:         Output file path for results
+#
+# Optional single-variant parameters:
+#   minMAF:             Min minor allele frequency filter (default: 0)
+#   minMAC:             Min minor allele count filter (default: 0.5)
+#   maxMissRate:        Max missing rate filter (default: 0.15)
+#   minINFO:            Min imputation info filter (default: 0)
+#   AlleleOrder:        "alt-first" or "ref-first" (default: alt-first)
+#   genoType:           "plink" (default: plink; vcf/bgen/pgen not yet supported)
+#   isImputation:       true/false (default: false)
+#   isMoreOutput:       Output het/hom counts (default: false)
+#   marker_chunksize:   Progress reporting interval (default: 10000)
+#   MACCutoffforER:     MAC cutoff for efficient resampling (default: 4)
+#   isFirth:            Use Firth correction (default: true)
+#   weights_beta:       Beta distribution weights [a, b] (default: [1, 25])
+#   checkpointDir:      Directory for checkpoint outputs (optional)
+#
+# Optional region/gene-based parameters (activates region testing when groupFile is set):
+#   groupFile:          Path to group file (gene definitions)
+#   annotationList:     Annotation mask list, e.g. ["lof", "lof;missense"]
+#   maxMAFList:         MAF thresholds, e.g. [0.0001, 0.001, 0.01]
+#   regionTestType:     "SKATO", "SKAT", or "BURDEN" (default: SKATO)
+#   r_corr:             0=SKAT-O, 1=BURDEN (default: 0)
+#   MACCutoff_to_CollapseUltraRare: MAC cutoff for URV collapsing (default: 10)
+#   markers_per_chunk_in_groupTest: Markers per P1/P2 chunk (default: 500)
+#   groups_per_chunk:   Regions to read per chunk (default: 100)
+#   isSingleInGroupTest: Output single-variant results within groups (default: false)
+#   max_markers_region: Max markers per region (default: 1000000)
+#
+
+# --- Test configuration: single-variant, quantitative trait ---
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/step2_results.txt
+
+# QC filters
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+
+# Options
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Checkpoints
+checkpointDir: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/Cpp

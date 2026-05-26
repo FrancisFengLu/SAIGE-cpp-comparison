@@ -1,0 +1,35 @@
+# SAIGE Step 2 Standalone - Binary Trait Comparison Configuration
+# ================================================================
+# Uses null model extracted from SAIGE's example_binary.rda
+# so that C++ results can be directly compared with R SAIGE output.
+#
+# This test exercises:
+#   - Binary trait handling (mu2 = mu*(1-mu))
+#   - SPA (saddlepoint approximation) correction
+#   - Firth correction for low-frequency variants
+#   - Sample subsetting (10000 in PLINK, 1000 in model)
+#
+# To generate the null model .arma files, first run:
+#   pixi Rscript test/R/convert_rda_to_arma_binary.R
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda_binary
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_binary.varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/genotype_100markers
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_compare_binary_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+
+# Binary-specific: Firth correction enabled
+isFirth: true
+
+# Efficient Resampling for ultra-rare binary variants (MAC <= threshold)
+# R's default is 4, matching SPAGMMATtest(max_MAC_use_ER = 4)
+MACCutoffforER: 4
+
+# Checkpoints
+checkpointDir: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/Cpp_compare_binary

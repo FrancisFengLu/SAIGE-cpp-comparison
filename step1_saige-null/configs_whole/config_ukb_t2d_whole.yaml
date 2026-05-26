@@ -1,0 +1,43 @@
+# UKB T2D (PheCode X250.2) Step-1 null model — whole UKB
+# Paths point at LOCAL /data/UKB_imp/ukb_step1_bench/ (staged via rsync, local disk)
+# nthreads is overridden per-run via -o fit.nthreads=N
+# NB: phenotype column in the whole TSV is XX250.2 (with double X — UKB PheCode prefix), not X250.2
+paths:
+  plinkFile: /data/UKB_imp/ukb_step1_bench/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned
+  fam: /data/UKB_imp/ukb_step1_bench/ukb_allchr_v2_newID_passedQC_white.British_geno0.05_poly_500_50_0.2.pruned.mapped.fam
+  out_prefix: /media/leelabsg-storage0/seokho/seokho92-SAIGE-cpp-comparison/code_copy/cpp_standalone/benchmark_results/ukb_t2d_whole_recap_2026-05-06/cpp_cpu/saige_out
+  out_prefix_vr: /media/leelabsg-storage0/seokho/seokho92-SAIGE-cpp-comparison/code_copy/cpp_standalone/benchmark_results/ukb_t2d_whole_recap_2026-05-06/cpp_cpu/saige_out_vr
+  sparse_grm: ""
+  sparse_grm_ids: ""
+  overwrite_varratio: true
+
+design:
+  csv: /data/UKB_imp/ukb_step1_bench/Basic_trait_with_PheCode_table_ICD10_081123_whites_batches_famFiltered_whole.tsv
+  iid_col: eid
+  y_col: XX250.2
+  covar_cols:
+    - Sex
+    - Age
+    - Batch
+    - PC1
+    - PC2
+    - PC3
+    - PC4
+  q_covar_cols:
+    - Sex
+
+fit:
+  trait: binary
+  covariate_offset: true
+  loco: false
+  nthreads: 16
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  num_markers_for_vr: 0
+  use_sparse_grm_to_fit: false
+  use_pcg_with_sparse_grm: false
+  relatedness_cutoff: 0.125
+  overwrite_vr: true

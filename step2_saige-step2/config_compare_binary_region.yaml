@@ -1,0 +1,49 @@
+# SAIGE Step 2 Standalone - Binary Trait Region/Gene-Based Testing Configuration
+# ==============================================================================
+# Binary trait region-based test (BURDEN/SKAT/SKAT-O)
+# for comparison with R SAIGE output.
+#
+# This test exercises:
+#   - Binary trait handling (mu2 = mu*(1-mu))
+#   - SPA Phi adjustment in region testing
+#   - Efficient resampling for rare binary variants
+#   - BURDEN/SKAT/SKAT-O p-values
+#
+# Uses null model extracted from SAIGE's example_binary.rda
+# and the same genotype file + group file as quantitative region test.
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda_binary
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_binary.varianceRatio.txt
+plinkFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_compare_binary_region_results.txt
+
+# Match R SPAGMMATtest parameters exactly
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: false
+
+# Region/gene-based testing parameters
+groupFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/group_region_test_cpp.txt
+annotationList:
+  - "lof"
+  - "missense;lof"
+maxMAFList:
+  - 0.0001
+  - 0.001
+  - 0.01
+
+# SKAT-O (r_corr=0) produces BURDEN, SKAT, and SKAT-O p-values
+r_corr: 0
+MACCutoff_to_CollapseUltraRare: 10
+markers_per_chunk_in_groupTest: 100
+groups_per_chunk: 100
+weights_beta:
+  - 1
+  - 25
+isSingleInGroupTest: true
+isOutputMarkerList: true
+
+# Binary-specific: Efficient Resampling for ultra-rare variants
+MACCutoffforER: 4

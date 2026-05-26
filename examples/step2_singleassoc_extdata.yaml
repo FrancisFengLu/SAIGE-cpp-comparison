@@ -1,0 +1,18 @@
+# Usage example — SAIGE Step-2 single-variant association, CHAINED from the Step-1
+# null produced by step1_quant_extdata.yaml. Run Step-1 first, then this.
+# Run: ./step2_saige-step2/saige-step2 examples/step2_singleassoc_extdata.yaml
+#
+# modelFile is the Step-1 out_prefix directory (contains nullmodel.json + *.arma);
+# varianceRatioFile is the Step-1 <out_prefix_vr>.varianceRatio.txt.
+modelFile:         /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/examples/output/step1_quant_null
+varianceRatioFile: /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/examples/output/step1_quant_vr.varianceRatio.txt
+
+genoType:  plink
+plinkFile: /media/leelabsg-storage0/UKBB_WORK/SAIGE_cpp/extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly_22chr
+outputFile: /media/leelabsg-storage0/seokho/SAIGE_cpp_260524/examples/output/step2_singleassoc.txt
+
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true

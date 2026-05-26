@@ -1,0 +1,25 @@
+# SAIGE Step 2 Standalone - PGEN Comparison Configuration
+# ======================================================
+# Uses the same null model as config_compare.yaml but reads
+# genotypes from PGEN format (.pgen/.pvar/.psam) instead of
+# PLINK (.bed/.bim/.fam). Output should be identical to PLINK.
+#
+# The PGEN files were created by converting the PLINK files using
+# test/data/bed_to_pgen (mode 0x02 basic variant-major).
+
+modelFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/nullmodel_from_rda
+varianceRatioFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/SAIGE/extdata/output/example_quantitative.varianceRatio.txt
+outputFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/output/cpp_pgen_results.txt
+
+# PGEN input
+genoType: pgen
+pgenFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/test_genotypes.pgen
+pvarFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/test_genotypes.pvar
+psamFile: /Users/francis/Desktop/Zhou_lab/SAIGE_gene_pixi/Step_2_Feb_11/test/data/test_genotypes.psam
+
+# Match R SPAGMMATtest parameters exactly (same as config_compare.yaml)
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
