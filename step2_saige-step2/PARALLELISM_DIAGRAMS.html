@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SAIGE step2 — Flow Diagrams</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 1200px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.55;
+    color: #1f2328;
+    background: #fff;
+  }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: .4rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .3rem; margin-top: 2.5rem; color: #0550ae; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: #f6f8fa;
+    padding: .15em .35em;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+  .caption {
+    background: #fafbfc;
+    border-left: 4px solid #0969da;
+    padding: .6rem 1rem;
+    margin: .75rem 0 1.5rem;
+    font-size: 0.95em;
+  }
+  .diagram {
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 1rem 0 2rem;
+    background: #fff;
+    overflow-x: auto;
+  }
+  .mermaid {
+    text-align: center;
+    min-width: 100%;
+  }
+  .meta {
+    background: #f6f8fa;
+    border-left: 4px solid #1a7f37;
+    padding: .75rem 1rem;
+    margin: 1rem 0 2rem;
+    font-size: 0.95em;
+  }
+  .toc {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: .75rem 1.25rem;
+    margin: 1rem 0 2rem;
+  }
+  .toc ol { margin: .25rem 0; padding-left: 1.5rem; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 2rem 0; }
+  .legend {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.88em;
+    margin: .5rem 0 1rem;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+  }
+  .legend-swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid #888;
+  }
+</style>
+</head>
+<body>
+
+<h1>SAIGE step2 — Flow Diagrams</h1>
+
+<div class="meta">
+  <strong>Companion to:</strong> <code>PARALLELISM_PLAN.md</code> &middot;
+  <strong>Branch:</strong> <code>step2-parallel</code> &middot;
+  <strong>Purpose:</strong> visualise current step2 control flow before designing parallelism.
+</div>
+
+<p>Five diagrams, all anchored to real <code>file:line</code> in the step2 source. Diagrams 1–4 describe the <strong>current serial code as-is</strong>. Only diagram 5 contrasts current vs proposed parallel layout.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#d1">Top-level <code>main()</code> dispatch</a></li>
+    <li><a href="#d2">Single-variant per-marker pipeline (<code>mainMarkerInCPP</code>)</a></li>
+    <li><a href="#d3">Region/group flow (<code>mainRegionInCPP</code>)</a></li>
+    <li><a href="#d4">Genotype reader — BGEN with zstd (current serial path)</a></li>
+    <li><a href="#d5">Single-variant loop — current serial vs proposed parallel layout</a></li>
+  </ol>
+</div>
+
+<hr>
+
+<h2 id="d1">1. Top-level <code>main()</code> dispatch</h2>
+<div class="caption">
+  What runs from program start to exit: config load → null model load → SAIGEClass construction → genotype reader setup → conditional-analysis setup → trifurcate into one of three paths (LD-matrix, single-variant, region/group) → cleanup.
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    A["main argc/argv<br/><i>main.cpp:2629</i>"] --> B["Parse YAML config<br/><i>main.cpp:2697</i>"]
+    B --> C["loadNullModel<br/><i>main.cpp:2983</i>"]
+    C --> D["setAssocTest_GlobalVarsInCPP<br/><i>main.cpp:2999</i>"]
+    D --> E["setSAIGEobjInCPP<br/>ptr_gSAIGEobj = new SAIGEClass<br/><i>main.cpp:3086</i>"]
+    E --> F{"genoType?"}
+    F -->|plink| G1["setPLINKobjInCPP<br/><i>main.cpp:3134</i>"]
+    F -->|vcf| G2["setVCFobjInCPP<br/><i>main.cpp:3137</i>"]
+    F -->|bgen| G3["setBGENobjInCPP<br/><i>main.cpp:3167</i>"]
+    F -->|pgen| G4["setPGENobjInCPP<br/><i>main.cpp:3170</i>"]
+    G1 --> H["Conditional analysis setup<br/>assign_conditionMarkers_factors<br/><i>main.cpp:3189-3263</i>"]
+    G2 --> H
+    G3 --> H
+    G4 --> H
+    H --> I{"Trifurcate<br/><i>main.cpp:3265</i>"}
+    I -->|"isLDMatrix &<br/>isRegionTest"| J1["LD-matrix path<br/>LDmatRegionInCPP per region<br/><i>main.cpp:3269-3408</i>"]
+    I -->|"!isRegionTest"| J2["Single-variant path<br/>mainMarkerInCPP<br/><i>main.cpp:3458</i>"]
+    I -->|"isRegionTest"| J3["Region/group path<br/>mainRegionInCPP per region<br/><i>main.cpp:3620</i>"]
+    J1 --> K["closeGenoFile<br/>delete ptr_gSAIGEobj<br/>mem report<br/><i>main.cpp:3666-3679</i>"]
+    J2 --> K
+    J3 --> K
+</div>
+</div>
+
+<hr>
+
+<h2 id="d2">2. Single-variant per-marker pipeline (<code>mainMarkerInCPP</code>)</h2>
+<div class="caption">
+  One iteration of the marker loop at <code>main.cpp:708</code>. Green = cheap path (runs for every marker). Red = slow path (runs only when triggered). Relative costs are vs the cheap score test.
+</div>
+<div class="legend">
+  <span class="legend-item"><span class="legend-swatch" style="background:#cdeacc"></span>Cheap path (runs always)</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#f7c6c7"></span>Slow path (10–100× cheap)</span>
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    A["Loop iter i<br/><i>main.cpp:708</i>"] --> B["Unified_getOneMarker<br/>read GVec, altFreq, missRate<br/><i>main.cpp:747</i>"]
+    B --> C{"QC pass?<br/>missRate, MAF, MAC, INFO<br/><i>main.cpp:779</i>"}
+    C -->|fail| Z["continue<br/><i>main.cpp:783</i>"]
+    C -->|pass| D["imputeGenoAndFlip<br/><i>main.cpp:788</i>"]
+    D --> E["Recompute MAC/MAF<br/>second QC gate<br/><i>main.cpp:812-815</i>"]
+    E --> F["set_flagSparseGRM_cur<br/>+ assignVarianceRatio<br/><i>main.cpp:837-851</i>"]
+    F --> G{"binary &<br/>MAC ≤ MACCutoffforER?<br/><i>main.cpp:871</i>"}
+    G -->|yes| H1["Unified_getMarkerPval<br/>t_isER = true<br/><i>main.cpp:872</i>"]
+    G -->|no| H2["Unified_getMarkerPval<br/>t_isER = false<br/><i>main.cpp:889</i>"]
+    H1 --> DSP
+    H2 --> DSP
+    DSP{"3-way score test dispatch<br/><i>saige_test.cpp:464</i>"}
+    DSP -->|"!sparseGRM &<br/>isnoadjCov"| S1["scoreTestFast_noadjCov<br/><i>saige_test.cpp:467</i>"]
+    DSP -->|sparseGRM_cur| S2["scoreTest<br/>sparse-GRM path<br/><i>saige_test.cpp:472</i>"]
+    DSP -->|else| S3["scoreTestFast<br/>with covar adj<br/><i>saige_test.cpp:476</i>"]
+    S1 --> STD["StdStat = |Tstat|/sqrt(var1)<br/><i>saige_test.cpp:480</i>"]
+    S2 --> STD
+    S3 --> STD
+    STD --> ERD{"binary & MAC≤ER &<br/>t_isER?<br/><i>saige_test.cpp:498</i>"}
+    ERD -->|yes| ER["ER: SKATExactBin_Work<br/>~100× cost<br/><i>saige_test.cpp:659</i>"]
+    ERD -->|no| SPAD{"binary or survival &<br/>StdStat > SPA_Cutoff?<br/><i>saige_test.cpp:508</i>"}
+    SPAD -->|no| OUT
+    SPAD -->|yes| SPA["SPA / SPA_fast<br/>~10-50× cost<br/><i>saige_test.cpp:553/556</i>"]
+    SPA --> FIRD{"is_Firth_beta &<br/>pval ≤ pCutoffforFirth?<br/><i>saige_test.cpp:622/629</i>"}
+    ER --> FIRD2{"is_Firth_beta &<br/>pval ≤ pCutoff?<br/><i>saige_test.cpp:690</i>"}
+    FIRD -->|yes| FIR["Firth: fast_logistf_fit_simple<br/>~50-100× cost<br/><i>saige_test.cpp:703</i>"]
+    FIRD2 -->|yes| FIR
+    FIRD -->|no| OUT
+    FIRD2 -->|no| OUT
+    FIR --> OUT["Return Beta/seBeta/pval"]
+    OUT --> RET{"isFastTest &<br/>pval &lt; cutoff?<br/><i>main.cpp:922</i>"}
+    RET -->|yes| RC["Recompute with<br/>sparseGRM + isnoadjCov=false<br/><i>main.cpp:941</i>"]
+    RET -->|no| APP
+    RC --> APP["Append to vectors<br/>BetaVec, pvalVec, ...<br/><i>main.cpp:972-1023</i>"]
+    APP --> NX["Next i"]
+
+    classDef cheap fill:#cdeacc,stroke:#2e7d32,color:#000
+    classDef slow fill:#f7c6c7,stroke:#b71c1c,color:#000
+    class S1,S2,S3,STD cheap
+    class ER,SPA,FIR,RC slow
+</div>
+</div>
+
+<hr>
+
+<h2 id="d3">3. Region/group flow (<code>mainRegionInCPP</code>)</h2>
+<div class="caption">
+  Outer driver loops over regions in chunks of <code>groups_per_chunk=100</code>. Per region: marker loop accumulates P1/P2 columns and URV pseudo-markers, flushes P1/P2 to disk every <code>g_region_maxMarkers_cutoff</code> markers, then reconstructs <code>VarMat = P1·P2</code> for BURDEN/SKAT/SKAT-O.
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    OL["Outer loop over regions<br/>chunks of groups_per_chunk<br/><i>main.cpp:3570-3577</i>"] --> RC["readRegionChunk<br/><i>main.cpp:3576</i>"]
+    RC --> CR{"for r in regionChunk<br/><i>main.cpp:3579</i>"}
+    CR -->|empty| SK["Skip region"]
+    CR -->|non-empty| CALL["mainRegionInCPP(region)<br/><i>main.cpp:3620</i>"]
+    SK --> CR
+    CALL --> OL
+
+    subgraph PER ["Per region — mainRegionInCPP (main.cpp:1645)"]
+        M0["Allocate genoURMat, genoSumMat,<br/>P1Mat/P2Mat per chunk<br/><i>main.cpp:1683-1759</i>"] --> ML["Inner marker loop i=0..q0<br/><i>main.cpp:1783</i>"]
+        ML --> MR["Unified_getOneMarker<br/><i>main.cpp:1813</i>"]
+        MR --> MQ{"QC pass?<br/><i>main.cpp:1850</i>"}
+        MQ -->|fail| ML
+        MQ -->|pass| MS{"MAC &gt; region_minMAC?<br/><i>main.cpp:1865</i>"}
+        MS -->|"yes (Non-URV)"| NU["Unified_getMarkerPval<br/>+ write P1Mat row,<br/>P2Mat col at i1InChunk<br/><i>main.cpp:1887-1914</i>"]
+        MS -->|"no (URV)"| UR["Accumulate genoURMat<br/>per annotation × MAF bin<br/><i>main.cpp:1972-2007</i>"]
+        NU --> FL{"i1InChunk == m1?<br/>g_region_maxMarkers_cutoff<br/><i>main.cpp:2011</i>"}
+        UR --> FL
+        FL -->|yes| FS["Flush:<br/>_P1Mat_Chunk_k.bin,<br/>_P2Mat_Chunk_k.bin<br/><i>main.cpp:2016-2022</i>"]
+        FL -->|no| ML
+        FS --> ML
+        ML -->|loop done| LF["Save final chunk<br/><i>main.cpp:2027-2041</i>"]
+        LF --> PU["Process URV pseudo-markers<br/>per annotation × MAF bin<br/><i>main.cpp:2044-2207</i>"]
+        PU --> VM["Build VarMat = P1·P2<br/>reconstructed from chunks;<br/>remove chunk files<br/><i>main.cpp:2213-2251</i>"]
+        VM --> TT{"regionTestType?"}
+        TT -->|BURDEN| BD["BURDEN per anno × MAF<br/>+ CCT_cpp combine<br/><i>main.cpp:2263-2372</i>"]
+        TT -->|SKAT/SKATO| SK2["get_SKAT_pvalue per group<br/>+ CCT combine<br/><i>main.cpp:2525-2598</i>"]
+        BD --> WB["writeOutfile_BURDEN<br/><i>main.cpp:2374</i>"]
+        SK2 --> WS["writeOutfile_singleInGroup<br/>+ region row<br/><i>main.cpp:2569-2611</i>"]
+    end
+
+    CALL --> M0
+</div>
+</div>
+
+<hr>
+
+<h2 id="d4">4. Genotype reader — BGEN with zstd (current serial path)</h2>
+<div class="caption">
+  What happens for <strong>one</strong> variant when format is BGEN. Note the shared per-instance state (<code>m_fin</code>, <code>m_buf</code>, <code>m_zBuf</code>) — this is the main blocker for naive multi-threading on a single reader.
+</div>
+<div class="diagram">
+<div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Caller<br/>(mainMarkerInCPP)
+    participant B as BgenClass<br/>(single instance)
+    participant F as m_fin (FILE*)
+    participant Z as m_buf / m_zBuf
+    participant D as ZSTD_DCtx
+
+    C->>B: getOneMarker(gIndex)
+    Note right of B: genotype_reader.cpp:1277
+    B->>F: fseek(m_fin, gIndex)
+    Note right of F: genotype_reader.cpp:1305
+    B->>F: fread metadata<br/>(snpID, rsID, chr, alleles, C, D)
+    Note right of F: genotype_reader.cpp:1317-1362
+    B->>Z: resize m_zBuf if needed
+    Note right of Z: genotype_reader.cpp:1359
+    B->>F: fread(&m_zBuf[0], 1, C-4)
+    Note right of F: genotype_reader.cpp:1365
+    B->>Z: resize m_buf if needed
+    Note right of Z: genotype_reader.cpp:1371
+    B->>B: Parse2(m_buf, m_zBuf, ...)
+    Note right of B: genotype_reader.cpp:1373
+    B->>D: ZSTD_createDCtx + ZSTD_decompressDCtx
+    Note right of D: genotype_reader.cpp:1137-1144
+    D-->>B: decompressed bytes in m_buf
+    B->>B: decode dosages sample-by-sample<br/>fill dosages[m_posSampleInModel[i]]
+    Note right of B: genotype_reader.cpp:1220-1252
+    B-->>C: arma::vec dosages, AF, AC, info
+
+    Note over B,Z: m_fin, m_buf, m_zBuf are shared instance state.<br/>Single FILE* + shared buffers ⇒ NOT thread-safe.<br/>Parallel decode needs per-worker scratch buffers.
+</div>
+</div>
+
+<hr>
+
+<h2 id="d5">5. Single-variant loop — current serial vs proposed parallel layout</h2>
+<div class="caption">
+  Left: today's loop processes one marker at a time, every marker going through every stage. Right: two-stage proposal — a matrix-level first pass produces candidate flags; only the few markers needing SPA/Firth/ER get fanned out to a thread pool for the existing scalar recompute. Results are merged back in original marker order.
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart LR
+    subgraph CUR ["Current (serial) — mainMarkerInCPP (main.cpp:708)"]
+        direction TB
+        S0["i = 0..N-1"] --> S1["Read marker i<br/>Unified_getOneMarker"]
+        S1 --> S2["QC + impute + flip"]
+        S2 --> S3["Cheap score test<br/>scoreTestFast / noadjCov / sparse"]
+        S3 --> S4{"StdStat &gt; SPA_Cutoff?<br/>MAC ≤ ER cutoff?"}
+        S4 -->|no| S6
+        S4 -->|yes| S5["SPA / ER / Firth<br/>(scalar, 10-100×)"]
+        S5 --> S6["Append to vectors<br/>BetaVec, pvalVec, ..."]
+        S6 --> S0
+    end
+
+    subgraph PROP ["Proposed (parallel) — two stages"]
+        direction TB
+        subgraph ST1 ["Stage 1: matrix-level first pass (block of B markers)"]
+            direction TB
+            P0["Block read B markers<br/>(new block-read API)"] --> P1["Block QC + impute + flip<br/>build G_block (n × B)"]
+            P1 --> P2["Block cheap score test<br/>vectorised Tstat, var1, StdStat,<br/>MAC per column"]
+            P2 --> P3["Per-marker output:<br/>Tstat_i, var1_i, MAC_i,<br/>cheap pval_i"]
+            P3 --> P4["Build candidate flags<br/>need_SPA / need_ER /<br/>need_Firth / need_FastRecompute"]
+        end
+
+        subgraph ST2 ["Stage 2: candidate recompute (thread pool)"]
+            direction TB
+            T0["Candidate list +<br/>cached G column, StdStat, MAC"] -.-> W1["Worker 1<br/>scalar SPA/Firth/ER"]
+            T0 -.-> W2["Worker 2<br/>scalar SPA/Firth/ER"]
+            T0 -.-> W3["Worker k<br/>scalar SPA/Firth/ER"]
+            W1 --> MG["Merge in original<br/>marker order"]
+            W2 --> MG
+            W3 --> MG
+        end
+
+        P4 ==> T0
+        MG --> WR["writeOutfile_single"]
+    end
+</div>
+</div>
+
+<hr>
+
+<p style="color:#57606a;font-size:0.9em;margin-top:2rem;">
+Diagrams render with <a href="https://mermaid.js.org/">Mermaid.js</a> from CDN. If a diagram doesn't render, check the browser console — sometimes corporate networks block jsdelivr.
+</p>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', flowchart: { useMaxWidth: true, htmlLabels: true } });
+</script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SAIGE step2 — Parallelism Design</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 2.5rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.55;
+    color: #1f2328;
+    background: #fff;
+  }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: .4rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .3rem; margin-top: 2rem; }
+  h3 { margin-top: 1.6rem; color: #0550ae; }
+  h4 { margin-top: 1.2rem; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: #f6f8fa;
+    padding: .15em .35em;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: .55rem .75rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f6f8fa; font-weight: 600; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  blockquote {
+    border-left: 4px solid #d0d7de;
+    margin: 0;
+    padding: .25rem 1rem;
+    color: #57606a;
+  }
+  .meta {
+    background: #f6f8fa;
+    border-left: 4px solid #0969da;
+    padding: .75rem 1rem;
+    margin: 1rem 0 2rem;
+    font-size: 0.95em;
+  }
+  .difficulty-easy { color: #1a7f37; font-weight: 600; }
+  .difficulty-medium { color: #9a6700; font-weight: 600; }
+  .difficulty-hard { color: #cf222e; font-weight: 600; }
+  .speedup-high { color: #1a7f37; font-weight: 600; }
+  .speedup-low { color: #57606a; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 2rem 0; }
+  ul, ol { padding-left: 1.5rem; }
+  li { margin: .2rem 0; }
+  .toc {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: .75rem 1.25rem;
+    margin: 1rem 0 2rem;
+  }
+  .toc ol { margin: .25rem 0; }
+</style>
+</head>
+<body>
+
+<h1>SAIGE step2 C++ — Parallelism Design</h1>
+
+<div class="meta">
+  <strong>Branch:</strong> <code>step2-parallel</code> &middot;
+  <strong>Author:</strong> Francis Lu (drafted with Claude) &middot;
+  <strong>For sign-off by:</strong> Seokho Jeong
+</div>
+
+<p>Goal: speed up step2 wall time by parallelizing the marker loops while keeping numerical results bit-comparable to the current serial implementation and to R SAIGE. This document does <strong>not</strong> propose code changes yet — it asks for sign-off on a phased plan before any commits.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#sec1">Canonical step2 pipeline</a></li>
+    <li><a href="#sec2">Parallelism opportunities</a></li>
+    <li><a href="#sec3">Recommended design (3 phases, mapped to Seokho's bullets)</a></li>
+    <li><a href="#sec4">Open questions for Seokho</a></li>
+    <li><a href="#sec5">Sequencing — smallest end-to-end vertical slice first</a></li>
+  </ol>
+</div>
+
+<hr>
+
+<h2 id="sec1">1. Canonical step2 pipeline</h2>
+
+<p>Step2 has two entry-loop shapes, both dispatched from <code>main.cpp</code> after the null model and genotype handles are loaded.</p>
+
+<h3>1a. Single-variant path (<code>mainMarkerInCPP</code>, main.cpp:637–1077)</h3>
+<ol>
+  <li><strong>Allocate per-marker output vectors</strong> sized <code>q = #markers</code> (main.cpp:649–688). Single shared variance ratio is pre-assigned if <code>m_varRatio_null.n_elem == 1</code> (main.cpp:697–703).</li>
+  <li><strong>For each marker i</strong> (main.cpp:708): parse byte offset → <code>Unified_getOneMarker</code> (main.cpp:747, dispatched at genotype_reader.cpp:2158) reads/decompresses one variant.</li>
+  <li><strong>QC filter</strong> on missing rate / MAF / MAC / INFO (main.cpp:779–783); else <code>imputeGenoAndFlip</code> (788).</li>
+  <li><strong>Variance-ratio + sparse-GRM flag selection</strong> mutates SAIGEClass scalars <code>m_flagSparseGRM_cur</code>, <code>m_varRatioVal</code> (main.cpp:837–851).</li>
+  <li><strong>Score test (cheap path)</strong> via <code>Unified_getMarkerPval</code> (main.cpp:872 ER branch, 889 normal). Inside <code>getMarkerPval</code> (saige_test.cpp:419) one of <code>scoreTestFast_noadjCov</code> (saige_test.cpp:317), <code>scoreTest</code> (153, sparse GRM), or <code>scoreTestFast</code> (233) runs.</li>
+  <li><strong>SPA</strong> if binary/survival and <code>|Tstat|/sqrt(var1) &gt; m_SPA_Cutoff</code> (saige_test.cpp:508).</li>
+  <li><strong>ER</strong> if binary and <code>MAC ≤ g_MACCutoffforER</code> (saige_test.cpp:498–501 + main.cpp:871).</li>
+  <li><strong>Firth re-fit</strong> if binary, <code>pval ≤ m_pCutoffforFirth</code>, and <code>m_is_Firth_beta</code> (saige_test.cpp:622, 629).</li>
+  <li><strong>Fast-test re-evaluation:</strong> if <code>m_isFastTest</code> and the cheap path produced <code>pval &lt; m_pval_cutoff_for_fastTest</code>, the marker is recomputed once with <code>m_isnoadjCov_cur=false</code> and possibly sparse GRM on (main.cpp:919–957).</li>
+  <li><strong>Append per-marker outputs</strong> into the pre-allocated vectors (main.cpp:972–1023). After the loop, <code>writeOutfile_single</code> flushes one file (main.cpp:1061).</li>
+</ol>
+
+<h3>1b. Region/group path (<code>mainRegionInCPP</code>, main.cpp:1645–2400; driver loop main.cpp:3570–3645)</h3>
+<p>The outer driver reads regions in chunks of <code>groups_per_chunk</code> (main.cpp:3573–3577) and calls <code>mainRegionInCPP</code> once per region (main.cpp:3620). Inside:</p>
+<ol>
+  <li><strong>Per-region setup</strong> allocates output vectors of length <code>q = q0 + q_anno*q_maf</code> (main.cpp:1685–1750).</li>
+  <li><strong>Marker loop</strong> over <code>q0</code> variants in the region (main.cpp:1783). For each: read → QC → split into "non-URV" (MAC &gt; <code>g_region_minMAC_cutoff</code>) vs URV.</li>
+  <li><strong>Non-URV branch</strong> calls the same <code>Unified_getMarkerPval</code> as the single path (main.cpp:1887/1894) and <em>additionally</em> writes a column of P1/P2 into in-memory matrices <code>P1Mat</code>, <code>P2Mat</code> (main.cpp:1913–1915).</li>
+  <li><strong>URV branch</strong> accumulates a collapsed pseudo-marker per (annotation × MAF) bin (main.cpp:1972–2005).</li>
+  <li><strong>Chunk flush:</strong> every <code>m1 = g_region_maxMarkers_cutoff</code> non-URV markers, <code>P1Mat</code>/<code>P2Mat</code> are written to <code>*_P1Mat_Chunk_N.bin</code> (main.cpp:2011–2023) and the in-memory chunk is reused.</li>
+  <li><strong>Post-loop:</strong> URV pseudo-markers go through <code>getMarkerPval</code> (main.cpp:2055–2207). Then <code>VarMat = P1*P2</code> is rebuilt by loading the chunked files back (main.cpp:2219–2252) and BURDEN / SKAT / SKAT-O p-values are computed per (annotation × MAF) group (main.cpp:2474–2566) and CCT-combined.</li>
+</ol>
+
+<blockquote><strong>Mutable per-marker SAIGEClass state</strong> (the threading blockers): <code>m_flagSparseGRM_cur</code> (saige_test.hpp:55), <code>m_isnoadjCov_cur</code> (saige_test.hpp:58), <code>m_varRatioVal</code> (saige_test.hpp:36). Setters at saige_test.cpp:838–851, 883, 929. Everything else on the class (XV, XVX, mu, mu2, res, sparse Σ, <code>m_varRatio_*</code> tables) is read-only after init.</blockquote>
+
+<hr>
+
+<h2 id="sec2">2. Parallelism opportunities</h2>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>Step</th><th>Parallelism option</th><th>Granularity</th><th>Expected speedup</th><th>Difficulty</th><th>Risk</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Single-variant cheap score test (loop at main.cpp:708)</td>
+      <td>OpenMP <code>parallel for</code> over markers, after lifting <code>m_*_cur</code> and <code>m_varRatioVal</code> into per-iteration locals</td>
+      <td>per marker</td>
+      <td class="speedup-high">4–10×</td>
+      <td class="difficulty-medium">Medium</td>
+      <td>Mutating shared <code>SAIGEClass</code> scalars (saige_test.hpp:36,55,58) ⇒ false sharing / wrong-varRatio bugs; output-vector ordering preserved since we index by <code>i</code></td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Matrix-level first pass: replace inner <code>scoreTestFast</code> with a single GEMM over a block of B markers stacked into <code>G ∈ ℝ^{n×B}</code></td>
+      <td>block of markers</td>
+      <td>2–4× on cheap path only</td>
+      <td class="difficulty-hard">Hard</td>
+      <td><code>scoreTestFast</code> uses sparse-G shortcuts (<code>getadjGFast</code>, <code>square(g1_tilde)·mu2</code>); naive GEMM gives up that sparsity for dense markers, may <em>slow down</em> PLINK/PGEN streaming</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Candidate recompute (SPA/Firth/ER) after first pass</td>
+      <td>OpenMP over candidate list</td>
+      <td>per candidate marker</td>
+      <td class="speedup-high">3–6× on candidate phase</td>
+      <td class="difficulty-medium">Medium</td>
+      <td>Same SAIGEClass mutable scalars; SPA itself writes only to stack — already safe once ctx refactor lands</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>BGEN block read + decode pipeline</td>
+      <td>producer thread reads <code>m_zBuf</code> chunks; worker pool runs <code>Parse2</code> (genotype_reader.cpp:1106)</td>
+      <td>per variant</td>
+      <td>1.5–3× on BGEN with zstd; ~0× on PLINK</td>
+      <td class="difficulty-medium">Medium</td>
+      <td><code>m_fin</code>/<code>m_buf</code>/<code>m_zBuf</code> are <em>shared instance state</em> (genotype_reader.cpp:1305, 1359, 1365, 1371) — needs per-worker scratch buffers</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>VCF parallel decode</td>
+      <td>n/a</td>
+      <td>—</td>
+      <td class="speedup-low">0×</td>
+      <td>n/a</td>
+      <td>VCF is single-stream via htslib here; no random access ⇒ not worth it. <strong>Recommend explicitly NOT parallelizing VCF.</strong></td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>Region-mode P1/P2 chunk reconstruction</td>
+      <td>parallel block-product loop at main.cpp:2219–2243</td>
+      <td>per off-diagonal block</td>
+      <td>1.2–2× on <code>VarMat</code> build only (rarely the bottleneck)</td>
+      <td class="difficulty-easy">Easy</td>
+      <td>Race on <code>VarMat.submat</code> writes; need per-block tile assignment</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td><strong>Outer region loop</strong> (main.cpp:3570–3645)</td>
+      <td>OpenMP over regions, one SAIGEClass per worker</td>
+      <td>per region</td>
+      <td class="speedup-high">4–8× on group-mode wall time if regions ≫ threads</td>
+      <td class="difficulty-hard">Hard</td>
+      <td><code>ptr_gSAIGEobj</code> is a singleton; needs either deep-copy per thread or moving <code>m_*_cur</code> into a per-call context struct; output-file ordering needs a serializer thread</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td><strong>Quantitative-trait fast path</strong> (no SPA/Firth/ER ever fires — saige_test.cpp:508)</td>
+      <td>trivial OpenMP over markers</td>
+      <td>per marker</td>
+      <td class="speedup-high">4–10× on quantitative-only runs</td>
+      <td class="difficulty-easy">Easy</td>
+      <td>Same as #1 minus the candidate path; <strong>isolate this as the first vertical slice</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<p><em>Excluded:</em> PCG solve inside <code>scoreTest</code> (saige_test.cpp:182) is already a hot Armadillo call; threading it across markers would oversubscribe BLAS — better left as the sparse-GRM fallback. Per-marker BLAS is already multi-threaded via Armadillo's OpenBLAS link.</p>
+
+<hr>
+
+<h2 id="sec3">3. Recommended design (3 phases, mapped to Seokho's bullets)</h2>
+
+<h3>Bullet 1 — "Matrix-level first pass for most markers"</h3>
+
+<p><strong>Concrete approach.</strong> Inside <code>mainMarkerInCPP</code>, read markers in blocks of B (default 256) into <code>G ∈ ℝ^{n×B}</code>. Run a <em>vectorized cheap path</em> that computes <code>Tstat[1..B]</code> and <code>var1[1..B]</code> jointly: for the no-sparse-GRM, no-noadjCov common case this is <code>S = (Gᵀ res) / tau</code>, <code>var2</code> per-marker via column-wise dot products with <code>m_mu2</code>. This is essentially <code>scoreTestFast</code> (saige_test.cpp:233–314) re-expressed as one GEMM + a few column reductions. Output for each marker is identical to the serial path <em>if</em> we keep the same dense-vs-sparse heuristic.</p>
+
+<p><strong>Why it's correct.</strong> <code>m_X</code>, <code>m_XV</code>, <code>m_XVX</code>, <code>m_XVX_inv</code>, <code>m_res</code>, <code>m_mu2</code>, <code>m_tauvec[0]</code>, <code>m_S_a</code> are all set in the SAIGEClass constructor and never written during the loop (saige_test.hpp:16–25). The cheap path takes only <code>m_varRatioVal</code> from per-marker state; we can lift it to a <code>varRatioVec[B]</code> precomputed once per block from <code>m_varRatio_null</code> using each marker's MAC. The only output is read-then-write into pre-allocated <code>BetaVec</code>, <code>seBetaVec</code>, <code>pvalVec</code> etc. (main.cpp:660–665) at index <code>i</code>, which is race-free if each thread owns disjoint i.</p>
+
+<p><strong>Implementation steps.</strong></p>
+<ol>
+  <li>Add <code>void scoreTestFast_block(const arma::mat&amp; G, ..., arma::vec&amp; Beta, ..., arma::vec&amp; pval_num)</code> next to <code>scoreTestFast</code> in saige_test.cpp.</li>
+  <li>In <code>mainMarkerInCPP</code>, restructure the loop into outer block iteration + inner per-marker bookkeeping (QC, output write).</li>
+  <li>Keep the existing single-marker <code>scoreTestFast</code> path as a fallback for markers that need the sparse-G shortcut.</li>
+  <li>Compute <code>StdStat = |Tstat|/sqrt(var1)</code> for the whole block; produce a <em>candidate mask</em> for markers needing SPA/Firth/ER.</li>
+  <li>Gate behind a CLI flag <code>--block-size N</code> (default 256, set N=1 to fall back to the current serial loop bit-for-bit).</li>
+</ol>
+
+<p><strong>Verification plan.</strong> Run all existing configs (<code>config_compare*.yaml</code>) with <code>--block-size 1</code> and confirm zero diff vs main. Then run with <code>--block-size 256</code> and require <code>|Δ pval| &lt; 1e-12</code> for the cheap path on the <code>extdata/input/</code> 1k-sample dataset and the binary/region/sparse configs. Regression risk: <code>var2_c = arma::accu(m_mu2) * (2*altFreq)^2</code> term in <code>scoreTestFast_noadjCov</code> (saige_test.cpp:336) reuses a precomputed scalar — must be hoisted, not recomputed per column.</p>
+
+<h3>Bullet 2 — "Separate only SPA/Firth/ER-needed markers as candidates"</h3>
+
+<p><strong>Concrete approach.</strong> After the block first pass, every marker has a <code>(Tstat, var1, pval_noadj, MAC)</code> tuple. Build three candidate lists:</p>
+<ul>
+  <li><code>spa_list</code>: binary/survival markers where <code>StdStat &gt; m_SPA_Cutoff</code> and <code>MAC &gt; g_MACCutoffforER</code> (saige_test.cpp:498–501, 508).</li>
+  <li><code>er_list</code>: binary markers where <code>MAC ≤ g_MACCutoffforER</code> (main.cpp:871).</li>
+  <li><code>firth_list</code>: built lazily from SPA output where <code>pval ≤ m_pCutoffforFirth</code> (saige_test.cpp:622).</li>
+</ul>
+<p>Process each list with the existing single-marker code, parallelized over candidates with OpenMP.</p>
+
+<p><strong>Why it's correct.</strong> SPA/Firth/ER are pure functions of <code>(GVec_i, m_mu, m_res, m_y, m_n_case)</code> plus <code>Tstat</code>/<code>var1</code> already computed. They write only to local stack variables and to output vectors at index <code>i</code>. The candidate list is built deterministically from first-pass results, so output ordering is preserved.</p>
+
+<p><strong>Implementation steps.</strong></p>
+<ol>
+  <li>Hoist the SPA-only / ER-only / Firth-only parts of <code>getMarkerPval</code> (saige_test.cpp:505–706) into standalone functions taking precomputed <code>Tstat, var1</code> and returning <code>(Beta, seBeta, pval, isConverge, …)</code>.</li>
+  <li>Run <code>#pragma omp parallel for schedule(dynamic, 8)</code> over each candidate list.</li>
+  <li>Make sure the lifted functions take <em>no</em> <code>SAIGEClass&amp;</code> mutable scalars — pass <code>varRatioVal</code> and <code>flagSparseGRM_cur</code> as args.</li>
+  <li>For Firth, retain the dependency on SPA's output (Firth needs the SPA <code>pval</code>), so SPA must finish before Firth list is built.</li>
+  <li><strong>Note for Seokho:</strong> this optimization does nothing for quantitative traits — <code>m_traitType != "quantitative"</code> gates SPA (saige_test.cpp:508) and Firth (binary-only block at 620), and ER is binary-only. Quantitative benefits only from Bullet 1 + Bullet 4.</li>
+</ol>
+
+<p><strong>Verification plan.</strong> Diff per-marker outputs against <code>--block-size 1</code> baseline on <code>config_compare_binary.yaml</code> (forces SPA path) and <code>config_compare_binary_region.yaml</code>. Acceptance: byte-identical <code>pvalVec</code> strings (since both paths print via the same <code>sprintf("%.6E", …)</code> at saige_test.cpp:602/611).</p>
+
+<h3>Bullet 3 — "Recompute candidates with the existing exact path"</h3>
+
+<p><strong>Concrete approach.</strong> This is the conservative variant of Bullet 2: instead of refactoring SPA/Firth/ER, just call the existing <code>Unified_getMarkerPval</code> (<code>getMarkerPval</code>) on each candidate, in parallel. The block first pass produces "preliminary" results that get overwritten for any candidate marker.</p>
+
+<p><strong>Why it's correct.</strong> No code path changes — we are reusing the audited serial code, just calling it on a subset. Per-call SAIGEClass mutations (<code>m_flagSparseGRM_cur</code>, <code>m_varRatioVal</code>) become per-thread races; we fix this by introducing a small <code>struct PerMarkerCtx { bool flagSparseGRM_cur; bool isnoadjCov_cur; double varRatioVal; }</code> passed as an argument, and a <code>getMarkerPval_ctx(...)</code> overload that reads only from the ctx, not the SAIGEClass scalars.</p>
+
+<p><strong>Implementation steps.</strong></p>
+<ol>
+  <li>Define <code>PerMarkerCtx</code> in saige_test.hpp.</li>
+  <li>Add <code>getMarkerPval_ctx(...)</code> that reads <code>t_isSparseGRM</code>, <code>t_isnoadjCov</code>, <code>t_varRatioVal</code> from the ctx and a local <code>is_region</code> flag, never touching <code>m_*_cur</code>.</li>
+  <li>Replace the three <code>m_*_cur</code> field reads inside <code>scoreTest</code>/<code>scoreTestFast</code>/<code>scoreTestFast_noadjCov</code> with passed-in arguments (~6 occurrences across saige_test.cpp).</li>
+  <li>Keep the old API as a wrapper around the ctx version so the existing region path doesn't have to change.</li>
+  <li>Parallelize the candidate-recompute over markers with OpenMP.</li>
+</ol>
+
+<p><strong>Verification plan.</strong> Same diff harness as Bullet 2 plus the conditional analysis config (<code>config_compare_conditional.yaml</code>) — this exercises the <code>m_P2Mat_cond</code>/<code>m_VarInvMat_cond</code> read paths (saige_test.cpp:715–845) which must remain read-only across threads.</p>
+
+<h3>Bullet 4 — "I/O parallelism only for block read/decode support"</h3>
+
+<p><strong>Concrete approach.</strong> Producer-consumer for BGEN only. One I/O thread does <code>fseek + fread</code> of the <code>(snpID, rsID, chr, alleles, C, D, zBuf[C-4])</code> block per variant (genotype_reader.cpp:1315–1365). A pool of decoder threads runs <code>Parse2</code> (genotype_reader.cpp:1106) on the compressed buffer. Output is a thread-safe queue of <code>(metadata, arma::vec dosages)</code>. The main thread consumes in original order.</p>
+
+<p><strong>Why it's correct.</strong> <code>Parse2</code> reads only <code>m_posSampleInModel</code> (set once at init, genotype_reader.cpp:1089–1097) and writes only to its <code>dosages</code> output arg — no per-instance mutable state. The unsafe state is the file pointer <code>m_fin</code> and the scratch buffers <code>m_buf</code>/<code>m_zBuf</code>, which are confined to the single I/O thread (genotype_reader.cpp:1305, 1359, 1365). Decoder workers each get their own <code>buf</code> allocated per call.</p>
+
+<p><strong>Implementation steps.</strong></p>
+<ol>
+  <li>Add <code>BgenClass::readRawBlock(uint64_t offset, RawBlock&amp; out)</code> that does only I/O — no Parse2.</li>
+  <li>Add <code>BgenClass::parseBlock(const RawBlock&amp;, arma::vec&amp; dosages, ...)</code> that does only decode (callable from any thread).</li>
+  <li>Add a <code>BgenStreamer</code> class with one reader thread and a <code>std::thread::hardware_concurrency()-2</code>-sized decoder pool, bounded queue (e.g. 64 raw blocks).</li>
+  <li>Plumb through <code>mainMarkerInCPP</code> / <code>mainRegionInCPP</code> so they pull from the streamer instead of calling <code>Unified_getOneMarker</code> directly when <code>t_genoType == "bgen"</code>.</li>
+  <li>For PLINK/PGEN, do <em>not</em> introduce a streamer — single-thread read is already fast (no decompression). For VCF, explicitly skip (htslib stream, no random access here).</li>
+</ol>
+
+<p><strong>Verification plan.</strong> Compare <code>output/</code> against serial on <code>config_test_bgen.yaml</code>. Measure wall-time on a real BGEN with zstd compression (this is where it pays off). <strong>If the BGEN streamer doesn't improve wall time by &gt;20% on the test data, drop the feature</strong> — it's not worth the complexity. Regression risk: order desynchronization in the queue ⇒ markers tagged with wrong byte offsets. Mitigation: each <code>RawBlock</code> carries its source marker index.</p>
+
+<hr>
+
+<h2 id="sec4">4. Open questions for Seokho</h2>
+
+<ol>
+  <li><strong>Target thread count.</strong> Should we expose <code>--threads N</code> as a CLI flag, or read <code>OMP_NUM_THREADS</code>? UKB-scale runs typically have 8–32 cores; what's the deployment target?</li>
+  <li><strong>Block size B for the matrix-level first pass.</strong> Auto-tune based on <code>n</code> and L2 cache size, or fix it (e.g. 256) and expose as a flag for benchmarking?</li>
+  <li><strong>VCF parallelism.</strong> I recommend <em>not</em> parallelizing VCF (no random access via htslib in our reader). Confirm or push back?</li>
+  <li><strong>Region-loop parallelism (table row #7).</strong> This is the biggest potential win for group-mode runs but requires per-thread SAIGEClass copies. Is the memory cost acceptable (one full SAIGEClass + <code>m_SigmaMat_sp</code> per thread can be hundreds of MB)?</li>
+  <li><strong>Bit-exact reproducibility.</strong> Are we OK with reordering reductions inside the block GEMM (which can change low bits via FP non-associativity), as long as <code>|Δ pval| &lt; 1e-10</code>? Or do we need bit-identical output?</li>
+  <li><strong>Firth + SPA on log-scale p-values.</strong> The current code has special-cased log-p arithmetic (saige_test.cpp:567–582, 629–640). Should the block first pass also support log-p, or fall back to serial for any marker where the cheap path returned a log-scale string?</li>
+</ol>
+
+<hr>
+
+<h2 id="sec5">5. Sequencing — smallest end-to-end vertical slice first</h2>
+
+<h4>Phase A (1–2 weeks). Foundation + Bullet 4 dry run.</h4>
+<ul>
+  <li><strong>A1.</strong> Add a benchmark harness: run all <code>config_compare*</code> configs serially, record per-config wall time and per-stage breakdown. Establishes baseline.</li>
+  <li><strong>A2.</strong> Refactor <code>m_flagSparseGRM_cur</code> / <code>m_isnoadjCov_cur</code> / <code>m_varRatioVal</code> into a <code>PerMarkerCtx</code> passed by argument (Bullet 3 step 1–3). This is <em>non-functional</em> — same code path, same output, just removes mutable shared state. Land this PR first; it unblocks everything else.</li>
+</ul>
+
+<h4>Phase B (2–3 weeks). Single-variant OpenMP — the first slice with measurable wall-time improvement.</h4>
+<ul>
+  <li><strong>B1.</strong> OpenMP <code>parallel for</code> over the marker loop in <code>mainMarkerInCPP</code> (Bullet 3 step 5). Output vectors are pre-sized; thread-safe by index. Per-thread buffers for <code>t_GVec</code>, <code>gtildeVec</code>, <code>t_P2Vec</code>.</li>
+  <li><strong>B2.</strong> Show ≥3× speedup on <code>config_compare.yaml</code> (PLINK, quantitative) with 8 threads. <strong>This is the smallest convincing vertical slice.</strong></li>
+  <li><strong>B3.</strong> Run all comparison configs; require bit-identical output (with a single thread) and <code>|Δ pval| &lt; 1e-10</code> (with N threads).</li>
+</ul>
+
+<h4>Phase C (3–4 weeks). Bullet 1 — matrix-level block path.</h4>
+<ul>
+  <li><strong>C1.</strong> Implement <code>scoreTestFast_block</code>.</li>
+  <li><strong>C2.</strong> Wire into single-variant loop; measure on quantitative traits first (no SPA/Firth/ER means full block path benefit).</li>
+  <li><strong>C3.</strong> Extend to binary traits with the candidate split (Bullet 2 — most of the work is already done by phase B).</li>
+</ul>
+
+<h4>Phase D (2 weeks). Bullet 4 — BGEN I/O+decode pipeline.</h4>
+<ul>
+  <li><strong>D1.</strong> Implement only if profiling in Phase B shows BGEN decode is &gt;20% of wall time.</li>
+  <li><strong>D2.</strong> PLINK/PGEN/VCF unchanged.</li>
+</ul>
+
+<h4>Phase E (optional, after sign-off).</h4>
+<p>Region-loop parallelism (table row #7) — only if step2 is bottlenecked on group-mode runs and the SAIGEClass memory cost is acceptable.</p>
+
+<blockquote><strong>Decision gate after Phase B:</strong> if we don't see a 3× wall-time speedup on a real test config with 8 threads after Phase B, stop and re-plan — Phases C/D add complexity that needs to be justified by Phase B results.</blockquote>
+
+</body>
+</html>

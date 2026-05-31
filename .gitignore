@@ -27,3 +27,6 @@ code_copy/SAIGE_isolated/extdata/
 code_copy/SAIGE_isolated/src/*.so
 code_copy/SAIGE_isolated/src/Makevars
 code_copy/SAIGE_isolated/src/RcppExports.cpp
+
+# Test data (transferred separately, not source)
+test_data/

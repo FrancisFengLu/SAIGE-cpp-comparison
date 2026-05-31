@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SAIGE step2 — Math flow diagrams</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 1240px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.55;
+    color: #1f2328;
+    background: #fff;
+  }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: .4rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .3rem; margin-top: 2.5rem; color: #0550ae; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: #f6f8fa;
+    padding: .15em .35em;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+  .caption {
+    background: #fafbfc;
+    border-left: 4px solid #0969da;
+    padding: .6rem 1rem;
+    margin: .75rem 0 1rem;
+    font-size: 0.95em;
+  }
+  .legend {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.88em;
+    margin: .5rem 0 1rem;
+    flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: .35rem; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #888; }
+  .diagram {
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 1rem 0 2rem;
+    background: #fff;
+    overflow-x: auto;
+  }
+  .mermaid { text-align: center; min-width: 100%; }
+  .meta {
+    background: #f6f8fa;
+    border-left: 4px solid #1a7f37;
+    padding: .75rem 1rem;
+    margin: 1rem 0 2rem;
+    font-size: 0.95em;
+  }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 2rem 0; }
+</style>
+</head>
+<body>
+
+<h1>SAIGE step 2 — math flow diagrams</h1>
+
+<div class="meta">
+  <strong>Three views:</strong>
+  <ol style="margin:.3rem 0 0;padding-left:1.4rem;">
+    <li><strong>宏观计算流程</strong> — step1 vs step2 的分工，constants 从哪来、loop 在哪里、产出什么</li>
+    <li><strong>数据形状 &amp; 维度流</strong> — 单 marker 走一遍，每个量的 shape / cost / 是否共享</li>
+    <li><strong>Region test 组合视图</strong> — per-variant scores 如何拼成 BURDEN / SKAT / SKAT-O</li>
+  </ol>
+</div>
+
+<p>颜色统一约定（贯穿三张图）：</p>
+<div class="legend">
+  <span class="legend-item"><span class="legend-swatch" style="background:#dbe9f7"></span>共享 / 一次性加载（read-only）</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#cdeacc"></span>每 marker 必跑（cheap）</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#ffe28a"></span>慢路径（SPA）</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#ffb066"></span>慢路径（Firth）</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#ff8a80"></span>慢路径（ER）</span>
+  <span class="legend-item"><span class="legend-swatch" style="background:#e8d5ff"></span>聚合 / region 级别</span>
+</div>
+
+<hr>
+
+<h2 id="d1">1. 宏观计算流程</h2>
+<div class="caption">
+  Step1 是独立程序，跑一次估计 GLMM 的 β̂/τ̂/μ̂ 和 variance ratio r̂。Step2 把这些 constants 一次性加载进 <code>SAIGEClass</code>，然后对千万级 markers / 万级 regions 做循环。<strong>红框 = step2 的主循环（这是我们要并行的部分）。</strong>
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    PHEN["Phenotype y [N]<br/>Covariates X [N×p]<br/>GRM Ψ (full or sparse)"]:::input
+
+    subgraph S1 ["Step 1 (separate program — fits null model once)"]
+        direction TB
+        FIT["Fit GLMM under H₀: γ=0<br/>logit(μᵢ) = Xβ + bᵢ, b~N(0, τΨ)<br/>(IRLS + AI iterations, expensive)"]:::const
+        FIT --> EST["β̂, τ̂, μ̂"]:::const
+        EST --> VR["Estimate variance ratio r̂<br/>on ~few hundred markers,<br/>stratified by MAC bins"]:::const
+        VR --> OUT1["nullmodel files +<br/>varianceRatio table"]:::const
+    end
+
+    PHEN --> FIT
+    OUT1 -->|"~seconds, one-time"| LOAD["loadNullModel + setSAIGEobjInCPP<br/>main.cpp:2983–3122"]:::const
+    LOAD --> SHARED["SAIGEClass (shared, READ-ONLY):<br/>μ̂ [N], W [N], X [N×p], X^TW [p×N],<br/>(X^TWX)⁻¹ [p×p], r̂ table,<br/>(sparse Σ if applicable)"]:::const
+
+    GENO["Genotype file<br/>BGEN / PLINK / VCF / PGEN<br/>(M markers, 10⁶–10⁷)"]:::input
+    GENO -->|"open reader<br/>main.cpp:3134–3170"| READER["genotype_reader<br/>(reads one marker at a time)"]:::const
+
+    SHARED --> DISP{"--region flag?"}
+    READER --> DISP
+
+    DISP -->|"no"| SLOOP
+    DISP -->|"yes"| RLOOP
+
+    subgraph LOOPS ["★ Step 2 main loops — this is the parallelism target"]
+        direction TB
+        SLOOP["Single-variant loop<br/>for i in 1..M:<br/>  read G_i → cheap score → maybe SPA/ER/Firth<br/>mainMarkerInCPP, main.cpp:708"]:::loop
+        RLOOP["Region loop<br/>for each region r:<br/>  for each marker in r: read + score + accumulate P1/P2<br/>  → VarMat = P1·P2<br/>  → BURDEN / SKAT / SKAT-O<br/>mainRegionInCPP, main.cpp:1645"]:::loop
+    end
+
+    SLOOP --> SVO["per-marker rows:<br/>Beta, SE, pval, AF,<br/>(case/ctrl counts if binary)"]:::output
+    RLOOP --> RVO["per-region rows:<br/>region-level p<br/>+ singleAssoc per variant"]:::output
+
+    SVO --> FILE1["output: single-variant.assoc"]:::output
+    RVO --> FILE2["output: region.assoc<br/>(per anno × MAF bin, CCT-combined)"]:::output
+
+    classDef input fill:#ffffff,stroke:#444,stroke-width:1.2px,color:#111
+    classDef const fill:#dbe9f7,stroke:#0969da,color:#0a2540
+    classDef loop fill:#fff2f0,stroke:#cf222e,stroke-width:2px,color:#3a0606
+    classDef output fill:#eeeeee,stroke:#666,color:#222
+</div>
+</div>
+
+<hr>
+
+<h2 id="d2">2. 数据形状 &amp; 维度流（单个 marker 走一遍）</h2>
+<div class="caption">
+  N = 样本数，p = 协变量数，k = 该 marker 的非零 carrier 数。绝大多数计算只触及 k 个样本（不是 N），这是 SAIGE 高速的关键。<strong>蓝色 = 一次性加载的 constants，绿色 = 每个 marker 都跑的便宜部分，黄/红/橙 = 慢路径（只在 mask 触发时跑）。</strong>每个箭头/节点都标了 shape 和 cost。
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart LR
+    subgraph CON ["constants from step1 (read-only, shared across all markers)"]
+        direction TB
+        MU["μ̂ [N]<br/>fitted means"]:::const
+        W["W = μ̂(1−μ̂) [N]<br/>'m_mu2'"]:::const
+        RES["res = (y−μ̂)/τ̂₀ [N]<br/>'m_res'"]:::const
+        XC["X [N×p]<br/>covariates"]:::const
+        XVX["(X^TWX)⁻¹·X^TW [p×N]<br/>'m_XVX_inv_XV' — pre-projected"]:::const
+        RVEC["r̂ table [#MAC_bins]<br/>variance ratio per bin"]:::const
+    end
+
+    G["G [N]<br/>raw dosage<br/>(but only k nonzero)"]:::input
+
+    G -->|"select nonzero<br/>cost O(N)"| GK["G_nz [k]<br/>k = #carriers"]:::input
+
+    GK --> ADJ["G̃ = G − X·((X^TWX)⁻¹·X^TW·G)<br/>'getadjGFast'<br/>cost <b>O(k·p)</b> sparse trick"]:::cheap
+    XVX -.->|read| ADJ
+    XC -.->|read| ADJ
+
+    ADJ --> GT["G̃ [N] (stored as k nonzero entries)<br/>covariate-adjusted genotype"]:::cheap
+
+    GT --> SCORE["S = (1/τ̂₀)·G̃ᵀ·(y−μ̂) [scalar]<br/>cost <b>O(k)</b>"]:::cheap
+    RES -.->|read| SCORE
+
+    GT --> V0["V₀ = Σᵢ G̃ᵢ²·μ̂ᵢ(1−μ̂ᵢ) [scalar]<br/>cost <b>O(k)</b>"]:::cheap
+    W -.->|read| V0
+
+    V0 --> VV["V = r̂·V₀ [scalar]<br/>variance ratio trick<br/>cost O(1) lookup"]:::cheap
+    RVEC -.->|MAC bin lookup| VV
+
+    GK -->|MAC| MAC["MAC = 2·#hom + #het [int]"]:::input
+    MAC -.->|select bin| VV
+
+    SCORE --> ZSTAT["Z = S/√V [scalar]<br/>StdStat"]:::cheap
+    VV --> ZSTAT
+
+    ZSTAT --> PASYM["p_asym = 2·Φ(−|Z|) [scalar]<br/><b>END for ~95% of markers</b>"]:::cheap
+
+    %% slow paths
+    ZSTAT -.->|"|Z| &gt; 2 &amp;<br/>binary or survival"| SPA["SPA: solve K'(t̂)=S<br/>Newton on K(t)=Σᵢ log(1−μ̂ᵢ+μ̂ᵢ·e^{t·G̃ᵢ})<br/>needs G̃ [N], μ̂ [N]<br/>cost <b>O(N·iter)</b>"]:::spa
+    GT -.->|read| SPA
+    MU -.->|read| SPA
+    SPA --> PSPA["p_SPA [scalar]"]:::spa
+
+    MAC -.->|"≤ 10 &amp; binary"| ER["ER: enumerate carrier assignments<br/>weighted by ∏μ̂·∏(1−μ̂)<br/>cost <b>O(C(N,k))</b> — feasible only for tiny k"]:::er
+    MU -.->|read| ER
+    ER --> PER["p_ER [scalar]"]:::er
+
+    PSPA -.->|"p ≤ 0.05 &amp; binary"| FIRTH["Firth IRLS on (intercept, G̃)<br/>U* = Σ[(y−π)+h·(0.5−π)]·x<br/>~50 IRLS iters<br/>cost <b>O(N·iter)</b>"]:::firth
+    GT -.->|read| FIRTH
+    FIRTH --> BSE["β̂_Firth, SE_Firth [scalar, scalar]<br/>(replaces β̂ only, p-value stays from SPA)"]:::firth
+
+    classDef input fill:#ffffff,stroke:#444,stroke-width:1.2px,color:#111
+    classDef const fill:#dbe9f7,stroke:#0969da,color:#0a2540
+    classDef cheap fill:#cdeacc,stroke:#2e7d32,color:#0f2e0a
+    classDef spa fill:#ffe28a,stroke:#b58b00,color:#3a2a00
+    classDef er fill:#ff8a80,stroke:#a3160c,color:#3a0606
+    classDef firth fill:#ffb066,stroke:#a64b00,color:#3a1a00
+</div>
+</div>
+
+<hr>
+
+<h2 id="d3">3. Region test 组合视图</h2>
+<div class="caption">
+  Region 里有 m 个 variants。每个 variant 先跑一遍单变体管线得到 G̃ᵢ 和 P2ᵢ（= W·G̃ᵢ 或 Σ⁻¹·G̃ᵢ），按列堆成 P1/P2 矩阵。<code>VarMat = P1·P2</code> 给出跨变体的 score 协方差 Σ_S，这是 BURDEN / SKAT / SKAT-O 三个 combinator 的共同输入。三个 test 提取 Σ_S 的不同 feature。
+</div>
+<div class="diagram">
+<div class="mermaid">
+flowchart TB
+    REGION["Region r: m variants<br/>(m ≈ 10 to 500)"]:::input
+
+    REGION --> MARKER_LOOP["for i in 1..m, run single-variant pipeline<br/>→ produces (G̃ᵢ, Sᵢ, Vᵢ, P2ᵢ)<br/>main.cpp:1783–2009"]:::cheap
+
+    MARKER_LOOP --> COLS["per-variant outputs:<br/>G̃ᵢ [N], Sᵢ [scalar], P2ᵢ [N], MACᵢ"]:::cheap
+
+    COLS --> STACK["stack into matrices:<br/>P1 = [√r·G̃ᵢᵀ] rows [m×N]<br/>P2 = [√r·P2ᵢ] columns [N×m]<br/>chunked to disk every m1 markers<br/>main.cpp:1913–1914, 2016–2022"]:::cheap
+
+    STACK --> VARMAT["VarMat = P1·P2 [m×m]<br/>= cross-variant score covariance Σ_S<br/>(Σ_S)ᵢⱼ = Cov(Sᵢ, Sⱼ)<br/>main.cpp:2213–2251"]:::agg
+
+    COLS --> SVEC["score vector:<br/>S [m]"]:::cheap
+
+    %% three combinators
+    VARMAT --> BURDEN_BOX
+    SVEC --> BURDEN_BOX
+    VARMAT --> SKAT_BOX
+    SVEC --> SKAT_BOX
+    VARMAT --> SKATO_BOX
+    SVEC --> SKATO_BOX
+
+    subgraph BURDEN_BOX ["BURDEN (collapse → 1-df chi-sq)"]
+        direction TB
+        BWEIGHT["weights w [m]<br/>e.g. Beta(1,25) on MAF"]:::agg
+        BWEIGHT --> BS["S_B = wᵀ·S [scalar]"]:::agg
+        BWEIGHT --> BV["V_B = wᵀ·Σ_S·w [scalar]"]:::agg
+        BS --> BP["p_BURDEN<br/>(reuses SPA on collapsed pseudo-marker)<br/>main.cpp:2263–2372"]:::agg
+        BV --> BP
+    end
+
+    subgraph SKAT_BOX ["SKAT (quadratic form → mixture of chi-sq)"]
+        direction TB
+        SWEIGHT["weights w [m]"]:::agg
+        SWEIGHT --> SQ["Q = Σᵢ wᵢ²·Sᵢ² [scalar]<br/>= sᵀ·diag(w²)·s"]:::agg
+        SQ --> SEIG["eigenvalues of<br/>diag(w)·Σ_S·diag(w) [m vals]"]:::agg
+        VARMAT -.->|eigendecompose| SEIG
+        SEIG --> SP["p_SKAT via Davies'<br/>(numerical char-fn inversion)<br/>skat.cpp"]:::agg
+    end
+
+    subgraph SKATO_BOX ["SKAT-O (interpolate ρ ∈ [0,1] + CCT)"]
+        direction TB
+        OGRID["ρ grid: 0, 0.01, 0.04, ..., 1<br/>~11 values"]:::agg
+        OGRID --> OQ["Q_ρ = ρ·Q_B + (1−ρ)·Q_SKAT<br/>for each ρ → p_ρ [11 vals]"]:::agg
+        OQ --> OCCT["CCT combine:<br/>T = Σ tan((0.5−p_ρ)·π)<br/>p_SKATO = 0.5 − atan(T/K)/π<br/>cct.cpp"]:::agg
+    end
+
+    BP --> COMBINE["CCT combine across<br/>(annotation × MAF bin) groups<br/>main.cpp:2591–2598"]:::output
+    SP --> COMBINE
+    OCCT --> COMBINE
+    COMBINE --> WRITE["write region row<br/>writeOutfile_BURDEN / SKAT"]:::output
+
+    classDef input fill:#ffffff,stroke:#444,stroke-width:1.2px,color:#111
+    classDef cheap fill:#cdeacc,stroke:#2e7d32,color:#0f2e0a
+    classDef agg fill:#e8d5ff,stroke:#6f42c1,color:#2e1a4a
+    classDef output fill:#eeeeee,stroke:#666,color:#222
+</div>
+</div>
+
+<hr>
+
+<p style="color:#57606a;font-size:0.9em;margin-top:2rem;">
+渲染需要能访问 <code>cdn.jsdelivr.net</code>。如果图打不开告诉我，我换 inline mermaid.js。
+</p>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' }
+  });
+</script>
+</body>
+</html>

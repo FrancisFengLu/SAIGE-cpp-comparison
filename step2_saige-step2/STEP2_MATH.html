@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SAIGE step2 — Math walkthrough</title>
+<script>
+  MathJax = {
+    tex: {
+      inlineMath: [['$', '$'], ['\\(', '\\)']],
+      displayMath: [['$$', '$$'], ['\\[', '\\]']],
+      processEscapes: true
+    },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 920px;
+    margin: 2.5rem auto;
+    padding: 0 1.5rem;
+    line-height: 1.65;
+    color: #1f2328;
+    background: #fff;
+  }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: .4rem; margin-top: 0; }
+  h2 {
+    border-bottom: 1px solid #d0d7de;
+    padding-bottom: .3rem;
+    margin-top: 2.5rem;
+    color: #0550ae;
+  }
+  h3 { margin-top: 1.6rem; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: #f6f8fa;
+    padding: .15em .35em;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 0.92em;
+    line-height: 1.45;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: .5rem .7rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f6f8fa; font-weight: 600; }
+  blockquote {
+    border-left: 4px solid #d0d7de;
+    margin: 0;
+    padding: .25rem 1rem;
+    color: #57606a;
+  }
+  .meta {
+    background: #f6f8fa;
+    border-left: 4px solid #0969da;
+    padding: .75rem 1rem;
+    margin: 1rem 0 2rem;
+    font-size: 0.95em;
+  }
+  .toc {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: .75rem 1.25rem;
+    margin: 1rem 0 2rem;
+  }
+  .toc ol { margin: .25rem 0; padding-left: 1.5rem; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 2rem 0; }
+  ul, ol { padding-left: 1.5rem; }
+  li { margin: .25rem 0; }
+  mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+</head>
+<body>
+
+<h1>SAIGE step 2 — the math, mapped to the C++ port</h1>
+
+<div class="meta">
+  <strong>Companion to:</strong> <code>PARALLELISM_PLAN.md</code> · <code>PARALLELISM_DIAGRAMS.html</code> &middot;
+  <strong>Branch:</strong> <code>step2-parallel</code> &middot;
+  <strong>Purpose:</strong> understand what step 2 actually computes per marker before designing parallelism.
+</div>
+
+<p>This is a math-first walkthrough of what <code>step2_saige-step2/</code> actually computes per marker, written for someone who is going to rewrite step 2 in C++ and wants the statistics nailed down before thinking about threads or vectorisation. All file references are inside <code>/home/francisfenglu4/projects/SAIGE-cpp-comparison/step2_saige-step2/</code>.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#s1">The GLMM SAIGE fits</a></li>
+    <li><a href="#s2">What step 1 hands to step 2</a></li>
+    <li><a href="#s3">The score statistic for one variant</a></li>
+    <li><a href="#s4">The variance ratio trick (why step 2 is fast)</a></li>
+    <li><a href="#s5">SPA — saddlepoint approximation</a></li>
+    <li><a href="#s6">Efficient Resampling (ER) for ultra-rare variants</a></li>
+    <li><a href="#s7">Firth correction (separation)</a></li>
+    <li><a href="#s8">Region / group tests</a></li>
+    <li><a href="#s9">What this means for parallelism</a></li>
+  </ol>
+</div>
+
+<hr>
+
+<h2 id="s1">1. The GLMM SAIGE fits</h2>
+
+<p>SAIGE assumes a generalised linear mixed model (GLMM) on $N$ unrelated/related individuals with $p$ covariates. The mean response of subject $i$ is</p>
+
+$$
+g(\mu_i) \;=\; X_i\,\beta \;+\; G_i\,\gamma \;+\; b_i, \qquad b \sim \mathcal{N}\!\bigl(0,\; \tau\,\Psi\bigr).
+$$
+
+<ul>
+  <li>$g$ is the link: $\mathrm{logit}$ for <code>traitType = "binary"</code>, identity for <code>"quantitative"</code>, $\log$-hazard for <code>"survival"</code>. The C++ branches on <code>m_traitType</code> everywhere it matters (e.g. <code>saige_test.cpp:257</code> and <code>:262</code>).</li>
+  <li>$X \in \mathbb{R}^{N\times p}$ — design matrix of covariates (intercept, PCs, age, sex, …). In the port this is <code>m_X</code>.</li>
+  <li>$G \in \mathbb{R}^N$ — the dosage of the single variant being tested ($0/1/2$ or imputed real-valued). Passed in as <code>t_GVec</code>.</li>
+  <li>$\gamma \in \mathbb{R}$ — the genetic effect; this is the parameter of interest, the thing whose p-value we want.</li>
+  <li>$b \in \mathbb{R}^N$ — sample-level random effects modelling genetic relatedness.</li>
+  <li>$\Psi$ — the genetic relationship matrix (GRM). It can be dense (full GRM, $N\times N$) or sparse (relatedness above some threshold), held in <code>m_spSigmaMat</code> / <code>m_diagSigma</code> when sparse.</li>
+  <li>$\tau$ — the variance component for $b$. In the binary case the residual scale is fixed at 1; in the quantitative case there is also a residual $\tau_0$, so the port carries <code>m_tauvec</code> of length 2.</li>
+</ul>
+
+<p>For binary traits ($Y_i \in \{0,1\}$), writing $\mu_i = \Pr(Y_i = 1 \mid X_i, G_i, b_i)$,</p>
+
+$$
+\mathrm{logit}(\mu_i) = X_i\beta + G_i\gamma + b_i, \qquad W_i \equiv \mu_i(1-\mu_i).
+$$
+
+<p>For quantitative ($Y_i \in \mathbb{R}$),</p>
+
+$$
+\mu_i = X_i\beta + G_i\gamma + b_i, \qquad Y_i \mid b_i \sim \mathcal{N}(\mu_i,\,\tau_0).
+$$
+
+<p>For survival, the Cox-style log-hazard $\lambda_i(t) = \lambda_0(t)\exp(X_i\beta + G_i\gamma + b_i)$ — step 2 supports this through the same score-test machinery but the SPA is not yet ported (<code>spa.cpp:30</code>).</p>
+
+<p><strong>Step 1 fits the null model</strong>, i.e. $H_0: \gamma = 0$:</p>
+
+$$
+g(\hat\mu_i) = X_i\hat\beta + \hat b_i, \quad \hat b \sim \mathcal{N}(0,\hat\tau\Psi).
+$$
+
+<p>Step 1 produces $\hat\beta$, $\hat\tau$, $\hat\mu$, and a handful of derived matrices that summarise the projection $(X^T W X)^{-1}$ etc. Step 2 reads them once into <code>SAIGEClass</code>, treats them as fixed, and loops over variants testing $H_0: \gamma = 0$ one variant at a time.</p>
+
+<hr>
+
+<h2 id="s2">2. What step 1 hands to step 2</h2>
+
+<p>These are the quantities <code>loadNullModel()</code> deposits and <code>SAIGEClass</code>'s constructor (<code>saige_test.cpp:51–145</code>) stashes — they are read-only for the entire step 2 run.</p>
+
+<table>
+  <thead><tr><th>symbol</th><th>meaning</th><th>code</th></tr></thead>
+  <tbody>
+    <tr><td>$\hat\mu \in \mathbb{R}^N$</td><td>fitted means under $H_0$</td><td><code>m_mu</code>, written from <code>mu.arma</code></td></tr>
+    <tr><td>$r = (y-\hat\mu)/\hat\tau_0$</td><td>working residuals</td><td><code>m_res</code></td></tr>
+    <tr><td>$W_i = \hat\mu_i(1-\hat\mu_i)$ for binary; $1/\hat\tau_0$ for quantitative</td><td>binomial / Gaussian variance weights</td><td><code>m_mu2</code> (<code>V</code> in the loader)</td></tr>
+    <tr><td>$X$</td><td>covariate matrix</td><td><code>m_X</code></td></tr>
+    <tr><td>$X^T W \in \mathbb{R}^{p\times N}$</td><td>weighted covariates</td><td><code>m_XV</code></td></tr>
+    <tr><td>$X^T W X \in \mathbb{R}^{p\times p}$</td><td>weighted covariate Gram</td><td><code>m_XVX</code></td></tr>
+    <tr><td>$(X^TWX)^{-1}$</td><td>its inverse</td><td><code>m_XVX_inv</code></td></tr>
+    <tr><td>$X(X^TWX)^{-1}$</td><td>left-multiplier used by <code>getadjG</code></td><td><code>m_XXVX_inv</code></td></tr>
+    <tr><td>$(X^TWX)^{-1} X^T W$</td><td>the regression-residualiser</td><td><code>m_XVX_inv_XV</code></td></tr>
+    <tr><td>$S_a = X^T r$</td><td>covariate-score (residual trick)</td><td><code>m_S_a</code></td></tr>
+    <tr><td>$\hat\tau = (\hat\tau_0, \hat\tau_1)$</td><td>variance components</td><td><code>m_tauvec</code></td></tr>
+    <tr><td>variance ratio tables</td><td>$r_\text{MAC-bin}$ for null / sparse / no-Xadj paths</td><td><code>m_varRatio_null</code>, <code>m_varRatio_sparse</code>, <code>m_varRatio_null_noXadj</code></td></tr>
+    <tr><td>MAC bin edges</td><td>which bin a given MAC falls into</td><td><code>m_cateVarRatioMinMACVecExclude</code>, <code>m_cateVarRatioMaxMACVecInclude</code></td></tr>
+    <tr><td>sparse GRM $\tilde\Sigma$ (optional)</td><td>$\tilde\Sigma \equiv \tau\Psi_{\text{sparse}} + I$ for binary case</td><td><code>m_spSigmaMat</code>, <code>m_diagSigma</code>, <code>m_Sigma_iXXSigma_iX</code></td></tr>
+  </tbody>
+</table>
+
+<p>The constructor never touches the GRM solver path unless <code>m_flagSparseGRM_cur</code> is set (see <code>saige_test.cpp:178–187</code>). <strong>The dense GRM is never materialised in step 2</strong> — it would be $N\times N$ doubles, gigabytes for biobanks, and the variance ratio trick (§4) is the whole reason it isn't.</p>
+
+<hr>
+
+<h2 id="s3">3. The score statistic for one variant</h2>
+
+<p>For a single test variant with dosage vector $G \in \mathbb{R}^N$, the standard score statistic for $\gamma$ in a GLMM follows from differentiating the (penalised) marginal log-likelihood at $\gamma=0$.</p>
+
+<h3>Covariate-adjusted genotype</h3>
+
+$$
+\tilde G \;=\; G - X\,(X^T W X)^{-1}\,X^T W\,G.
+$$
+
+<p>This projects $G$ onto the orthogonal complement of the columns of $X$ in the $W$-inner product. The function <code>getadjGFast</code> (<code>saige_test.cpp:394–402</code>) implements exactly this, exploiting sparsity:</p>
+
+<pre><code>m_XVG  = sum_{i: G_i != 0} (X^T W)_{:,i} * G_i      // = X^T W G
+g_tilde = G - m_XXVX_inv * m_XVG                     // = G - X (X^TWX)^{-1} X^TWG</code></pre>
+
+<p>In code, the result is <code>gtildeVec</code> (also stored as <code>t_gtilde</code>).</p>
+
+<p><code>scoreTestFast</code> (<code>saige_test.cpp:233–314</code>) collapses the same algebra into a smaller computation. Let $\mathcal{I} = \{i: G_i \neq 0\}$ (<code>indexForNonZero</code>). With $g_1 = G_\mathcal{I}$, $X_1 = X_\mathcal{I}$, $A_1 = ((X^TWX)^{-1}X^TW)_\mathcal{I}$:</p>
+
+$$
+Z = A_1^T g_1, \quad B = X_1 Z, \quad \tilde G_\mathcal{I} = g_1 - B.
+$$
+
+<p>These are lines 247–252.</p>
+
+<h3>The score itself</h3>
+
+<p>Differentiating the GLMM log-likelihood at $\gamma = 0$ gives</p>
+
+$$
+S \;=\; \frac{1}{\hat\tau_0}\,\tilde G^T (y - \hat\mu) \;=\; \frac{1}{\hat\tau_0}\,\tilde G^T r.
+$$
+
+<p>In <code>scoreTest</code> (<code>saige_test.cpp:175–176</code>):</p>
+
+<pre><code>S = dot(t_gtilde, m_res);   // = tilde G^T (y-mu)/tau0
+S = S / m_tauvec[0];        // = (1/tau0) of the above</code></pre>
+
+<p>In <code>scoreTestFast</code>, the same $S$ is built piecewise (lines 268–274) by decomposing $\tilde G^T r = g_1^T r_1 - Z^T(S_a - X_1^T r_1)$, where $S_a = X^T r$ is precomputed (<code>m_S_a</code>). This is just bookkeeping that avoids ever forming the full-length $\tilde G$.</p>
+
+<h3>Variance — the full version</h3>
+
+<p>Under the full GLMM (with the random effect $b$), the asymptotic variance of $S$ is</p>
+
+$$
+V_{\text{full}} \;=\; \tilde G^T \, P \, \tilde G,
+$$
+
+<p>where $P$ is the projection matrix that arises from profiling out $\beta$. For the binary case,</p>
+
+$$
+V_{\text{full}} \;=\; \tilde G^T \bigl(\Sigma^{-1} - \Sigma^{-1} X (X^T \Sigma^{-1} X)^{-1} X^T \Sigma^{-1}\bigr) \tilde G,
+$$
+
+<p>with $\Sigma = W^{-1} + \hat\tau\Psi$ — the "P matrix" of the GLMM. Naïvely this needs a solve against $\Sigma$, which is $N\times N$ and dense if $\Psi$ is dense. In the sparse-GRM branch (<code>scoreTest</code>, <code>saige_test.cpp:181–187</code>), the code computes</p>
+
+<pre><code>t_P2Vec = getPCG1ofSigmaAndGtilde(t_gtilde, 100, 0.02);   // Sigma^{-1} tilde G via PCG
+var2m   = dot(t_P2Vec, t_gtilde);                          // tilde G^T Sigma^{-1} tilde G
+if (m_isVarPsadj) {
+  var2m -= t_gtilde.t() * m_Sigma_iXXSigma_iX * m_X.t() * t_P2Vec;
+}</code></pre>
+
+<p>That preconditioned-CG solve (<code>saige_test.cpp:1119–1152</code>) is the <em>only</em> place step 2 ever pays GRM cost, and only for the sparse case.</p>
+
+<h3>Variance — the cheap version</h3>
+
+<p>Drop the random-effect part of $P$ and you get the "null-model" variance</p>
+
+$$
+V_0 \;=\; \tilde G^T W \tilde G
+\;=\; \sum_i \tilde G_i^{\,2}\, \hat\mu_i(1-\hat\mu_i).
+$$
+
+<p>This is what <code>scoreTestFast</code> computes — see <code>saige_test.cpp:259–261</code>:</p>
+
+<pre><code>g1tildemu2 = dot(square(g1_tilde), mu21);              // sum tildeG^2 * mu(1-mu) on nonzero idx
+Bmu2       = dot(square(B), mu21);                     // boundary correction
+var2       = ZtXVXZ(0,0) - Bmu2 + g1tildemu2;          // = tilde G^T W tilde G (= V0 * tau0)</code></pre>
+
+<p>The algebra (expand $\tilde G = g - B$ with $B = X_1 Z$) reproduces $V_0$ exactly while only touching nonzero entries of $G$.</p>
+
+<h3>Combining the two</h3>
+
+<p>Step 2 always reports the variance</p>
+
+$$
+V \;\equiv\; V_{\text{full}} \;\approx\; r\,V_0,
+$$
+
+<p>where $r$ is the variance ratio (§4). In code: <code>var1 = var2 * m_varRatioVal</code> (lines 189 and 267). In the slow path <code>var2</code> is already $V_{\text{full}}$ so <code>m_varRatioVal = 1</code>; in the fast path <code>var2 = V_0</code> and <code>m_varRatioVal = r</code>.</p>
+
+<h3>Test statistic and p-value</h3>
+
+$$
+Z \;=\; \frac{S}{\sqrt{V}} \;\sim\; \mathcal{N}(0,1) \quad \text{under } H_0,
+$$
+
+<p>equivalently $T = S^2/V \sim \chi^2_1$. In code, <code>StdStat = |Tstat|/sqrt(var1)</code> (<code>saige_test.cpp:480</code>), and the chi-square upper-tail p-value is computed with a careful log-asymptotic to avoid underflow below $p \approx 10^{-300}$ (<code>log_chisq1_uppertail</code>, lines 34–48).</p>
+
+<h3>Effect-size estimate</h3>
+
+$$
+\hat\gamma \;\approx\; \frac{S}{V}, \qquad \operatorname{SE}(\hat\gamma) \;\approx\; \frac{1}{\sqrt{V}}.
+$$
+
+<p>In code (lines 225–226 and 309–310): <code>t_Beta = S / var1</code>, <code>t_seBeta = |t_Beta| / sqrt(|stat|)</code>.</p>
+
+<p><code>scoreTestFast_noadjCov</code> (<code>saige_test.cpp:317–382</code>) is the same idea with $\tilde G \to G$ (no covariate adjustment); a single global correction is applied via <code>m_varRatio_null_noXadj</code>.</p>
+
+<hr>
+
+<h2 id="s4">4. The variance ratio trick (why step 2 is fast)</h2>
+
+<p>The score statistic <em>requires</em> $V_{\text{full}} = \tilde G^T P \tilde G$, which involves $\Sigma^{-1}$ — i.e. an $N\times N$ solve. For a biobank ($N \sim 4\times 10^5$, tens of millions of variants), doing this once per variant is hopeless even with the sparse-GRM PCG solver.</p>
+
+<h3>The empirical observation</h3>
+
+<p>$V_{\text{full}}/V_0$ is approximately constant in $G$. Intuitively, $V_0$ already captures the dominant "how much variation does this genotype contribute" piece; the random-effect adjustment scales it down by a near-constant factor that depends on $\hat\tau$ and the <em>shape</em> of $G$ relative to $X$, not on the specific marker. So</p>
+
+$$
+V_{\text{full}}(\tilde G) \;\approx\; r \cdot V_0(\tilde G) \quad \text{for all variants in a MAC bin.}
+$$
+
+<p>Empirically this approximation degrades as MAC drops (rare variants), so SAIGE estimates $r$ in MAC strata — the "multi-VR" option that produces the <code>m_varRatio_null</code> <em>vector</em> indexed by MAC bin.</p>
+
+<h3>Step 1's job</h3>
+
+<p>Pick a few hundred random variants. For each, compute $V_{\text{full}}$ honestly (via PCG against the sparse or full GRM) and $V_0$ cheaply, take the ratio, and average within MAC bins. Output:</p>
+
+<ul>
+  <li><code>varRatio_null</code> — for use without sparse-GRM step-2 path</li>
+  <li><code>varRatio_sparse</code> — for the sparse-GRM PCG path (closer to 1)</li>
+  <li><code>varRatio_null_noXadj</code> — for the no-covariate-adjustment fast path</li>
+</ul>
+
+<h3>Step 2's job</h3>
+
+<p>For each variant: classify by MAC (<code>assignVarianceRatio</code>, <code>saige_test.cpp:872–941</code>), pick the relevant $r$, write it to <code>m_varRatioVal</code>, and use $V = r \cdot V_0$ instead of doing the GRM solve. <code>scoreTestFast</code> therefore <strong>never touches</strong> $\Psi$ at all. The MAC-bin lookup (lines 880–900) is a linear scan over a small vector of bin edges and is negligible.</p>
+
+<h3>When the sparse path runs</h3>
+
+<p><code>getMarkerPval</code> flips to <code>scoreTest</code> (the slow path) whenever <code>m_flagSparseGRM_cur</code> is true, which by default is restricted to MAC values inside the variance-ratio-fitted range (see the gating in <code>main.cpp:924–928</code>). Outside that range, the code reverts to the dense-<code>scoreTestFast</code> path with the fitted dense-GRM ratio.</p>
+
+<blockquote>This is the entire reason step 2 is dominated by genotype I/O rather than linear algebra.</blockquote>
+
+<hr>
+
+<h2 id="s5">5. SPA — saddlepoint approximation</h2>
+
+<p>For rare variants in case-control-imbalanced studies, the normal approximation $Z \sim N(0,1)$ is wrong in the tails: the true distribution of $S = \tilde G^T(Y - \hat\mu)$ is skewed because $Y$ is binary and $\hat\mu$ is near 0 (or near 1). The normal-based p-value is <em>anti-conservative</em> — type-I error inflated by orders of magnitude in the $p < 10^{-6}$ region we care about for GWAS.</p>
+
+<h3>Setup</h3>
+
+<p>Conditional on the step-1 fitted $\hat\mu$, treat $Y_i \sim \text{Bernoulli}(\hat\mu_i)$ independently. Then</p>
+
+$$
+S \;=\; \sum_{i=1}^N \tilde G_i \,(Y_i - \hat\mu_i)
+$$
+
+<p>is a sum of $N$ independent (non-identically-distributed, bounded) terms. Its moment-generating function factorises:</p>
+
+$$
+M_S(t) \;=\; \prod_{i=1}^N \mathbb{E}\!\left[e^{t \tilde G_i(Y_i - \hat\mu_i)}\right]
+\;=\; \prod_{i=1}^N \bigl[(1-\hat\mu_i) + \hat\mu_i e^{t\tilde G_i}\bigr]\,e^{-t\tilde G_i\hat\mu_i},
+$$
+
+<p>and its cumulant-generating function is</p>
+
+$$
+K(t) \;=\; \log M_S(t) \;=\; \sum_i \log\!\bigl(1-\hat\mu_i + \hat\mu_i e^{t\tilde G_i}\bigr) - t\sum_i \tilde G_i\hat\mu_i.
+$$
+
+<p>This is <code>Korg_Binom</code> in <code>spa_binary.cpp:20–25</code>.</p>
+
+<h3>The saddlepoint p-value</h3>
+
+<p>Solve $K'(\hat t) = s$ for the observed $s$, then by Lugannani–Rice,</p>
+
+$$
+\Pr(S \geq s) \;\approx\; 1 - \Phi(w) + \phi(w)\!\left(\tfrac{1}{w} - \tfrac{1}{v}\right),
+$$
+
+<p>where $w = \mathrm{sign}(\hat t)\sqrt{2(\hat t s - K(\hat t))}$ and $v = \hat t\sqrt{K''(\hat t)}$. The implementation factors this as $Z_{\text{test}} = w + \tfrac{1}{w}\log(v/w)$ and feeds it through $\Phi$ (<code>Get_Saddle_Prob_Binom</code>, <code>spa_binary.cpp:134–187</code>). The root-finding for $\hat t$ is Newton with bisection-style fallback in <code>getroot_K1_Binom</code> (lines 61–130).</p>
+
+<h3>Why the cutoff</h3>
+
+<p>SPA is <em>only</em> invoked when $|Z| > $ <code>m_SPA_Cutoff</code> (default 2.0) — see the gate at <code>saige_test.cpp:508</code>:</p>
+
+<pre><code>if (!std::isnan(StdStat) && (StdStat &gt; m_SPA_Cutoff) && m_traitType != "quantitative") { ... SPA ... }</code></pre>
+
+<p>For small $|Z|$ the normal approximation is accurate enough, and SPA is not free (root-find plus a few $O(N)$ sums). The quantitative-trait branch is excluded because $Y_i - \hat\mu_i$ is approximately Gaussian, so $S$ is already approximately normal and the saddlepoint correction adds nothing.</p>
+
+<h3>Two-sided assembly</h3>
+
+<p>The code computes a saddlepoint p-value at both $s$ and <code>qinv</code> (a mirror of $s$ about $m_1 = \tilde G^T \hat\mu$, see lines 533–538), then sums them (or <code>add_logp</code> in log-space, <code>spa.cpp:69</code>).</p>
+
+<h3>The "fast" SPA</h3>
+
+<p>When the carrier set is much smaller than the full sample (the cheap path threshold is <code>p_iIndexComVecSize &gt;= 0.5</code>, line 518), <code>SPA_fast</code> exploits the fact that the bulk of non-carriers contribute a normal-looking term — split $K$ into a contribution from carriers (computed exactly) and a normal approximation for the non-carriers (mean <code>NAmu</code>, variance <code>NAsigma</code>, lines 526–547).</p>
+
+<hr>
+
+<h2 id="s6">6. Efficient Resampling (ER) for ultra-rare variants</h2>
+
+<p>When the minor allele count is tiny (MAC $\leq$ <code>g_MACCutoffforER</code>, default 4 — see <code>main.cpp:2774</code>), SPA itself is unreliable: the saddlepoint $\hat t$ may not exist, or the cumulant expansion is dominated by a handful of carrier contributions and the Gaussian-tail approximation in Lugannani–Rice degrades.</p>
+
+<h3>The exact alternative</h3>
+
+<p>With $k$ carriers in $N$ individuals, under $H_0$ the carrier assignment is exchangeable with the case-control labels conditional on $\hat\mu$ — specifically, the distribution of which $k$ samples carry the variant is proportional to the product of their fitted phenotype probabilities. The conditional distribution of $S$ under $H_0$ is therefore a finite weighted sum over the $\binom{N}{k}$ assignments, weighted by</p>
+
+$$
+\Pr(\text{carriers} = \mathcal{C}) \;\propto\; \prod_{i \in \mathcal{C}} \hat\mu_i \,\prod_{i \notin \mathcal{C}} (1 - \hat\mu_i),
+$$
+
+<p>restricted to assignments compatible with the observed total carrier count. ER tabulates the resulting $S$-distribution and reads off</p>
+
+$$
+p_{\text{ER}} \;=\; \Pr_{H_0}\!\bigl(|S| \geq |S_{\text{obs}}|\bigr).
+$$
+
+<p>Because $k$ is small (say $\leq 10$), the combinatorial space is tractable. The implementation lives in <code>er_binary.cpp</code> — <code>ER::SKATExactBin_Work</code> (called from <code>saige_test.cpp:659</code>) wraps the exact enumeration, with fallback resampling for cases too large for full enumeration. The <code>HyperGeo</code> class (<code>er_binary.cpp:160–200</code>) builds the table of log-probabilities of each carrier-count split across pre-grouped strata of $\hat\mu$.</p>
+
+<h3>Gating</h3>
+
+<p>In <code>main.cpp:871</code> for single variants and <code>main.cpp:2310</code> for region-burden URV markers:</p>
+
+<pre><code>if (MAC &lt;= g_MACCutoffforER && t_traitType == "binary") { ... t_isER = true ... }</code></pre>
+
+<p>When ER returns NaN or out-of-range (degenerate ultra-rare configs where all carriers are in one phenotype group → resampling variance zero), the code now clamps to 1 (<code>saige_test.cpp:665–667</code>) to keep downstream <code>quantile</code> calls finite.</p>
+
+<hr>
+
+<h2 id="s7">7. Firth correction (separation)</h2>
+
+<p>When a rare variant is observed almost exclusively in cases (or almost exclusively in controls), the MLE of $\gamma$ in $\mathrm{logit}(\mu_i) = X_i\hat\beta + G_i\gamma$ diverges to $\pm\infty$ — <em>complete or quasi-complete separation</em>. The score-test p-value is fine (the test doesn't need finite $\hat\gamma$), but the reported effect-size estimate <code>Beta</code> becomes meaningless: tiny <code>var1</code> gives huge <code>Beta = S/var1</code>, and the SE inverted from a SPA p-value is no longer interpretable as a Wald SE around a real $\hat\gamma$.</p>
+
+<h3>Firth's penalty</h3>
+
+<p>Add the Jeffreys-prior log-determinant term to the log-likelihood:</p>
+
+$$
+\ell^\star(\gamma) \;=\; \ell(\gamma) \;+\; \tfrac{1}{2}\log|I(\gamma)|,
+$$
+
+<p>where $I(\gamma)$ is the Fisher information. Differentiating gives the penalised score</p>
+
+$$
+U^\star(\gamma) \;=\; \sum_i \bigl[(y_i - \mu_i) + h_i(0.5 - \mu_i)\bigr]\,x_i,
+$$
+
+<p>where $h_i$ is the leverage (diagonal of the "hat" matrix in the $W^{1/2}$-rescaled space). This is the line <code>ypih = (y - pi) + (h % (0.5 - pi));</code> at <code>saige_test.cpp:1064</code>. Solving $U^\star = 0$ by IRLS (<code>fast_logistf_fit_simple</code>, <code>saige_test.cpp:1022–1108</code>) shrinks $\hat\gamma$ to a finite value even under separation.</p>
+
+<h3>Mechanics</h3>
+
+<ol>
+  <li>Form $W = \mathrm{diag}(\pi(1-\pi))$, $X W^{1/2}$, do thin-QR to get $h_i = \sum_j Q_{ij}^2$ (line 1060).</li>
+  <li>Build penalised score $U^\star$ and Fisher info $X^T W X$.</li>
+  <li>Solve $\delta = (X^T W X)^{-1} U^\star$, with a step-halving cap (<code>mx = max|δ|/maxstep</code>, line 1084).</li>
+  <li>Iterate until $\max|\delta|<$ <code>xconv</code> and $\|U^\star\|_\infty <$ <code>gconv</code>.</li>
+</ol>
+
+<p>The model fitted has just two columns: intercept and $\tilde G$ (lines 700–701).</p>
+
+<h3>Trigger and role</h3>
+
+<p><code>m_is_Firth_beta && pval &lt;= m_pCutoffforFirth</code> (default cutoff 0.05; lines 622, 629). The p-value still comes from SPA (or ER); only the effect-size estimate is replaced (lines 703–705):</p>
+
+<pre><code>fast_logistf_fit_simple(...);                              // Firth IRLS → beta_G, sebeta_G
+t_seBeta = |t_Beta| / |t_qval_Firth|;                       // back out SE compatible with SPA p</code></pre>
+
+<blockquote>Firth in SAIGE is a <em>post-hoc effect-size estimator</em>, not a p-value method.</blockquote>
+
+<hr>
+
+<h2 id="s8">8. Region / group tests</h2>
+
+<p>For gene-burden, SKAT and SKAT-O the same per-variant score and per-variant $V$ are reused, but combined across the $m$ variants in a region. Per-variant, the orchestrator caches the <em>covariance-scaled</em> projection: <code>main.cpp:1913–1914</code> and <code>:390–391</code></p>
+
+<pre><code>P1Mat.row(i) = sqrt(varRatioVal) * gtildeVec.t();   // row i = sqrt(r) tilde G_i^T
+P2Mat.col(i) = sqrt(varRatioVal) * P2Vec;            // col i = sqrt(r) (W tilde G_i or Sigma^{-1} tilde G_i)</code></pre>
+
+<p>so that <code>VarMat = P1Mat * P2Mat</code> (line 415 / 2217) yields the cross-variant score covariance</p>
+
+$$
+\Sigma_S \;=\; \bigl(\,\tilde G_i^T \,P\, \tilde G_j\,\bigr)_{i,j=1\ldots m}, \qquad \mathrm{Var}(S_i, S_j) = (\Sigma_S)_{ij}.
+$$
+
+<p>(Outside the variance-ratio regime, $P = W$ and <code>P2Vec = tilde G % m_mu2 * tauvec[0]</code>, see <code>saige_test.cpp:864</code>. Inside the sparse-GRM regime, <code>P2Vec = Sigma^{-1} tilde G</code> from PCG.)</p>
+
+<h3>BURDEN</h3>
+
+<p>Collapse with weights $w_j$ (default beta(1,25) density on MAF):</p>
+
+$$
+S_B \;=\; \sum_{j=1}^m w_j\, S_j, \qquad V_B \;=\; w^T \Sigma_S\, w,
+$$
+
+<p>then a one-degree-of-freedom score test on $S_B$ — same SPA/ER machinery as a single variant. Implementation: <code>main.cpp:2263–2372</code> builds a single dosage <code>genoSumVec = sum_j w_j G_j</code> and reuses <code>getMarkerPval</code> on it (line 2312/2320).</p>
+
+<h3>SKAT</h3>
+
+<p>Use the quadratic statistic</p>
+
+$$
+Q \;=\; \sum_{j=1}^m w_j^2\, S_j^2.
+$$
+
+<p>Under $H_0$, $Q$ is a weighted sum of independent $\chi^2_1$ variables with weights equal to the eigenvalues of $W \Sigma_S W$ where $W = \mathrm{diag}(w_j)$. The p-value comes from Davies' method (numerical inversion of the characteristic function) or, as fallback, Liu / Kuonen / Saddlepoint moment-matching. Implementation: <code>skat.cpp</code> (via <code>get_SKAT_pvalue</code> called at <code>main.cpp:2525</code>).</p>
+
+<h3>SKAT-O</h3>
+
+<p>Family of statistics indexed by $\rho \in [0,1]$:</p>
+
+$$
+Q_\rho \;=\; \rho\, Q_B \;+\; (1-\rho)\, Q_{\text{SKAT}},
+$$
+
+<p>which interpolates between burden ($\rho=1$) and SKAT ($\rho=0$). Compute $p$-values on a grid of $\rho$ (typically $0, 0.1^2, 0.2^2, \ldots, 1$) and combine the minimum via Cauchy combination (CCT, in <code>cct.cpp</code>):</p>
+
+$$
+T_{\text{CCT}} \;=\; \sum_{k} \tan\!\bigl((0.5 - p_k)\pi\bigr), \qquad p_{\text{CCT}} \;=\; 0.5 - \arctan(T_{\text{CCT}}/K)/\pi.
+$$
+
+<p>CCT is also used to combine across annotation $\times$ MAF-threshold groups (<code>main.cpp:2591–2598</code>).</p>
+
+<h3>SPA adjustment for the region covariance</h3>
+
+<p>For binary traits, the SKAT/SKAT-O variance $\Sigma_S$ is rescaled per-variant by the SPA single-variant p-value (the "scale factor" idea; <code>get_newPhi_scaleFactor_traitType</code> at <code>main.cpp:2518</code>), so the resulting null distribution accounts for the same case-control imbalance correction that SPA applies in the single-variant test.</p>
+
+<hr>
+
+<h2 id="s9">9. What this means for parallelism</h2>
+
+<p>Per-variant, the score test needs: $\tilde G_i$ (one $O(\#\text{carriers})$ projection through <code>getadjGFast</code>), the precomputed $r$, $W$, and $y-\hat\mu$. <strong>All but the first are constant across variants and read-only on the <code>SAIGEClass</code>.</strong> SPA, ER and Firth are all pure functions of $\tilde G_i$, $\hat\mu$, $y$ and the SAIGE state — no cross-variant dependency.</p>
+
+<p>Per-region tests trivially parallelise across regions; within a region the per-variant scores can be filled in parallel and combined serially (a small Gram matrix product). The only contended resource is the genotype reader, which is sequential by file format and is the natural pipeline boundary.</p>
+
+</body>
+</html>
