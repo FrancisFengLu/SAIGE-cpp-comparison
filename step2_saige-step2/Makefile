@@ -6,7 +6,7 @@ else
   CXX ?= g++
 endif
 
-CXXFLAGS ?= -std=c++17 -O3 -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP
+CXXFLAGS ?= -std=c++17 -O3 -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -fopenmp -pthread
 
 PKG_CONFIG   := $(shell command -v pkg-config 2>/dev/null)
 
@@ -60,7 +60,8 @@ ifeq ($(UNAME_S),Darwin)
           -L/opt/homebrew/opt/superlu/lib -lsuperlu \
           -L/opt/homebrew/lib -lhts \
           -L/opt/homebrew/Cellar/zstd/1.5.7/lib -lzstd \
-          -lz
+          -lz \
+          -fopenmp -pthread
 else
   LIBS := -lyaml-cpp \
           -larmadillo \
@@ -70,7 +71,8 @@ else
           -L/usr/local/lib -lhts \
           -lzstd \
           -lz \
-          -lsqlite3
+          -lsqlite3 \
+          -fopenmp -pthread
 endif
 
 ifneq ($(strip $(YAML_LIBS)),)

@@ -19,6 +19,11 @@
 #include <algorithm>
 #include <cfloat>
 #include <limits>
+#include <atomic>
+#include <random>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
@@ -49,23 +54,40 @@ void SL_free(void * ptr){
 
 // ============================================================
 //  Binary_resampling functions (from Binary_resampling.cpp)
-//  Standalone branch: uses rand()/srand()
+//  Standalone branch: thread-safe std::mt19937 (one engine per thread)
 // ============================================================
 
-double SL_runif_double(){
-    double val;
-    val = ((double)rand()/(double)RAND_MAX);
-    return val;
+static std::atomic<uint64_t> g_er_base_seed{1};
+static std::atomic<uint64_t> g_er_seed_epoch{0};
+
+static std::mt19937& er_rng() {
+    thread_local std::mt19937 engine;
+    thread_local uint64_t local_epoch = (uint64_t)-1;
+    uint64_t cur_epoch = g_er_seed_epoch.load(std::memory_order_relaxed);
+    if (local_epoch != cur_epoch) {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        uint64_t s = g_er_base_seed.load(std::memory_order_relaxed) ^ (uint64_t)tid;
+        engine.seed((uint32_t)(s & 0xFFFFFFFFu));
+        local_epoch = cur_epoch;
+    }
+    return engine;
 }
 
-int SL_runif_INT(int max){
-    int val;
-    val = rand() % max;
-    return val;
+double SL_runif_double() {
+    std::uniform_real_distribution<double> d(0.0, 1.0);
+    return d(er_rng());
 }
-
-void SL_setseed(int seed){
-    srand(seed);
+int SL_runif_INT(int max) {
+    std::uniform_int_distribution<int> d(0, max - 1);
+    return d(er_rng());
+}
+void SL_setseed(int seed) {
+    g_er_base_seed.store((uint64_t)seed, std::memory_order_relaxed);
+    g_er_seed_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SL_out(){
