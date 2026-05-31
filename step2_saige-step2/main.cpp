@@ -201,6 +201,61 @@ void Unified_getMarkerPval(
 }
 
 
+// Ctx-based overload (Phase A of step2 parallelism plan): same as above but
+// routes to the SAIGEClass::getMarkerPval ctx overload so per-marker scalars
+// (flagSparseGRM_cur / isnoadjCov_cur / varRatioVal) come from `ctx` rather
+// than mutable class state.
+void Unified_getMarkerPval(
+    arma::vec & t_GVec,
+    bool t_isOnlyOutputNonZero,
+    arma::uvec & t_indexForNonZero_vec,
+    arma::uvec & t_indexForZero_vec,
+    double& t_Beta,
+    double& t_seBeta,
+    std::string& t_pval,
+    std::string& t_pval_noSPA,
+    double& t_Tstat,
+    double& t_gy,
+    double& t_varT,
+    double t_altFreq,
+    bool & t_isSPAConverge,
+    arma::vec & t_gtilde,
+    bool & is_gtilde,
+    bool  is_region,
+    arma::vec & t_P2Vec,
+    bool t_isCondition,
+    double& t_Beta_c,
+    double& t_seBeta_c,
+    std::string& t_pval_c,
+    std::string& t_pval_noSPA_c,
+    double& t_Tstat_c,
+    double& t_varT_c,
+    arma::rowvec & t_G1tilde_P_G2tilde_Vec,
+    bool & t_isFirth,
+    bool & t_isFirthConverge,
+    bool t_isER,
+    bool t_isnoadjCov,
+    bool t_isSparseGRM,
+    const SAIGE::PerMarkerCtx& ctx)
+{
+    if (t_isOnlyOutputNonZero == true)
+        throw std::runtime_error(
+            "When using SAIGE method to calculate marker-level p-values, "
+            "'t_isOnlyOutputNonZero' should be false.");
+
+    ptr_gSAIGEobj->getMarkerPval(
+        t_GVec, t_indexForNonZero_vec, t_indexForZero_vec,
+        t_Beta, t_seBeta, t_pval, t_pval_noSPA,
+        t_altFreq, t_Tstat, t_gy, t_varT,
+        t_isSPAConverge, t_gtilde, is_gtilde,
+        is_region, t_P2Vec,
+        t_isCondition, t_Beta_c, t_seBeta_c, t_pval_c, t_pval_noSPA_c,
+        t_Tstat_c, t_varT_c, t_G1tilde_P_G2tilde_Vec,
+        t_isFirth, t_isFirthConverge, t_isER,
+        t_isnoadjCov, t_isSparseGRM, ctx);
+}
+
+
 // ============================================================
 // setSAIGEobjInCPP
 // Direct port from SAIGE/src/Main.cpp lines 918-989
@@ -868,6 +923,26 @@ void mainMarkerInCPP(
 
                 bool is_region = false;
 
+                // Phase A: build per-marker ctx so the call doesn't depend on
+                // SAIGEClass mutable singletons. flagSparseGRM_cur mirrors the
+                // set_flagSparseGRM_cur above; varRatioVal mirrors the
+                // assignVarianceRatio/assignSingleVarianceRatio just above.
+                SAIGE::PerMarkerCtx ctx_first;
+                ctx_first.flagSparseGRM_cur = ptr_gSAIGEobj->m_isFastTest
+                    ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                ctx_first.isnoadjCov_cur = ptr_gSAIGEobj->m_isnoadjCov;
+                {
+                    bool dummyHas;
+                    if (isSingleVarianceRatio) {
+                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                            ctx_first.flagSparseGRM_cur, ptr_gSAIGEobj->m_isnoadjCov);
+                    } else {
+                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                            MAC, ctx_first.flagSparseGRM_cur, ptr_gSAIGEobj->m_isnoadjCov,
+                            dummyHas);
+                    }
+                }
+
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
                     Unified_getMarkerPval(
                         t_GVec,
@@ -884,7 +959,8 @@ void mainMarkerInCPP(
                         is_Firth, is_FirthConverge,
                         true,  // t_isER
                         ptr_gSAIGEobj->m_isnoadjCov,
-                        ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                        ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                        ctx_first);
                 } else {
                     Unified_getMarkerPval(
                         t_GVec,
@@ -901,7 +977,8 @@ void mainMarkerInCPP(
                         is_Firth, is_FirthConverge,
                         false,  // t_isER
                         ptr_gSAIGEobj->m_isnoadjCov,
-                        ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                        ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                        ctx_first);
                 }
 
                 double pval_num;
@@ -938,6 +1015,26 @@ void mainMarkerInCPP(
                                 ptr_gSAIGEobj->m_isnoadjCov_cur);
                         }
 
+                        // Phase A: build ctx mirroring the set_*_cur and
+                        // assignVarianceRatio* mutations above. isnoadjCov_cur
+                        // was just set to false (see set_isnoadjCov_cur(false)).
+                        SAIGE::PerMarkerCtx ctx_fast;
+                        ctx_fast.flagSparseGRM_cur =
+                            (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                                ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                        ctx_fast.isnoadjCov_cur = false;
+                        {
+                            bool dummyHas;
+                            if (!isSingleVarianceRatio) {
+                                ctx_fast.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                                    MAC, ctx_fast.flagSparseGRM_cur,
+                                    ctx_fast.isnoadjCov_cur, dummyHas);
+                            } else {
+                                ctx_fast.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                                    ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
+                            }
+                        }
+
                         Unified_getMarkerPval(
                             t_GVec,
                             false,
@@ -953,7 +1050,8 @@ void mainMarkerInCPP(
                             is_Firth, is_FirthConverge,
                             false,
                             ptr_gSAIGEobj->m_isnoadjCov_cur,
-                            ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                            ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                            ctx_fast);
                     }
                 }  // if((t_traitType == "binary" && MAC > g_MACCutoffforER) || t_traitType != "binary")
 
@@ -1883,20 +1981,41 @@ void mainRegionInCPP(
 
             if (t_regionTestType != "BURDEN" || t_isSingleinGroupTest) {
                 indexZeroVec_arma = arma::conv_to<arma::uvec>::from(indexZeroVec);
+
+                // Phase A: build ctx mirroring the set_flagSparseGRM_cur and
+                // assignVarianceRatio* mutations just above. The region path
+                // hard-codes isnoXadj=false at the assignVarianceRatio call,
+                // and t_isnoadjCov is passed as false at both call sites.
+                SAIGE::PerMarkerCtx ctx_region;
+                ctx_region.flagSparseGRM_cur =
+                    (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                        ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                ctx_region.isnoadjCov_cur = false;
+                {
+                    bool dummyHas;
+                    if (!isSingleVarianceRatio) {
+                        ctx_region.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                            MAC, ctx_region.flagSparseGRM_cur, false, dummyHas);
+                    } else {
+                        ctx_region.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                            ctx_region.flagSparseGRM_cur, false);
+                    }
+                }
+
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
                     Unified_getMarkerPval(GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
                         Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT, altFreq,
                         isSPAConverge, gtildeVec, is_gtilde, true, P2Vec, isCondition,
                         Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c,
                         G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge,
-                        true, false, ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                        true, false, ptr_gSAIGEobj->m_flagSparseGRM_cur, ctx_region);
                 } else {
                     Unified_getMarkerPval(GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
                         Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT, altFreq,
                         isSPAConverge, gtildeVec, is_gtilde, true, P2Vec, isCondition,
                         Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c,
                         G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge,
-                        false, false, ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                        false, false, ptr_gSAIGEobj->m_flagSparseGRM_cur, ctx_region);
                 }
 
                 BetaVec.at(i) = Beta * (1 - 2 * flip);

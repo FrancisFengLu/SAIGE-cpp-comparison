@@ -165,6 +165,29 @@ void SAIGEClass::scoreTest(arma::vec & t_GVec,
 		     double& t_gy,
 		     bool t_is_region,
 		     arma::uvec & t_indexForNonZero){
+    PerMarkerCtx ctx{m_flagSparseGRM_cur, m_isnoadjCov_cur, m_varRatioVal};
+    scoreTest(t_GVec, t_Beta, t_seBeta, t_pval_str, t_pval, t_islogp,
+              t_altFreq, t_Tstat, t_var1, t_var2, t_gtilde, t_P2Vec,
+              t_gy, t_is_region, t_indexForNonZero, ctx);
+}
+
+// Ctx overload (Phase A).
+void SAIGEClass::scoreTest(arma::vec & t_GVec,
+                     double& t_Beta,
+                     double& t_seBeta,
+                     std::string& t_pval_str,
+		     double& t_pval,
+		     bool& t_islogp,
+                     double t_altFreq,
+                     double &t_Tstat,
+                     double &t_var1,
+                     double &t_var2,
+                     arma::vec & t_gtilde,
+		     arma::vec & t_P2Vec,
+		     double& t_gy,
+		     bool t_is_region,
+		     arma::uvec & t_indexForNonZero,
+                     const PerMarkerCtx& ctx){
     arma::vec Sm, var2m;
     double S, var2;
     getadjGFast(t_GVec, t_gtilde, t_indexForNonZero);
@@ -175,7 +198,7 @@ void SAIGEClass::scoreTest(arma::vec & t_GVec,
     S = dot(t_gtilde, m_res);
     S = S/m_tauvec[0];
 
-    if(!m_flagSparseGRM_cur){
+    if(!ctx.flagSparseGRM_cur){
       t_P2Vec = t_gtilde % m_mu2 *m_tauvec[0];
       var2m = dot(t_P2Vec , t_gtilde);
     }else{
@@ -186,7 +209,7 @@ void SAIGEClass::scoreTest(arma::vec & t_GVec,
       }
     }
     var2 = var2m(0,0);
-    double var1 = var2 * m_varRatioVal;
+    double var1 = var2 * ctx.varRatioVal;
 
     double stat = S*S/var1;
     if (var1 <= std::numeric_limits<double>::min()){
@@ -241,6 +264,24 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
                      double &t_Tstat,
                      double &t_var1,
                      double &t_var2){
+    PerMarkerCtx ctx{m_flagSparseGRM_cur, m_isnoadjCov_cur, m_varRatioVal};
+    scoreTestFast(t_GVec, t_indexForNonZero, t_Beta, t_seBeta, t_pval_str,
+                  t_pval, t_islogp, t_altFreq, t_Tstat, t_var1, t_var2, ctx);
+}
+
+// Ctx overload (Phase A).
+void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
+                     arma::uvec & t_indexForNonZero,
+                     double& t_Beta,
+                     double& t_seBeta,
+                     std::string& t_pval_str,
+		     double& t_pval,
+                     bool& t_islogp,
+                     double t_altFreq,
+                     double &t_Tstat,
+                     double &t_var1,
+                     double &t_var2,
+                     const PerMarkerCtx& ctx){
 
     arma::vec g1 = t_GVec.elem(t_indexForNonZero);
     arma::mat X1 = m_X.rows(t_indexForNonZero);
@@ -264,7 +305,7 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
       var2 = ZtXVXZ(0,0)*m_tauvec[0] +  dot(g1,g1) - 2*Bmu2;
     }
 
-    var1 = var2 * m_varRatioVal;
+    var1 = var2 * ctx.varRatioVal;
     S1 = dot(res1, g1_tilde);
     arma::mat res1X1_temp = (res1.t()) * X1;
     arma::vec res1X1 = res1X1_temp.t();
@@ -325,6 +366,25 @@ void SAIGEClass::scoreTestFast_noadjCov(arma::vec & t_GVec,
                      double &t_Tstat,
                      double &t_var1,
                      double &t_var2){
+    PerMarkerCtx ctx{m_flagSparseGRM_cur, m_isnoadjCov_cur, m_varRatioVal};
+    scoreTestFast_noadjCov(t_GVec, t_indexForNonZero, t_Beta, t_seBeta,
+                           t_pval_str, t_pval, t_islogp, t_altFreq,
+                           t_Tstat, t_var1, t_var2, ctx);
+}
+
+// Ctx overload (Phase A).
+void SAIGEClass::scoreTestFast_noadjCov(arma::vec & t_GVec,
+		     arma::uvec & t_indexForNonZero,
+                     double& t_Beta,
+                     double& t_seBeta,
+                     std::string& t_pval_str,
+                     double& t_pval,
+                     bool& t_islogp,
+                     double t_altFreq,
+                     double &t_Tstat,
+                     double &t_var1,
+                     double &t_var2,
+                     const PerMarkerCtx& ctx){
 
       arma::vec g1 = t_GVec.elem(t_indexForNonZero);
       arma::vec m_mu21 = m_mu2.elem(t_indexForNonZero);
@@ -340,7 +400,7 @@ void SAIGEClass::scoreTestFast_noadjCov(arma::vec & t_GVec,
     S = dot(g1, m_res1)  - arma::accu(m_res)*(2*t_altFreq);
     S = S/m_tauvec[0];
 
-    double var1 = var2 * m_varRatioVal;
+    double var1 = var2 * ctx.varRatioVal;
     double stat = S*S/var1;
     if (var1 <= std::numeric_limits<double>::min()){
           t_pval = 1;
@@ -446,6 +506,51 @@ void SAIGEClass::getMarkerPval(arma::vec & t_GVec,
 				bool t_isnoadjCov,
 				bool t_isSparseGRM)
 {
+    PerMarkerCtx ctx{m_flagSparseGRM_cur, m_isnoadjCov_cur, m_varRatioVal};
+    getMarkerPval(t_GVec, iIndex, iIndexComVec, t_Beta, t_seBeta, t_pval,
+                  t_pval_noSPA, t_altFreq, t_Tstat, t_gy, t_var1,
+                  t_isSPAConverge, t_gtilde, is_gtilde, is_region, t_P2Vec,
+                  t_isCondition, t_Beta_c, t_seBeta_c, t_pval_c,
+                  t_pval_noSPA_c, t_Tstat_c, t_varT_c, t_G1tilde_P_G2tilde,
+                  t_isFirth, t_isFirthConverge, t_isER, t_isnoadjCov,
+                  t_isSparseGRM, ctx);
+}
+
+// Ctx overload (Phase A): same body as the member-state version, but reads
+// ctx.flagSparseGRM_cur / ctx.varRatioVal instead of class members. Nested
+// scoreTest*/scoreTestFast* calls are routed to their ctx overloads so they
+// too use ctx rather than mutable class state.
+void SAIGEClass::getMarkerPval(arma::vec & t_GVec,
+			       arma::uvec & iIndex,
+			       arma::uvec & iIndexComVec,
+                               double& t_Beta,
+                               double& t_seBeta,
+			       std::string& t_pval,
+			       std::string& t_pval_noSPA,
+                               double t_altFreq,
+                               double& t_Tstat,
+			       double& t_gy,
+			       double& t_var1,
+			       bool & t_isSPAConverge,
+			       arma::vec & t_gtilde,
+			       bool & is_gtilde,
+			       bool  is_region,
+                               arma::vec & t_P2Vec,
+			       bool t_isCondition,
+			       double& t_Beta_c,
+                           	double& t_seBeta_c,
+			       std::string& t_pval_c,
+                               std::string& t_pval_noSPA_c,
+                           	double& t_Tstat_c,
+                           	double& t_varT_c,
+			   	arma::rowvec & t_G1tilde_P_G2tilde,
+				bool & t_isFirth,
+				bool & t_isFirthConverge,
+				bool t_isER,
+				bool t_isnoadjCov,
+				bool t_isSparseGRM,
+				const PerMarkerCtx& ctx)
+{
 
 
 
@@ -453,7 +558,7 @@ void SAIGEClass::getMarkerPval(arma::vec & t_GVec,
   std::string t_pval_str;
   double t_var2, t_SPApval;
   bool isScoreFast = true;
-  if(m_flagSparseGRM_cur){
+  if(ctx.flagSparseGRM_cur){
     isScoreFast = false;
   }
 
@@ -461,19 +566,19 @@ void SAIGEClass::getMarkerPval(arma::vec & t_GVec,
   double pval_noadj, pval, t_qval_Firth;
   bool ispvallog;
 
-if(!m_flagSparseGRM_cur && t_isnoadjCov){
+if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
 	is_gtilde = false;
         isScoreFast = true;
-	scoreTestFast_noadjCov(t_GVec, iIndex, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq,t_Tstat, t_var1, t_var2);
+	scoreTestFast_noadjCov(t_GVec, iIndex, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq,t_Tstat, t_var1, t_var2, ctx);
 
-}else if(m_flagSparseGRM_cur){
+}else if(ctx.flagSparseGRM_cur){
 	is_gtilde = true;
         isScoreFast = false;
-        scoreTest(t_GVec, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq, t_Tstat, t_var1, t_var2, t_gtilde, t_P2Vec, t_gy, is_region, iIndex);
+        scoreTest(t_GVec, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq, t_Tstat, t_var1, t_var2, t_gtilde, t_P2Vec, t_gy, is_region, iIndex, ctx);
 }else{
 	is_gtilde = false;
         isScoreFast = true;
-        scoreTestFast(t_GVec, iIndex, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq, t_Tstat, t_var1, t_var2);
+        scoreTestFast(t_GVec, iIndex, t_Beta, t_seBeta, t_pval_noSPA, pval_noadj, ispvallog, t_altFreq, t_Tstat, t_var1, t_var2, ctx);
 }
 
 
@@ -549,7 +654,7 @@ if(!t_isER){
   }
 	double tol0 = std::numeric_limits<double>::epsilon();
 	tol1 = std::pow(tol0, 0.25);
-	if(p_iIndexComVecSize >= 0.5 && !m_flagSparseGRM_cur){
+	if(p_iIndexComVecSize >= 0.5 && !ctx.flagSparseGRM_cur){
         	SPA_fast(m_mu, t_gtilde, q, qinv, pval_noadj, ispvallog, gNA, gNB, muNA, muNB, NAmu, NAsigma, tol1, m_traitType, t_SPApval, t_isSPAConverge);
 
 	}else{
@@ -712,7 +817,7 @@ if(!t_isER){
         	getadjGFast(t_GVec, t_gtilde, iIndex);
         	is_gtilde = true;
         }
-        t_G1tilde_P_G2tilde = sqrt(m_varRatioVal) * t_gtilde.t() * m_P2Mat_cond;
+        t_G1tilde_P_G2tilde = sqrt(ctx.varRatioVal) * t_gtilde.t() * m_P2Mat_cond;
         arma::vec t_Tstat_ctemp =  t_G1tilde_P_G2tilde * m_VarInvMat_cond * m_Tstat_cond;
 	arma::mat tempgP2 = t_gtilde.t() * m_P2Mat_cond;
 
@@ -783,7 +888,7 @@ if(!t_isER){
         }
 
 
-        if(p_iIndexComVecSize >= 0.5 && !m_flagSparseGRM_cur){
+        if(p_iIndexComVecSize >= 0.5 && !ctx.flagSparseGRM_cur){
                 SPA_fast(m_mu, t_gtilde, q_c, qinv_c, pval_noSPA_c, ispvallog, gNA, gNB, muNA, muNB, NAmu, NAsigma, tol1, m_traitType, SPApval_c, t_isSPAConverge_c);
         }else{
                 SPA(m_mu, t_gtilde, q_c, qinv_c, pval_noSPA_c, tol1, ispvallog, m_traitType, SPApval_c, t_isSPAConverge_c);
@@ -860,7 +965,7 @@ if(!t_isER){
     if(is_region && isScoreFast){
 
       t_gy = dot(t_gtilde, m_y);
-      if(!m_flagSparseGRM_cur){
+      if(!ctx.flagSparseGRM_cur){
         t_P2Vec = t_gtilde % m_mu2 *m_tauvec[0];
       }else{
 	t_P2Vec = getPCG1ofSigmaAndGtilde(t_gtilde, 100, 0.02);
@@ -973,6 +1078,103 @@ void SAIGEClass::assignSingleVarianceRatio(bool issparseforVR, bool isnoXadj){
 
 void SAIGEClass::assignSingleVarianceRatio_withinput(double t_varRatioVal){
         m_varRatioVal = t_varRatioVal;
+}
+
+
+// ============================================================
+// Pure computeVarianceRatio* helpers (Phase A of step2 parallelism plan).
+// These return the value that the corresponding assignVarianceRatio* would
+// have written into m_varRatioVal, without mutating any class member. They
+// let per-marker call-sites build a PerMarkerCtx without touching shared
+// state, enabling thread-safe parallel marker processing in Phase B.
+// ============================================================
+
+double SAIGEClass::computeVarianceRatio(double MAC, bool issparseforVR, bool& hasVarRatio) const {
+    hasVarRatio = false;
+    double out = 1.0;
+    arma::vec varRatio;
+    if(issparseforVR){
+        varRatio = m_varRatio_sparse;
+    }else{
+        varRatio = m_varRatio_null;
+    }
+    for(unsigned int i = 0; i < m_cateVarRatioMaxMACVecInclude.n_elem; i++){
+        if(MAC <= m_cateVarRatioMaxMACVecInclude(i) && MAC > m_cateVarRatioMinMACVecExclude(i)){
+            out = varRatio(i);
+            hasVarRatio = true;
+        }
+    }
+    if(!hasVarRatio){
+        if(MAC <= m_cateVarRatioMinMACVecExclude(0)){
+            out = varRatio(0);
+            hasVarRatio = true;
+        }
+    }
+    if(!hasVarRatio){
+        if(MAC > m_cateVarRatioMaxMACVecInclude.back()){
+            out = varRatio.back();
+            hasVarRatio = true;
+        }
+    }
+    return out;
+}
+
+double SAIGEClass::computeVarianceRatio(double MAC, bool issparseforVR, bool isnoXadj, bool& hasVarRatio) const {
+    hasVarRatio = false;
+    double out = 1.0;
+    arma::vec varRatio;
+    if(issparseforVR){
+        varRatio = m_varRatio_sparse;
+    }else{
+        if(!isnoXadj){
+            varRatio = m_varRatio_null;
+        }else{
+            varRatio = m_varRatio_null_noXadj;
+        }
+    }
+    for(unsigned int i = 0; i < m_cateVarRatioMaxMACVecInclude.n_elem; i++){
+        if(MAC <= m_cateVarRatioMaxMACVecInclude(i) && MAC > m_cateVarRatioMinMACVecExclude(i)){
+            out = varRatio(i);
+            hasVarRatio = true;
+        }
+    }
+    if(!hasVarRatio){
+        if(MAC <= m_cateVarRatioMinMACVecExclude(0)){
+            out = varRatio(0);
+            hasVarRatio = true;
+        }
+    }
+    if(!hasVarRatio){
+        if(MAC > m_cateVarRatioMaxMACVecInclude.back()){
+            out = varRatio.back();
+            hasVarRatio = true;
+        }
+    }
+    return out;
+}
+
+double SAIGEClass::computeSingleVarianceRatio(bool issparseforVR) const {
+    arma::vec varRatio;
+    if(issparseforVR){
+        varRatio = m_varRatio_sparse;
+    }else{
+        varRatio = m_varRatio_null;
+    }
+    return varRatio(0);
+}
+
+double SAIGEClass::computeSingleVarianceRatio(bool issparseforVR, bool isnoXadj) const {
+    arma::rowvec varRatio;
+    if(issparseforVR){
+        varRatio = m_varRatio_sparse;
+    }else{
+        if(isnoXadj){
+            varRatio = m_varRatio_null_noXadj;
+        }else{
+            varRatio = m_varRatio_null;
+        }
+    }
+    return varRatio(0);
 }
 
 

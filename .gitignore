@@ -30,3 +30,7 @@ code_copy/SAIGE_isolated/src/RcppExports.cpp
 
 # Test data (transferred separately, not source)
 test_data/
+
+# Compiled binaries
+step2_saige-step2/saige-step2
+step1_saige-null/saige-null
