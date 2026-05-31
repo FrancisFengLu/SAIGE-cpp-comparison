@@ -222,6 +222,31 @@ void scoreTestFast_noadjCov(arma::vec & t_GVec,
                      double &t_var2,
                      const PerMarkerCtx& ctx);
 
+// Phase C: matrix-level first pass. Computes Tstat / var1 / var2 for a block
+// of B markers via a single BLAS-3 GEMM, replacing B BLAS-2 dot products.
+// This is the dense-block analogue of scoreTestFast (with covariate adjustment,
+// non-sparse GRM). Caller is responsible for routing columns that need a
+// different path (sparse-GRM, noadjCov, SPA/ER/Firth recompute, conditional)
+// to the scalar code; this block method does only the cheap first-pass score
+// test math.
+//
+// G: N x B dense block of genotypes (already imputed / QC-passed).
+// varRatioVec: length B; per-column variance ratio (NaN entries skipped).
+// Outputs are length B; entries for skipped columns are left untouched.
+// validMask: length B, true for columns that were computed.
+void scoreTestFast_block(const arma::mat& G,
+                          const arma::vec& varRatioVec,
+                          const std::vector<bool>& validMask,
+                          arma::vec& Beta,
+                          arma::vec& seBeta,
+                          arma::vec& Tstat,
+                          arma::vec& var1,
+                          arma::vec& var2,
+                          arma::vec& StdStat,
+                          arma::vec& pvalNoadj,
+                          std::vector<bool>& pvalIsLog,
+                          std::vector<std::string>& pvalStr) const;
+
 
 
      void set_flagSparseGRM_cur(bool t_flagSparseGRM_cur);
