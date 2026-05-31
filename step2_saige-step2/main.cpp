@@ -773,8 +773,12 @@ void mainMarkerInCPP(
 
     // Phase D (Wave 1.3): BGEN block-read + decode pipeline. For t_genoType
     // == "bgen" we spin up a streamer (1 reader + N decoders + bounded queue)
-    // and consume markers in original order via getNext(). Other genoTypes go
-    // through the existing per-iteration Unified_getOneMarker path.
+    // and consume markers by index via getMarker(i). The streamer's reader
+    // thread enumerates markers in input file order; consumers retrieve them
+    // by the OMP loop index, which preserves output order even though
+    // dynamic,64 scheduling visits i's non-monotonically across threads.
+    // Other genoTypes go through the existing per-iteration
+    // Unified_getOneMarker path.
     std::unique_ptr<BGEN::BgenStreamer> bgenStreamer;
     if (t_genoType == "bgen") {
         if (ptr_gBGENobj == nullptr) {
@@ -830,7 +834,12 @@ void mainMarkerInCPP(
             // Phase D: BGEN streamer is internally thread-safe (single reader
             // thread + N decoder threads + bounded queue). No critical needed.
             BGEN::BgenDecodedMarker dm;
-            isReadMarker = bgenStreamer->getNext(dm);
+            // BUG 2 fix: request the specific marker for THIS iteration index.
+            // Under OMP dynamic,64 the loop iterations are visited out of
+            // monotonic order across threads; getNext() (FIFO) would assign
+            // wrong dosages to BetaVec[i]. getMarker(i) blocks until
+            // decodedMap[i] is ready and returns the correct marker.
+            isReadMarker = bgenStreamer->getMarker((uint64_t)i, dm);
             if (isReadMarker) {
                 ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
                 alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";

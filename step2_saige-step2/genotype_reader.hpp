@@ -506,16 +506,19 @@ struct BgenDecodedMarker {
 //
 // Lifecycle:
 //   BgenStreamer s(bgenObj, nDecoders=4, queueCapacity=64);
-//   while (s.getNext(dm)) { ... use dm ... }
+//   while (s.getMarker(i, dm)) { ... use dm ... }
 //   // destructor joins all threads cleanly
 //
 // Threading model:
 //   - reader thread: pops jobs from a sequential marker-index counter, calls
-//     bgen->readRawBlock(), pushes BgenRawBlock to rawQueue
+//     bgen->readRawBlock(), pushes BgenRawBlock to rawQueue. Throttles itself
+//     so m_decoded never exceeds m_decodedCap (backpressure for memory).
 //   - decoder threads (N): pop from rawQueue, call BgenClass::parseBlock with
 //     thread-local scratch, insert into decodedMap[markerIndex]
-//   - main thread (consumer): getNext() pulls decodedMap[next_expected_idx],
-//     blocks on cv if not yet decoded
+//   - consumer threads: getMarker(idx) blocks on cv until decodedMap[idx]
+//     is present (or stream truncated past idx). Each idx must be requested
+//     at most once — caller is the OpenMP parallel for indexing 0..N-1.
+//     After retrieval, the entry is evicted from the map.
 // ============================================================
 class BgenStreamer {
 public:
@@ -532,9 +535,13 @@ public:
                  size_t queueCapacity = 64);
     ~BgenStreamer();
 
-    // Returns true and fills `out` with the next-in-order marker.
-    // Returns false at EOF (no more markers).
-    bool getNext(BgenDecodedMarker& out);
+    // Returns true and fills `out` with the marker at `markerIndex`.
+    // Blocks until decodedMap[markerIndex] is ready, or returns false if the
+    // stream truncated before reaching markerIndex (EOF / read failure).
+    // IMPORTANT: each markerIndex must be requested AT MOST ONCE — the entry
+    // is evicted after retrieval. Safe under OpenMP parallel for with
+    // monotonic i = 0..N-1 (each i visited exactly once).
+    bool getMarker(uint64_t markerIndex, BgenDecodedMarker& out);
 
     BgenStreamer(const BgenStreamer&) = delete;
     BgenStreamer& operator=(const BgenStreamer&) = delete;
@@ -558,10 +565,13 @@ private:
     bool                        m_readerDone = false;
 
     // Decoders -> consumer map (keyed by markerIndex for order preservation)
+    // Bounded by m_decodedCap to apply memory backpressure on the reader thread
+    // when consumers fall behind.
     std::mutex                              m_decMtx;
-    std::condition_variable                 m_decReady;
+    std::condition_variable                 m_decReady;     // a marker arrived
+    std::condition_variable                 m_decNotFull;   // map shrank
     std::map<uint64_t, BgenDecodedMarker>   m_decoded;
-    uint64_t                                m_nextIdx = 0;
+    size_t                                  m_decodedCap = 256;
     uint64_t                                m_decodersFinishedAt = UINT64_MAX;  // EOF marker
 
     std::atomic<bool>           m_stop{false};
