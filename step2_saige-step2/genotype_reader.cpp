@@ -1690,6 +1690,7 @@ BgenStreamer::~BgenStreamer()
     m_rawNotEmpty.notify_all();
     m_rawNotFull.notify_all();
     m_decReady.notify_all();
+    m_decNotFull.notify_all();
     if (m_readerThread.joinable()) m_readerThread.join();
     for (auto& t : m_decoderThreads) {
         if (t.joinable()) t.join();
@@ -1701,6 +1702,17 @@ void BgenStreamer::readerLoop()
     const uint64_t M = m_byteOffsets.size();
     for (uint64_t i = 0; i < M; i++) {
         if (m_stop.load()) break;
+
+        // Memory backpressure: don't read so far ahead that m_decoded grows
+        // unbounded. If the consumer is slow / out-of-order, pause here until
+        // it has drained some entries.
+        {
+            std::unique_lock<std::mutex> dlk(m_decMtx);
+            m_decNotFull.wait(dlk, [&]() {
+                return m_decoded.size() < m_decodedCap || m_stop.load();
+            });
+            if (m_stop.load()) break;
+        }
 
         BgenRawBlock blk;
         bool ok = m_bgen->readRawBlock(i, m_byteOffsets[i], blk);
@@ -1725,6 +1737,12 @@ void BgenStreamer::readerLoop()
         std::unique_lock<std::mutex> lk(m_rawMtx);
         m_readerDone = true;
         m_rawNotEmpty.notify_all();
+    }
+    // Wake any consumer waiting on a marker that will never arrive (e.g. if
+    // m_stop fired or we exited early without setting m_decodersFinishedAt).
+    {
+        std::unique_lock<std::mutex> dlk(m_decMtx);
+        m_decReady.notify_all();
     }
 }
 
@@ -1766,29 +1784,33 @@ void BgenStreamer::decoderLoop()
     }
 }
 
-bool BgenStreamer::getNext(BgenDecodedMarker& out)
+bool BgenStreamer::getMarker(uint64_t markerIndex, BgenDecodedMarker& out)
 {
-    // We know exactly how many markers exist (size of m_byteOffsets) and where
-    // the stream truncates if the reader hit EOF early (m_decodersFinishedAt).
-    // The right EOF condition is purely "m_nextIdx >= effective_total" — no
-    // need to peek at m_rawQueue / m_readerDone, which would race across
-    // mutexes.
+    // Block until the specific marker we asked for is in m_decoded, or until
+    // it is provably never going to arrive (out-of-range, truncated stream,
+    // or stop signal). Each markerIndex is requested at most once by the
+    // OpenMP consumer, so we evict from the map after retrieval to bound
+    // memory.
     std::unique_lock<std::mutex> lk(m_decMtx);
     const uint64_t total = m_byteOffsets.size();
+
+    if (markerIndex >= total) return false;
+
     m_decReady.wait(lk, [&]() {
-        if (m_nextIdx >= total) return true;
-        if (m_nextIdx >= m_decodersFinishedAt) return true;
-        return m_decoded.find(m_nextIdx) != m_decoded.end();
+        if (m_stop.load()) return true;
+        if (markerIndex >= m_decodersFinishedAt) return true;  // truncated past us
+        return m_decoded.find(markerIndex) != m_decoded.end();
     });
 
-    if (m_nextIdx >= total) return false;
-    if (m_nextIdx >= m_decodersFinishedAt) return false;
+    if (m_stop.load()) return false;
+    if (markerIndex >= m_decodersFinishedAt) return false;
 
-    auto it = m_decoded.find(m_nextIdx);
+    auto it = m_decoded.find(markerIndex);
     if (it == m_decoded.end()) return false;
     out = std::move(it->second);
     m_decoded.erase(it);
-    m_nextIdx++;
+    // Tell reader thread the decoded-map now has room (backpressure release).
+    m_decNotFull.notify_one();
     return out.valid;
 }
 
