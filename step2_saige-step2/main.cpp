@@ -24,6 +24,12 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <omp.h>
+
+// OpenBLAS thread-count knob (no public header in some installs); declared here
+// so we can clamp BLAS to 1 thread per OMP worker and avoid nested oversubscription.
+extern "C" void openblas_set_num_threads(int);
+
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -73,6 +79,7 @@ double g_maxMAFLimit;
 unsigned int g_region_maxMarkers_cutoff;
 bool g_isOutputMoreDetails;
 int g_marker_chunksize;
+int g_nThreads = 1;
 
 std::string g_method_to_CollapseUltraRare;
 double g_DosageCutoff_for_UltraRarePresence;
@@ -738,18 +745,12 @@ void mainMarkerInCPP(
     std::vector<double> N_case_hetVec(q);
     std::vector<double> N_ctrl_homVec(q);
     std::vector<uint32_t> N_Vec(q);
-    std::vector<uint> indexZeroVec;
-    std::vector<uint> indexNonZeroVec;
-    std::vector<uint> indexForMissing;
-
     int n = ptr_gSAIGEobj->m_n;
-    arma::vec t_GVec(n);
-    arma::vec gtildeVec(n);
-    arma::vec t_P2Vec;
 
-    bool hasVarRatio = true;
     bool isSingleVarianceRatio = true;
     if ((ptr_gSAIGEobj->m_varRatio_null).n_elem == 1) {
+        // One-time setup before parallel region; OK to mutate here because no
+        // threads are running yet.
         ptr_gSAIGEobj->assignSingleVarianceRatio(
             ptr_gSAIGEobj->m_flagSparseGRM,
             ptr_gSAIGEobj->m_isnoadjCov);
@@ -759,11 +760,31 @@ void mainMarkerInCPP(
 
     int mFirth = 0;
     int mFirthConverge = 0;
+    // Phase B: end-of-stream flag (some readers signal EOF mid-iteration). With
+    // OpenMP we cannot 'break' out of a parallel for, so we record the lowest
+    // failing index and skip work for i >= that index.
+    int firstEndIdx = q;  // q == "no end yet"
 
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < q; i++) {
+        // Phase B: per-iteration scratch — declared inside the loop body so
+        // each thread has its own copies (no false sharing, no races).
+        arma::vec t_GVec(n);
+        arma::vec gtildeVec(n);
+        arma::vec t_P2Vec;
+        std::vector<uint> indexZeroVec;
+        std::vector<uint> indexNonZeroVec;
+        std::vector<uint> indexForMissing;
+
+        // Skip if another thread already hit end-of-stream at an earlier index.
+        if (i >= firstEndIdx) continue;
+
         if ((i + 1) % g_marker_chunksize == 0) {
-            std::cout << "Completed " << (i + 1) << "/" << q
-                      << " markers in the chunk." << std::endl;
+            #pragma omp critical(progress)
+            {
+                std::cout << "Completed " << (i + 1) << "/" << q
+                          << " markers in the chunk." << std::endl;
+            }
         }
 
         // information of marker
@@ -777,40 +798,37 @@ void mainMarkerInCPP(
         char* end;
         uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
 
+        // For absolute-seek readers (PLINK, BGEN, PGEN, VCF), gIndex_prev=0
+        // forces SEEK_SET inside the reader — required for correctness when
+        // iterations execute out of order under OpenMP.
         uint64_t gIndex_prev = 0;
-        if (i == 0) {
-            gIndex_prev = 0;
-        } else {
-            char* end_prev;
-            std::string t_genoIndex_prev_str;
-            if (t_genoType == "bgen") {
-                t_genoIndex_prev_str = t_genoIndex_prev.at(i - 1);
-            } else if (t_genoType == "plink" || t_genoType == "pgen" || t_genoType == "vcf") {
-                t_genoIndex_prev_str = t_genoIndex.at(i - 1);
-            }
-            gIndex_prev = std::strtoull(t_genoIndex_prev_str.c_str(), &end_prev, 10);
-        }
 
         bool isOutputIndexForMissing = true;
         bool isOnlyOutputNonZero = false;
 
-        // clear vectors
-        indexZeroVec.clear();
-        indexNonZeroVec.clear();
-        indexForMissing.clear();
-
-        bool isReadMarker = Unified_getOneMarker(
-            t_genoType, gIndex_prev, gIndex,
-            ref, alt, marker, pd, chr,
-            altFreq, altCounts, missingRate, imputeInfo,
-            isOutputIndexForMissing,
-            indexForMissing,
-            isOnlyOutputNonZero,
-            indexNonZeroVec, t_GVec, t_isImputation);
+        bool isReadMarker;
+        #pragma omp critical(genoread)
+        {
+            // Genotype readers (PLINK FILE*/buffer, BGEN/PGEN/VCF singletons)
+            // are not thread-safe. Serialize disk I/O; parallelize compute below.
+            isReadMarker = Unified_getOneMarker(
+                t_genoType, gIndex_prev, gIndex,
+                ref, alt, marker, pd, chr,
+                altFreq, altCounts, missingRate, imputeInfo,
+                isOutputIndexForMissing,
+                indexForMissing,
+                isOnlyOutputNonZero,
+                indexNonZeroVec, t_GVec, t_isImputation);
+        }
 
         if (!isReadMarker) {
-            g_markerTestEnd = true;
-            break;
+            #pragma omp critical(endflag)
+            {
+                if (i < firstEndIdx) firstEndIdx = i;
+                g_markerTestEnd = true;
+            }
+            // pvalVec[i] already initialized to "NA" sentinel; just stop work.
+            continue;
         }
 
         std::string pds = std::to_string(pd);
@@ -888,21 +906,25 @@ void mainMarkerInCPP(
                 t_P2Vec.clear();
                 G1tilde_P_G2tilde_Vec.clear();
 
-                // Set variance ratio
-                if (ptr_gSAIGEobj->m_isFastTest) {
-                    ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
-                } else {
-                    ptr_gSAIGEobj->set_flagSparseGRM_cur(ptr_gSAIGEobj->m_flagSparseGRM);
-                }
-
-                if (isSingleVarianceRatio) {
-                    ptr_gSAIGEobj->assignSingleVarianceRatio(
-                        ptr_gSAIGEobj->m_flagSparseGRM_cur,
-                        ptr_gSAIGEobj->m_isnoadjCov);
-                } else {
-                    hasVarRatio = ptr_gSAIGEobj->assignVarianceRatio(
-                        MAC, ptr_gSAIGEobj->m_flagSparseGRM_cur,
-                        ptr_gSAIGEobj->m_isnoadjCov);
+                // Phase B: build per-marker ctx (no mutation of SAIGEClass).
+                // Previously this block called set_flagSparseGRM_cur(),
+                // assignSingleVarianceRatio(), and assignVarianceRatio() which
+                // wrote to ptr_gSAIGEobj fields — those are data races under
+                // OpenMP. ctx now carries the per-marker scalars directly.
+                SAIGE::PerMarkerCtx ctx_first;
+                ctx_first.flagSparseGRM_cur = ptr_gSAIGEobj->m_isFastTest
+                    ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                ctx_first.isnoadjCov_cur = ptr_gSAIGEobj->m_isnoadjCov;
+                {
+                    bool dummyHas;
+                    if (isSingleVarianceRatio) {
+                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                            ctx_first.flagSparseGRM_cur, ctx_first.isnoadjCov_cur);
+                    } else {
+                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                            MAC, ctx_first.flagSparseGRM_cur, ctx_first.isnoadjCov_cur,
+                            dummyHas);
+                    }
                 }
 
                 // === CHECKPOINT OUTPUT BEGIN ===
@@ -912,7 +934,7 @@ void mainMarkerInCPP(
                     if (ofs.is_open()) {
                         ofs << std::setprecision(15);
                         ofs << "field\tvalue" << std::endl;
-                        ofs << "varRatioVal\t" << ptr_gSAIGEobj->m_varRatioVal << std::endl;
+                        ofs << "varRatioVal\t" << ctx_first.varRatioVal << std::endl;
                         ofs << "isSingleVarianceRatio\t" << isSingleVarianceRatio << std::endl;
                         ofs << "isFastTest\t" << ptr_gSAIGEobj->m_isFastTest << std::endl;
                         ofs.close();
@@ -922,26 +944,6 @@ void mainMarkerInCPP(
                 // === CHECKPOINT OUTPUT END ===
 
                 bool is_region = false;
-
-                // Phase A: build per-marker ctx so the call doesn't depend on
-                // SAIGEClass mutable singletons. flagSparseGRM_cur mirrors the
-                // set_flagSparseGRM_cur above; varRatioVal mirrors the
-                // assignVarianceRatio/assignSingleVarianceRatio just above.
-                SAIGE::PerMarkerCtx ctx_first;
-                ctx_first.flagSparseGRM_cur = ptr_gSAIGEobj->m_isFastTest
-                    ? false : ptr_gSAIGEobj->m_flagSparseGRM;
-                ctx_first.isnoadjCov_cur = ptr_gSAIGEobj->m_isnoadjCov;
-                {
-                    bool dummyHas;
-                    if (isSingleVarianceRatio) {
-                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
-                            ctx_first.flagSparseGRM_cur, ptr_gSAIGEobj->m_isnoadjCov);
-                    } else {
-                        ctx_first.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
-                            MAC, ctx_first.flagSparseGRM_cur, ptr_gSAIGEobj->m_isnoadjCov,
-                            dummyHas);
-                    }
-                }
 
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
                     Unified_getMarkerPval(
@@ -958,8 +960,8 @@ void mainMarkerInCPP(
                         Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                         is_Firth, is_FirthConverge,
                         true,  // t_isER
-                        ptr_gSAIGEobj->m_isnoadjCov,
-                        ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                        ctx_first.isnoadjCov_cur,
+                        ctx_first.flagSparseGRM_cur,
                         ctx_first);
                 } else {
                     Unified_getMarkerPval(
@@ -976,8 +978,8 @@ void mainMarkerInCPP(
                         Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                         is_Firth, is_FirthConverge,
                         false,  // t_isER
-                        ptr_gSAIGEobj->m_isnoadjCov,
-                        ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                        ctx_first.isnoadjCov_cur,
+                        ctx_first.flagSparseGRM_cur,
                         ctx_first);
                 }
 
@@ -998,26 +1000,10 @@ void mainMarkerInCPP(
 
                     if (ptr_gSAIGEobj->m_isFastTest &&
                         pval_num < (ptr_gSAIGEobj->m_pval_cutoff_for_fastTest)) {
-                        if (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back()) {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
-                        } else {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(ptr_gSAIGEobj->m_flagSparseGRM);
-                        }
-                        ptr_gSAIGEobj->set_isnoadjCov_cur(false);
-
-                        if (!isSingleVarianceRatio) {
-                            hasVarRatio = ptr_gSAIGEobj->assignVarianceRatio(
-                                MAC, ptr_gSAIGEobj->m_flagSparseGRM_cur,
-                                ptr_gSAIGEobj->m_isnoadjCov_cur);
-                        } else {
-                            ptr_gSAIGEobj->assignSingleVarianceRatio(
-                                ptr_gSAIGEobj->m_flagSparseGRM_cur,
-                                ptr_gSAIGEobj->m_isnoadjCov_cur);
-                        }
-
-                        // Phase A: build ctx mirroring the set_*_cur and
-                        // assignVarianceRatio* mutations above. isnoadjCov_cur
-                        // was just set to false (see set_isnoadjCov_cur(false)).
+                        // Phase B: build ctx for the fast-test re-eval. The
+                        // previous block called set_flagSparseGRM_cur(),
+                        // set_isnoadjCov_cur(false), and assignVarianceRatio*
+                        // on the shared SAIGEClass — those are races under OMP.
                         SAIGE::PerMarkerCtx ctx_fast;
                         ctx_fast.flagSparseGRM_cur =
                             (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
@@ -1049,16 +1035,18 @@ void mainMarkerInCPP(
                             Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                             is_Firth, is_FirthConverge,
                             false,
-                            ptr_gSAIGEobj->m_isnoadjCov_cur,
-                            ptr_gSAIGEobj->m_flagSparseGRM_cur,
+                            ctx_fast.isnoadjCov_cur,
+                            ctx_fast.flagSparseGRM_cur,
                             ctx_fast);
                     }
                 }  // if((t_traitType == "binary" && MAC > g_MACCutoffforER) || t_traitType != "binary")
 
                 if (t_traitType == "binary") {
                     if (is_Firth) {
+                        #pragma omp atomic
                         mFirth = mFirth + 1;
                         if (is_FirthConverge) {
+                            #pragma omp atomic
                             mFirthConverge = mFirthConverge + 1;
                         }
                     }
@@ -2780,6 +2768,7 @@ int main(int argc, char* argv[])
             std::cerr << "  isImputation:      true/false (default: false)" << std::endl;
             std::cerr << "  isMoreOutput:      true/false (default: false)" << std::endl;
             std::cerr << "  marker_chunksize:  markers per progress report (default: 10000)" << std::endl;
+            std::cerr << "  nThreads:          OpenMP threads for marker loop (default: 1)" << std::endl;
             std::cerr << "  MACCutoffforER:    MAC cutoff for ER (default: 4)" << std::endl;
             std::cerr << "  weights_beta:      [a, b] for Beta weights (default: [1, 25])" << std::endl;
             std::cerr << "  checkpointDir:     Directory for checkpoint outputs (optional)" << std::endl;
@@ -2890,6 +2879,12 @@ int main(int argc, char* argv[])
         bool isImputation = config["isImputation"] ? config["isImputation"].as<bool>() : false;
         bool isMoreOutput = config["isMoreOutput"] ? config["isMoreOutput"].as<bool>() : false;
         int marker_chunksize = config["marker_chunksize"] ? config["marker_chunksize"].as<int>() : 10000;
+        int nThreads = config["nThreads"] ? config["nThreads"].as<int>() : 1;
+        if (nThreads < 1) nThreads = 1;
+        g_nThreads = nThreads;
+        omp_set_num_threads(g_nThreads);
+        // Prevent BLAS oversubscription when OMP threads call BLAS underneath.
+        openblas_set_num_threads(1);
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
@@ -3046,6 +3041,7 @@ int main(int argc, char* argv[])
         std::cout << "  MACCutoffforER:    " << MACCutoffforER << std::endl;
         std::cout << "  weights_beta:      [" << weights_beta(0) << ", " << weights_beta(1) << "]" << std::endl;
         std::cout << "  marker_chunksize:  " << marker_chunksize << std::endl;
+        std::cout << "  nThreads:          " << g_nThreads << std::endl;
         if (isRegionTest) {
             std::cout << std::endl;
             std::cout << "  --- Region testing ---" << std::endl;
