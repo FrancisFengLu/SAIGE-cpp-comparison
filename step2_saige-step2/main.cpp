@@ -739,7 +739,16 @@ void mainMarkerInCPP(
     std::vector<double> Tstat_cVec(q, arma::datum::nan);
     std::vector<double> varT_cVec(q, arma::datum::nan);
     std::vector<std::string> pvalNA_cVec(q, "NA");
-    arma::rowvec G1tilde_P_G2tilde_Vec(ptr_gSAIGEobj->m_numMarker_cond);
+    // BUG 1 fix: G1tilde_P_G2tilde_Vec was previously declared here (shared across
+    // threads). Inside the OMP parallel for below, each thread calls .clear() and
+    // then has it written by getMarkerPval -> SAIGEClass::getMarkerPval (saige_test.cpp
+    // line 820), which assigns `sqrt(varRatio)*gtilde.t()*m_P2Mat_cond` to it.
+    // Thread A's .clear() (size becomes 1x0) raced with thread B's read at the
+    // matmul `t_G1tilde_P_G2tilde * m_VarInvMat_cond` (3x3), producing
+    // "incompatible matrix dimensions: 1x0 and 3x3". Declaring it inside the
+    // loop body (see below) gives each thread its own per-iteration scratch.
+    // Cache the cond marker count once (used only for sizing inside the loop).
+    const int g_numMarker_cond_local = ptr_gSAIGEobj->m_numMarker_cond;
 
     std::vector<bool> isSPAConvergeVec(q);
     std::vector<double> AF_caseVec(q);
@@ -797,6 +806,11 @@ void mainMarkerInCPP(
         std::vector<uint> indexZeroVec;
         std::vector<uint> indexNonZeroVec;
         std::vector<uint> indexForMissing;
+        // BUG 1 fix: per-thread conditional-analysis scratch (was previously a
+        // single shared instance above this loop; see comment near declaration
+        // of g_numMarker_cond_local). getMarkerPval writes into it via
+        // t_G1tilde_P_G2tilde = sqrt(varRatio)*gtilde.t()*m_P2Mat_cond.
+        arma::rowvec G1tilde_P_G2tilde_Vec(g_numMarker_cond_local);
 
         // Skip if another thread already hit end-of-stream at an earlier index.
         if (i >= firstEndIdx) continue;
