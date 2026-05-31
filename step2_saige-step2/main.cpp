@@ -1928,9 +1928,10 @@ void mainRegionInCPP(
     bool isSingleVarianceRatio = true;
     if ((ptr_gSAIGEobj->m_varRatio_null).n_elem > 1) {
         isSingleVarianceRatio = false;
-    } else {
-        ptr_gSAIGEobj->assignSingleVarianceRatio(ptr_gSAIGEobj->m_flagSparseGRM_cur);
     }
+    // Phase E: removed assignSingleVarianceRatio mutation here. All
+    // getMarkerPval callsites below now use a per-call PerMarkerCtx that
+    // sources varRatioVal via compute* helpers (no shared mutation).
 
     unsigned int nchunks = 0;
     unsigned int ichunk = 0;
@@ -1956,24 +1957,26 @@ void mainRegionInCPP(
         char* end;
         uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
 
+        // Phase E: under OMP parallel-for over regions, the per-region marker
+        // sequence is interleaved across threads at the critical(genoread)
+        // gate. PLINK/PGEN/VCF/BGEN readers rely on file-position state, so
+        // we MUST force absolute seeks by passing gIndex_prev=0 for every
+        // call. The non-zero gIndex_prev path (sequential) would jump from
+        // some other thread's last position to ours, corrupting GVec.
         uint64_t gIndex_prev = 0;
-        if (i == 0) {
-            gIndex_prev = 0;
-        } else {
-            char* end_prev;
-            std::string t_genoIndex_prev_str;
-            if (t_genoType == "bgen") {
-                t_genoIndex_prev_str = t_genoIndex_prev.at(i - 1);
-            } else if (t_genoType == "plink" || t_genoType == "pgen" || t_genoType == "vcf") {
-                t_genoIndex_prev_str = t_genoIndex.at(i - 1);
-            }
-            gIndex_prev = std::strtoull(t_genoIndex_prev_str.c_str(), &end_prev, 10);
-        }
 
-        bool isReadMarker = Unified_getOneMarker(t_genoType, gIndex_prev, gIndex,
-            ref, alt, marker, pd, chr, altFreq, altCounts, missingRate, imputeInfo,
-            isOutputIndexForMissing, indexForMissing,
-            isOnlyOutputNonZero, indexNonZeroVec, GVec, t_isImputation);
+        // Phase E: PLINK/PGEN/VCF readers are not thread-safe; BGEN reader
+        // also relies on file-position state. Serialize disk reads across
+        // outer-region threads via critical(genoread). The expensive work
+        // (Unified_getMarkerPval, group accumulators) runs in parallel.
+        bool isReadMarker;
+        #pragma omp critical(genoread)
+        {
+            isReadMarker = Unified_getOneMarker(t_genoType, gIndex_prev, gIndex,
+                ref, alt, marker, pd, chr, altFreq, altCounts, missingRate, imputeInfo,
+                isOutputIndexForMissing, indexForMissing,
+                isOnlyOutputNonZero, indexNonZeroVec, GVec, t_isImputation);
+        }
 
         if (!isReadMarker) {
             std::cout << "ERROR: Reading " << i << "th marker failed." << std::endl;
@@ -2029,17 +2032,9 @@ void mainRegionInCPP(
                 std::cout << "Start analyzing chunk " << ichunk << "....." << std::endl;
             }
 
-            if (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back()) {
-                ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
-            } else {
-                ptr_gSAIGEobj->set_flagSparseGRM_cur(ptr_gSAIGEobj->m_flagSparseGRM);
-            }
-
-            if (!isSingleVarianceRatio) {
-                hasVarRatio = ptr_gSAIGEobj->assignVarianceRatio(MAC, ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
-            } else {
-                ptr_gSAIGEobj->assignSingleVarianceRatio(ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
-            }
+            // Phase E: set_flagSparseGRM_cur + assignVarianceRatio mutations
+            // removed here; ctx_region (built below) supplies the same values
+            // without touching shared SAIGEobj state.
 
             if (t_regionTestType != "BURDEN" || t_isSingleinGroupTest) {
                 indexZeroVec_arma = arma::conv_to<arma::uvec>::from(indexZeroVec);
@@ -2054,7 +2049,7 @@ void mainRegionInCPP(
                         ? false : ptr_gSAIGEobj->m_flagSparseGRM;
                 ctx_region.isnoadjCov_cur = false;
                 {
-                    bool dummyHas;
+                    bool dummyHas = true;
                     if (!isSingleVarianceRatio) {
                         ctx_region.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
                             MAC, ctx_region.flagSparseGRM_cur, false, dummyHas);
@@ -2062,6 +2057,7 @@ void mainRegionInCPP(
                         ctx_region.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
                             ctx_region.flagSparseGRM_cur, false);
                     }
+                    hasVarRatio = dummyHas;
                 }
 
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
@@ -2091,8 +2087,8 @@ void mainRegionInCPP(
                 isSPAConvergeVec.at(i) = isSPAConverge;
 
                 if (t_regionTestType != "BURDEN") {
-                    P1Mat.row(i1InChunk) = std::sqrt(ptr_gSAIGEobj->m_varRatioVal) * gtildeVec.t();
-                    P2Mat.col(i1InChunk) = std::sqrt(ptr_gSAIGEobj->m_varRatioVal) * P2Vec;
+                    P1Mat.row(i1InChunk) = std::sqrt(ctx_region.varRatioVal) * gtildeVec.t();
+                    P2Mat.col(i1InChunk) = std::sqrt(ctx_region.varRatioVal) * P2Vec;
                 }
             }
 
@@ -2279,15 +2275,23 @@ void mainRegionInCPP(
                     MAC_ur = MAF_ur * 2 * t_n;
 
                     if (t_regionTestType != "BURDEN" || t_isSingleinGroupTest) {
-                        if (MAC_ur > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back()) {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
-                        } else {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(ptr_gSAIGEobj->m_flagSparseGRM);
-                        }
-                        if (!isSingleVarianceRatio) {
-                            hasVarRatio = ptr_gSAIGEobj->assignVarianceRatio(MAC_ur, ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
-                        } else {
-                            ptr_gSAIGEobj->assignSingleVarianceRatio(ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
+                        // Phase E: per-call ctx; no SAIGEobj mutations so we
+                        // are safe under OMP parallel-for across outer regions.
+                        SAIGE::PerMarkerCtx ctx_ur;
+                        ctx_ur.flagSparseGRM_cur =
+                            (MAC_ur > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                                ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                        ctx_ur.isnoadjCov_cur = false;
+                        {
+                            bool dummyHas;
+                            if (!isSingleVarianceRatio) {
+                                ctx_ur.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                                    MAC_ur, ctx_ur.flagSparseGRM_cur, false, dummyHas);
+                                hasVarRatio = dummyHas;
+                            } else {
+                                ctx_ur.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                                    ctx_ur.flagSparseGRM_cur, false);
+                            }
                         }
 
                         annoMAFIndicatorVec.zeros();
@@ -2309,14 +2313,14 @@ void mainRegionInCPP(
                                 isSPAConverge, gtildeVec, is_gtilde, true, P2Vec, isCondition,
                                 Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c,
                                 G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge,
-                                true, false, ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                                true, false, ctx_ur.flagSparseGRM_cur, ctx_ur);
                         } else {
                             ptr_gSAIGEobj->getMarkerPval(genoURVec, indexNonZeroVec_arma_ur, indexZeroVec_arma_ur,
                                 Beta, seBeta, pval, pval_noSPA, altFreq_ur, Tstat, gy, varT,
                                 isSPAConverge, gtildeVec, is_gtilde, true, P2Vec, isCondition,
                                 Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c,
                                 G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge,
-                                false, false, ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                                false, false, ctx_ur.flagSparseGRM_cur, ctx_ur);
                         }
 
                         BetaVec.at(i_ur) = Beta * (1 - 2 * flip_ur);
@@ -2353,8 +2357,8 @@ void mainRegionInCPP(
                         }
 
                         if (t_regionTestType != "BURDEN") {
-                            P1Mat.row(i1InChunk) = std::sqrt(ptr_gSAIGEobj->m_varRatioVal) * gtildeVec.t();
-                            P2Mat.col(i1InChunk) = std::sqrt(ptr_gSAIGEobj->m_varRatioVal) * P2Vec;
+                            P1Mat.row(i1InChunk) = std::sqrt(ctx_ur.varRatioVal) * gtildeVec.t();
+                            P2Mat.col(i1InChunk) = std::sqrt(ctx_ur.varRatioVal) * P2Vec;
                         }
                     } else {
                         // BURDEN-only path for URV
@@ -2477,15 +2481,23 @@ void mainRegionInCPP(
 
                     if (indexNZ.n_elem > 0 && MAC_b >= g_min_gourpmac_for_burdenonly) {
                         isPolyMarker = true;
-                        if (MAC_b > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back()) {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
-                        } else {
-                            ptr_gSAIGEobj->set_flagSparseGRM_cur(ptr_gSAIGEobj->m_flagSparseGRM);
-                        }
-                        if (!isSingleVarianceRatio) {
-                            hasVarRatio = ptr_gSAIGEobj->assignVarianceRatio(MAC_b, ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
-                        } else {
-                            ptr_gSAIGEobj->assignSingleVarianceRatio(ptr_gSAIGEobj->m_flagSparseGRM_cur, false);
+                        // Phase E: build per-call ctx; eliminates SAIGEobj
+                        // mutations so the outer region loop is OMP-safe.
+                        SAIGE::PerMarkerCtx ctx_b;
+                        ctx_b.flagSparseGRM_cur =
+                            (MAC_b > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                                ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                        ctx_b.isnoadjCov_cur = false;
+                        {
+                            bool dummyHas = true;
+                            if (!isSingleVarianceRatio) {
+                                ctx_b.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                                    MAC_b, ctx_b.flagSparseGRM_cur, false, dummyHas);
+                                hasVarRatio = dummyHas;
+                            } else {
+                                ctx_b.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                                    ctx_b.flagSparseGRM_cur, false);
+                            }
                         }
 
                         if (MAC_b <= g_MACCutoffforER && t_traitType == "binary"
@@ -2496,7 +2508,7 @@ void mainRegionInCPP(
                                 isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c,
                                 Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                                 is_Firth, is_FirthConverge, true, false,
-                                ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                                ctx_b.flagSparseGRM_cur, ctx_b);
                         } else {
                             ptr_gSAIGEobj->getMarkerPval(genoSumVec, indexNZ, indexZ,
                                 Beta, seBeta, pval, pval_noSPA, altFreq_b, Tstat, gy, varT,
@@ -2504,7 +2516,7 @@ void mainRegionInCPP(
                                 isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c,
                                 Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                                 is_Firth, is_FirthConverge, false, false,
-                                ptr_gSAIGEobj->m_flagSparseGRM_cur);
+                                ctx_b.flagSparseGRM_cur, ctx_b);
                         }
 
                         BURDEN_AnnoName_Vec.at(i_b) = AnnoName;
@@ -2552,12 +2564,18 @@ void mainRegionInCPP(
         arma::vec nonMissingPvalVec = arma::conv_to<arma::vec>::from(nonMissingPvalVec_std);
         cctpval = CCT_cpp(nonMissingPvalVec);
 
-        writeOutfile_BURDEN(regionName, BURDEN_AnnoName_Vec, BURDEN_maxMAFName_Vec,
-            BURDEN_pval_Vec, BURDEN_Beta_Vec, BURDEN_seBeta_Vec,
-            BURDEN_pval_cVec, BURDEN_Beta_cVec, BURDEN_seBeta_cVec,
-            MAC_GroupVec, MACCase_GroupVec, MACControl_GroupVec,
-            NumRare_GroupVec, NumUltraRare_GroupVec,
-            cctpval, cctpval_cond, q_anno, q_maf, isCondition, t_traitType);
+        // Phase E: serialize file appends across threads. Output row order
+        // is now in region-completion order (not input order). Downstream
+        // tools should sort by chr/pos anyway.
+        #pragma omp critical(outwrite)
+        {
+            writeOutfile_BURDEN(regionName, BURDEN_AnnoName_Vec, BURDEN_maxMAFName_Vec,
+                BURDEN_pval_Vec, BURDEN_Beta_Vec, BURDEN_seBeta_Vec,
+                BURDEN_pval_cVec, BURDEN_Beta_cVec, BURDEN_seBeta_cVec,
+                MAC_GroupVec, MACCase_GroupVec, MACControl_GroupVec,
+                NumRare_GroupVec, NumUltraRare_GroupVec,
+                cctpval, cctpval_cond, q_anno, q_maf, isCondition, t_traitType);
+        }
 
     } else {
         // ===== SKAT-O / SKAT path =====
@@ -2747,57 +2765,63 @@ void mainRegionInCPP(
         }
 
         // ===== Write region output =====
+        // Phase E: serialize OutFile writes across threads.
         if (!pval_SKATO_vec.empty()) {
-            // Write each annotation x MAF result
-            for (size_t ix = 0; ix < pval_SKATO_vec.size(); ix++) {
-                OutFile << regionName << "\t";
-                OutFile << annoName_vec[ix] << "\t";
-                OutFile << maxMAFName_vec[ix] << "\t";
-                OutFile << pval_SKATO_vec[ix] << "\t";
-                OutFile << pval_Burden_vec[ix] << "\t";
-                OutFile << pval_SKAT_vec[ix] << "\t";
-                OutFile << beta_Burden_vec[ix] << "\t";
-                OutFile << se_Burden_vec[ix] << "\t";
-                OutFile << mac_vec[ix] << "\t";
-                if (t_traitType == "binary" || t_traitType == "survival") {
-                    OutFile << mac_case_vec[ix] << "\t";
-                    OutFile << mac_ctrl_vec[ix] << "\t";
+            #pragma omp critical(outwrite)
+            {
+                for (size_t ix = 0; ix < pval_SKATO_vec.size(); ix++) {
+                    OutFile << regionName << "\t";
+                    OutFile << annoName_vec[ix] << "\t";
+                    OutFile << maxMAFName_vec[ix] << "\t";
+                    OutFile << pval_SKATO_vec[ix] << "\t";
+                    OutFile << pval_Burden_vec[ix] << "\t";
+                    OutFile << pval_SKAT_vec[ix] << "\t";
+                    OutFile << beta_Burden_vec[ix] << "\t";
+                    OutFile << se_Burden_vec[ix] << "\t";
+                    OutFile << mac_vec[ix] << "\t";
+                    if (t_traitType == "binary" || t_traitType == "survival") {
+                        OutFile << mac_case_vec[ix] << "\t";
+                        OutFile << mac_ctrl_vec[ix] << "\t";
+                    }
+                    OutFile << nrare_vec[ix] << "\t";
+                    OutFile << nultra_vec[ix] << "\n";
                 }
-                OutFile << nrare_vec[ix] << "\t";
-                OutFile << nultra_vec[ix] << "\n";
-            }
 
-            // CCT combination across annotation x MAF groups
-            if (annoStringVec.size() > 1 || q_maf > 1) {
-                double cctpval_SKATO = get_CCT_pvalue(pval_SKATO_vec);
-                double cctpval_Burden = get_CCT_pvalue(pval_Burden_vec);
-                double cctpval_SKAT = get_CCT_pvalue(pval_SKAT_vec);
+                if (annoStringVec.size() > 1 || q_maf > 1) {
+                    double cctpval_SKATO = get_CCT_pvalue(pval_SKATO_vec);
+                    double cctpval_Burden = get_CCT_pvalue(pval_Burden_vec);
+                    double cctpval_SKAT = get_CCT_pvalue(pval_SKAT_vec);
 
-                OutFile << regionName << "\tCauchy\tNA\t";
-                OutFile << cctpval_SKATO << "\t";
-                OutFile << cctpval_Burden << "\t";
-                OutFile << cctpval_SKAT << "\t";
-                OutFile << "NA\tNA\t";  // BETA, SE
-                OutFile << "NA\t";       // MAC
-                if (t_traitType == "binary" || t_traitType == "survival") {
-                    OutFile << "NA\tNA\t";
+                    OutFile << regionName << "\tCauchy\tNA\t";
+                    OutFile << cctpval_SKATO << "\t";
+                    OutFile << cctpval_Burden << "\t";
+                    OutFile << cctpval_SKAT << "\t";
+                    OutFile << "NA\tNA\t";  // BETA, SE
+                    OutFile << "NA\t";       // MAC
+                    if (t_traitType == "binary" || t_traitType == "survival") {
+                        OutFile << "NA\tNA\t";
+                    }
+                    OutFile << "NA\tNA\n"; // Number_rare, Number_ultra_rare
                 }
-                OutFile << "NA\tNA\n"; // Number_rare, Number_ultra_rare
             }
         }
     }
 
     // ===== Write singleInGroup output =====
     if (t_isSingleinGroupTest) {
-        int numofUR0 = writeOutfile_singleInGroup(t_isMoreOutput, t_isImputation,
-            isCondition, is_Firth, 0, 0, t_traitType,
-            chrVec, posVec, markerVec, refVec, altVec,
-            altCountsVec, altFreqVec, imputationInfoVec, missingRateVec,
-            BetaVec, seBetaVec, TstatVec, varTVec, pvalVec, pvalNAVec,
-            isSPAConvergeVec, Beta_cVec, seBeta_cVec, Tstat_cVec, varT_cVec,
-            pval_cVec, pvalNA_cVec, AF_caseVec, AF_ctrlVec,
-            N_caseVec, N_ctrlVec, N_case_homVec, N_ctrl_hetVec,
-            N_case_hetVec, N_ctrl_homVec, N_Vec, OutFile_singleInGroup);
+        #pragma omp critical(outwrite)
+        {
+            int numofUR0 = writeOutfile_singleInGroup(t_isMoreOutput, t_isImputation,
+                isCondition, is_Firth, 0, 0, t_traitType,
+                chrVec, posVec, markerVec, refVec, altVec,
+                altCountsVec, altFreqVec, imputationInfoVec, missingRateVec,
+                BetaVec, seBetaVec, TstatVec, varTVec, pvalVec, pvalNAVec,
+                isSPAConvergeVec, Beta_cVec, seBeta_cVec, Tstat_cVec, varT_cVec,
+                pval_cVec, pvalNA_cVec, AF_caseVec, AF_ctrlVec,
+                N_caseVec, N_ctrlVec, N_case_homVec, N_ctrl_hetVec,
+                N_case_hetVec, N_ctrl_homVec, N_Vec, OutFile_singleInGroup);
+            (void)numofUR0;
+        }
     }
 }
 
@@ -3730,22 +3754,15 @@ int main(int argc, char* argv[])
             }
             std::cout << std::endl;
 
-            // ---- 11b. Allocate P1Mat and P2Mat ----
+            // ---- 11b. P1Mat / P2Mat are per-region scratch. Phase E:
+            //          allocated INSIDE the parallel for loop body (one set
+            //          per thread per region) to avoid sharing across threads.
             unsigned int t_n = (unsigned int)nullModel.n;
-            arma::mat P1Mat, P2Mat;
             if (regionTestType != "BURDEN") {
-                P1Mat.set_size(markers_per_chunk_in_groupTest, t_n);
-                P2Mat.set_size(t_n, markers_per_chunk_in_groupTest);
-                P1Mat.zeros();
-                P2Mat.zeros();
-                std::cout << "  P1Mat size: " << P1Mat.n_rows << " x " << P1Mat.n_cols << std::endl;
-                std::cout << "  P2Mat size: " << P2Mat.n_rows << " x " << P2Mat.n_cols << std::endl;
-            } else {
-                // BURDEN doesn't need P1Mat/P2Mat (1x1 placeholder)
-                P1Mat.set_size(1, 1);
-                P2Mat.set_size(1, 1);
-                P1Mat.zeros();
-                P2Mat.zeros();
+                std::cout << "  P1Mat per-thread size: " << markers_per_chunk_in_groupTest
+                          << " x " << t_n << std::endl;
+                std::cout << "  P2Mat per-thread size: " << t_n
+                          << " x " << markers_per_chunk_in_groupTest << std::endl;
             }
 
             // ---- 12b. Loop over regions ----
@@ -3768,33 +3785,53 @@ int main(int argc, char* argv[])
                 // Read a chunk of regions from the group file
                 std::vector<RegionData> regionChunk = readRegionChunk(
                     gf, nregions_to_read, nline_per_gene, annotationList, markerIDToIndex);
+                int regionChunkBaseIdx = regionsProcessed + regionsSkipped;
+                int chunkSize = (int)regionChunk.size();
 
-                for (int r = 0; r < (int)regionChunk.size(); r++) {
+                // Phase E: parallelize over regions. schedule(dynamic, 1)
+                // because region sizes vary wildly (5..500 markers). Per-
+                // region scratch (P1Mat/P2Mat, weightVec, outputFile tag)
+                // is allocated INSIDE the loop body so each thread has its
+                // own copies. Output writes are serialized via critical
+                // sections inside mainRegionInCPP / writeOutfile_*.
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (int r = 0; r < chunkSize; r++) {
                     RegionData& region = regionChunk[r];
-                    int totalIdx = regionsProcessed + regionsSkipped + 1;
+                    int totalIdx = regionChunkBaseIdx + r + 1;
 
                     // Skip regions with no matching variants
                     if (region.variantIDs.empty() || region.annoVec.empty()) {
-                        std::cout << "  Skipping region " << region.regionName
-                                  << " (" << totalIdx << "/" << nRegions
-                                  << "): no matching variants." << std::endl;
-                        regionsSkipped++;
+                        #pragma omp critical(region_progress)
+                        {
+                            std::cout << "  Skipping region " << region.regionName
+                                      << " (" << totalIdx << "/" << nRegions
+                                      << "): no matching variants." << std::endl;
+                            regionsSkipped++;
+                        }
                         continue;
                     }
 
-                    std::cout << "  Analyzing region " << region.regionName
-                              << " (" << totalIdx << "/" << nRegions
-                              << "), " << region.variantIDs.size() << " variants."
-                              << std::endl;
-
-                    // Set sparseGRM flag for this region
-                    if (!nullModel.isFastTest) {
-                        ptr_gSAIGEobj->set_flagSparseGRM_cur(nullModel.flagSparseGRM);
-                    } else {
-                        ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
+                    #pragma omp critical(region_progress)
+                    {
+                        std::cout << "  Analyzing region " << region.regionName
+                                  << " (" << totalIdx << "/" << nRegions
+                                  << "), " << region.variantIDs.size() << " variants."
+                                  << std::endl;
                     }
 
-                    // Build weight vector
+                    // Per-region (=> per-thread) scratch buffers. Each region
+                    // gets fresh P1Mat/P2Mat; sized for the SKAT-O path,
+                    // 1x1 placeholder for BURDEN.
+                    arma::mat P1Mat_local, P2Mat_local;
+                    if (regionTestType != "BURDEN") {
+                        P1Mat_local.zeros(markers_per_chunk_in_groupTest, t_n);
+                        P2Mat_local.zeros(t_n, markers_per_chunk_in_groupTest);
+                    } else {
+                        P1Mat_local.zeros(1, 1);
+                        P2Mat_local.zeros(1, 1);
+                    }
+
+                    // Per-region weight vector
                     arma::vec weightVec;
                     if (!region.weights.empty()) {
                         weightVec.set_size(region.weights.size());
@@ -3802,23 +3839,24 @@ int main(int argc, char* argv[])
                             weightVec(w) = region.weights[w];
                         }
                     } else {
-                        // No weights provided in group file: use zeros to signal
-                        // that default Beta(MAF, 1, 25) weights should be used.
-                        // This matches R SAIGE behavior where WEIGHT=c(0) when
-                        // the group file has no weight line (nline_per_gene != 3).
                         weightVec = arma::zeros<arma::vec>(1);
                     }
 
-                    // Call mainRegionInCPP for this region
+                    // Per-region tempfile tag: prevents P1/P2 chunk file
+                    // collisions when two threads spill chunks at the same
+                    // moment. Tag = region index across the whole run.
+                    std::string regionOutputFile = outputFile + "_region" +
+                        std::to_string(totalIdx);
+
                     mainRegionInCPP(
                         genoType,
                         nullModel.traitType,
                         region,
                         maxMAFList,
-                        outputFile,
+                        regionOutputFile,
                         t_n,
-                        P1Mat,
-                        P2Mat,
+                        P1Mat_local,
+                        P2Mat_local,
                         regionTestType,
                         isImputation,
                         weightVec,
@@ -3827,12 +3865,16 @@ int main(int argc, char* argv[])
                         r_corr_vec,
                         nullModel.mu);
 
-                    regionsProcessed++;
+                    int processedNow;
+                    #pragma omp atomic capture
+                    processedNow = ++regionsProcessed;
 
-                    // Progress report
-                    if (regionsProcessed % 100 == 0) {
-                        std::cout << "    Processed " << regionsProcessed << " regions ("
-                                  << regionsSkipped << " skipped)." << std::endl;
+                    if (processedNow % 100 == 0) {
+                        #pragma omp critical(region_progress)
+                        {
+                            std::cout << "    Processed " << processedNow << " regions ("
+                                      << regionsSkipped << " skipped)." << std::endl;
+                        }
                     }
                 }
             }

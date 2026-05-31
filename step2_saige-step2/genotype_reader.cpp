@@ -309,17 +309,18 @@ void PlinkClass::getOneMarker(uint64_t& t_gIndex_prev,
         }
     }
 
-    // Seek to the correct position in the .bed file
-    uint64_t posSeek;
-    if (t_gIndex > 0) {
-        if (t_gIndex_prev == 0) {  // if it is the first element
-            posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
-            fseek(m_fin, posSeek, SEEK_SET);
-        } else {
-            posSeek = m_numBytesofEachMarker0 * (t_gIndex - t_gIndex_prev - 1);
-            if (posSeek > 0) {
-                fseek(m_fin, posSeek, SEEK_CUR);
-            }
+    // Seek to the correct position in the .bed file.
+    // Phase E: when t_gIndex_prev == 0 we ALWAYS force an absolute SEEK_SET
+    // (even when t_gIndex == 0), so callers under OpenMP (where reads from
+    // different regions interleave at a critical section) can request any
+    // marker without depending on the prior file position.
+    if (t_gIndex_prev == 0) {
+        uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
+        fseek(m_fin, posSeek, SEEK_SET);
+    } else if (t_gIndex > 0) {
+        uint64_t posSeek = m_numBytesofEachMarker0 * (t_gIndex - t_gIndex_prev - 1);
+        if (posSeek > 0) {
+            fseek(m_fin, posSeek, SEEK_CUR);
         }
     }
 
