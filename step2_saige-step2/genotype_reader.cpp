@@ -1410,6 +1410,394 @@ void BgenClass::getOneMarker(uint64_t& t_gIndex_prev,
 }
 
 // ============================================================
+// Phase D: readRawBlock — pure I/O, runs single-threaded on the streamer's
+// reader thread. Mutates only m_fin; emits a BgenRawBlock that decoders can
+// process independently (they own scratch + zBuf).
+// ============================================================
+bool BgenClass::readRawBlock(uint64_t t_markerIndex,
+                              uint64_t t_byteOffset,
+                              BgenRawBlock& out)
+{
+    out.markerIndex = t_markerIndex;
+    out.byteOffset  = t_byteOffset;
+    out.eof         = false;
+
+    if (t_byteOffset > 0) {
+        fseek(m_fin, t_byteOffset, SEEK_SET);
+    }
+
+    char snpID[65536], rsID[65536], chrStr[65536];
+    uint16_t LS;
+    size_t numBoolRead = fread(&LS, 2, 1, m_fin);
+    if (numBoolRead == 0) {
+        out.eof = true;
+        return false;
+    }
+
+    fread(snpID, 1, LS, m_fin); snpID[LS] = '\0';
+    out.snpID = std::string(snpID);
+
+    uint16_t LR;
+    fread(&LR, 2, 1, m_fin);
+    fread(rsID, 1, LR, m_fin); rsID[LR] = '\0';
+    out.rsID = (std::string(rsID) == "." ? out.snpID : std::string(rsID));
+
+    uint16_t LC;
+    fread(&LC, 2, 1, m_fin);
+    fread(chrStr, 1, LC, m_fin); chrStr[LC] = '\0';
+    out.chr = std::string(chrStr);
+
+    uint32_t physpos;
+    fread(&physpos, 4, 1, m_fin);
+    out.physpos = physpos;
+
+    uint16_t K;
+    fread(&K, 2, 1, m_fin);
+    (void)K;  // validated in parseBlock
+
+    uint32_t LA;
+    fread(&LA, 4, 1, m_fin);
+    if (LA >= allele1.size()) allele1.resize(2 * LA);
+    fread(allele1.data(), 1, LA, m_fin); allele1[LA] = '\0';
+    std::string first_allele(allele1.data());
+
+    uint32_t LB;
+    fread(&LB, 4, 1, m_fin);
+    if (LB >= allele0.size()) allele0.resize(2 * LB);
+    fread(allele0.data(), 1, LB, m_fin); allele0[LB] = '\0';
+    std::string second_allele(allele0.data());
+
+    out.alleles.clear();
+    out.alleles.push_back(first_allele);
+    out.alleles.push_back(second_allele);
+
+    uint32_t C;
+    fread(&C, 4, 1, m_fin);
+    out.C = C;
+
+    uint32_t D;
+    fread(&D, 4, 1, m_fin);
+    out.D = D;
+
+    out.zBuf.resize(C - 4);
+    fread(out.zBuf.data(), 1, C - 4, m_fin);
+
+    return true;
+}
+
+// ============================================================
+// Phase D: parseBlock — pure decode, callable from any decoder thread.
+// Uses caller-supplied scratch buffer for the decompressed bytes.
+// Mirrors Parse2 + the post-Parse2 allele-order-swap logic from getOneMarker.
+// ============================================================
+void BgenClass::parseBlock(const BgenClass::ParseCtx& ctx,
+                            const BgenRawBlock& in,
+                            BgenDecodedMarker& out,
+                            std::vector<unsigned char>& scratchBuf)
+{
+    out.markerIndex = in.markerIndex;
+    out.snpID       = in.snpID;
+    out.rsID        = in.rsID;
+    out.chr         = in.chr;
+    out.physpos     = in.physpos;
+    out.alleles     = in.alleles;       // [first_allele, second_allele] for now
+    out.indexForMissing.clear();
+    out.indexForNonZero.clear();
+    out.valid       = false;
+
+    if (in.eof) return;
+
+    // Grow scratch as needed (per-thread, reused across markers)
+    if (in.D > scratchBuf.size()) scratchBuf.resize(in.D);
+
+    // Decompress into scratchBuf
+    if (ctx.compressedSNPBlocks == COMPRESSION_ZLIB) {
+        z_stream strm = {};
+        strm.next_in   = const_cast<Bytef*>(in.zBuf.data());
+        strm.avail_in  = in.zBuf.size();
+        strm.next_out  = scratchBuf.data();
+        strm.avail_out = in.D;
+        if (inflateInit(&strm) != Z_OK) {
+            std::cerr << "inflateInit failed" << std::endl;
+            return;
+        }
+        int ret = inflate(&strm, Z_FINISH);
+        if (ret != Z_STREAM_END) {
+            std::cerr << "inflate failed with code " << ret << std::endl;
+        }
+        inflateEnd(&strm);
+    } else if (ctx.compressedSNPBlocks == COMPRESSION_ZSTD) {
+        ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        size_t actual = ZSTD_decompressDCtx(dctx, scratchBuf.data(), in.D,
+                                             in.zBuf.data(), in.zBuf.size());
+        if (ZSTD_isError(actual)) {
+            std::cerr << "Decompression failed: " << ZSTD_getErrorName(actual) << std::endl;
+            ZSTD_freeDCtx(dctx);
+            return;
+        }
+        ZSTD_freeDCtx(dctx);
+    }
+
+    unsigned char* bufAt = scratchBuf.data();
+    uint32_t N = bufAt[0] | (bufAt[1] << 8) | (bufAt[2] << 16) | (bufAt[3] << 24);
+    bufAt += 4;
+    if (N != ctx.N0) {
+        std::cerr << "ERROR: " << in.rsID << " has N = " << N
+                  << " (mismatch with header block)" << std::endl;
+        throw std::runtime_error("BGEN sample count mismatch in variant " + in.rsID);
+    }
+
+    uint32_t K = bufAt[0] | (bufAt[1] << 8); bufAt += 2;
+    if (K != 2U) {
+        throw std::runtime_error("Non-bi-allelic variant in BGEN: " + in.rsID);
+    }
+    uint32_t Pmin = *bufAt++; if (Pmin != 2U) {
+        throw std::runtime_error("Unsupported minimum ploidy in BGEN: " + in.rsID);
+    }
+    uint32_t Pmax = *bufAt++; if (Pmax != 2U) {
+        throw std::runtime_error("Unsupported maximum ploidy in BGEN: " + in.rsID);
+    }
+
+    const unsigned char* ploidyMissBytes = bufAt;
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t ploidyMiss = *bufAt++;
+        if (ploidyMiss != 2U && ploidyMiss != 130U) {
+            throw std::runtime_error("Unsupported ploidy/missingness in BGEN: " + in.rsID);
+        }
+    }
+
+    uint32_t Phased = *bufAt++;
+    if (Phased != 0U) {
+        throw std::runtime_error("Phased data not supported in BGEN reader: " + in.rsID);
+    }
+    uint32_t B = *bufAt++;
+    if (B != 8U) {
+        throw std::runtime_error("Unsupported bit depth in BGEN: " + in.rsID);
+    }
+
+    double lut[256];
+    for (int i = 0; i <= 255; i++) lut[i] = i / 255.0;
+
+    double sum_eij = 0, sum_fij_minus_eij2 = 0, sum_eij_sub = 0;
+    double p11, p10, dosage, eij, fij, dosage_new;
+
+    out.dosages.set_size(ctx.N);
+    out.dosages.fill(arma::datum::nan);
+    std::size_t missing_cnt = 0;
+
+    const auto& posMap = *ctx.posSampleInModel;
+    for (uint32_t i = 0; i < N; i++) {
+        if (ploidyMissBytes[i] != 130U) {
+            p11 = lut[*bufAt++];
+            p10 = lut[*bufAt++];
+            if (posMap[i] >= 0) {
+                dosage = 2 * p11 + p10;
+                dosage_new = 2 - dosage;          // ref-first default
+                eij = dosage;
+                fij = 4 * p11 + p10;
+                sum_eij += eij;
+                sum_fij_minus_eij2 += fij - eij * eij;
+                out.dosages[posMap[i]] = dosage_new;
+                if (dosage_new > 0) out.indexForNonZero.push_back(posMap[i]);
+                sum_eij_sub += eij;
+            }
+        } else {
+            bufAt += 2;
+            if (posMap[i] >= 0) {
+                out.indexForMissing.push_back(posMap[i]);
+                ++missing_cnt;
+                out.dosages[posMap[i]] = -1;
+            }
+        }
+    }
+
+    double AC = 2 * ((double)(ctx.N - missing_cnt)) - sum_eij_sub;
+    double AF = (ctx.N == missing_cnt) ? 0.0 : AC / 2 / ((double)(ctx.N - missing_cnt));
+
+    double thetaHat = sum_eij / (2 * (ctx.N - missing_cnt));
+    double info;
+    if (ctx.isImputation) {
+        info = (thetaHat == 0 || thetaHat == 1) ? 1.0 :
+            1.0 - sum_fij_minus_eij2 / (2 * (ctx.N - missing_cnt) * thetaHat * (1 - thetaHat));
+    } else {
+        info = 1.0;
+    }
+
+    // Default ref-first: ref=second_allele, alt=first_allele inverted? No —
+    // mirror existing getOneMarker: ref-first means t_ref=first, t_alt=second
+    // (see getOneMarker lines ~1378-1380).
+    std::string ref = in.alleles[0];      // first_allele
+    std::string alt = in.alleles[1];      // second_allele
+    double altFreq = AF;
+    double altCounts = AC;
+
+    if (ctx.alleleOrder == "alt-first") {
+        std::swap(ref, alt);
+        altFreq = 1 - altFreq;
+        altCounts = altFreq * 2 * ((double)ctx.N - (double)out.indexForMissing.size());
+        for (unsigned int i = 0; i < out.dosages.n_elem; i++) {
+            if (out.dosages[i] >= 0) {
+                out.dosages[i] = 2 - out.dosages[i];
+            }
+        }
+    }
+
+    out.alleles.clear();
+    out.alleles.push_back(ref);
+    out.alleles.push_back(alt);
+    out.altFreq     = altFreq;
+    out.altCounts   = altCounts;
+    out.info        = info;
+    out.missingRate = (double)out.indexForMissing.size() / (double)ctx.N;
+    out.valid       = true;
+}
+
+// ============================================================
+// Phase D: BgenStreamer — 1 reader + N decoders + bounded queue,
+// order-preserving consumer via decodedMap[markerIndex].
+// ============================================================
+BgenStreamer::BgenStreamer(BgenClass* bgen,
+                           const std::vector<std::string>& genoIndex,
+                           bool isImputation,
+                           int nDecoders,
+                           size_t queueCapacity)
+    : m_bgen(bgen), m_queueCap(queueCapacity), m_nDecoders(nDecoders)
+{
+    m_byteOffsets.reserve(genoIndex.size());
+    for (const auto& s : genoIndex) {
+        char* end;
+        m_byteOffsets.push_back(std::strtoull(s.c_str(), &end, 10));
+    }
+
+    m_ctx.N0                  = bgen->getN0();
+    m_ctx.N                   = bgen->getN();
+    m_ctx.compressedSNPBlocks = bgen->getCompressedSNPBlocks();
+    m_ctx.posSampleInModel    = &bgen->getPosSampleInModel();
+    m_ctx.alleleOrder         = bgen->getAlleleOrder();
+    m_ctx.isImputation        = isImputation;
+
+    m_readerThread = std::thread(&BgenStreamer::readerLoop, this);
+    m_decoderThreads.reserve(nDecoders);
+    for (int i = 0; i < nDecoders; i++) {
+        m_decoderThreads.emplace_back(&BgenStreamer::decoderLoop, this);
+    }
+}
+
+BgenStreamer::~BgenStreamer()
+{
+    m_stop.store(true);
+    // Wake everyone so they can observe m_stop and exit
+    m_rawNotEmpty.notify_all();
+    m_rawNotFull.notify_all();
+    m_decReady.notify_all();
+    if (m_readerThread.joinable()) m_readerThread.join();
+    for (auto& t : m_decoderThreads) {
+        if (t.joinable()) t.join();
+    }
+}
+
+void BgenStreamer::readerLoop()
+{
+    const uint64_t M = m_byteOffsets.size();
+    for (uint64_t i = 0; i < M; i++) {
+        if (m_stop.load()) break;
+
+        BgenRawBlock blk;
+        bool ok = m_bgen->readRawBlock(i, m_byteOffsets[i], blk);
+        if (!ok) {
+            // EOF mid-stream: record where decoders should stop and bail out
+            std::unique_lock<std::mutex> dlk(m_decMtx);
+            m_decodersFinishedAt = i;
+            m_decReady.notify_all();
+            break;
+        }
+
+        std::unique_lock<std::mutex> lk(m_rawMtx);
+        m_rawNotFull.wait(lk, [&]() {
+            return m_rawQueue.size() < m_queueCap || m_stop.load();
+        });
+        if (m_stop.load()) break;
+        m_rawQueue.push(std::move(blk));
+        m_rawNotEmpty.notify_one();
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(m_rawMtx);
+        m_readerDone = true;
+        m_rawNotEmpty.notify_all();
+    }
+}
+
+void BgenStreamer::decoderLoop()
+{
+    std::vector<unsigned char> scratch;     // per-thread, reused across markers
+    while (true) {
+        BgenRawBlock raw;
+        {
+            std::unique_lock<std::mutex> lk(m_rawMtx);
+            m_rawNotEmpty.wait(lk, [&]() {
+                return !m_rawQueue.empty() || m_readerDone || m_stop.load();
+            });
+            if (m_stop.load()) return;
+            if (m_rawQueue.empty()) {
+                if (m_readerDone) return;
+                continue;
+            }
+            raw = std::move(m_rawQueue.front());
+            m_rawQueue.pop();
+            m_rawNotFull.notify_one();
+        }
+
+        BgenDecodedMarker dm;
+        try {
+            BgenClass::parseBlock(m_ctx, raw, dm, scratch);
+        } catch (const std::exception& e) {
+            std::cerr << "BgenStreamer decoder error at idx "
+                      << raw.markerIndex << ": " << e.what() << std::endl;
+            dm.markerIndex = raw.markerIndex;
+            dm.valid = false;
+        }
+
+        {
+            std::unique_lock<std::mutex> lk(m_decMtx);
+            m_decoded[raw.markerIndex] = std::move(dm);
+            m_decReady.notify_all();
+        }
+    }
+}
+
+bool BgenStreamer::getNext(BgenDecodedMarker& out)
+{
+    // We know exactly how many markers exist (size of m_byteOffsets) and where
+    // the stream truncates if the reader hit EOF early (m_decodersFinishedAt).
+    // The right EOF condition is purely "m_nextIdx >= effective_total" — no
+    // need to peek at m_rawQueue / m_readerDone, which would race across
+    // mutexes.
+    std::unique_lock<std::mutex> lk(m_decMtx);
+    const uint64_t total = m_byteOffsets.size();
+    m_decReady.wait(lk, [&]() {
+        if (m_nextIdx >= total) return true;
+        if (m_nextIdx >= m_decodersFinishedAt) return true;
+        return m_decoded.find(m_nextIdx) != m_decoded.end();
+    });
+
+    if (m_nextIdx >= total) return false;
+    if (m_nextIdx >= m_decodersFinishedAt) return false;
+
+    auto it = m_decoded.find(m_nextIdx);
+    if (it == m_decoded.end()) return false;
+    out = std::move(it->second);
+    m_decoded.erase(it);
+    m_nextIdx++;
+    return out.valid;
+}
+
+// Kept as a no-op (helper present only to satisfy the header declaration; the
+// real cross-queue check would require holding m_rawMtx while m_decMtx is
+// held, which we deliberately avoid).
+bool BgenStreamer::m_rawQueueIsEmptyHelper() const { return true; }
+
+// ============================================================
 // populateFromBgi: pre-populate marker metadata from BGEN .bgi SQLite index
 // so by-ID lookups (e.g. SAIGE-GENE+ region tests) work without first
 // streaming every marker. Schema (bgenix v1.1.x):

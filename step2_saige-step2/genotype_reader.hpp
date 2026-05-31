@@ -11,7 +11,14 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cstdint>
 #include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <map>
+#include <queue>
 
 // Forward-declare htslib types to avoid including htslib headers in the header
 struct htsFile;
@@ -355,6 +362,14 @@ private:
                 bool isImputation);
 
 public:
+    // Read-only accessors used by BgenStreamer (parseBlock is static / runs on
+    // decoder threads, but needs to see the per-file context that was set up at
+    // open time). All of these are immutable after construction.
+    uint32_t getCompressedSNPBlocks() const { return CompressedSNPBlocks; }
+    const std::vector<int32_t>& getPosSampleInModel() const { return m_posSampleInModel; }
+    const std::string& getAlleleOrder() const { return m_AlleleOrder; }
+
+public:
     BgenClass(const std::string& t_bgenFileName,
               const std::vector<std::string>& t_SampleInBgen,
               std::vector<std::string>& t_SampleInModel,
@@ -398,6 +413,33 @@ public:
                       arma::vec& dosages,
                       bool t_isImputation);
 
+    // ---- Phase D: streaming pipeline ----
+    // readRawBlock: pure I/O. Seeks to t_byteOffset, reads the variant block
+    // metadata + the compressed payload into `out`. NO decompression, NO decode.
+    // Must be called from a single thread (the streamer's reader thread); the
+    // file handle m_fin is not thread-safe.
+    // Returns false if EOF / nothing read (matching getOneMarker semantics).
+    bool readRawBlock(uint64_t t_markerIndex,
+                      uint64_t t_byteOffset,
+                      struct BgenRawBlock& out);
+
+    // parseBlock: pure decode. Takes a raw block (already on disk -> memory by
+    // readRawBlock), decompresses it with thread-local scratch buffers, and
+    // produces a fully-decoded marker (dosages + summary stats). Static, no
+    // instance state — `ctx` carries the immutable per-file context.
+    struct ParseCtx {
+        uint32_t N0;                                // BGEN sample count
+        uint32_t N;                                 // analysis sample count
+        uint32_t compressedSNPBlocks;               // 1=zlib, 2=zstd
+        const std::vector<int32_t>* posSampleInModel;
+        std::string alleleOrder;                    // "alt-first" or "ref-first"
+        bool isImputation;
+    };
+    static void parseBlock(const ParseCtx& ctx,
+                           const struct BgenRawBlock& in,
+                           struct BgenDecodedMarker& out,
+                           std::vector<unsigned char>& scratchBuf /* per-thread */);
+
     uint32_t getN0() { return m_N0; }
     uint32_t getN()  { return m_N; }
     uint32_t getM0() { return m_M0; }
@@ -412,6 +454,119 @@ public:
     std::vector<std::string> getChrVec() { return m_chr; }
 
     void closegenofile();
+};
+
+// ============================================================
+// Phase D streaming types: raw block (post-I/O, pre-decode) and decoded marker
+// (post-decode, ready to feed mainMarkerInCPP).
+// ============================================================
+struct BgenRawBlock {
+    uint64_t markerIndex = 0;             // sequential index in caller's loop
+    uint64_t byteOffset  = 0;             // .bgi file_start_position
+    bool     eof         = false;         // true if reader hit EOF before this
+
+    // Variant metadata (already parsed from the fixed-size variant header)
+    std::string snpID;
+    std::string rsID;
+    std::string chr;
+    uint32_t    physpos = 0;
+    std::vector<std::string> alleles;     // [first_allele, second_allele]
+
+    // Compressed payload + sizes
+    uint32_t C = 0;                        // payload length on disk (incl. 4-byte D)
+    uint32_t D = 0;                        // decompressed buffer length
+    std::vector<unsigned char> zBuf;       // compressed bytes (size = C - 4)
+};
+
+struct BgenDecodedMarker {
+    uint64_t markerIndex = 0;
+
+    // Variant metadata
+    std::string snpID;
+    std::string rsID;
+    std::string chr;
+    uint32_t    physpos = 0;
+    std::vector<std::string> alleles;     // [ref, alt] AFTER allele-order swap
+
+    // Decoded payload
+    arma::vec   dosages;
+    double      altFreq      = 0.0;
+    double      altCounts    = 0.0;
+    double      info         = 1.0;
+    double      missingRate  = 0.0;
+    std::vector<uint> indexForMissing;
+    std::vector<uint> indexForNonZero;
+
+    bool        valid        = false;     // false => EOF / read failed
+};
+
+// ============================================================
+// BgenStreamer: 1 I/O thread + N decoder threads + bounded queue,
+// order-preserving via decodedMap[markerIndex].
+//
+// Lifecycle:
+//   BgenStreamer s(bgenObj, nDecoders=4, queueCapacity=64);
+//   while (s.getNext(dm)) { ... use dm ... }
+//   // destructor joins all threads cleanly
+//
+// Threading model:
+//   - reader thread: pops jobs from a sequential marker-index counter, calls
+//     bgen->readRawBlock(), pushes BgenRawBlock to rawQueue
+//   - decoder threads (N): pop from rawQueue, call BgenClass::parseBlock with
+//     thread-local scratch, insert into decodedMap[markerIndex]
+//   - main thread (consumer): getNext() pulls decodedMap[next_expected_idx],
+//     blocks on cv if not yet decoded
+// ============================================================
+class BgenStreamer {
+public:
+    // bgen      - shared BgenClass; readRawBlock is invoked single-threaded
+    // genoIndex - byte offsets (as strings, parsed once) in the order the
+    //             caller wants them
+    // isImputation - passed through to parseBlock
+    // nDecoders - number of decoder threads (default 4)
+    // queueCapacity - bound on in-flight raw blocks (default 64)
+    BgenStreamer(BgenClass* bgen,
+                 const std::vector<std::string>& genoIndex,
+                 bool isImputation,
+                 int nDecoders = 4,
+                 size_t queueCapacity = 64);
+    ~BgenStreamer();
+
+    // Returns true and fills `out` with the next-in-order marker.
+    // Returns false at EOF (no more markers).
+    bool getNext(BgenDecodedMarker& out);
+
+    BgenStreamer(const BgenStreamer&) = delete;
+    BgenStreamer& operator=(const BgenStreamer&) = delete;
+
+private:
+    void readerLoop();
+    void decoderLoop();
+    bool m_rawQueueIsEmptyHelper() const;
+
+    BgenClass*               m_bgen;
+    std::vector<uint64_t>    m_byteOffsets;
+    BgenClass::ParseCtx      m_ctx;
+    size_t                   m_queueCap;
+    int                      m_nDecoders;
+
+    // Reader -> decoders queue (bounded)
+    std::mutex                  m_rawMtx;
+    std::condition_variable     m_rawNotEmpty;
+    std::condition_variable     m_rawNotFull;
+    std::queue<BgenRawBlock>    m_rawQueue;
+    bool                        m_readerDone = false;
+
+    // Decoders -> consumer map (keyed by markerIndex for order preservation)
+    std::mutex                              m_decMtx;
+    std::condition_variable                 m_decReady;
+    std::map<uint64_t, BgenDecodedMarker>   m_decoded;
+    uint64_t                                m_nextIdx = 0;
+    uint64_t                                m_decodersFinishedAt = UINT64_MAX;  // EOF marker
+
+    std::atomic<bool>           m_stop{false};
+    std::thread                 m_readerThread;
+    std::vector<std::thread>    m_decoderThreads;
 };
 
 } // namespace BGEN

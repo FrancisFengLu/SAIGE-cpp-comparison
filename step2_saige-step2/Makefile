@@ -6,7 +6,7 @@ else
   CXX ?= g++
 endif
 
-CXXFLAGS ?= -std=c++17 -O3 -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP
+CXXFLAGS ?= -std=c++17 -O3 -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -pthread
 
 PKG_CONFIG   := $(shell command -v pkg-config 2>/dev/null)
 
@@ -95,7 +95,7 @@ TARGET  ?= saige-step2
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(OBJECTS) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(OBJECTS) $(LIBS) -pthread -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@

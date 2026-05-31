@@ -23,6 +23,7 @@
 
 #include <vector>
 #include <thread>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -73,6 +74,11 @@ double g_maxMAFLimit;
 unsigned int g_region_maxMarkers_cutoff;
 bool g_isOutputMoreDetails;
 int g_marker_chunksize;
+// Phase D (Wave 1.3): number of BGEN decoder threads in BgenStreamer.
+// Only used by mainMarkerInCPP when t_genoType=="bgen". Set via YAML key
+// `bgenDecoders` (default 4). Region/group path (mainRegionInCPP) is not
+// wired to use the streamer.
+int g_bgenDecoders = 4;
 
 std::string g_method_to_CollapseUltraRare;
 double g_DosageCutoff_for_UltraRarePresence;
@@ -760,6 +766,22 @@ void mainMarkerInCPP(
     int mFirth = 0;
     int mFirthConverge = 0;
 
+    // Phase D (Wave 1.3): BGEN block-read + decode pipeline. For t_genoType
+    // == "bgen" we spin up a streamer (1 reader + N decoders + bounded queue)
+    // and consume markers in original order via getNext(). Other genoTypes go
+    // through the existing per-iteration Unified_getOneMarker path.
+    std::unique_ptr<BGEN::BgenStreamer> bgenStreamer;
+    if (t_genoType == "bgen") {
+        if (ptr_gBGENobj == nullptr) {
+            throw std::runtime_error(
+                "mainMarkerInCPP: BGEN object not initialized but t_genoType=='bgen'.");
+        }
+        int nDec = (g_bgenDecoders > 0 ? g_bgenDecoders : 4);
+        bgenStreamer.reset(new BGEN::BgenStreamer(
+            ptr_gBGENobj, t_genoIndex, t_isImputation, nDec, /*queueCap*/ 64));
+        std::cout << "BGEN streamer: " << nDec << " decoders, queueCap=64" << std::endl;
+    }
+
     for (int i = 0; i < q; i++) {
         if ((i + 1) % g_marker_chunksize == 0) {
             std::cout << "Completed " << (i + 1) << "/" << q
@@ -773,23 +795,6 @@ void mainMarkerInCPP(
         uint32_t pd, N_case, N_ctrl, N;
 
         bool flip = false;
-        std::string t_genoIndex_str = t_genoIndex.at(i);
-        char* end;
-        uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
-
-        uint64_t gIndex_prev = 0;
-        if (i == 0) {
-            gIndex_prev = 0;
-        } else {
-            char* end_prev;
-            std::string t_genoIndex_prev_str;
-            if (t_genoType == "bgen") {
-                t_genoIndex_prev_str = t_genoIndex_prev.at(i - 1);
-            } else if (t_genoType == "plink" || t_genoType == "pgen" || t_genoType == "vcf") {
-                t_genoIndex_prev_str = t_genoIndex.at(i - 1);
-            }
-            gIndex_prev = std::strtoull(t_genoIndex_prev_str.c_str(), &end_prev, 10);
-        }
 
         bool isOutputIndexForMissing = true;
         bool isOnlyOutputNonZero = false;
@@ -799,14 +804,52 @@ void mainMarkerInCPP(
         indexNonZeroVec.clear();
         indexForMissing.clear();
 
-        bool isReadMarker = Unified_getOneMarker(
-            t_genoType, gIndex_prev, gIndex,
-            ref, alt, marker, pd, chr,
-            altFreq, altCounts, missingRate, imputeInfo,
-            isOutputIndexForMissing,
-            indexForMissing,
-            isOnlyOutputNonZero,
-            indexNonZeroVec, t_GVec, t_isImputation);
+        bool isReadMarker;
+        if (t_genoType == "bgen") {
+            BGEN::BgenDecodedMarker dm;
+            isReadMarker = bgenStreamer->getNext(dm);
+            if (isReadMarker) {
+                ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
+                alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";
+                marker      = dm.rsID;
+                pd          = dm.physpos;
+                chr         = dm.chr;
+                altFreq     = dm.altFreq;
+                altCounts   = dm.altCounts;
+                missingRate = dm.missingRate;
+                imputeInfo  = dm.info;
+                indexForMissing = std::move(dm.indexForMissing);
+                if (isOnlyOutputNonZero) {
+                    indexNonZeroVec = std::move(dm.indexForNonZero);
+                }
+                t_GVec = std::move(dm.dosages);
+            }
+        } else {
+            std::string t_genoIndex_str = t_genoIndex.at(i);
+            char* end;
+            uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
+
+            uint64_t gIndex_prev = 0;
+            if (i == 0) {
+                gIndex_prev = 0;
+            } else {
+                char* end_prev;
+                std::string t_genoIndex_prev_str;
+                if (t_genoType == "plink" || t_genoType == "pgen" || t_genoType == "vcf") {
+                    t_genoIndex_prev_str = t_genoIndex.at(i - 1);
+                }
+                gIndex_prev = std::strtoull(t_genoIndex_prev_str.c_str(), &end_prev, 10);
+            }
+
+            isReadMarker = Unified_getOneMarker(
+                t_genoType, gIndex_prev, gIndex,
+                ref, alt, marker, pd, chr,
+                altFreq, altCounts, missingRate, imputeInfo,
+                isOutputIndexForMissing,
+                indexForMissing,
+                isOnlyOutputNonZero,
+                indexNonZeroVec, t_GVec, t_isImputation);
+        }
 
         if (!isReadMarker) {
             g_markerTestEnd = true;
@@ -2890,6 +2933,10 @@ int main(int argc, char* argv[])
         bool isImputation = config["isImputation"] ? config["isImputation"].as<bool>() : false;
         bool isMoreOutput = config["isMoreOutput"] ? config["isMoreOutput"].as<bool>() : false;
         int marker_chunksize = config["marker_chunksize"] ? config["marker_chunksize"].as<int>() : 10000;
+        // Phase D (Wave 1.3): BGEN streaming decoder thread count.
+        // Only used when genoType=="bgen" in single-variant mode.
+        int bgenDecoders = config["bgenDecoders"] ? config["bgenDecoders"].as<int>() : 4;
+        g_bgenDecoders = bgenDecoders;
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
