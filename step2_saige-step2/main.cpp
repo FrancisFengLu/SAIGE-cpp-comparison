@@ -23,6 +23,7 @@
 
 #include <vector>
 #include <thread>
+#include <memory>
 #include <chrono>
 #include <omp.h>
 
@@ -80,6 +81,11 @@ unsigned int g_region_maxMarkers_cutoff;
 bool g_isOutputMoreDetails;
 int g_marker_chunksize;
 int g_nThreads = 1;
+// Phase D (Wave 1.3): number of BGEN decoder threads in BgenStreamer.
+// Only used by mainMarkerInCPP when t_genoType=="bgen". Set via YAML key
+// `bgenDecoders` (default 4). Region/group path (mainRegionInCPP) is not
+// wired to use the streamer.
+int g_bgenDecoders = 4;
 
 std::string g_method_to_CollapseUltraRare;
 double g_DosageCutoff_for_UltraRarePresence;
@@ -765,6 +771,22 @@ void mainMarkerInCPP(
     // failing index and skip work for i >= that index.
     int firstEndIdx = q;  // q == "no end yet"
 
+    // Phase D (Wave 1.3): BGEN block-read + decode pipeline. For t_genoType
+    // == "bgen" we spin up a streamer (1 reader + N decoders + bounded queue)
+    // and consume markers in original order via getNext(). Other genoTypes go
+    // through the existing per-iteration Unified_getOneMarker path.
+    std::unique_ptr<BGEN::BgenStreamer> bgenStreamer;
+    if (t_genoType == "bgen") {
+        if (ptr_gBGENobj == nullptr) {
+            throw std::runtime_error(
+                "mainMarkerInCPP: BGEN object not initialized but t_genoType=='bgen'.");
+        }
+        int nDec = (g_bgenDecoders > 0 ? g_bgenDecoders : 4);
+        bgenStreamer.reset(new BGEN::BgenStreamer(
+            ptr_gBGENobj, t_genoIndex, t_isImputation, nDec, /*queueCap*/ 64));
+        std::cout << "BGEN streamer: " << nDec << " decoders, queueCap=64" << std::endl;
+    }
+
     #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < q; i++) {
         // Phase B: per-iteration scratch — declared inside the loop body so
@@ -794,31 +816,60 @@ void mainMarkerInCPP(
         uint32_t pd, N_case, N_ctrl, N;
 
         bool flip = false;
-        std::string t_genoIndex_str = t_genoIndex.at(i);
-        char* end;
-        uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
-
-        // For absolute-seek readers (PLINK, BGEN, PGEN, VCF), gIndex_prev=0
-        // forces SEEK_SET inside the reader — required for correctness when
-        // iterations execute out of order under OpenMP.
-        uint64_t gIndex_prev = 0;
 
         bool isOutputIndexForMissing = true;
         bool isOnlyOutputNonZero = false;
 
+        // clear vectors
+        indexZeroVec.clear();
+        indexNonZeroVec.clear();
+        indexForMissing.clear();
+
         bool isReadMarker;
-        #pragma omp critical(genoread)
-        {
-            // Genotype readers (PLINK FILE*/buffer, BGEN/PGEN/VCF singletons)
-            // are not thread-safe. Serialize disk I/O; parallelize compute below.
-            isReadMarker = Unified_getOneMarker(
-                t_genoType, gIndex_prev, gIndex,
-                ref, alt, marker, pd, chr,
-                altFreq, altCounts, missingRate, imputeInfo,
-                isOutputIndexForMissing,
-                indexForMissing,
-                isOnlyOutputNonZero,
-                indexNonZeroVec, t_GVec, t_isImputation);
+        if (t_genoType == "bgen") {
+            // Phase D: BGEN streamer is internally thread-safe (single reader
+            // thread + N decoder threads + bounded queue). No critical needed.
+            BGEN::BgenDecodedMarker dm;
+            isReadMarker = bgenStreamer->getNext(dm);
+            if (isReadMarker) {
+                ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
+                alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";
+                marker      = dm.rsID;
+                pd          = dm.physpos;
+                chr         = dm.chr;
+                altFreq     = dm.altFreq;
+                altCounts   = dm.altCounts;
+                missingRate = dm.missingRate;
+                imputeInfo  = dm.info;
+                indexForMissing = std::move(dm.indexForMissing);
+                if (isOnlyOutputNonZero) {
+                    indexNonZeroVec = std::move(dm.indexForNonZero);
+                }
+                t_GVec = std::move(dm.dosages);
+            }
+        } else {
+            std::string t_genoIndex_str = t_genoIndex.at(i);
+            char* end;
+            uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
+
+            // For absolute-seek readers (PLINK, PGEN, VCF), gIndex_prev=0
+            // forces SEEK_SET inside the reader — required for correctness when
+            // iterations execute out of order under OpenMP.
+            uint64_t gIndex_prev = 0;
+
+            // Phase B: PLINK/PGEN/VCF readers are not thread-safe. Serialize
+            // disk I/O via critical(genoread); parallelize compute below.
+            #pragma omp critical(genoread)
+            {
+                isReadMarker = Unified_getOneMarker(
+                    t_genoType, gIndex_prev, gIndex,
+                    ref, alt, marker, pd, chr,
+                    altFreq, altCounts, missingRate, imputeInfo,
+                    isOutputIndexForMissing,
+                    indexForMissing,
+                    isOnlyOutputNonZero,
+                    indexNonZeroVec, t_GVec, t_isImputation);
+            }
         }
 
         if (!isReadMarker) {
@@ -2885,6 +2936,10 @@ int main(int argc, char* argv[])
         omp_set_num_threads(g_nThreads);
         // Prevent BLAS oversubscription when OMP threads call BLAS underneath.
         openblas_set_num_threads(1);
+        // Phase D (Wave 1.3): BGEN streaming decoder thread count.
+        // Only used when genoType=="bgen" in single-variant mode.
+        int bgenDecoders = config["bgenDecoders"] ? config["bgenDecoders"].as<int>() : 4;
+        g_bgenDecoders = bgenDecoders;
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
