@@ -60,6 +60,18 @@ extern "C" void openblas_set_num_threads(int);
 #include "skat.hpp"
 #include "ldmat.hpp"
 
+#include <chrono>  // TIMING_INSTRUMENT_REMOVE_ME
+using TimingClock = std::chrono::steady_clock;  // TIMING_INSTRUMENT_REMOVE_ME
+static TimingClock::time_point g_timing_start;  // TIMING_INSTRUMENT_REMOVE_ME
+static TimingClock::time_point g_timing_last;  // TIMING_INSTRUMENT_REMOVE_ME
+static inline void timing_mark(const char* label) {  // TIMING_INSTRUMENT_REMOVE_ME
+    auto now = TimingClock::now();  // TIMING_INSTRUMENT_REMOVE_ME
+    double since_start = std::chrono::duration<double>(now - g_timing_start).count();  // TIMING_INSTRUMENT_REMOVE_ME
+    double since_last  = std::chrono::duration<double>(now - g_timing_last ).count();  // TIMING_INSTRUMENT_REMOVE_ME
+    std::cerr << "[TIMING] " << label << "  +" << since_last << "s   total=" << since_start << "s\n";  // TIMING_INSTRUMENT_REMOVE_ME
+    g_timing_last = now;  // TIMING_INSTRUMENT_REMOVE_ME
+}  // TIMING_INSTRUMENT_REMOVE_ME
+
 // ============================================================
 // Global variables (exact match from SAIGE/src/Main.cpp)
 // ============================================================
@@ -1716,6 +1728,7 @@ void mainMarkerInCPP(
                          N_case_hetVec,
                          N_ctrl_homVec,
                          N_Vec);
+    timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
 }
 
 
@@ -3297,6 +3310,9 @@ void mainRegionInCPP(
 // ============================================================
 int main(int argc, char* argv[])
 {
+    g_timing_start = TimingClock::now();  // TIMING_INSTRUMENT_REMOVE_ME
+    g_timing_last = g_timing_start;  // TIMING_INSTRUMENT_REMOVE_ME
+    timing_mark("00_main_start");  // TIMING_INSTRUMENT_REMOVE_ME
     try {
         // ---- 1. Parse command-line ----
         if (argc < 2) {
@@ -3664,9 +3680,11 @@ int main(int argc, char* argv[])
         }
         std::cout << std::endl;
 
+        timing_mark("10_yaml_parsed");  // TIMING_INSTRUMENT_REMOVE_ME
         // ---- 3. Load null model from Step 1 ----
         std::cout << "===== Loading null model =====" << std::endl;
         NullModelData nullModel = loadNullModel(modelFile, varianceRatioFile);
+        timing_mark("20_null_model_loaded");  // TIMING_INSTRUMENT_REMOVE_ME
 
         std::cout << "  Trait type:   " << nullModel.traitType << std::endl;
         std::cout << "  Sample size:  " << nullModel.n << std::endl;
@@ -3803,6 +3821,7 @@ int main(int argc, char* argv[])
             nullModel.pCutoffforFirth,
             nullModel.offset,
             nullModel.resout);
+        timing_mark("30_saige_obj_built");  // TIMING_INSTRUMENT_REMOVE_ME
 
         std::cout << "  SAIGEClass constructed successfully." << std::endl;
         std::cout << "  n = " << ptr_gSAIGEobj->m_n << ", p = " << ptr_gSAIGEobj->m_p << std::endl;
@@ -3864,6 +3883,7 @@ int main(int argc, char* argv[])
         std::cout << "  Total samples in genotype file: " << numSamplesGeno << std::endl;
         std::cout << "  Samples in analysis:            " << numSamplesAnalysis << std::endl;
         std::cout << std::endl;
+        timing_mark("40_geno_reader_ready");  // TIMING_INSTRUMENT_REMOVE_ME
 
         // Verify sample size consistency
         if ((int)numSamplesAnalysis != nullModel.n) {
@@ -3946,6 +3966,7 @@ int main(int argc, char* argv[])
             assign_conditionMarkers_factors(genoType, condGenoIndices,
                                             numSamplesAnalysis, cond_weights);
             std::cout << std::endl;
+            timing_mark("45_cond_setup_done");  // TIMING_INSTRUMENT_REMOVE_ME
         }
 
         // ================================================================
@@ -4141,6 +4162,7 @@ int main(int argc, char* argv[])
             std::cout << "===== Starting single-variant testing =====" << std::endl;
             arma::vec timeStart = getTime();
 
+            timing_mark("50_before_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
             mainMarkerInCPP(
                 genoType,
                 nullModel.traitType,
@@ -4149,6 +4171,7 @@ int main(int argc, char* argv[])
                 isMoreOutput,
                 isImputation,
                 isFirth);
+            timing_mark("60_after_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
 
             arma::vec timeEnd = getTime();
             printTime(timeStart, timeEnd, "complete single-variant testing");
@@ -4237,6 +4260,7 @@ int main(int argc, char* argv[])
             // ---- 12b. Loop over regions ----
             std::cout << "===== Starting region-based testing =====" << std::endl;
             arma::vec timeStart = getTime();
+            timing_mark("50_before_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
 
             std::ifstream gf(groupFile);
             if (!gf.is_open()) {
@@ -4349,6 +4373,7 @@ int main(int argc, char* argv[])
             }
 
             gf.close();
+            timing_mark("60_after_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
 
             arma::vec timeEnd = getTime();
             printTime(timeStart, timeEnd, "complete region-based testing");
@@ -4369,6 +4394,7 @@ int main(int argc, char* argv[])
         // ---- Close genotype file ----
         closeGenoFile(genoType);
 
+        timing_mark("80_cleanup_start");  // TIMING_INSTRUMENT_REMOVE_ME
         // ---- Cleanup ----
         if (ptr_gSAIGEobj) {
             delete ptr_gSAIGEobj;
@@ -4395,6 +4421,7 @@ int main(int argc, char* argv[])
         }
         std::cout << std::endl;
 
+        timing_mark("99_main_end");  // TIMING_INSTRUMENT_REMOVE_ME
         return 0;
 
     } catch (const std::exception& e) {
