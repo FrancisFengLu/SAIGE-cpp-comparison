@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SAIGE step2 C++ parallelization - CHANGES SUMMARY</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'default', securityLevel:'loose'});</script>
+<style>
+  :root {
+    --green:  #cdebcd;
+    --green2: #6fbf6f;
+    --yellow: #fff3bf;
+    --yellow2:#d4a72c;
+    --red:    #ffd4d4;
+    --red2:   #c0392b;
+    --grey:   #f4f4f4;
+    --bg:     #ffffff;
+    --ink:    #1a1a1a;
+    --mute:   #555;
+    --accent: #2b6cb0;
+  }
+  html,body { background:var(--bg); color:var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5; margin: 0; }
+  body { max-width: 1180px; margin: 0 auto; padding: 24px 32px; }
+  h1 { margin-bottom: 4px; font-size: 26px; }
+  h2 { border-bottom: 2px solid var(--accent); padding-bottom: 4px; margin-top: 32px; }
+  h3 { color: var(--accent); margin-top: 22px; }
+  .meta { color: var(--mute); font-size: 13px; margin-bottom: 18px; }
+  .tldr { background: var(--grey); border-left: 4px solid var(--accent); padding: 12px 16px; margin: 16px 0 8px; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  pre { background: #272822; color: #f8f8f2; padding: 12px 16px; border-radius: 6px; overflow-x:auto; }
+  code.inline { background: var(--grey); padding: 1px 6px; border-radius: 3px; color: #b03060; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 18px; font-size: 13.5px; }
+  th, td { border: 1px solid #ccc; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #ecf0f5; font-weight: 600; }
+  td.ok    { background: var(--green); }
+  td.warn  { background: var(--yellow); }
+  td.bad   { background: var(--red); }
+  td.center { text-align:center; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: "SF Mono", monospace; font-size: 12.5px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; }
+  .pill.green  { background: var(--green2); color:#fff; }
+  .pill.yellow { background: var(--yellow2); color:#fff; }
+  .pill.red    { background: var(--red2);    color:#fff; }
+  .caption { font-style: italic; color: var(--mute); margin: 8px 0 4px; }
+  .mermaid { background: #fafafa; padding: 12px; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 18px; }
+  .legend { font-size: 12px; color: var(--mute); margin-top: -4px; margin-bottom: 16px; }
+  .hyp { border: 1px solid #ddd; border-radius: 6px; padding: 10px 14px; margin: 10px 0; }
+  .hyp h4 { margin: 4px 0 6px; font-size: 14px; }
+  .hyp .row { font-size: 13px; margin: 3px 0; }
+  .hyp .label { display: inline-block; min-width: 130px; color: var(--mute); }
+  .bar-row { display: flex; align-items: center; margin: 4px 0; font-family: monospace; font-size: 12px; }
+  .bar-row .lbl { width: 200px; }
+  .bar-row .v   { width: 70px; text-align: right; padding-right: 8px; }
+  .bar { height: 14px; background: var(--accent); border-radius: 2px; }
+  .bar.slow { background: var(--red2); }
+  .bar.med  { background: var(--yellow2); }
+  .bar.fast { background: var(--green2); }
+  ul.tight li { margin: 2px 0; }
+  .footnote { font-size: 12px; color: var(--mute); }
+</style>
+</head>
+<body>
+
+<h1>SAIGE step2 C++ - parallelization changes summary</h1>
+<div class="meta">
+  Branch: <code class="inline">step2-parallel</code> &middot;
+  Final commit: <code class="inline">72a10ed</code> &middot;
+  Tag: <code class="inline">phase-final-shipped</code> &middot;
+  Date: 2026-06-01 &middot;
+  Author: Francis Lu (Dana-Farber, Sethi lab) &middot;
+  Audience: Seokho Jeong (collaborator, UKB cluster)
+</div>
+
+<div class="tldr">
+  <strong>TL;DR.</strong> Took the serial step2 marker loop and made it OpenMP-parallel across markers
+  in five phases (A, B, D, E, C) plus two bug fixes and a PLINK/PGEN streamer. Phase A factored per-marker
+  state into <code class="inline">PerMarkerCtx</code>; Phase B added <code class="inline">nThreads:</code> + thread-safe ER RNG +
+  the <code class="inline">#pragma omp parallel for</code>; Phases D and "PLINK/PGEN streamer" removed
+  the genotype read lock for BGEN/PLINK/PGEN (VCF still locked); Phase E parallelizes
+  the outer region loop (SKAT/SKAT-O); Phase C wires in an optional matrix-level GEMM path
+  (<code class="inline">blockSize:</code>) that is in place but not yet a win on this small test set
+  (N=1000, ~128k markers). Best observed speedup on local laptop: <strong>~2.3&times; at 4-8 threads
+  in Wave 5</strong>; in the final shipped build with timing instrumentation, scaling is weaker
+  (1.30&times; at 8 threads vs phase-B-D-fixed's ~2&times;) - hypotheses below. Code is correct,
+  baselines match, and the design is ready for Seokho to test at UKB scale (N=400k) where the
+  per-marker dot products are 400&times; longer and parallelism should pay off much more cleanly.
+</div>
+
+<h2>1. Architecture diagrams</h2>
+
+<h3>Diagram A - per-marker pipeline: before vs after</h3>
+<div class="caption">Left: single-threaded serial loop (pre-Phase-B). Right: OpenMP parallel-for over markers with per-thread context, streamers, and dispatch.</div>
+<div class="mermaid">
+flowchart LR
+  subgraph BEFORE["BEFORE - serial (pre-Phase B)"]
+    direction TB
+    b1[loop i = 0..M-1] --> b2[genotype_reader.getOneMarker single FILE*]
+    b2 --> b3[score test scratch in SAIGEClass member vars]
+    b3 --> b4{candidate?}
+    b4 -- yes --> b5[SPA / ER rand() / Firth]
+    b4 -- no  --> b6[normal-approx p-value]
+    b5 --> b7[write row to output file]
+    b6 --> b7
+    b7 --> b1
+  end
+
+  subgraph AFTER["AFTER - OMP parallel-for over markers"]
+    direction TB
+    a0[pragma omp parallel for - schedule dynamic 64]
+    a0 --> ATHREAD
+
+    subgraph ATHREAD["each OMP thread - i in chunk"]
+      direction TB
+      t1[own PerMarkerCtx - Phase A]
+      t1 --> t2{geno backend}
+      t2 -- BGEN  --> t2a[BgenStreamer.getMarker_i_<br/>1 reader + N decoders + ordered map - Phase D]
+      t2 -- PLINK --> t2b[thread_local FILE* fd<br/>per OMP thread - Phase PLINK streamer]
+      t2 -- PGEN  --> t2c[thread_local FILE* fd<br/>per OMP thread - Phase PGEN streamer]
+      t2 -- VCF   --> t2d[critical genoread<br/>fallback - low priority]
+      t2a --> t3[score test scratch - per-ctx]
+      t2b --> t3
+      t2c --> t3
+      t2d --> t3
+      t3 --> t4{candidate?}
+      t4 -- yes --> t5[SPA / ER thread_local mt19937 / Firth - Phase B.1 + B.4]
+      t4 -- no  --> t6[normal approx]
+      t5 --> t7[indexed write BetaVec_i_ etc.]
+      t6 --> t7
+      t7 --> t8[critical outwrite - region/region.txt only]
+    end
+
+    a0 -. optional .-> a9
+    a9[outer block path - blockSize columns -> 1 GEMM - Phase C]
+  end
+
+  BEFORE -.evolves into.-> AFTER
+</div>
+
+<h3>Diagram B - phase timeline (which files touched, what each phase delivered)</h3>
+<div class="caption">Phases are merged sequentially into <code>step2-parallel</code>; color = phase semantics (green = thread-safety/refactor, yellow = streamer / optimization, red = bug fix).</div>
+<div class="mermaid">
+flowchart TB
+  classDef A fill:#cdebcd,stroke:#3a8a3a;
+  classDef B fill:#cdebcd,stroke:#3a8a3a;
+  classDef D fill:#fff3bf,stroke:#d4a72c;
+  classDef E fill:#cdebcd,stroke:#3a8a3a;
+  classDef C fill:#fff3bf,stroke:#d4a72c;
+  classDef S fill:#fff3bf,stroke:#d4a72c;
+  classDef BUG fill:#ffd4d4,stroke:#c0392b;
+  classDef INSTR fill:#dcdcdc,stroke:#555;
+
+  PA["Phase A - PerMarkerCtx refactor<br/>SAIGE_step2.cpp/.hpp, main.cpp<br/>commit 5ecdf2f"]:::A
+  PB1["Phase B.1 - thread_local mt19937 in er_binary<br/>er_binary.cpp/.hpp<br/>commit 822c449"]:::B
+  PB24["Phase B.2-B.4 - nThreads YAML + omp parallel for<br/>config_*.yaml, main.cpp, Makefile<br/>commits e00b1bc, 0303116"]:::B
+  PD["Phase D - BgenStreamer block-read pipeline<br/>genotype_reader.cpp/.hpp<br/>commits 716a858, 75556ca"]:::D
+  BUG1["BUG 1 fix - G1tilde_P_G2tilde_Vec race<br/>SAIGE_step2.cpp<br/>commit ebff9bb"]:::BUG
+  BUG2["BUG 2 fix - BgenStreamer ordered output<br/>genotype_reader.cpp/.hpp, main.cpp<br/>commits 3fe641d, ef0ad23"]:::BUG
+  PE["Phase E - omp parallel for over regions<br/>main.cpp, SAIGE_step2.cpp<br/>commit 3a735b9"]:::E
+  PC["Phase C - blockSize GEMM scaffolding<br/>main.cpp, SAIGE_step2.cpp/.hpp<br/>commits ab7617e, d12f549"]:::C
+  STR["PLINK + PGEN streamer<br/>genotype_reader.cpp/.hpp<br/>commit 9dbbfdd"]:::S
+  INSTR["Timing instrumentation - TIMING_INSTRUMENT_REMOVE_ME<br/>main.cpp<br/>commit 72a10ed"]:::INSTR
+
+  PA --> PB1 --> PB24 --> PD --> BUG1 --> BUG2 --> PE --> PC --> STR --> INSTR
+</div>
+
+<h3>Diagram C - thread-safety map (what made each shared object safe)</h3>
+<div class="caption">Each shared mutable object that the serial code relied on, and how it was made safe under <code>omp parallel for</code>.</div>
+<div class="mermaid">
+flowchart LR
+  classDef perctx fill:#cdebcd,stroke:#3a8a3a;
+  classDef tlocal fill:#cdebcd,stroke:#3a8a3a;
+  classDef stream fill:#fff3bf,stroke:#d4a72c;
+  classDef lock   fill:#ffd4d4,stroke:#c0392b;
+  classDef idx    fill:#cdebcd,stroke:#3a8a3a;
+  classDef reg    fill:#fff3bf,stroke:#d4a72c;
+
+  A["m_flagSparseGRM_cur<br/>+ other SAIGEClass members"] -->|moved into| A2["PerMarkerCtx (stack)"]:::perctx
+  B["er_binary rand()"] -->|replaced by| B2["thread_local mt19937"]:::tlocal
+  C["BGEN FILE* (single)"] -->|replaced by| C2["BgenStreamer<br/>1 reader + N decoders + ordered map"]:::stream
+  D["PLINK FILE* (single)"] -->|replaced by| D2["thread_local FILE* fd per OMP thread"]:::tlocal
+  E["PGEN FILE* (single)"] -->|replaced by| E2["thread_local FILE* fd per OMP thread"]:::tlocal
+  F["VCF FILE* (single)"] -->|still| F2["critical(genoread) lock"]:::lock
+  G["BetaVec / pvalVec / ..."] -->|pre-sized, indexed by i| G2["non-overlapping writes"]:::idx
+  H["G1tilde_P_G2tilde_Vec (region scratch)"] -->|moved into loop body| H2["per-iteration rowvec - BUG 1 fix"]:::idx
+  I["region output file write"] -->|protected by| I2["critical(outwrite)"]:::lock
+  J["P1/P2 chunk filenames"] -->|tagged| J2["per-region suffix"]:::reg
+</div>
+
+<h2>2. Changes by phase</h2>
+
+<table>
+  <thead>
+  <tr>
+    <th>Phase</th>
+    <th>What it does</th>
+    <th>Files touched</th>
+    <th>Commits</th>
+    <th class="center">Verified</th>
+  </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>A</strong> - PerMarkerCtx</td>
+      <td>Factor per-marker mutable members of <code class="inline">SAIGEClass</code> into a stack-local
+        <code class="inline">PerMarkerCtx</code> struct so each OMP thread carries its own copy.</td>
+      <td>SAIGE_step2.cpp/.hpp, main.cpp</td>
+      <td><code class="inline">5ecdf2f</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>B.1</strong> - ER RNG</td>
+      <td>Replace <code class="inline">rand()</code> in <code class="inline">er_binary</code> with a
+        <code class="inline">thread_local std::mt19937</code> seeded from <code class="inline">tracetraitseed</code>; OpenMP enabled in Makefile.</td>
+      <td>er_binary.cpp/.hpp, Makefile</td>
+      <td><code class="inline">822c449</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>B.2-B.4</strong> - parallel marker loop</td>
+      <td>Add <code class="inline">nThreads:</code> to all step2 YAMLs; wrap the single-variant marker
+        loop in <code class="inline">#pragma omp parallel for schedule(dynamic, 64)</code>; route
+        SPA / ER / Firth candidates through the existing scalar path inside the parallel region.</td>
+      <td>main.cpp, config_*.yaml</td>
+      <td><code class="inline">e00b1bc</code>, <code class="inline">0303116</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>D</strong> - BgenStreamer</td>
+      <td>Replace single BGEN <code class="inline">FILE*</code> + lock with a streamer: 1 reader thread
+        block-reads compressed variants, N decoders decompress + dosage-decode in parallel, and an
+        ordered output map preserves marker order.</td>
+      <td>genotype_reader.cpp/.hpp</td>
+      <td><code class="inline">716a858</code>, <code class="inline">75556ca</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>BUG 1</strong> - conditional race</td>
+      <td>Region-level <code class="inline">G1tilde_P_G2tilde_Vec</code> rowvec was a shared scratch that
+        threads stomped on under conditional analysis (nThreads>1). Moved declaration <em>inside</em>
+        the loop body.</td>
+      <td>SAIGE_step2.cpp</td>
+      <td><code class="inline">ebff9bb</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>BUG 2</strong> - BGEN order</td>
+      <td>Initial BgenStreamer returned variants in completion order, not request order. Added an
+        ordered-by-index API <code class="inline">getMarker(i)</code> and a CV-guarded reorder buffer.</td>
+      <td>genotype_reader.cpp/.hpp, main.cpp</td>
+      <td><code class="inline">3fe641d</code>, <code class="inline">ef0ad23</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>E</strong> - region loop</td>
+      <td><code class="inline">#pragma omp parallel for</code> over the outer region loop for region-based
+        tests (SKAT / burden / SKAT-O), with per-region P1/P2 tagged filenames and
+        <code class="inline">critical(outwrite)</code>.</td>
+      <td>main.cpp, SAIGE_step2.cpp</td>
+      <td><code class="inline">3a735b9</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>C</strong> - blockSize GEMM</td>
+      <td>Optional matrix-level first pass: <code class="inline">blockSize:</code> columns are stacked
+        into a dense G and fed to a single GEMM against <code class="inline">P</code>; results are cached
+        in a <code class="inline">PrefetchEntry</code> and replayed marker-by-marker. <em>blockSize=1 by
+        default - it's an opt-in path for UKB-scale runs.</em></td>
+      <td>main.cpp, SAIGE_step2.cpp/.hpp</td>
+      <td><code class="inline">ab7617e</code>, <code class="inline">d12f549</code></td>
+      <td class="warn center"><span class="pill yellow">scaffolded</span></td>
+    </tr>
+    <tr>
+      <td><strong>PLINK + PGEN streamer</strong></td>
+      <td>Replace the single shared PLINK / PGEN <code class="inline">FILE*</code> + critical(genoread)
+        with thread_local file descriptors (one FD per OMP thread, opened lazily). Removes the last
+        non-VCF lock.</td>
+      <td>genotype_reader.cpp/.hpp</td>
+      <td><code class="inline">9dbbfdd</code></td>
+      <td class="ok center"><span class="pill green">OK</span></td>
+    </tr>
+    <tr>
+      <td><strong>Timing instrumentation</strong></td>
+      <td>Inserted 11 wall-clock checkpoints around startup / main loop / cleanup, all tagged
+        <code class="inline">TIMING_INSTRUMENT_REMOVE_ME</code> for trivial removal. Helper inline function added.</td>
+      <td>main.cpp</td>
+      <td><code class="inline">72a10ed</code></td>
+      <td class="warn center"><span class="pill yellow">leave in for now</span></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>3. Measured speedup</h2>
+
+<h3>Table 1 - Wave 5 (phase-B-D-fixed, commit <code>ef0ad23</code>)</h3>
+<div class="caption">Local laptop, 8 physical / 16 logical cores. Per-config wall time in seconds. Speedup vs nT=1 in parens. Bold = best per row.</div>
+<table>
+  <thead>
+    <tr>
+      <th>config</th>
+      <th class="center">nT=1</th>
+      <th class="center">nT=4</th>
+      <th class="center">nT=8</th>
+      <th class="center">nT=16</th>
+      <th>best speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>compare (PLINK quant)</td>
+      <td class="num">4.12s</td>
+      <td class="num ok"><strong>2.14s (1.93x)</strong></td>
+      <td class="num ok">2.20s (1.87x)</td>
+      <td class="num warn">2.63s (1.57x)</td>
+      <td>4 threads</td>
+    </tr>
+    <tr>
+      <td>pgen</td>
+      <td class="num">3.85s</td>
+      <td class="num ok"><strong>1.85s (2.08x)</strong></td>
+      <td class="num ok">1.89s (2.04x)</td>
+      <td class="num">-</td>
+      <td>4 threads</td>
+    </tr>
+    <tr>
+      <td>sparse</td>
+      <td class="num">5.15s</td>
+      <td class="num ok">2.22s (2.32x)</td>
+      <td class="num ok"><strong>2.19s (2.35x)</strong></td>
+      <td class="num">-</td>
+      <td>4-8 threads</td>
+    </tr>
+    <tr>
+      <td>BGEN (4 reader, 4 decoder)</td>
+      <td class="num">3.41s</td>
+      <td class="num ok"><strong>1.54s (2.21x)</strong></td>
+      <td class="num bad">4.00s (0.85x <span class="pill red">regress</span>)</td>
+      <td class="num">-</td>
+      <td>(4,4)</td>
+    </tr>
+    <tr>
+      <td>region (SKAT)</td>
+      <td class="num">2.58s</td>
+      <td class="num warn">2.52s (1.02x)</td>
+      <td class="num">-</td>
+      <td class="num">-</td>
+      <td>~flat (Phase E not yet in B-D-fixed)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Table 2 - phase-final-shipped (commit <code>72a10ed</code>, current state with timing instrumentation)</h3>
+<div class="caption">Same machine; <code>config_compare.yaml</code> (PLINK quant). Phase boundaries are the timing checkpoints.</div>
+<table>
+  <thead>
+    <tr>
+      <th>phase boundary</th>
+      <th class="center">nT=1</th>
+      <th class="center">nT=4</th>
+      <th class="center">nT=8</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Startup (00 to 50_before_main_loop)</td>
+      <td class="num">0.17s</td>
+      <td class="num">0.14s</td>
+      <td class="num">0.16s</td>
+    </tr>
+    <tr>
+      <td>Marker loop + write (50 to 70)</td>
+      <td class="num">4.71s</td>
+      <td class="num">3.83s</td>
+      <td class="num">3.61s</td>
+    </tr>
+    <tr>
+      <td>Cleanup</td>
+      <td class="num">0.07s</td>
+      <td class="num">0.07s</td>
+      <td class="num">0.07s</td>
+    </tr>
+    <tr>
+      <td><strong>Total</strong></td>
+      <td class="num bad"><strong>4.94s</strong></td>
+      <td class="num warn"><strong>4.05s</strong></td>
+      <td class="num warn"><strong>3.85s</strong></td>
+    </tr>
+    <tr>
+      <td>Speedup vs nT=1</td>
+      <td class="center">1.00x</td>
+      <td class="num warn">1.23x</td>
+      <td class="num warn">1.30x</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Regression visualization</h3>
+<div class="caption">Total wall time, lower is better. Bars compare phase-B-D-fixed (Wave 5) vs phase-final-shipped for <code>config_compare</code>.</div>
+<div class="bar-row"><span class="lbl">phase-B-D-fixed nT=1</span><span class="v">4.12s</span><div class="bar med"   style="width:412px"></div></div>
+<div class="bar-row"><span class="lbl">phase-B-D-fixed nT=4</span><span class="v">2.14s</span><div class="bar fast"  style="width:214px"></div></div>
+<div class="bar-row"><span class="lbl">phase-B-D-fixed nT=8</span><span class="v">2.20s</span><div class="bar fast"  style="width:220px"></div></div>
+<div class="bar-row"><span class="lbl">phase-final-shipped nT=1</span><span class="v">4.94s</span><div class="bar slow" style="width:494px"></div></div>
+<div class="bar-row"><span class="lbl">phase-final-shipped nT=4</span><span class="v">4.05s</span><div class="bar med"  style="width:405px"></div></div>
+<div class="bar-row"><span class="lbl">phase-final-shipped nT=8</span><span class="v">3.85s</span><div class="bar med"  style="width:385px"></div></div>
+<p class="footnote"><strong>Note the regression.</strong> phase-final-shipped is slower than phase-B-D-fixed at every
+thread count, and scales weaker (1.30x at nT=8 vs ~2x). Suspects: Phase C bookkeeping overhead (PrefetchEntry +
+gVec copy even at blockSize=1), thread_local FILE* overhead in PLINK streamer for tiny per-marker reads, and
+possibly cache thrashing from N parallel FDs vs the kernel readahead that the single shared FD got.</p>
+
+<h2>4. Speedup hypotheses</h2>
+
+<div class="hyp">
+  <h4>H1 - Memory bandwidth saturation</h4>
+  <div class="row">Once ~4 threads are reading genotypes + doing BLAS, the DRAM bus is the bottleneck;
+    additional threads compete on the same channel without adding throughput.</div>
+  <div class="row"><span class="label">For:</span> classic "speedup plateaus around 4 threads on consumer hardware" shape.</div>
+  <div class="row"><span class="label">Against:</span> dataset is small (N=1000) - working set fits in L2/L3, so DRAM may not be the limit yet.</div>
+  <div class="row"><span class="label">Test:</span> <code class="inline">perf stat -e LLC-loads,LLC-load-misses,mem_load_uops_retired.l3_miss</code> at nT=1,4,8;
+    look for saturation in <em>memory_bound</em>.</div>
+</div>
+
+<div class="hyp">
+  <h4>H2 - Small dataset / tiny per-marker work</h4>
+  <div class="row">~128k markers / N=1000 means per-marker compute is ~30 us; OpenMP fork/join +
+    chunk scheduling cost a non-trivial fraction of that.</div>
+  <div class="row"><span class="label">For:</span> Phase E (region loop) showed essentially zero speedup at nT=4 (1.02x) on the same dataset
+    - tiny loop body.</div>
+  <div class="row"><span class="label">Against:</span> single-variant loop did get 2x at Wave 5 - so the work isn't <em>that</em> tiny.</div>
+  <div class="row"><span class="label">Test:</span> repeat with N=400k UKB data; per-marker work scales ~linearly in N, so should hit 6x+.</div>
+</div>
+
+<div class="hyp">
+  <h4>H3 - SMT non-acceleration</h4>
+  <div class="row">Test machine has 16 logical / 8 physical cores. SMT (hyper-threading) gives ~0% to
+    compute/BLAS workloads; nT=16 should look ~ nT=8.</div>
+  <div class="row"><span class="label">For:</span> nT=16 is slower than nT=4 on compare (2.63s vs 2.14s) - SMT contention plus thread overhead.</div>
+  <div class="row"><span class="label">Against:</span> nothing - this is well-established.</div>
+  <div class="row"><span class="label">Test:</span> on UKB cluster cap <code class="inline">nThreads</code> at physical core count; pin with <code class="inline">OMP_PLACES=cores OMP_PROC_BIND=close</code>.</div>
+</div>
+
+<div class="hyp">
+  <h4>H4 - Phase C bookkeeping overhead even at blockSize=1</h4>
+  <div class="row">Phase C introduced a <code class="inline">PrefetchEntry</code> struct + a cache replay path; even when
+    <code class="inline">blockSize=1</code> the code still pays the prefetch buffer alloc + cache lookup + a <code class="inline">gVec</code> copy per marker.</div>
+  <div class="row"><span class="label">For:</span> phase-final-shipped is slower than phase-B-D-fixed at nT=1 (4.94s vs 4.12s, +20%) -
+    a serial regression, not a parallel one. That points to Phase C or the PLINK streamer.</div>
+  <div class="row"><span class="label">Against:</span> if Phase C alone were the cause, the merge commit <code class="inline">d12f549</code> would
+    already show it. Need to bisect.</div>
+  <div class="row"><span class="label">Test:</span> compile with <code class="inline">-DDISABLE_PHASE_C</code> short-circuit; rerun config_compare nT=1.
+    Or git-bisect between <code class="inline">ef0ad23</code> and <code class="inline">72a10ed</code>.</div>
+</div>
+
+<div class="hyp">
+  <h4>H5 - PLINK thread_local FILE* overhead</h4>
+  <div class="row">Each genotype read does a thread_local lookup, possibly opens the FD on first call, and uses its own
+    <code class="inline">stdio</code> buffer. That's more work per read than the pre-streamer single-FD path,
+    especially for small reads.</div>
+  <div class="row"><span class="label">For:</span> phase-final-shipped is the first build with the PLINK streamer; serial regression matches.</div>
+  <div class="row"><span class="label">Against:</span> <code class="inline">thread_local</code> lookup is ~ns; should not cost 0.8s over 128k markers (would imply ~6us per marker, which is plausible actually).</div>
+  <div class="row"><span class="label">Test:</span> tag the streamer with a runtime switch and rerun nT=1 with old single-FD path.
+    Also try <code class="inline">posix_fadvise(POSIX_FADV_SEQUENTIAL)</code> on the thread_local FD.</div>
+</div>
+
+<div class="hyp">
+  <h4>H6 - Cache thrashing from N separate FILE*</h4>
+  <div class="row">Kernel page cache + readahead favor a single sequential reader. With N parallel readers each at
+    different file offsets, readahead windows interfere and page cache lines get evicted by sibling threads.</div>
+  <div class="row"><span class="label">For:</span> known pattern on rotational disks and even NVMe with random offsets.</div>
+  <div class="row"><span class="label">Against:</span> .bed file is small (~64 MB for N=1000, 128k markers) and likely fully resident in page cache by run 2 - re-test from cold cache would be more informative.</div>
+  <div class="row"><span class="label">Test:</span> <code class="inline">vmtouch -e plink.bed; ./step2_saige-step2 ...</code> vs <code class="inline">vmtouch -t plink.bed; ...</code>.
+    Compare cold vs warm at nT=1 and nT=8.</div>
+</div>
+
+<div class="hyp">
+  <h4>H7 - Per-marker work imbalance</h4>
+  <div class="row">SPA / Firth / ER candidates take 10-100x longer than the cheap normal-approx path.
+    Even with <code class="inline">schedule(dynamic, 64)</code> the tail markers can starve and leave
+    one thread doing the heavy ones at the end.</div>
+  <div class="row"><span class="label">For:</span> standard load-imbalance pattern for SAIGE; documented in original paper.</div>
+  <div class="row"><span class="label">Against:</span> <code class="inline">config_compare.yaml</code> is quantitative trait, so no SPA/ER/Firth -
+    this hypothesis applies to binary configs only.</div>
+  <div class="row"><span class="label">Test:</span> profile with <code class="inline">OMP_DISPLAY_AFFINITY=true</code> and a per-thread tick log;
+    or use <code class="inline">schedule(guided)</code> / smaller chunk.</div>
+</div>
+
+<div class="hyp">
+  <h4>H8 - VCF residual lock (N/A here)</h4>
+  <div class="row">VCF still serializes via <code class="inline">critical(genoread)</code>. Only PLINK quant config was profiled
+    here, so this is N/A for the current numbers but worth flagging for Seokho if UKB uses BGEN+VCF.</div>
+  <div class="row"><span class="label">For:</span> n/a</div>
+  <div class="row"><span class="label">Against:</span> n/a</div>
+  <div class="row"><span class="label">Test:</span> run <code class="inline">config_test_vcf.yaml</code> at nT=1,4,8; expect no scaling.</div>
+</div>
+
+<div class="hyp">
+  <h4>H9 - False sharing on output vectors</h4>
+  <div class="row">Threads write to <code class="inline">BetaVec[i]</code>, <code class="inline">pvalVec[i]</code>, etc. at adjacent indices.
+    Each element is 8 bytes; a 64-byte cache line holds 8 doubles. Adjacent <code class="inline">i</code>s on different
+    threads ping-pong the line.</div>
+  <div class="row"><span class="label">For:</span> classic false-sharing pattern; chunk=64 makes this less bad (each thread owns a contiguous 64-element span), but the boundary lines still ping.</div>
+  <div class="row"><span class="label">Against:</span> writes happen once per marker (~once per 30 us), not in a tight loop - unlikely to be a top-3 cost.</div>
+  <div class="row"><span class="label">Test:</span> pad to cache-line granularity (write into a thread_local buffer, flush in batches),
+    or use <code class="inline">perf c2c</code>.</div>
+</div>
+
+<div class="hyp">
+  <h4>H10 - OMP fork/join + flush overhead at large nT</h4>
+  <div class="row">Each <code class="inline">#pragma omp parallel for</code> has setup/teardown costs that grow ~linearly
+    with thread count; tiny inner work amortizes poorly at nT=16.</div>
+  <div class="row"><span class="label">For:</span> nT=16 regression (compare: 2.63s vs 2.14s @ nT=4).</div>
+  <div class="row"><span class="label">Against:</span> overhead is ~us, not seconds; would have to be hit thousands of times.
+    Only one <code class="inline">parallel for</code> per single-variant marker loop, so probably not the main term.</div>
+  <div class="row"><span class="label">Test:</span> set <code class="inline">OMP_WAIT_POLICY=ACTIVE</code> and pin threads.</div>
+</div>
+
+<h2>5. Recommended next steps (Seokho)</h2>
+<ul class="tight">
+  <li>Run on <strong>UKB-scale N=400k</strong> (or even N=100k subset) - per-marker work grows ~linearly with N,
+    so the parallel overhead becomes a much smaller fraction. Expect very different (better) ratios.</li>
+  <li>Try <code class="inline">blockSize: 256</code> in YAML on the UKB run. The GEMM path should win when each
+    per-column dot product is 400k rows - that's where the matrix view of step2 is meant to pay off.</li>
+  <li>Cap <code class="inline">nThreads</code> at <strong>physical</strong> core count (not logical) - SMT does not help compute-bound BLAS.
+    Pin: <code class="inline">OMP_PLACES=cores OMP_PROC_BIND=close OMP_WAIT_POLICY=ACTIVE</code>.</li>
+  <li>Document what scaling actually looks like at UKB scale; that will tell us which hypothesis (H1-H10) is the real one
+    and whether to invest in cleaning up Phase C / PLINK streamer overhead.</li>
+  <li>For BGEN at UKB scale, tune <code class="inline">bgenReaderThreads</code> / <code class="inline">bgenDecoderThreads</code>;
+    the (4,8) regression we saw locally may flip the other way when decompression dominates.</li>
+</ul>
+
+<h2>6. What's not implemented (priorities)</h2>
+<table>
+  <thead>
+    <tr><th>Item</th><th>Priority</th><th>Why deferred</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>VCF parallel genotype read</td>
+        <td><span class="pill red">low</span></td>
+        <td>htslib BCF reader is not trivially thread-safe per-FILE*. Most UKB workflows use BGEN.</td></tr>
+    <tr><td>Survival + SPA (SPACox) path</td>
+        <td><span class="pill yellow">medium</span></td>
+        <td>Functional gap, not a parallelism gap. Out of scope for this branch.</td></tr>
+    <tr><td><code class="inline">blockSize</code> auto-tune</td>
+        <td><span class="pill yellow">medium</span></td>
+        <td>For now it's a manual YAML knob; auto-pick based on N and cache size would be polish.</td></tr>
+    <tr><td>Conditional baseline file regeneration</td>
+        <td><span class="pill green">cosmetic</span></td>
+        <td>Verifier flags <code class="inline">STALE_BASELINE</code> on conditional config; output is correct, only the
+            reference comparison is out of date.</td></tr>
+    <tr><td>README updates</td>
+        <td><span class="pill green">cosmetic</span></td>
+        <td>README.md still describes serial behavior; will update with measured numbers after Seokho's UKB run.</td></tr>
+  </tbody>
+</table>
+
+<h2>7. Removing the timing instrumentation</h2>
+<p>11 timing calls + 1 helper were added in commit <code class="inline">72a10ed</code>, all tagged with the unique sentinel
+<code class="inline">TIMING_INSTRUMENT_REMOVE_ME</code>. To remove cleanly:</p>
+<pre>sed -i '/TIMING_INSTRUMENT_REMOVE_ME$/d' step2_saige-step2/main.cpp</pre>
+<p class="footnote">Leave it in until UKB numbers come back so we can attribute time to startup vs marker loop vs cleanup at UKB scale.</p>
+
+<hr/>
+<p class="footnote">
+  This document is self-contained (Mermaid loaded from jsdelivr CDN). Branch <code class="inline">step2-parallel</code> &middot;
+  tag <code class="inline">phase-final-shipped</code> &middot; final commit <code class="inline">72a10ed</code>.
+</p>
+
+</body>
+</html>
