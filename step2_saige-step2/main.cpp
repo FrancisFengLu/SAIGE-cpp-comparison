@@ -1328,23 +1328,30 @@ void mainMarkerInCPP(
             char* end;
             uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
 
-            // For absolute-seek readers (PLINK, PGEN, VCF), gIndex_prev=0
-            // forces SEEK_SET inside the reader — required for correctness when
-            // iterations execute out of order under OpenMP.
-            uint64_t gIndex_prev = 0;
-
-            // Phase B: PLINK/PGEN/VCF readers are not thread-safe. Serialize
-            // disk I/O via critical(genoread); parallelize compute below.
-            #pragma omp critical(genoread)
-            {
-                isReadMarker = Unified_getOneMarker(
-                    t_genoType, gIndex_prev, gIndex,
+            // PLINK / PGEN: use the _ts variants (thread_local FILE* + scratch).
+            // No critical needed — each thread has its own fd to the .bed/.pgen.
+            // VCF: htslib bcf_read is streaming and not thread-safe; the _ts
+            //   dispatcher still falls back to the locked path internally, so
+            //   we wrap in critical(genoread).
+            if (t_genoType == "vcf") {
+                #pragma omp critical(genoread)
+                {
+                    isReadMarker = Unified_getOneMarker_ts(
+                        t_genoType, gIndex,
+                        ref, alt, marker, pd, chr,
+                        altFreq, altCounts, missingRate, imputeInfo,
+                        isOutputIndexForMissing, indexForMissing,
+                        isOnlyOutputNonZero,    indexNonZeroVec,
+                        t_GVec, t_isImputation);
+                }
+            } else {
+                isReadMarker = Unified_getOneMarker_ts(
+                    t_genoType, gIndex,
                     ref, alt, marker, pd, chr,
                     altFreq, altCounts, missingRate, imputeInfo,
-                    isOutputIndexForMissing,
-                    indexForMissing,
-                    isOnlyOutputNonZero,
-                    indexNonZeroVec, t_GVec, t_isImputation);
+                    isOutputIndexForMissing, indexForMissing,
+                    isOnlyOutputNonZero,    indexNonZeroVec,
+                    t_GVec, t_isImputation);
             }
         }
 
@@ -2410,22 +2417,26 @@ void mainRegionInCPP(
         char* end;
         uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
 
-        // Phase E: under OMP parallel-for over regions, the per-region marker
-        // sequence is interleaved across threads at the critical(genoread)
-        // gate. PLINK/PGEN/VCF/BGEN readers rely on file-position state, so
-        // we MUST force absolute seeks by passing gIndex_prev=0 for every
-        // call. The non-zero gIndex_prev path (sequential) would jump from
-        // some other thread's last position to ours, corrupting GVec.
-        uint64_t gIndex_prev = 0;
-
-        // Phase E: PLINK/PGEN/VCF readers are not thread-safe; BGEN reader
-        // also relies on file-position state. Serialize disk reads across
-        // outer-region threads via critical(genoread). The expensive work
-        // (Unified_getMarkerPval, group accumulators) runs in parallel.
+        // Streamer / thread-safe reader paths:
+        //   - PLINK / PGEN: per-thread FILE* via getOneMarker_ts; absolute SEEK_SET
+        //     per call. No critical needed.
+        //   - VCF: htslib bcf_read is streaming and not parallel-safe. Wrap in
+        //     critical(genoread).
+        //   - BGEN: not reachable here; this region path uses the locked
+        //     dispatcher historically (BGEN region streaming TBD elsewhere).
         bool isReadMarker;
-        #pragma omp critical(genoread)
-        {
-            isReadMarker = Unified_getOneMarker(t_genoType, gIndex_prev, gIndex,
+        if (t_genoType == "vcf" || t_genoType == "bgen") {
+            uint64_t gIndex_prev = 0;
+            #pragma omp critical(genoread)
+            {
+                isReadMarker = Unified_getOneMarker(t_genoType, gIndex_prev, gIndex,
+                    ref, alt, marker, pd, chr, altFreq, altCounts, missingRate, imputeInfo,
+                    isOutputIndexForMissing, indexForMissing,
+                    isOnlyOutputNonZero, indexNonZeroVec, GVec, t_isImputation);
+            }
+        } else {
+            // PLINK / PGEN — thread-safe variant, no critical.
+            isReadMarker = Unified_getOneMarker_ts(t_genoType, gIndex,
                 ref, alt, marker, pd, chr, altFreq, altCounts, missingRate, imputeInfo,
                 isOutputIndexForMissing, indexForMissing,
                 isOnlyOutputNonZero, indexNonZeroVec, GVec, t_isImputation);

@@ -267,6 +267,150 @@ void PlinkClass::closegenofile()
 }
 
 // ============================================================
+// getOneMarker_ts: thread-safe variant of getOneMarker.
+//
+// Each OMP thread keeps its own FILE* + scratch buffer in thread_local
+// storage. On first use the thread opens its own fd to the .bed file
+// (the kernel maintains an independent file position per fd, so multiple
+// threads can read concurrently with no contention).
+//
+// Always performs absolute SEEK_SET (no sequential CUR seek). This is
+// correct under OMP parallel-for where iterations execute out of order.
+//
+// The thread_local FILE* is leaked at thread exit (no destructor for
+// raw FILE*). For SAIGE step 2 this is fine: the process exits shortly
+// after the parallel region, and the OS reclaims the fd.
+// ============================================================
+void PlinkClass::getOneMarker_ts(uint64_t t_gIndex,
+                                 std::string& t_ref,
+                                 std::string& t_alt,
+                                 std::string& t_marker,
+                                 uint32_t& t_pd,
+                                 std::string& t_chr,
+                                 double& t_altFreq,
+                                 double& t_altCounts,
+                                 double& t_missingRate,
+                                 double& t_imputeInfo,
+                                 bool t_isOutputIndexForMissing,
+                                 std::vector<uint>& t_indexForMissing,
+                                 bool t_isOnlyOutputNonZero,
+                                 std::vector<uint>& t_indexForNonZero,
+                                 bool t_isTrueGenotype,
+                                 arma::vec& OneMarkerG1)
+{
+    if (!t_isTrueGenotype) {
+        if (t_isOutputIndexForMissing) {
+            throw std::runtime_error(
+                "Check PlinkClass::getOneMarker_ts, if t_isTrueGenotype = FALSE, "
+                "then t_isOutputIndexForMissing should be FALSE.");
+        }
+        if (t_isOnlyOutputNonZero) {
+            throw std::runtime_error(
+                "Check PlinkClass::getOneMarker_ts, if t_isTrueGenotype = FALSE, "
+                "then t_isOnlyOutputNonZero should be FALSE.");
+        }
+    }
+
+    // Per-thread file handle and scratch buffer. Opened lazily on first
+    // call from each thread.
+    thread_local FILE* tlsFin = nullptr;
+    thread_local std::vector<unsigned char> tlsOneMarkerG4;
+
+    if (tlsFin == nullptr) {
+        tlsFin = fopen(m_bedFile.c_str(), "rb");
+        if (!tlsFin) {
+            throw std::runtime_error(
+                "PlinkClass::getOneMarker_ts: cannot open .bed file: " + m_bedFile);
+        }
+    }
+    if (tlsOneMarkerG4.size() < m_numBytesofEachMarker0) {
+        tlsOneMarkerG4.resize(m_numBytesofEachMarker0);
+    }
+
+    // Always absolute seek (thread-safe; no dependence on prior file pos)
+    uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
+    fseek(tlsFin, posSeek, SEEK_SET);
+
+    size_t nRead = fread((char*)(tlsOneMarkerG4.data()), 1,
+                         m_numBytesofEachMarker0, tlsFin);
+    if (nRead != m_numBytesofEachMarker0) {
+        throw std::runtime_error(
+            "PlinkClass::getOneMarker_ts: short read on marker " +
+            std::to_string(t_gIndex));
+    }
+
+    t_indexForMissing.clear();
+    t_indexForNonZero.clear();
+
+    t_marker = m_MarkerInPlink[t_gIndex];
+    t_pd     = m_pd[t_gIndex];
+    t_chr    = m_chr[t_gIndex];
+
+    std::vector<int8_t> genoMaps;
+    if (m_AlleleOrder == "alt-first") {
+        t_ref = m_ref[t_gIndex];
+        t_alt = m_alt[t_gIndex];
+        genoMaps = m_genoMaps_alt_first;
+    }
+    if (m_AlleleOrder == "ref-first") {
+        t_ref = m_alt[t_gIndex];
+        t_alt = m_ref[t_gIndex];
+        genoMaps = m_genoMaps_ref_first;
+    }
+
+    uint j = 0;
+    int counts[] = {0, 0, 0, 0};
+
+    for (uint32_t i = 0; i < m_N; i++) {
+        auto ind = m_posSampleInPlink[i];
+        unsigned char bufferG4 = tlsOneMarkerG4[ind / 4];
+        size_t bufferG1;
+
+        getGenotype(bufferG4, ind % 4, bufferG1);
+        counts[bufferG1]++;
+
+        if (bufferG1 == MISSING && t_isOutputIndexForMissing) {
+            t_indexForMissing.push_back(i);
+        }
+        if (t_isTrueGenotype) {
+            bufferG1 = genoMaps[bufferG1];
+        }
+        if (bufferG1 > 0) {
+            t_indexForNonZero.push_back(i);
+        }
+        if (t_isOnlyOutputNonZero) {
+            if (bufferG1 > 0) {
+                OneMarkerG1[j] = bufferG1;
+                j = j + 1;
+            }
+        } else {
+            OneMarkerG1[i] = bufferG1;
+        }
+    }
+
+    int numMissing = counts[MISSING];
+    int count = m_N - numMissing;
+    t_missingRate = (double)numMissing / (double)m_N;
+    t_imputeInfo  = 1;
+    t_altCounts   = (double)(counts[HET] + 2 * counts[HOM_ALT]);
+
+    if (count > 0) {
+        t_altFreq = t_altCounts / (double)count / 2;
+    } else {
+        t_altFreq = 0;
+    }
+
+    if (m_AlleleOrder == "ref-first") {
+        t_altFreq = 1 - t_altFreq;
+        t_altCounts = 2 * (double)count * t_altFreq;
+    }
+
+    if (t_isOnlyOutputNonZero) {
+        OneMarkerG1.resize(j);
+    }
+}
+
+// ============================================================
 // getOneMarker: read one marker from .bed and decode genotypes
 //
 // This is a direct port of SAIGE/src/PLINK.cpp::getOneMarker
@@ -2421,6 +2565,119 @@ void PgenClass::closegenofile()
     }
 }
 
+// ============================================================
+// getOneMarker_ts: thread-safe variant of getOneMarker.
+//
+// Each OMP thread keeps its own FILE* + scratch buffer in thread_local
+// storage. On first use the thread opens its own fd to the same .pgen
+// file. PGEN mode 0x01/0x02 records are fixed-size (m_bytesPerVariant
+// bytes per variant after m_dataOffset), so a thread can seek directly
+// by variant index without coordinating with other threads.
+//
+// The thread_local FILE* is leaked at thread exit (cleaned up on
+// process exit by the OS). Acceptable for SAIGE step 2's lifecycle.
+// ============================================================
+void PgenClass::getOneMarker_ts(uint64_t t_gIndex,
+                                std::string& t_ref,
+                                std::string& t_alt,
+                                std::string& t_marker,
+                                uint32_t& t_pd,
+                                std::string& t_chr,
+                                double& t_altFreq,
+                                double& t_altCounts,
+                                double& t_missingRate,
+                                double& t_imputeInfo,
+                                bool t_isOutputIndexForMissing,
+                                std::vector<uint>& t_indexForMissing,
+                                bool t_isOnlyOutputNonZero,
+                                std::vector<uint>& t_indexForNonZero,
+                                arma::vec& OneMarkerG1)
+{
+    t_indexForMissing.clear();
+    t_indexForNonZero.clear();
+
+    t_chr    = m_chr[t_gIndex];
+    t_pd     = m_position[t_gIndex];
+    t_ref    = m_ref[t_gIndex];
+    t_alt    = m_alt[t_gIndex];
+    t_marker = m_variantId[t_gIndex];
+
+    thread_local FILE* tlsFin = nullptr;
+    thread_local std::vector<unsigned char> tlsOneMarkerRaw;
+
+    if (tlsFin == nullptr) {
+        tlsFin = fopen(m_pgenFile.c_str(), "rb");
+        if (!tlsFin) {
+            throw std::runtime_error(
+                "PgenClass::getOneMarker_ts: cannot open .pgen file: " + m_pgenFile);
+        }
+    }
+    if (tlsOneMarkerRaw.size() < m_bytesPerVariant) {
+        tlsOneMarkerRaw.resize(m_bytesPerVariant);
+    }
+
+    uint64_t filePos = m_dataOffset + m_bytesPerVariant * t_gIndex;
+    fseek(tlsFin, filePos, SEEK_SET);
+
+    if (fread(tlsOneMarkerRaw.data(), 1, m_bytesPerVariant, tlsFin) != m_bytesPerVariant) {
+        throw std::runtime_error(
+            "PgenClass::getOneMarker_ts: failed to read variant " +
+            std::to_string(t_gIndex) + " from PGEN file");
+    }
+
+    // Decode genotypes (PGEN mode 0x02 encoding: 00=0, 01=1, 10=2, 11=missing)
+    // We inline the 2-bit extraction because getGenotype() reads m_OneMarkerRaw.
+    uint32_t numMissing = 0;
+    t_altCounts = 0;
+    uint j = 0;
+
+    for (uint32_t i = 0; i < m_N; i++) {
+        uint32_t sampleIdx = m_posSampleInPgen[i];
+        uint32_t byteIdx  = sampleIdx / 4;
+        uint32_t bitShift = (sampleIdx % 4) * 2;
+        uint8_t  geno     = (tlsOneMarkerRaw[byteIdx] >> bitShift) & 0x03;
+
+        double genoVal;
+        if (geno == 0x03) {
+            genoVal = std::numeric_limits<double>::quiet_NaN();
+            numMissing++;
+            if (t_isOutputIndexForMissing) {
+                t_indexForMissing.push_back(i);
+            }
+        } else {
+            genoVal = (double)geno;
+            t_altCounts += genoVal;
+        }
+
+        if (geno > 0 && geno != 0x03) {
+            t_indexForNonZero.push_back(i);
+        }
+
+        if (t_isOnlyOutputNonZero) {
+            if (geno > 0 && geno != 0x03) {
+                OneMarkerG1[j] = genoVal;
+                j++;
+            }
+        } else {
+            OneMarkerG1[i] = genoVal;
+        }
+    }
+
+    uint32_t count = m_N - numMissing;
+    t_missingRate = (double)numMissing / (double)m_N;
+    t_imputeInfo  = 1.0;
+
+    if (count > 0) {
+        t_altFreq = t_altCounts / (double)count / 2.0;
+    } else {
+        t_altFreq = 0;
+    }
+
+    if (t_isOnlyOutputNonZero) {
+        OneMarkerG1.resize(j);
+    }
+}
+
 } // namespace PGEN
 
 
@@ -2649,6 +2906,86 @@ bool Unified_getOneMarker(std::string& t_genoType,
     }
 
     return isBoolRead;
+}
+
+
+// ============================================================
+// Unified_getOneMarker_ts: thread-safe unified dispatcher.
+//
+// For PLINK / PGEN: dispatches to per-format _ts variants that use
+//   thread_local FILE* + scratch buffers. No critical section required.
+// For VCF: falls back to the locked getOneMarker — htslib bcf_read is
+//   sequential and not thread-safe in our usage. The CALLER is responsible
+//   for wrapping the VCF call in a critical section.
+// For BGEN: should not be called via this dispatcher — the BgenStreamer
+//   already provides thread-safe access. Throws if invoked.
+// ============================================================
+bool Unified_getOneMarker_ts(std::string& t_genoType,
+                             uint64_t t_gIndex,
+                             std::string& t_ref,
+                             std::string& t_alt,
+                             std::string& t_marker,
+                             uint32_t& t_pd,
+                             std::string& t_chr,
+                             double& t_altFreq,
+                             double& t_altCounts,
+                             double& t_missingRate,
+                             double& t_imputeInfo,
+                             bool t_isOutputIndexForMissing,
+                             std::vector<uint>& t_indexForMissing,
+                             bool t_isOnlyOutputNonZero,
+                             std::vector<uint>& t_indexForNonZero,
+                             arma::vec& t_GVec,
+                             bool t_isImputation)
+{
+    if (t_genoType == "plink") {
+        if (ptr_gPLINKobj == nullptr) {
+            throw std::runtime_error(
+                "Unified_getOneMarker_ts: PLINK object not initialized.");
+        }
+        bool isTrueGenotype = true;
+        ptr_gPLINKobj->getOneMarker_ts(
+            t_gIndex,
+            t_ref, t_alt, t_marker, t_pd, t_chr,
+            t_altFreq, t_altCounts, t_missingRate, t_imputeInfo,
+            t_isOutputIndexForMissing, t_indexForMissing,
+            t_isOnlyOutputNonZero,    t_indexForNonZero,
+            isTrueGenotype, t_GVec);
+        return true;
+    } else if (t_genoType == "pgen") {
+        if (ptr_gPGENobj == nullptr) {
+            throw std::runtime_error(
+                "Unified_getOneMarker_ts: PGEN object not initialized.");
+        }
+        ptr_gPGENobj->getOneMarker_ts(
+            t_gIndex,
+            t_ref, t_alt, t_marker, t_pd, t_chr,
+            t_altFreq, t_altCounts, t_missingRate, t_imputeInfo,
+            t_isOutputIndexForMissing, t_indexForMissing,
+            t_isOnlyOutputNonZero,    t_indexForNonZero,
+            t_GVec);
+        return true;
+    } else if (t_genoType == "vcf") {
+        // VCF cannot be parallelized here — caller must serialize.
+        // Reuse the (locked-by-caller) getOneMarker.
+        if (ptr_gVCFobj == nullptr) {
+            throw std::runtime_error(
+                "Unified_getOneMarker_ts: VCF object not initialized.");
+        }
+        return ptr_gVCFobj->getOneMarker(
+            t_ref, t_alt, t_marker, t_pd, t_chr,
+            t_altFreq, t_altCounts, t_missingRate, t_imputeInfo,
+            t_isOutputIndexForMissing, t_indexForMissing,
+            t_isOnlyOutputNonZero,    t_indexForNonZero,
+            t_GVec, t_isImputation);
+    } else if (t_genoType == "bgen") {
+        throw std::runtime_error(
+            "Unified_getOneMarker_ts: BGEN should be read via BgenStreamer, "
+            "not this dispatcher.");
+    } else {
+        throw std::runtime_error(
+            "Unified_getOneMarker_ts: Unknown genotype type '" + t_genoType + "'.");
+    }
 }
 
 

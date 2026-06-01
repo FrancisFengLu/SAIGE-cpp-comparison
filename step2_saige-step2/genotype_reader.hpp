@@ -113,6 +113,30 @@ public:
                       bool& t_isTrueGenotype,
                       arma::vec& OneMarkerG1);
 
+    // Thread-safe variant of getOneMarker.
+    // Uses thread_local FILE* and scratch buffer so concurrent OMP threads
+    // don't contend on m_fin / m_OneMarkerG4. Each thread opens its own fd
+    // to the same .bed file on first call; fd is leaked at thread exit
+    // (cleaned up at process exit, which is fine for SAIGE step 2's lifecycle).
+    // Always performs absolute SEEK_SET (no sequential CUR seek) — caller
+    // does not need to track gIndex_prev.
+    void getOneMarker_ts(uint64_t t_gIndex,
+                         std::string& t_ref,
+                         std::string& t_alt,
+                         std::string& t_marker,
+                         uint32_t& t_pd,
+                         std::string& t_chr,
+                         double& t_altFreq,
+                         double& t_altCounts,
+                         double& t_missingRate,
+                         double& t_imputeInfo,
+                         bool t_isOutputIndexForMissing,
+                         std::vector<uint>& t_indexForMissing,
+                         bool t_isOnlyOutputNonZero,
+                         std::vector<uint>& t_indexForNonZero,
+                         bool t_isTrueGenotype,
+                         arma::vec& OneMarkerG1);
+
     // Convenience overload: simplified getOneMarker (like SAIGE PLINK.hpp inline overloads)
     void getOneMarker(uint64_t t_gIndex_prev,
                       uint64_t t_gIndex,
@@ -708,6 +732,36 @@ public:
                      isOnlyOutputNonZero, indexForNonZero, OneMarkerG1);
     }
 
+    // Thread-safe variant of getOneMarker.
+    // Uses thread_local FILE* + scratch buffer; each OMP thread opens its
+    // own fd to the same .pgen file. Always absolute SEEK_SET.
+    void getOneMarker_ts(uint64_t t_gIndex,
+                         std::string& t_ref,
+                         std::string& t_alt,
+                         std::string& t_marker,
+                         uint32_t& t_pd,
+                         std::string& t_chr,
+                         double& t_altFreq,
+                         double& t_altCounts,
+                         double& t_missingRate,
+                         double& t_imputeInfo,
+                         bool t_isOutputIndexForMissing,
+                         std::vector<uint>& t_indexForMissing,
+                         bool t_isOnlyOutputNonZero,
+                         std::vector<uint>& t_indexForNonZero,
+                         arma::vec& OneMarkerG1);
+
+    // Read-only access to per-file context for the _ts variant.
+    const std::string& getPgenFilePath() const { return m_pgenFile; }
+    uint64_t getDataOffset()      const { return m_dataOffset; }
+    uint64_t getBytesPerVariant() const { return m_bytesPerVariant; }
+    const std::vector<uint32_t>& getPosSampleInPgen() const { return m_posSampleInPgen; }
+    const std::string& getChrAt(uint32_t i)       const { return m_chr[i]; }
+    uint32_t           getPosAt(uint32_t i)       const { return m_position[i]; }
+    const std::string& getRefAt(uint32_t i)       const { return m_ref[i]; }
+    const std::string& getAltAt(uint32_t i)       const { return m_alt[i]; }
+    const std::string& getVariantIdAt(uint32_t i) const { return m_variantId[i]; }
+
     uint32_t getN0() { return m_N0; }
     uint32_t getN()  { return m_N; }
     uint32_t getM()  { return m_M; }
@@ -781,6 +835,31 @@ bool Unified_getOneMarker(std::string& t_genoType,
                           std::vector<uint>& t_indexForNonZero,
                           arma::vec& t_GVec,
                           bool t_isImputation);
+
+// Thread-safe unified dispatcher. For "plink" and "pgen", dispatches to the
+// _ts variants (which use thread_local FILE* + scratch — no shared mutable
+// state, no lock needed). For "vcf" the caller MUST still wrap this in a
+// critical section because htslib bcf_read is streaming and not parallelizable
+// in our current code path. For "bgen", the BgenStreamer is used instead, so
+// this dispatcher should not be called for bgen. Returns true if a marker
+// was read.
+bool Unified_getOneMarker_ts(std::string& t_genoType,
+                             uint64_t t_gIndex,
+                             std::string& t_ref,
+                             std::string& t_alt,
+                             std::string& t_marker,
+                             uint32_t& t_pd,
+                             std::string& t_chr,
+                             double& t_altFreq,
+                             double& t_altCounts,
+                             double& t_missingRate,
+                             double& t_imputeInfo,
+                             bool t_isOutputIndexForMissing,
+                             std::vector<uint>& t_indexForMissing,
+                             bool t_isOnlyOutputNonZero,
+                             std::vector<uint>& t_indexForNonZero,
+                             arma::vec& t_GVec,
+                             bool t_isImputation);
 
 // Helper: set up PLINK object (mirrors SAIGE Main.cpp::setPLINKobjInCPP)
 void setPLINKobjInCPP(std::string t_bimFile,
