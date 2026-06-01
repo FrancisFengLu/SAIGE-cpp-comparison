@@ -86,6 +86,12 @@ int g_nThreads = 1;
 // `bgenDecoders` (default 4). Region/group path (mainRegionInCPP) is not
 // wired to use the streamer.
 int g_bgenDecoders = 4;
+// Phase C: block size for matrix-level first pass via BLAS-3 GEMM in
+// mainMarkerInCPP. blockSize=1 falls back to the original per-marker path
+// (bit-identical). blockSize>1 reads B markers, computes Tstat/var1 via one
+// GEMM, and uses the block results for markers that don't need SPA/ER/Firth
+// recompute. Set via YAML key `blockSize` (default 256).
+int g_blockSize = 256;
 
 std::string g_method_to_CollapseUltraRare;
 double g_DosageCutoff_for_UltraRarePresence;
@@ -800,6 +806,287 @@ void mainMarkerInCPP(
         std::cout << "BGEN streamer: " << nDec << " decoders, queueCap=64" << std::endl;
     }
 
+    // Phase C: matrix-level first pass via BLAS-3 GEMM.
+    // When g_blockSize > 1, the outer block prefetch (below) reads B markers
+    // worth of genotypes, computes Tstat / var1 / Beta / pval for cheap-path
+    // columns via one scoreTestFast_block call, and stores results in
+    // blkCache[i]. The per-marker OMP loop then consults blkCache[i]: if
+    // useBlock is true (marker stays on cheap path, no SPA/ER/Firth/cond/
+    // fast-test reroute), the loop writes the cached results to output
+    // vectors and skips the redundant scoreTestFast call. Otherwise the
+    // loop falls back to scalar getMarkerPval.
+    //
+    // To avoid double-reading markers, the prefetch also caches the imputed
+    // genotype, indexNonZero/indexZero, flip flag, MAC/MAF/altFreq/etc. per
+    // marker so the main loop can reuse them directly.
+    struct PrefetchEntry {
+        bool readOk = false;       // marker read from file
+        bool passedQC = false;     // initial + post-impute QC pass
+        bool runMeta = false;      // metadata fields populated
+        bool useBlock = false;     // block first-pass result usable as final
+        bool blockComputed = false;// scoreTestFast_block ran for this marker
+        // metadata
+        std::string chr, ref, alt, marker, pds, info;
+        uint32_t pd = 0;
+        double altFreq = 0.0, altCounts = 0.0, missingRate = 0.0, imputeInfo = 0.0;
+        double MAC = 0.0, MAF = 0.0;
+        bool flip = false;
+        arma::vec gVec;            // imputed genotype (post-flip)
+        std::vector<uint> indexZeroVec, indexNonZeroVec;
+        double varRatioVal = 1.0;
+        bool flagSparseGRM_cur = false;
+        bool isnoadjCov_cur = false;
+        // block first-pass results
+        double Beta = arma::datum::nan;
+        double seBeta = arma::datum::nan;
+        double Tstat = arma::datum::nan;
+        double var1 = arma::datum::nan;
+        std::string pvalStr;       // formatted pval (noadj/noSPA)
+        double pvalNum = 1.0;
+    };
+    const bool useBlockPath = (g_blockSize > 1);
+    std::vector<PrefetchEntry> prefetch;
+    if (useBlockPath) {
+        prefetch.resize(q);
+    }
+
+    // Outer block prefetch (only when useBlockPath). Runs sequentially: reads
+    // B markers from the genotype stream, then computes the block GEMM. This
+    // keeps stream ordering trivially correct for PLINK/PGEN/VCF.
+    if (useBlockPath) {
+        const int B = g_blockSize;
+        std::vector<bool> validMask;
+        std::vector<int> colToIdx;    // column j in G --> prefetch index i
+        arma::mat G;
+        arma::vec varRatioVecBlock;
+        arma::vec Beta_blk, seBeta_blk, Tstat_blk, var1_blk, var2_blk;
+        arma::vec StdStat_blk, pvalNoadj_blk;
+        std::vector<bool> pvalIsLog_blk;
+        std::vector<std::string> pvalStr_blk;
+
+        for (int blockStart = 0; blockStart < q; blockStart += B) {
+            int blockEnd = std::min(blockStart + B, q);
+            int Bcur = blockEnd - blockStart;
+            colToIdx.clear();
+
+            // Pre-allocate per-block scratch buffers for raw read data so the
+            // I/O step (which is serial because the file readers aren't
+            // thread-safe) can hand off to a parallel impute+QC step.
+            std::vector<std::vector<uint>> rawIdxMissing(Bcur);
+            std::vector<arma::vec> rawGVec(Bcur);
+            std::vector<double> rawAltFreq(Bcur), rawAltCounts(Bcur),
+                rawMissingRate(Bcur), rawImputeInfo(Bcur);
+            std::vector<std::string> rawChr(Bcur), rawRef(Bcur),
+                rawAlt(Bcur), rawMarker(Bcur);
+            std::vector<uint32_t> rawPd(Bcur);
+            std::vector<bool> rawReadOk(Bcur, false);
+
+            // Phase 1 (serial): read B markers from the file.
+            for (int j = 0; j < Bcur; j++) {
+                int i = blockStart + j;
+                if (t_genoType == "bgen") {
+                    BGEN::BgenDecodedMarker dm;
+                    bool ok = bgenStreamer->getMarker((uint64_t)i, dm);
+                    rawReadOk[j] = ok;
+                    if (ok) {
+                        rawRef[j] = dm.alleles.size() > 0 ? dm.alleles[0] : "";
+                        rawAlt[j] = dm.alleles.size() > 1 ? dm.alleles[1] : "";
+                        rawMarker[j] = dm.rsID;
+                        rawPd[j] = dm.physpos;
+                        rawChr[j] = dm.chr;
+                        rawAltFreq[j] = dm.altFreq;
+                        rawAltCounts[j] = dm.altCounts;
+                        rawMissingRate[j] = dm.missingRate;
+                        rawImputeInfo[j] = dm.info;
+                        rawIdxMissing[j] = std::move(dm.indexForMissing);
+                        rawGVec[j] = std::move(dm.dosages);
+                    }
+                } else {
+                    std::string t_genoIndex_str = t_genoIndex.at(i);
+                    char* end;
+                    uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
+                    uint64_t gIndex_prev = 0;
+                    bool isOutputIndexForMissing = true;
+                    bool isOnlyOutputNonZero = false;
+                    std::vector<uint> dummyIdxNonZero;
+                    arma::vec t_GVec(n);
+                    bool ok = Unified_getOneMarker(
+                        t_genoType, gIndex_prev, gIndex,
+                        rawRef[j], rawAlt[j], rawMarker[j], rawPd[j], rawChr[j],
+                        rawAltFreq[j], rawAltCounts[j], rawMissingRate[j],
+                        rawImputeInfo[j], isOutputIndexForMissing,
+                        rawIdxMissing[j], isOnlyOutputNonZero,
+                        dummyIdxNonZero, t_GVec, t_isImputation);
+                    rawReadOk[j] = ok;
+                    if (ok) {
+                        rawGVec[j] = std::move(t_GVec);
+                    }
+                }
+                if (!rawReadOk[j]) {
+                    int i = blockStart + j;
+                    #pragma omp critical(endflag)
+                    {
+                        if (i < firstEndIdx) firstEndIdx = i;
+                        g_markerTestEnd = true;
+                    }
+                }
+            }
+
+            // Phase 2 (parallel): impute + QC each marker in this block, plus
+            // build ctx (variance ratio etc). Per-marker work, fully thread-
+            // safe (only reads from SAIGEClass, writes to per-entry struct).
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < Bcur; j++) {
+                int i = blockStart + j;
+                PrefetchEntry& pe = prefetch[i];
+                pe.readOk = rawReadOk[j];
+                if (!pe.readOk) continue;
+                pe.chr = std::move(rawChr[j]);
+                pe.ref = std::move(rawRef[j]);
+                pe.alt = std::move(rawAlt[j]);
+                pe.marker = std::move(rawMarker[j]);
+                pe.pd = rawPd[j];
+                pe.pds = std::to_string(pe.pd);
+                pe.info = pe.chr + ":" + pe.pds + ":" + pe.ref + ":" + pe.alt;
+                pe.altFreq = rawAltFreq[j];
+                pe.altCounts = rawAltCounts[j];
+                pe.missingRate = rawMissingRate[j];
+                pe.imputeInfo = rawImputeInfo[j];
+                pe.runMeta = true;
+
+                double altFreq = pe.altFreq;
+                double altCounts = pe.altCounts;
+                double missingRate = pe.missingRate;
+                double imputeInfo = pe.imputeInfo;
+                double MAF = std::min(altFreq, 1 - altFreq);
+                double MAC = MAF * n * (1 - missingRate) * 2;
+                if ((missingRate > g_missingRate_cutoff) ||
+                    (MAF < g_marker_minMAF_cutoff) ||
+                    (MAC < g_marker_minMAC_cutoff) ||
+                    (imputeInfo < g_marker_minINFO_cutoff)) {
+                    continue;
+                }
+                std::vector<uint> indexZeroVec, indexNonZeroVec;
+                arma::vec t_GVec = std::move(rawGVec[j]);
+                std::vector<uint> indexForMissing = std::move(rawIdxMissing[j]);
+                bool flip = imputeGenoAndFlip(
+                    t_GVec, altFreq, altCounts, indexForMissing,
+                    g_impute_method, g_dosage_zerod_cutoff,
+                    g_dosage_zerod_MAC_cutoff, MAC, indexZeroVec,
+                    indexNonZeroVec);
+                MAC = std::min(altCounts, 2.0 * n - altCounts);
+                MAF = std::min(altFreq, 1 - altFreq);
+                if ((MAF < g_marker_minMAF_cutoff) ||
+                    (MAC < g_marker_minMAC_cutoff)) {
+                    continue;
+                }
+                pe.passedQC = true;
+                pe.flip = flip;
+                pe.MAC = MAC; pe.MAF = MAF;
+                pe.altFreq = altFreq; pe.altCounts = altCounts;
+                pe.gVec = std::move(t_GVec);
+                pe.indexZeroVec = std::move(indexZeroVec);
+                pe.indexNonZeroVec = std::move(indexNonZeroVec);
+                pe.flagSparseGRM_cur = ptr_gSAIGEobj->m_isFastTest
+                    ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                pe.isnoadjCov_cur = ptr_gSAIGEobj->m_isnoadjCov;
+                bool dummyHas;
+                if (isSingleVarianceRatio) {
+                    pe.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                        pe.flagSparseGRM_cur, pe.isnoadjCov_cur);
+                } else {
+                    pe.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                        MAC, pe.flagSparseGRM_cur, pe.isnoadjCov_cur,
+                        dummyHas);
+                }
+            }
+
+            // Phase 3 (serial): collect eligible columns for the GEMM.
+            for (int j = 0; j < Bcur; j++) {
+                int i = blockStart + j;
+                PrefetchEntry& pe = prefetch[i];
+                if (!pe.passedQC) continue;
+                bool eligible = true;
+                if (pe.MAC <= g_MACCutoffforER && t_traitType == "binary")
+                    eligible = false;
+                if (pe.flagSparseGRM_cur) eligible = false;
+                if (pe.isnoadjCov_cur) eligible = false;
+                if (isCondition) eligible = false;
+                if (g_writeCheckpoints && i == 0 && !g_checkpointDir.empty())
+                    eligible = false;
+                if (!eligible) continue;
+                colToIdx.push_back(i);
+            }
+
+            // No eligible cols in this block? Skip GEMM.
+            int Bvalid = (int)colToIdx.size();
+            if (Bvalid == 0) continue;
+
+            // Build the genotype matrix and varRatio vector for the GEMM.
+            G.set_size(n, Bvalid);
+            varRatioVecBlock.set_size(Bvalid);
+            validMask.assign(Bvalid, true);
+            for (int k = 0; k < Bvalid; k++) {
+                int idx = colToIdx[k];
+                G.col(k) = prefetch[idx].gVec;
+                varRatioVecBlock[k] = prefetch[idx].varRatioVal;
+            }
+
+            ptr_gSAIGEobj->scoreTestFast_block(
+                G, varRatioVecBlock, validMask,
+                Beta_blk, seBeta_blk, Tstat_blk, var1_blk, var2_blk,
+                StdStat_blk, pvalNoadj_blk, pvalIsLog_blk, pvalStr_blk);
+
+            // Distribute results into prefetch[]. Decide if the block result
+            // is final for each column (cheap-path eligibility post-GEMM):
+            //   * StdStat <= SPA_Cutoff  (no SPA needed) OR quantitative
+            //   * !(isFastTest && pval_num < pval_cutoff_for_fastTest)
+            //   * !(m_is_Firth_beta && binary && pval <= pCutoffforFirth)
+            const double spaCut = ptr_gSAIGEobj->m_SPA_Cutoff;
+            const bool isFastTest = ptr_gSAIGEobj->m_isFastTest;
+            const double fastCut = ptr_gSAIGEobj->m_pval_cutoff_for_fastTest;
+            const bool firthOn = ptr_gSAIGEobj->m_is_Firth_beta;
+            const double firthCut = ptr_gSAIGEobj->m_pCutoffforFirth;
+            for (int k = 0; k < Bvalid; k++) {
+                int i = colToIdx[k];
+                PrefetchEntry& pe = prefetch[i];
+                pe.blockComputed = true;
+                pe.Beta = Beta_blk[k];
+                pe.seBeta = seBeta_blk[k];
+                pe.Tstat = Tstat_blk[k];
+                pe.var1 = var1_blk[k];
+                pe.pvalStr = pvalStr_blk[k];
+
+                // pval_num: linear domain (parses pvalStr like scalar code).
+                double pval_num = 0.0;
+                try { pval_num = std::stod(pe.pvalStr); }
+                catch (...) { pval_num = 0.0; }
+                pe.pvalNum = pval_num;
+
+                double stdStat = StdStat_blk[k];
+                bool needSPA = (!std::isnan(stdStat) && stdStat > spaCut &&
+                                t_traitType != "quantitative");
+                bool needFastRecompute = false;
+                if ((t_traitType == "binary" && pe.MAC > g_MACCutoffforER) ||
+                    t_traitType != "binary") {
+                    if (isFastTest && pval_num < fastCut) {
+                        needFastRecompute = true;
+                    }
+                }
+                bool needFirth = false;
+                if (t_traitType == "binary" && firthOn) {
+                    if (!pvalIsLog_blk[k]) {
+                        if (pval_num <= firthCut) needFirth = true;
+                    } else {
+                        // pvalNoadj_blk[k] is log(p) when islog
+                        if (pvalNoadj_blk[k] <= std::log(firthCut)) needFirth = true;
+                    }
+                }
+                pe.useBlock = !needSPA && !needFastRecompute && !needFirth;
+            }
+        }
+    }
+
     #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < q; i++) {
         // Phase B: per-iteration scratch — declared inside the loop body so
@@ -842,6 +1129,172 @@ void mainMarkerInCPP(
         indexZeroVec.clear();
         indexNonZeroVec.clear();
         indexForMissing.clear();
+
+        // Phase C: when block prefetch ran, replay cached data and short-
+        // circuit the file read + (possibly) the scalar getMarkerPval call.
+        if (useBlockPath) {
+            PrefetchEntry& pe = prefetch[i];
+            if (!pe.readOk) {
+                // EOF / read failure already recorded firstEndIdx and pval='NA'.
+                continue;
+            }
+            if (!pe.runMeta) continue;  // shouldn't happen but be safe
+            chrVec.at(i) = pe.chr;
+            posVec.at(i) = pe.pds;
+            refVec.at(i) = pe.ref;
+            altVec.at(i) = pe.alt;
+            markerVec.at(i) = pe.marker;
+            infoVec.at(i) = pe.info;
+            altFreqVec.at(i) = pe.altFreq;
+            missingRateVec.at(i) = pe.missingRate;
+            imputationInfoVec.at(i) = pe.imputeInfo;
+            if (!pe.passedQC) continue;
+
+            altFreqVec.at(i) = pe.altFreq;
+            altCountsVec.at(i) = pe.altCounts;
+            bool flip = pe.flip;
+            double MAC = pe.MAC;
+            double MAF = pe.MAF;
+            t_GVec = pe.gVec;  // copy out (loop may consume)
+            arma::uvec indexZeroVec_arma =
+                arma::conv_to<arma::uvec>::from(pe.indexZeroVec);
+            arma::uvec indexNonZeroVec_arma =
+                arma::conv_to<arma::uvec>::from(pe.indexNonZeroVec);
+
+            double Beta, seBeta, Tstat, varT, gy;
+            double Beta_c, seBeta_c, Tstat_c, varT_c;
+            std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+            bool isSPAConverge = false, is_gtilde = false;
+            bool is_Firth = false, is_FirthConverge = false;
+
+            if (pe.blockComputed && pe.useBlock) {
+                // Use block first-pass result directly.
+                Beta = pe.Beta;
+                seBeta = pe.seBeta;
+                Tstat = pe.Tstat;
+                varT = pe.var1;
+                pval = pe.pvalStr;
+                pval_noSPA = pe.pvalStr;
+                isSPAConverge = false;  // SPA was never invoked
+            } else {
+                // Fall back to scalar getMarkerPval.
+                SAIGE::PerMarkerCtx ctx_first;
+                ctx_first.flagSparseGRM_cur = pe.flagSparseGRM_cur;
+                ctx_first.isnoadjCov_cur = pe.isnoadjCov_cur;
+                ctx_first.varRatioVal = pe.varRatioVal;
+                bool is_region = false;
+                if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
+                    Unified_getMarkerPval(
+                        t_GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
+                        Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
+                        pe.altFreq, isSPAConverge, gtildeVec, is_gtilde,
+                        is_region, t_P2Vec, isCondition,
+                        Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                        Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                        is_Firth, is_FirthConverge, true,
+                        ctx_first.isnoadjCov_cur, ctx_first.flagSparseGRM_cur,
+                        ctx_first);
+                } else {
+                    Unified_getMarkerPval(
+                        t_GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
+                        Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
+                        pe.altFreq, isSPAConverge, gtildeVec, is_gtilde,
+                        is_region, t_P2Vec, isCondition,
+                        Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                        Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                        is_Firth, is_FirthConverge, false,
+                        ctx_first.isnoadjCov_cur, ctx_first.flagSparseGRM_cur,
+                        ctx_first);
+                }
+                double pval_num;
+                try { pval_num = std::stod(pval); }
+                catch (...) { pval_num = 0; }
+                if ((t_traitType == "binary" && MAC > g_MACCutoffforER) ||
+                    t_traitType != "binary") {
+                    if (ptr_gSAIGEobj->m_isFastTest &&
+                        pval_num < (ptr_gSAIGEobj->m_pval_cutoff_for_fastTest)) {
+                        SAIGE::PerMarkerCtx ctx_fast;
+                        ctx_fast.flagSparseGRM_cur =
+                            (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                                ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                        ctx_fast.isnoadjCov_cur = false;
+                        bool dummyHas;
+                        if (!isSingleVarianceRatio) {
+                            ctx_fast.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                                MAC, ctx_fast.flagSparseGRM_cur,
+                                ctx_fast.isnoadjCov_cur, dummyHas);
+                        } else {
+                            ctx_fast.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                                ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
+                        }
+                        Unified_getMarkerPval(
+                            t_GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
+                            Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
+                            pe.altFreq, isSPAConverge, gtildeVec, is_gtilde,
+                            false, t_P2Vec, isCondition,
+                            Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                            Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                            is_Firth, is_FirthConverge, false,
+                            ctx_fast.isnoadjCov_cur, ctx_fast.flagSparseGRM_cur,
+                            ctx_fast);
+                    }
+                }
+            }
+            if (t_traitType == "binary" && is_Firth) {
+                #pragma omp atomic
+                mFirth = mFirth + 1;
+                if (is_FirthConverge) {
+                    #pragma omp atomic
+                    mFirthConverge = mFirthConverge + 1;
+                }
+            }
+            BetaVec.at(i) = Beta * (1 - 2 * flip);
+            seBetaVec.at(i) = seBeta;
+            pvalVec.at(i) = pval;
+            pvalNAVec.at(i) = pval_noSPA;
+            TstatVec.at(i) = Tstat * (1 - 2 * flip);
+            varTVec.at(i) = varT;
+            if (isCondition) {
+                Beta_cVec.at(i) = Beta_c * (1 - 2 * flip);
+                seBeta_cVec.at(i) = seBeta_c;
+                pval_cVec.at(i) = pval_c;
+                pvalNA_cVec.at(i) = pval_noSPA_c;
+                Tstat_cVec.at(i) = Tstat_c * (1 - 2 * flip);
+                varT_cVec.at(i) = varT_c;
+            }
+            if (t_traitType == "binary" || t_traitType == "survival") {
+                arma::vec dosage_case = t_GVec.elem(ptr_gSAIGEobj->m_case_indices);
+                arma::vec dosage_ctrl = t_GVec.elem(ptr_gSAIGEobj->m_ctrl_indices);
+                double AF_case = arma::mean(dosage_case) / 2;
+                double AF_ctrl = arma::mean(dosage_ctrl) / 2;
+                uint32_t N_case = dosage_case.n_elem;
+                uint32_t N_ctrl = dosage_ctrl.n_elem;
+                if (flip) { AF_case = 1 - AF_case; AF_ctrl = 1 - AF_ctrl; }
+                isSPAConvergeVec.at(i) = isSPAConverge;
+                AF_caseVec.at(i) = AF_case;
+                AF_ctrlVec.at(i) = AF_ctrl;
+                N_caseVec.at(i) = N_case;
+                N_ctrlVec.at(i) = N_ctrl;
+                if (t_isMoreOutput) {
+                    arma::uvec N_case_ctrl_het_hom0;
+                    N_case_ctrl_het_hom0 = arma::find(dosage_case <= 2 && dosage_case >= 1.5);
+                    N_case_homVec.at(i) = N_case_ctrl_het_hom0.n_elem;
+                    N_case_ctrl_het_hom0 = arma::find(dosage_case < 1.5 && dosage_case >= 0.5);
+                    N_case_hetVec.at(i) = N_case_ctrl_het_hom0.n_elem;
+                    N_case_ctrl_het_hom0 = arma::find(dosage_ctrl <= 2 && dosage_ctrl >= 1.5);
+                    N_ctrl_homVec.at(i) = N_case_ctrl_het_hom0.n_elem;
+                    N_case_ctrl_het_hom0 = arma::find(dosage_ctrl < 1.5 && dosage_ctrl >= 0.5);
+                    N_ctrl_hetVec.at(i) = N_case_ctrl_het_hom0.n_elem;
+                    if (flip) {
+                        N_case_homVec.at(i) = N_case - N_case_hetVec.at(i) - N_case_homVec.at(i);
+                        N_ctrl_homVec.at(i) = N_ctrl - N_ctrl_hetVec.at(i) - N_ctrl_homVec.at(i);
+                    }
+                }
+            } else if (t_traitType == "quantitative") {
+                N_Vec.at(i) = n;
+            }
+            continue;  // skip the rest of the per-marker scalar path
+        }
 
         bool isReadMarker;
         if (t_genoType == "bgen") {
@@ -2987,6 +3440,10 @@ int main(int argc, char* argv[])
         // Only used when genoType=="bgen" in single-variant mode.
         int bgenDecoders = config["bgenDecoders"] ? config["bgenDecoders"].as<int>() : 4;
         g_bgenDecoders = bgenDecoders;
+        // Phase C: blockSize (default 256; set to 1 for per-marker fallback).
+        int blockSize = config["blockSize"] ? config["blockSize"].as<int>() : 256;
+        if (blockSize < 1) blockSize = 1;
+        g_blockSize = blockSize;
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
@@ -3144,6 +3601,7 @@ int main(int argc, char* argv[])
         std::cout << "  weights_beta:      [" << weights_beta(0) << ", " << weights_beta(1) << "]" << std::endl;
         std::cout << "  marker_chunksize:  " << marker_chunksize << std::endl;
         std::cout << "  nThreads:          " << g_nThreads << std::endl;
+        std::cout << "  blockSize:         " << g_blockSize << std::endl;
         if (isRegionTest) {
             std::cout << std::endl;
             std::cout << "  --- Region testing ---" << std::endl;

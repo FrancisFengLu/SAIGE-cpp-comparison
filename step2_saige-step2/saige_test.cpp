@@ -445,6 +445,185 @@ void SAIGEClass::scoreTestFast_noadjCov(arma::vec & t_GVec,
 
 
 
+// ============================================================
+// Phase C: matrix-level first pass via single BLAS-3 GEMM block.
+// For a block of B markers (G is N x B dense), compute Tstat / var1 / var2
+// using the same math as scoreTestFast (covar-adjusted, non-sparse GRM)
+// but vectorized over columns.
+//
+// Math (per column j):
+//   tildeG_j = G_j - X * (X^TWX)^{-1} X^TW * G_j
+//   S_j = tildeG_j^T (y - mu) / tau_0
+//   var2_j = tildeG_j^T W tildeG_j   (binary/survival)
+//          = tildeG_j^T tildeG_j     (quantitative, with tau_0 scale on X-part)
+//   var1_j = var2_j * varRatio_j
+// Vectorized:
+//   Z = (X^TW) * G          [p x B]
+//   B_X = X * (X^TWX)^{-1} * Z  -- but we use the cached identity
+//                                  m_XXVX_inv * (X^TW) = X (X^TWX)^{-1} X^TW
+//                                  expressed via Z and m_XVX_inv
+//   In scoreTestFast the math uses:
+//     Z = m_XVX_inv_XV.rows(idx).t() * g1  (= (X^TWX)^{-1} X^TW g restricted)
+//     B = X * Z = m_XXVX_inv.rows(idx) * Z (= X (X^TWX)^{-1} X^TW g restricted)
+//   Here for dense block over all N samples (no idx restriction since G is full
+//   length, dense, with zeros explicit), we compute:
+//     Z = m_XV * G            [p x B]  // X^TW * G
+//     tildeG = G - m_XXVX_inv * (m_XVX_inv * Z)  -- BUT m_XXVX_inv already
+//   absorbs (X^TWX)^{-1}: m_XXVX_inv == X * (X^TWX)^{-1}. And X^TW is m_XV.
+//   So tildeG = G - m_XXVX_inv * (m_XV * G) -- one GEMM for Z, one for subtract.
+//   This is exactly getadjG done for all columns at once.
+//
+// For var2 in binary/survival, we use the column-by-column formula
+//   var2_j = Z_j^T * m_XVX * Z_j - sum_i mu2_i * B_{ij}^2 + sum_i mu2_i * tildeG_{ij}^2
+// where B = m_XXVX_inv * Z (without the X subtraction, just the projected part).
+// This matches scoreTestFast (which uses g1, X1, A1 restricted to nonzero idx,
+// but algebraically is equivalent when G is full-length dense and we account
+// for zero rows correctly).
+//
+// For quantitative:
+//   var2_j = Z_j^T * m_XVX * Z_j * tau_0 + G_j^T G_j - 2 * G_j^T B_j
+// (matches the scalar formula with g1 = G_j, dot products over full N since
+// zero rows contribute 0).
+//
+// S (Tstat) for all columns:
+//   S_j = tildeG_j^T m_res / tau_0
+//        = ( G_j^T m_res - Z_j^T (X^T m_res) ) / tau_0
+// We use the equivalent:
+//   S_j = G_j^T m_res / tau_0 - Z_j^T * m_S_a
+// Note scoreTestFast uses: S = S1 + S2; S1 = dot(res1, g1_tilde); the
+// algebraic equivalent on full N is dot(m_res, tildeG_j) = dot(m_res, G_j) -
+// dot(m_res, B_j) where B_j = m_XXVX_inv * Z_j. Then divide by tauvec[0].
+void SAIGEClass::scoreTestFast_block(const arma::mat& G,
+                                      const arma::vec& varRatioVec,
+                                      const std::vector<bool>& validMask,
+                                      arma::vec& Beta,
+                                      arma::vec& seBeta,
+                                      arma::vec& Tstat,
+                                      arma::vec& var1,
+                                      arma::vec& var2,
+                                      arma::vec& StdStat,
+                                      arma::vec& pvalNoadj,
+                                      std::vector<bool>& pvalIsLog,
+                                      std::vector<std::string>& pvalStr) const {
+    const unsigned int B = G.n_cols;
+    const double tau0 = m_tauvec[0];
+
+    // Matrix layout notes (from null_model_engine score builder):
+    //   m_X           : N x p   = covariate design
+    //   m_XV          : p x N   = X^TW
+    //   m_XXVX_inv    : N x p   = X (X^TWX)^{-1}
+    //   m_XVX_inv_XV  : N x p   = X (X^TWX)^{-1} per row scaled by V
+    //   m_XVX         : p x p   = X^TWX
+    //
+    // Per scalar scoreTestFast (over idx of nonzero g rows):
+    //   Z   = m_XVX_inv_XV.rows(idx).t() * g1   = (X^TWX)^{-1} X^TW g   (p-vec)
+    //   B   = X1 * Z                            = X * Z   restricted to idx
+    //         (Z already absorbed the (X^TWX)^{-1} factor, so the projection
+    //         from latent space back to data space is plain X * Z, NOT
+    //         m_XXVX_inv * Z which would re-apply (X^TWX)^{-1}.)
+    // Block analogue:
+    //   Z   = m_XVX_inv_XV.t() * G                                      [p x B]
+    //   BX  = m_X * Z                                                   [N x B]
+    // Since G has explicit zeros for the "zero" rows (post-impute), the full-N
+    // dot products coincide with the |idx|-restricted ones.
+    arma::mat Z = m_XVX_inv_XV.t() * G;          // p x B
+    arma::mat BX = m_X * Z;                       // N x B
+    // tildeG only needed for var2 computation (column-wise squared sums).
+    // tildeG = G - BX
+    // We avoid materializing tildeG separately by computing the column squared
+    // sums directly: but for clarity and simplicity allocate once.
+    arma::mat tildeG = G - BX;                    // N x B
+
+    // ---- S = (G^T m_res - Z^T X^T m_res) / tau0 -----------------------------
+    // Use S = tildeG^T m_res / tau0   (matches scalar exactly)
+    arma::vec S_vec = (tildeG.t() * m_res) / tau0;        // length B
+
+    // ---- var2 ---------------------------------------------------------------
+    arma::vec var2_vec(B, arma::fill::zeros);
+    if (m_traitType == "binary" || m_traitType == "survival") {
+        // var2_j = Z_j^T * m_XVX * Z_j  - sum_i mu2_i * B_{ij}^2  + sum_i mu2_i * tildeG_{ij}^2
+        // ZtXVXZ diag: diag(Z^T m_XVX Z) -- compute via (m_XVX * Z) elem mul Z.
+        arma::mat XVXZ = m_XVX * Z;                          // p x B
+        arma::vec ZtXVXZ_diag = arma::sum(Z % XVXZ, 0).t();  // length B
+        // Bmu2_j = sum_i mu2_i * B_{ij}^2
+        arma::vec Bmu2 = (arma::square(BX).t()) * m_mu2;     // length B
+        arma::vec g1tildemu2 = (arma::square(tildeG).t()) * m_mu2;
+        var2_vec = ZtXVXZ_diag - Bmu2 + g1tildemu2;
+    } else if (m_traitType == "quantitative") {
+        // var2_j = ZtXVXZ_diag * tau0 + G_j^T G_j - 2 * G_j^T B_j
+        arma::mat XVXZ = m_XVX * Z;
+        arma::vec ZtXVXZ_diag = arma::sum(Z % XVXZ, 0).t();
+        arma::vec GtG = arma::sum(arma::square(G), 0).t();
+        arma::vec GtB = arma::sum(G % BX, 0).t();
+        var2_vec = ZtXVXZ_diag * tau0 + GtG - 2.0 * GtB;
+    }
+
+    // ---- per-column finalize (cheap scalar work) ----------------------------
+    Beta.set_size(B);
+    seBeta.set_size(B);
+    Tstat.set_size(B);
+    var1.set_size(B);
+    var2.set_size(B);
+    StdStat.set_size(B);
+    pvalNoadj.set_size(B);
+    if (pvalIsLog.size() != B) pvalIsLog.assign(B, false);
+    if (pvalStr.size() != B) pvalStr.assign(B, std::string());
+
+    for (unsigned int j = 0; j < B; j++) {
+        if (!validMask[j]) {
+            Beta[j] = arma::datum::nan;
+            seBeta[j] = arma::datum::nan;
+            Tstat[j] = arma::datum::nan;
+            var1[j] = arma::datum::nan;
+            var2[j] = arma::datum::nan;
+            StdStat[j] = arma::datum::nan;
+            pvalNoadj[j] = 1.0;
+            pvalIsLog[j] = false;
+            pvalStr[j].clear();
+            continue;
+        }
+        double S = S_vec[j];
+        double v2 = var2_vec[j];
+        double v1 = v2 * varRatioVec[j];
+        double stat = S * S / v1;
+        double pval;
+        bool islogp = false;
+        if (v1 <= std::numeric_limits<double>::min()) {
+            pval = 1.0;
+        } else if (!std::isnan(stat) && std::isfinite(stat)) {
+            boost::math::chi_squared chisq_dist(1);
+            pval = boost::math::cdf(complement(chisq_dist, stat));
+        } else {
+            pval = 1.0;
+            stat = 0.0;
+        }
+        char pValueBuf[100];
+        if (pval != 0) {
+            sprintf(pValueBuf, "%.6E", pval);
+            islogp = false;
+        } else {
+            double logp = log_chisq1_uppertail(stat);
+            double log10p = logp / std::log(10);
+            int exponent = (int)std::floor(log10p);
+            double fraction = std::pow(10.0, log10p - exponent);
+            if (fraction >= 9.95) { fraction = 1; exponent++; }
+            sprintf(pValueBuf, "%.1fE%d", fraction, exponent);
+            pval = logp;
+            islogp = true;
+        }
+        Beta[j] = S / v1;
+        seBeta[j] = std::fabs(Beta[j]) / std::sqrt(std::fabs(stat));
+        Tstat[j] = S;
+        var1[j] = v1;
+        var2[j] = v2;
+        StdStat[j] = std::fabs(S) / std::sqrt(v1);
+        pvalNoadj[j] = pval;
+        pvalIsLog[j] = islogp;
+        pvalStr[j] = std::string(pValueBuf);
+    }
+}
+
+
 void SAIGEClass::getadjG(arma::vec & t_GVec, arma::vec & g){
    g = m_XV * t_GVec;
     g = t_GVec - m_XXVX_inv * g;
