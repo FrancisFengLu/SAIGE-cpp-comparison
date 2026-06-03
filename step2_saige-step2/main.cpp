@@ -102,8 +102,18 @@ int g_bgenDecoders = 4;
 // mainMarkerInCPP. blockSize=1 falls back to the original per-marker path
 // (bit-identical). blockSize>1 reads B markers, computes Tstat/var1 via one
 // GEMM, and uses the block results for markers that don't need SPA/ER/Firth
-// recompute. Set via YAML key `blockSize` (default 256).
-int g_blockSize = 256;
+// recompute. Set via YAML key `blockSize` (default 1).
+//
+// KNOWN ISSUE (post-mortem): blockSize > 1 has a serial-I/O bottleneck in the
+// prefetch loop — the prefetch reads markers via the pre-thread_local
+// PLINK/PGEN reader API, which serializes all I/O. As a result, blockSize > 1
+// is currently SLOWER than blockSize = 1 in both single-thread (~2.2x
+// regression) and multi-thread (~3.6x regression) on HAPNEST N=200k.
+// Default is blockSize = 1 (per-marker dispatch path with thread_local readers
+// from Phase B/D), which achieves ~5x speedup at 8 threads.
+// Do NOT set blockSize > 1 until Phase C prefetch is rewritten to use the
+// thread-safe getOneMarker_ts reader.
+int g_blockSize = 1;
 
 std::string g_method_to_CollapseUltraRare;
 double g_DosageCutoff_for_UltraRarePresence;
@@ -3467,8 +3477,11 @@ int main(int argc, char* argv[])
         // Only used when genoType=="bgen" in single-variant mode.
         int bgenDecoders = config["bgenDecoders"] ? config["bgenDecoders"].as<int>() : 4;
         g_bgenDecoders = bgenDecoders;
-        // Phase C: blockSize (default 256; set to 1 for per-marker fallback).
-        int blockSize = config["blockSize"] ? config["blockSize"].as<int>() : 256;
+        // Phase C: blockSize (default 1; per-marker dispatch path with
+        // thread_local readers — the working multi-threaded path).
+        // blockSize > 1 enables matrix-level prefetch via legacy reader and is
+        // currently SLOWER (serial-I/O bottleneck — see g_blockSize comment).
+        int blockSize = config["blockSize"] ? config["blockSize"].as<int>() : 1;
         if (blockSize < 1) blockSize = 1;
         g_blockSize = blockSize;
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;

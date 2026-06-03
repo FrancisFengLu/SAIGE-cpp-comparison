@@ -745,5 +745,52 @@ output volume). Report the speedup curve and the
 <code class="inline">[TIMING]</code> phase breakdown from
 <code class="inline">main.cpp</code> instrumentation.</p>
 
+<h2>9. Known issue (post-mortem): Phase C <code class="inline">blockSize &gt; 1</code> is broken</h2>
+
+<p>Phase C's matrix-level first pass
+(<code class="inline">blockSize &gt; 1</code> in
+<code class="inline">main.cpp</code>) has a <strong>serial I/O
+bottleneck</strong> in its prefetch loop &mdash; the prefetch reads
+markers sequentially via the pre-<code class="inline">thread_local</code>
+PLINK/PGEN reader API (the legacy reader is shared across threads and
+gated by an internal mutex). As a result, <code class="inline">blockSize
+&gt; 1</code> is currently <strong>slower</strong> than
+<code class="inline">blockSize: 1</code> in both single-threaded and
+multi-threaded modes on HAPNEST N=200k:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Config</th>
+      <th><code class="inline">blockSize=256</code> (old default)</th>
+      <th><code class="inline">blockSize=1</code> (new default)</th>
+      <th>Regression of large blockSize</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>nT=1</td><td>~67s</td><td>~30s</td><td>2.2&times; slower</td></tr>
+    <tr><td>nT=8</td><td>~47s (1.4&times; vs nT=1)</td><td>~5.6s (5.4&times; vs nT=1)</td><td>3.6&times; slower wall, scaling collapse</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Resolution.</strong> Default is now
+<code class="inline">blockSize: 1</code> (tag
+<code class="inline">phase-real-final-shipped</code>), which routes
+through the per-marker dispatch path with
+<code class="inline">thread_local</code> readers (Phase B/D code path)
+and achieves <strong>~5&times; wall speedup at 8 threads</strong> on
+HAPNEST N=200k real-LD synthetic data.</p>
+
+<p><strong>Recommendation.</strong> Users should <strong>not</strong>
+set <code class="inline">blockSize &gt; 1</code> until Phase C prefetch
+is rewritten to use the thread-safe
+<code class="inline">getOneMarker_ts</code> reader. The block-GEMM
+optimization remains a viable future improvement once the prefetch
+serialization is fixed.</p>
+
+<p>See verification artifacts in
+<code class="inline">/tmp/b1-verify/</code> and
+<code class="inline">/tmp/verify-amdahl/</code>.</p>
+
 </body>
 </html>
