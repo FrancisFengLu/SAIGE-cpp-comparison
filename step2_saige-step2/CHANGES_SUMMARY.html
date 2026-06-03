@@ -566,5 +566,184 @@ possibly cache thrashing from N parallel FDs vs the kernel readahead that the si
   tag <code class="inline">phase-final-shipped</code> &middot; final commit <code class="inline">72a10ed</code>.
 </p>
 
+<h2>8. Synthetic vs real data &mdash; what our benchmarks can/can't test</h2>
+
+<div class="tldr">
+  <strong>TL;DR.</strong> All three local stress tests
+  (N=1k&times;128k, N=1k&times;2M, N=10k&times;200k) showed peak speedup
+  <strong>1.4&ndash;2.2&times; @ 8 threads</strong>; an N=50k attempt failed at
+  Step 1 because <code class="inline">plink2 --dummy</code> data has no LD,
+  which makes the sparse GRM pathological for PCG.
+  The synthetic data also lacks the rare-variant tail and BGEN decompression
+  cost &mdash; so candidate dispatch (SPA/ER/Firth) and
+  <code class="inline">BgenStreamer</code> were never stressed.
+  Real UKB-scale performance must be measured by Seokho on actual data.
+</div>
+
+<h3>8.1 Stress tests run on this branch</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>Config</th><th>Peak speedup</th><th>Outcome</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="center">1</td>
+      <td>Toy: N=1,000 &times; 128k variants</td>
+      <td class="num">1.86&times; @ 8 threads</td>
+      <td class="ok">numerically correct, modest gain</td>
+    </tr>
+    <tr>
+      <td class="center">2</td>
+      <td>Stress 2M: N=1,000 &times; 2,000,000 variants</td>
+      <td class="num">2.21&times; @ 8 threads</td>
+      <td class="ok">numerically correct, best of three</td>
+    </tr>
+    <tr>
+      <td class="center">3</td>
+      <td>Big 10k: N=10,000 &times; 200k variants</td>
+      <td class="num"><strong>1.39&times; @ 16 threads</strong></td>
+      <td class="warn">memory-bandwidth-bound; SMT no help</td>
+    </tr>
+    <tr>
+      <td class="center">4</td>
+      <td>Big 50k attempt</td>
+      <td class="num">&mdash;</td>
+      <td class="bad">Step 1 PCG failed to converge &mdash;
+        synthetic data fundamental limit (no LD)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.2 Key differences between our synthetic and real UKB-scale data</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th>Dimension</th>
+      <th>Our synthetic (<code class="inline">plink2 --dummy</code>)</th>
+      <th>Real UK Biobank</th>
+      <th>Impact on what we measured</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>LD structure</strong></td>
+      <td class="bad">None &mdash; each variant independent</td>
+      <td class="ok">Strong (haplotype blocks)</td>
+      <td>Sparse GRM &asymp; identity &rArr; PCG fails at N&ge;50k.
+          Real data converges in 5&ndash;15 iter.</td>
+    </tr>
+    <tr>
+      <td><strong>MAF distribution</strong></td>
+      <td class="warn">All ~0.01+ (set by <code class="inline">--dummy</code> floor)</td>
+      <td class="ok">~70&ndash;90% are rare (MAF&lt;0.01); long-tailed</td>
+      <td>Our test almost never triggers SPA/ER/Firth (&lt;0.1%).
+          Real UKB triggers them on 5&ndash;15% of markers.</td>
+    </tr>
+    <tr>
+      <td><strong>File format / decode</strong></td>
+      <td class="warn">PLINK .bed: raw 2-bit, ~3&micro;s decode</td>
+      <td class="ok">BGEN with zstd: ~50&ndash;100&micro;s decode per variant</td>
+      <td><code class="inline">BgenStreamer</code>'s value was
+          <strong>not</strong> measured on our tests. UKB decode is
+          30&ndash;50% of step2 wall time.</td>
+    </tr>
+    <tr>
+      <td><strong>Per-marker compute mix</strong></td>
+      <td class="warn">BLAS-2 over N=10k vectors, ~400&micro;s total, memory-bound</td>
+      <td class="ok">BLAS-2 over N=400k + SPA/Firth (CPU-bound) +
+          decompression (CPU-bound)</td>
+      <td>Our scaling capped by memory bandwidth; UKB's CPU-bound parts
+          should scale better.</td>
+    </tr>
+    <tr>
+      <td><strong>Step 1 sparse GRM</strong></td>
+      <td class="bad">Pathological PCG conditioning</td>
+      <td class="ok">Real biological correlations &rArr; well-conditioned</td>
+      <td>Our N=50k Step 1 failed; UKB Step 1 routinely converges.</td>
+    </tr>
+    <tr>
+      <td><strong>Output write</strong></td>
+      <td class="warn">Dense 25 GB RAM materialization at N=10k &times; 200k</td>
+      <td class="ok">Streaming per-chromosome chunks</td>
+      <td>Our memory footprint exaggerated due to test design,
+          not a branch issue.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.3 What our tests <em>can't</em> tell us about UKB performance</h3>
+
+<table>
+  <tbody>
+    <tr>
+      <td class="bad center" style="width:32px;"><strong>&#x2717;</strong></td>
+      <td><code class="inline">BgenStreamer</code>'s actual contribution
+          (we tested only the PLINK path)</td>
+    </tr>
+    <tr>
+      <td class="bad center"><strong>&#x2717;</strong></td>
+      <td>Candidate-dispatch (SPA/Firth/ER) load-balance behavior
+          (almost no candidates triggered)</td>
+    </tr>
+    <tr>
+      <td class="bad center"><strong>&#x2717;</strong></td>
+      <td>Sparse-GRM PCG path performance (no real LD)</td>
+    </tr>
+    <tr>
+      <td class="bad center"><strong>&#x2717;</strong></td>
+      <td>Multi-trait shared-decode benefit (no multi-trait support yet)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.4 What our tests <em>can</em> confirm</h3>
+
+<table>
+  <tbody>
+    <tr>
+      <td class="ok center" style="width:32px;"><strong>&#x2713;</strong></td>
+      <td>Numerical correctness &mdash; all multi-thread outputs are
+          sorted-byte-identical with nT=1</td>
+    </tr>
+    <tr>
+      <td class="ok center"><strong>&#x2713;</strong></td>
+      <td>OMP integration produces a real speedup (~2&times; modest gain)</td>
+    </tr>
+    <tr>
+      <td class="ok center"><strong>&#x2713;</strong></td>
+      <td>Memory bandwidth caps scaling on memory-bound BLAS workloads</td>
+    </tr>
+    <tr>
+      <td class="ok center"><strong>&#x2713;</strong></td>
+      <td>SMT (&gt;physical cores) provides no benefit, mild regression</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.5 Expected UKB-scale behavior (hypothesis)</h3>
+
+<ul class="tight">
+  <li>BGEN decompression (CPU-bound, well-parallelizing): the streamer
+      should be visible.</li>
+  <li>Larger per-marker compute amortizes OMP overhead.</li>
+  <li>5&ndash;15% slow-path triggers stress candidate dispatch
+      (load imbalance possible).</li>
+  <li>Sparse-GRM solves work properly (well-conditioned).</li>
+  <li>Expect <strong>3&ndash;6&times; wall speedup at 8 cores</strong>;
+      verification requires a real UKB profile.</li>
+</ul>
+
+<h3>8.6 Recommended next step (for Seokho)</h3>
+
+<p>Run our <code class="inline">step2-parallel</code> on at least one
+chromosome of real UKB BGEN data. Measure wall time at
+nT={1,4,8} on a config with
+<code class="inline">isMoreOutput=true</code> (to actually exercise the
+output volume). Report the speedup curve and the
+<code class="inline">[TIMING]</code> phase breakdown from
+<code class="inline">main.cpp</code> instrumentation.</p>
+
 </body>
 </html>

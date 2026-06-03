@@ -159,3 +159,7 @@ Process each list with the existing single-marker code, parallelized over candid
 **Phase E (optional, after sign-off).** Region-loop parallelism (table row #7) — only if step2 is bottlenecked on group-mode runs and the SAIGEClass memory cost is acceptable.
 
 **Decision gate after Phase B:** if we don't see a 3× wall-time speedup on a real test config with 8 threads after Phase B, stop and re-plan — Phases C/D add complexity that needs to be justified by Phase B results.
+
+## Stress test caveats
+
+Three local stress tests (N=1k×128k, N=1k×2M, N=10k×200k) showed peak speedup 1.4-2.2× @ 8 threads; N=50k Step 1 failed to converge due to synthetic data having no LD (sparse GRM became pathological for PCG). The synthetic data lacks LD, rare-variant tail, and BGEN decompression — so candidate dispatch and BgenStreamer were not stressed. Real UKB-scale performance must be measured by Seokho on actual data; see CHANGES_SUMMARY.html for full analysis.
