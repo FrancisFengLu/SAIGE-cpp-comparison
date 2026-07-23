@@ -1,0 +1,929 @@
+// Standalone port of SAIGE/src/PLINK.hpp, SAIGE/src/VCF.hpp, and SAIGE/src/BGEN.hpp
+// PLINK + VCF + BGEN genotype readers -- all Rcpp dependencies removed
+// Ported from: /SAIGE/src/PLINK.hpp, /SAIGE/src/PLINK.cpp,
+//              /SAIGE/src/VCF.hpp, /SAIGE/src/VCF.cpp,
+//              /SAIGE/src/BGEN.hpp, /SAIGE/src/BGEN.cpp
+
+#ifndef GENOTYPE_READER_HPP
+#define GENOTYPE_READER_HPP
+
+#include <armadillo>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cstdint>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <map>
+#include <queue>
+
+// Forward-declare htslib types to avoid including htslib headers in the header
+struct htsFile;
+struct bcf_hdr_t;
+struct bcf1_t;
+
+namespace PLINK {
+
+class PlinkClass {
+private:
+
+    // added on 03/14/2021
+    std::string m_AlleleOrder;  // "alt-first" or "ref-first"
+
+    // information from bim file
+    uint32_t m_M0, m_M;  // total markers, markers in analysis
+    std::vector<std::string> m_chr;               // Chromosome code
+    std::vector<std::string> m_MarkerInPlink;     // Variant identifier
+    std::vector<float> m_gd;                      // Position in morgans or centimorgans
+    std::vector<uint32_t> m_pd;                   // Base-pair coordinate (1-based)
+    std::vector<std::string> m_alt;               // Allele 1 (clear bits in .bed; usually minor)
+    std::vector<std::string> m_ref;               // Allele 2 (set bits in .bed; usually major)
+
+    // information from fam file
+    std::vector<std::string> m_SampleInPlink;
+    uint32_t m_N0, m_N;
+    unsigned long long int m_numBytesofEachMarker0, m_numBytesofEachMarker;
+
+    // input file stream of .bed file
+    FILE* m_fin;
+
+    // PLINK files
+    std::string m_bimFile, m_famFile, m_bedFile;
+    std::vector<uint32_t> m_posSampleInPlink;
+
+    // https://www.cog-genomics.org/plink/1.9/formats#bed
+    // PLINK format
+    // The two-bit genotype codes have the following meanings:
+    // 00  Homozygous for first allele in .bim file
+    // 01  Missing genotype
+    // 10  Heterozygous
+    // 11  Homozygous for second allele in .bim file
+    static const unsigned char HOM_REF = 0x3;   // 0b11
+    static const unsigned char HET = 0x2;       // 0b10
+    static const unsigned char HOM_ALT = 0x0;   // 0b00
+    static const unsigned char MISSING = 0x1;   // 0b01
+
+    // Genotype mapping vectors
+    std::vector<int8_t> m_genoMaps_alt_first = {2, -1, 1, 0};
+    std::vector<int8_t> m_genoMaps_ref_first = {0, -1, 1, 2};
+
+    // pipeline: OneMarkerG4 --> bufferG4 --> bufferG1 --> OneMarkerG1
+    std::vector<unsigned char> m_OneMarkerG4;
+
+    void readBimFile();
+    void readFamFile();
+
+    // extract geno (0,1,2,3) at specific pos (0,1,2,3) of address c (1 byte)
+    inline void getGenotype(const unsigned char c, const uint32_t pos, size_t& geno) {
+        geno = (c >> (pos << 1)) & 0x3;  // 0b11 = 0x3
+    }
+
+public:
+
+    PlinkClass(std::string t_bimFile,
+               std::string t_famFile,
+               std::string t_bedFile,
+               std::string t_AlleleOrder);
+
+    // setup PlinkClass
+    void setPlinkobj(std::string t_bimFile,
+                     std::string t_famFile,
+                     std::string t_bedFile);
+
+    void setPosSampleInPlink(std::vector<std::string>& t_SampleInModel);
+
+    void getOneMarker(uint64_t& t_gIndex_prev,
+                      uint64_t& t_gIndex,
+                      std::string& t_ref,
+                      std::string& t_alt,
+                      std::string& t_marker,
+                      uint32_t& t_pd,
+                      std::string& t_chr,
+                      double& t_altFreq,
+                      double& t_altCounts,
+                      double& t_missingRate,
+                      double& t_imputeInfo,
+                      bool& t_isOutputIndexForMissing,
+                      std::vector<uint>& t_indexForMissing,
+                      bool& t_isOnlyOutputNonZero,
+                      std::vector<uint>& t_indexForNonZero,
+                      bool& t_isTrueGenotype,
+                      arma::vec& OneMarkerG1);
+
+    // Thread-safe variant of getOneMarker.
+    // Uses thread_local FILE* and scratch buffer so concurrent OMP threads
+    // don't contend on m_fin / m_OneMarkerG4. Each thread opens its own fd
+    // to the same .bed file on first call; fd is leaked at thread exit
+    // (cleaned up at process exit, which is fine for SAIGE step 2's lifecycle).
+    // Always performs absolute SEEK_SET (no sequential CUR seek) — caller
+    // does not need to track gIndex_prev.
+    void getOneMarker_ts(uint64_t t_gIndex,
+                         std::string& t_ref,
+                         std::string& t_alt,
+                         std::string& t_marker,
+                         uint32_t& t_pd,
+                         std::string& t_chr,
+                         double& t_altFreq,
+                         double& t_altCounts,
+                         double& t_missingRate,
+                         double& t_imputeInfo,
+                         bool t_isOutputIndexForMissing,
+                         std::vector<uint>& t_indexForMissing,
+                         bool t_isOnlyOutputNonZero,
+                         std::vector<uint>& t_indexForNonZero,
+                         bool t_isTrueGenotype,
+                         arma::vec& OneMarkerG1);
+
+    // B2 (Pillar 3 dense-write elimination): decode a marker directly into the
+    // post-imputeGenoAndFlip *carrier* (nonzero) representation WITHOUT
+    // materializing the dense N-vector. Two passes over the L2-resident packed
+    // buffer. Faithfully reproduces read + imputeGenoAndFlip for the single-
+    // variant fused path (alt-first hard-calls; impute mean/bestguess/none).
+    // Returns false on short read / EOF.
+    struct CarrierMarker {
+        std::string ref, alt, marker, chr;
+        uint32_t pd = 0;
+        double altFreq = 0, altCount = 0, missingRate = 0, imputeInfo = 1;
+        double MAC = 0;              // post-impute QC MAC = min(altCount,2N-altCount)
+        bool   flip = false;
+        std::vector<uint>   idx;     // carrier (nonzero) sample indices, ascending
+        std::vector<double> val;     // carrier values (post impute/flip/clean)
+        uint32_t nMissing = 0;
+    };
+    bool getOneMarker_carriers_ts(uint64_t t_gIndex,
+                                  double t_dosage_zerod_cutoff,
+                                  double t_dosage_zerod_MAC_cutoff,
+                                  int t_impute_case,   // 1=bestguess 2=mean 3=none
+                                  CarrierMarker& out);
+
+    // Convenience overload: simplified getOneMarker (like SAIGE PLINK.hpp inline overloads)
+    void getOneMarker(uint64_t t_gIndex_prev,
+                      uint64_t t_gIndex,
+                      double& t_altFreq,
+                      double& t_missingRate,
+                      std::string& t_chr,
+                      arma::vec& OneMarkerG1)
+    {
+        std::string ref, alt, marker;
+        uint32_t pd;
+        double altCounts, imputeInfo;
+        std::vector<uint> indexForMissing, indexForNonZero;
+        bool isOutputIndexForMissing = false;
+        bool isOnlyOutputNonZero = false;
+        bool isTrueGenotype = false;
+        getOneMarker(t_gIndex_prev, t_gIndex, ref, alt, marker, pd, t_chr,
+                     t_altFreq, altCounts, t_missingRate, imputeInfo,
+                     isOutputIndexForMissing, indexForMissing,
+                     isOnlyOutputNonZero, indexForNonZero,
+                     isTrueGenotype, OneMarkerG1);
+    }
+
+    // Convenience overload: with indexForMissing output
+    void getOneMarker(uint64_t t_gIndex_prev,
+                      uint64_t t_gIndex,
+                      double& t_altFreq,
+                      double& t_missingRate,
+                      std::vector<uint>& t_indexForMissing,
+                      arma::vec& OneMarkerG1)
+    {
+        std::string ref, alt, marker, chr;
+        uint32_t pd;
+        double altCounts, imputeInfo;
+        std::vector<uint> indexForNonZero;
+        bool isOutputIndexForMissing = false;
+        bool isOnlyOutputNonZero = false;
+        bool isTrueGenotype = true;
+        getOneMarker(t_gIndex_prev, t_gIndex, ref, alt, marker, pd, chr,
+                     t_altFreq, altCounts, t_missingRate, imputeInfo,
+                     isOutputIndexForMissing, t_indexForMissing,
+                     isOnlyOutputNonZero, indexForNonZero,
+                     isTrueGenotype, OneMarkerG1);
+    }
+
+    uint32_t getN0() { return m_N0; }
+    uint32_t getN() { return m_N; }
+    uint32_t getM0() { return m_M0; }
+    uint32_t getM() { return m_M; }
+    uint32_t getnumBytesofEachMarker0() { return m_numBytesofEachMarker0; }
+    uint32_t getnumBytesofEachMarker() { return m_numBytesofEachMarker; }
+
+    std::vector<std::string> getChrVec() { return m_chr; }
+
+    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to marker index
+    // Used by group file parser to look up variant genotype indices
+    std::unordered_map<std::string, uint32_t> getMarkerIDToIndex() {
+        std::unordered_map<std::string, uint32_t> idMap;
+        for (uint32_t i = 0; i < m_M0; i++) {
+            // Primary key: chr:pos:ref:alt
+            std::string id1 = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":"
+                             + m_ref[i] + ":" + m_alt[i];
+            idMap[id1] = i;
+            // Secondary key: chr:pos:alt:ref (reversed allele order)
+            std::string id2 = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":"
+                             + m_alt[i] + ":" + m_ref[i];
+            if (idMap.find(id2) == idMap.end()) {
+                idMap[id2] = i;
+            }
+        }
+        return idMap;
+    }
+
+    // Build a map from rsID (column 2 of .bim, m_MarkerInPlink) to marker index
+    // Used by conditional analysis to look up conditioning markers by name
+    std::unordered_map<std::string, uint32_t> getMarkerNameToIndex() {
+        std::unordered_map<std::string, uint32_t> nameMap;
+        for (uint32_t i = 0; i < m_M0; i++) {
+            nameMap[m_MarkerInPlink[i]] = i;
+        }
+        return nameMap;
+    }
+
+    void closegenofile();
+};
+
+} // namespace PLINK
+
+
+// ============================================================
+// VCF namespace: VCF/BCF/VCF.GZ reader using htslib
+// Ported from SAIGE/src/VCF.hpp and VCF.cpp
+// ============================================================
+namespace VCF {
+
+class VcfClass {
+private:
+    // htslib file handles
+    htsFile*   m_htsFile;
+    bcf_hdr_t* m_hdr;
+    bcf1_t*    m_rec;
+
+    // VCF file path
+    std::string m_vcfFileName;
+
+    // Format field to read: "GT", "DS", or "HDS"
+    std::string m_fmtField;
+
+    // Sample information
+    std::vector<std::string> m_SampleInVcf;  // sample IDs from VCF header
+    uint32_t m_N0;  // total samples in VCF
+    uint32_t m_N;   // samples in analysis
+
+    // Mapping from VCF sample index -> model sample index
+    // m_posSampleInModel[vcf_idx] = model_idx, or -1 if not in model
+    std::vector<int32_t> m_posSampleInModel;
+
+    // Marker information (accumulated as markers are read)
+    uint32_t m_M0;          // total markers read so far
+    std::vector<std::string> m_chr;
+    std::vector<uint32_t> m_pd;
+    std::vector<std::string> m_ref;
+    std::vector<std::string> m_alt;
+    std::vector<std::string> m_MarkerInVcf;
+
+    // Pre-scanned marker count (total markers in file)
+    uint32_t m_totalMarkers;
+    bool m_isPreScanned;
+
+    // Internal: read sample IDs from VCF header
+    void getSampleIDlist();
+
+public:
+    VcfClass(const std::string& t_vcfFileName,
+             const std::string& t_vcfField,
+             std::vector<std::string>& t_SampleInModel);
+
+    ~VcfClass();
+
+    // Set up sample position mapping (model samples -> VCF samples)
+    void setPosSampleInVcf(std::vector<std::string>& t_SampleInModel);
+
+    // Read one marker from VCF (sequential read, ignores gIndex for seeking)
+    // Returns false if end of file reached
+    bool getOneMarker(
+        std::string& t_ref,
+        std::string& t_alt,
+        std::string& t_marker,
+        uint32_t& t_pd,
+        std::string& t_chr,
+        double& t_altFreq,
+        double& t_altCounts,
+        double& t_missingRate,
+        double& t_imputeInfo,
+        bool t_isOutputIndexForMissing,
+        std::vector<uint>& t_indexForMissing,
+        bool t_isOnlyOutputNonZero,
+        std::vector<uint>& t_indexForNonZero,
+        arma::vec& dosages,
+        bool t_isImputation);
+
+    uint32_t getN0() { return m_N0; }
+    uint32_t getN()  { return m_N; }
+    uint32_t getM0() { return m_totalMarkers; }
+
+    // Pre-scan VCF to count total markers (needed for index generation)
+    uint32_t prescanMarkerCount();
+
+    // Reset file to beginning for re-reading
+    void resetFile();
+
+    // Build marker ID to index map (chr:pos:ref:alt -> index)
+    // Note: requires a full prescan first
+    std::unordered_map<std::string, uint32_t> getMarkerIDToIndex();
+
+    // Build marker name to index map (ID field -> index)
+    std::unordered_map<std::string, uint32_t> getMarkerNameToIndex();
+
+    std::vector<std::string> getChrVec() { return m_chr; }
+
+    void closegenofile();
+};
+
+} // namespace VCF
+
+
+// ============================================================
+// BGEN namespace: BGEN v1.2 reader (manual binary parsing)
+// Ported from SAIGE/src/BGEN.hpp and BGEN.cpp
+// Supports zstd and zlib decompression
+// ============================================================
+namespace BGEN {
+
+static constexpr uint32_t COMPRESSION_ZLIB = 1;
+static constexpr uint32_t COMPRESSION_ZSTD = 2;
+
+class BgenClass {
+private:
+    // Allele order: "alt-first" or "ref-first"
+    std::string m_AlleleOrder;
+
+    // BGEN file path
+    std::string m_bgenFileName;
+
+    // File handle for binary reading
+    FILE* m_fin;
+
+    // Decompression buffers
+    std::vector<unsigned char> m_buf;
+    std::vector<unsigned char> m_zBuf;
+    uint32_t m_zBufLens;
+    uint32_t m_bufLens;
+    uint32_t CompressedSNPBlocks;  // 1=zlib, 2=zstd
+
+    // Sample mapping: m_posSampleInModel[bgen_idx] = model_idx, or -1 if not in model
+    std::vector<int32_t> m_posSampleInModel;
+
+    // Sample information
+    std::vector<std::string> m_SampleInBgen;
+    uint32_t m_N0;   // total samples in BGEN
+    uint32_t m_N;    // samples in analysis
+    uint32_t m_M0;   // total markers in BGEN header
+
+    // Marker metadata (accumulated during sequential reading for index maps)
+    std::vector<std::string> m_chr;
+    std::vector<uint32_t> m_pd;
+    std::vector<std::string> m_ref;
+    std::vector<std::string> m_alt;
+    std::vector<std::string> m_MarkerInBgen;
+    // Byte offset (file_start_position) of each variant block, parallel to the
+    // metadata vectors. Populated from the .bgi index in populateFromBgi.
+    // getMarkerIDToIndex()/getMarkerNameToIndex() return THIS (the byte offset
+    // that getOneMarker() seeks to), NOT the sequential row index.
+    std::vector<uint64_t> m_byteOffset;
+
+    // Pre-allocated allele buffers (to avoid repeated allocation)
+    std::vector<char> allele0, allele1;
+
+    // Internal: decompress and parse genotype probabilities
+    void Parse2(unsigned char* buf, uint32_t bufLen,
+                const unsigned char* zBuf, uint32_t zBufLen,
+                std::string& snpName,
+                arma::vec& dosages,
+                double& AC, double& AF,
+                std::vector<uint>& indexforMissing,
+                double& info,
+                std::vector<uint>& indexNonZero,
+                bool isImputation);
+
+public:
+    // Read-only accessors used by BgenStreamer (parseBlock is static / runs on
+    // decoder threads, but needs to see the per-file context that was set up at
+    // open time). All of these are immutable after construction.
+    uint32_t getCompressedSNPBlocks() const { return CompressedSNPBlocks; }
+    const std::vector<int32_t>& getPosSampleInModel() const { return m_posSampleInModel; }
+    const std::string& getAlleleOrder() const { return m_AlleleOrder; }
+
+public:
+    BgenClass(const std::string& t_bgenFileName,
+              const std::vector<std::string>& t_SampleInBgen,
+              std::vector<std::string>& t_SampleInModel,
+              const std::string& t_AlleleOrder);
+
+    ~BgenClass();
+
+    // Set up BGEN file: read header, validate
+    void setBgenObj(const std::string& t_bgenFileName,
+                    const std::vector<std::string>& t_SampleInBgen);
+
+    // Pre-populate marker metadata vectors (m_chr/m_pd/m_ref/m_alt/m_MarkerInBgen)
+    // from the BGEN .bgi SQLite index, so getMarkerIDToIndex() and other
+    // by-ID lookups work BEFORE any markers have been streamed. Required for
+    // SAIGE-GENE+ region tests where the group-file marker IDs must be resolved
+    // up-front. Returns the number of variants loaded.
+    uint32_t populateFromBgi(const std::string& t_bgiFileName);
+
+    // Set up sample position mapping
+    void setPosSampleInBgen(std::vector<std::string>& t_SampleInModel);
+
+    // Read one marker from BGEN (sequential read using byte-position seeking)
+    // t_gIndex / t_gIndex_prev are byte positions (for BGEN), not marker indices
+    // Returns false via t_isBoolRead if EOF
+    void getOneMarker(uint64_t& t_gIndex_prev,
+                      uint64_t& t_gIndex,
+                      std::string& t_ref,
+                      std::string& t_alt,
+                      std::string& t_marker,
+                      uint32_t& t_pd,
+                      std::string& t_chr,
+                      double& t_altFreq,
+                      double& t_altCounts,
+                      double& t_missingRate,
+                      double& t_imputeInfo,
+                      bool& t_isOutputIndexForMissing,
+                      std::vector<uint>& t_indexForMissing,
+                      bool& t_isOnlyOutputNonZero,
+                      std::vector<uint>& t_indexForNonZero,
+                      bool& t_isBoolRead,
+                      arma::vec& dosages,
+                      bool t_isImputation);
+
+    // ---- Phase D: streaming pipeline ----
+    // readRawBlock: pure I/O. Seeks to t_byteOffset, reads the variant block
+    // metadata + the compressed payload into `out`. NO decompression, NO decode.
+    // Must be called from a single thread (the streamer's reader thread); the
+    // file handle m_fin is not thread-safe.
+    // Returns false if EOF / nothing read (matching getOneMarker semantics).
+    bool readRawBlock(uint64_t t_markerIndex,
+                      uint64_t t_byteOffset,
+                      struct BgenRawBlock& out);
+
+    // parseBlock: pure decode. Takes a raw block (already on disk -> memory by
+    // readRawBlock), decompresses it with thread-local scratch buffers, and
+    // produces a fully-decoded marker (dosages + summary stats). Static, no
+    // instance state — `ctx` carries the immutable per-file context.
+    struct ParseCtx {
+        uint32_t N0;                                // BGEN sample count
+        uint32_t N;                                 // analysis sample count
+        uint32_t compressedSNPBlocks;               // 1=zlib, 2=zstd
+        const std::vector<int32_t>* posSampleInModel;
+        std::string alleleOrder;                    // "alt-first" or "ref-first"
+        bool isImputation;
+    };
+    static void parseBlock(const ParseCtx& ctx,
+                           const struct BgenRawBlock& in,
+                           struct BgenDecodedMarker& out,
+                           std::vector<unsigned char>& scratchBuf /* per-thread */);
+
+    uint32_t getN0() { return m_N0; }
+    uint32_t getN()  { return m_N; }
+    uint32_t getM0() { return m_M0; }
+
+    // Build marker ID to index map (chr:pos:ref:alt -> marker read order index)
+    // Note: only contains markers that have been read so far
+    std::unordered_map<std::string, uint32_t> getMarkerIDToIndex();
+
+    // Build marker name to index map (RSID -> marker read order index)
+    std::unordered_map<std::string, uint32_t> getMarkerNameToIndex();
+
+    std::vector<std::string> getChrVec() { return m_chr; }
+
+    void closegenofile();
+};
+
+// ============================================================
+// Phase D streaming types: raw block (post-I/O, pre-decode) and decoded marker
+// (post-decode, ready to feed mainMarkerInCPP).
+// ============================================================
+struct BgenRawBlock {
+    uint64_t markerIndex = 0;             // sequential index in caller's loop
+    uint64_t byteOffset  = 0;             // .bgi file_start_position
+    bool     eof         = false;         // true if reader hit EOF before this
+
+    // Variant metadata (already parsed from the fixed-size variant header)
+    std::string snpID;
+    std::string rsID;
+    std::string chr;
+    uint32_t    physpos = 0;
+    std::vector<std::string> alleles;     // [first_allele, second_allele]
+
+    // Compressed payload + sizes
+    uint32_t C = 0;                        // payload length on disk (incl. 4-byte D)
+    uint32_t D = 0;                        // decompressed buffer length
+    std::vector<unsigned char> zBuf;       // compressed bytes (size = C - 4)
+};
+
+struct BgenDecodedMarker {
+    uint64_t markerIndex = 0;
+
+    // Variant metadata
+    std::string snpID;
+    std::string rsID;
+    std::string chr;
+    uint32_t    physpos = 0;
+    std::vector<std::string> alleles;     // [ref, alt] AFTER allele-order swap
+
+    // Decoded payload
+    arma::vec   dosages;
+    double      altFreq      = 0.0;
+    double      altCounts    = 0.0;
+    double      info         = 1.0;
+    double      missingRate  = 0.0;
+    std::vector<uint> indexForMissing;
+    std::vector<uint> indexForNonZero;
+
+    bool        valid        = false;     // false => EOF / read failed
+};
+
+// ============================================================
+// BgenStreamer: 1 I/O thread + N decoder threads + bounded queue,
+// order-preserving via decodedMap[markerIndex].
+//
+// Lifecycle:
+//   BgenStreamer s(bgenObj, nDecoders=4, queueCapacity=64);
+//   while (s.getMarker(i, dm)) { ... use dm ... }
+//   // destructor joins all threads cleanly
+//
+// Threading model:
+//   - reader thread: pops jobs from a sequential marker-index counter, calls
+//     bgen->readRawBlock(), pushes BgenRawBlock to rawQueue. Throttles itself
+//     so m_decoded never exceeds m_decodedCap (backpressure for memory).
+//   - decoder threads (N): pop from rawQueue, call BgenClass::parseBlock with
+//     thread-local scratch, insert into decodedMap[markerIndex]
+//   - consumer threads: getMarker(idx) blocks on cv until decodedMap[idx]
+//     is present (or stream truncated past idx). Each idx must be requested
+//     at most once — caller is the OpenMP parallel for indexing 0..N-1.
+//     After retrieval, the entry is evicted from the map.
+// ============================================================
+class BgenStreamer {
+public:
+    // bgen      - shared BgenClass; readRawBlock is invoked single-threaded
+    // genoIndex - byte offsets (as strings, parsed once) in the order the
+    //             caller wants them
+    // isImputation - passed through to parseBlock
+    // nDecoders - number of decoder threads (default 4)
+    // queueCapacity - bound on in-flight raw blocks (default 64)
+    BgenStreamer(BgenClass* bgen,
+                 const std::vector<std::string>& genoIndex,
+                 bool isImputation,
+                 int nDecoders = 4,
+                 size_t queueCapacity = 64);
+    ~BgenStreamer();
+
+    // Returns true and fills `out` with the marker at `markerIndex`.
+    // Blocks until decodedMap[markerIndex] is ready, or returns false if the
+    // stream truncated before reaching markerIndex (EOF / read failure).
+    // IMPORTANT: each markerIndex must be requested AT MOST ONCE — the entry
+    // is evicted after retrieval. Safe under OpenMP parallel for with
+    // monotonic i = 0..N-1 (each i visited exactly once).
+    bool getMarker(uint64_t markerIndex, BgenDecodedMarker& out);
+
+    BgenStreamer(const BgenStreamer&) = delete;
+    BgenStreamer& operator=(const BgenStreamer&) = delete;
+
+private:
+    void readerLoop();
+    void decoderLoop();
+    bool m_rawQueueIsEmptyHelper() const;
+
+    BgenClass*               m_bgen;
+    std::vector<uint64_t>    m_byteOffsets;
+    BgenClass::ParseCtx      m_ctx;
+    size_t                   m_queueCap;
+    int                      m_nDecoders;
+
+    // Reader -> decoders queue (bounded)
+    std::mutex                  m_rawMtx;
+    std::condition_variable     m_rawNotEmpty;
+    std::condition_variable     m_rawNotFull;
+    std::queue<BgenRawBlock>    m_rawQueue;
+    bool                        m_readerDone = false;
+
+    // Decoders -> consumer map (keyed by markerIndex for order preservation)
+    // Bounded by m_decodedCap to apply memory backpressure on the reader thread
+    // when consumers fall behind.
+    std::mutex                              m_decMtx;
+    std::condition_variable                 m_decReady;     // a marker arrived
+    std::condition_variable                 m_decNotFull;   // map shrank
+    std::map<uint64_t, BgenDecodedMarker>   m_decoded;
+    size_t                                  m_decodedCap = 256;
+    uint64_t                                m_decodersFinishedAt = UINT64_MAX;  // EOF marker
+
+    std::atomic<bool>           m_stop{false};
+    std::thread                 m_readerThread;
+    std::vector<std::thread>    m_decoderThreads;
+};
+
+} // namespace BGEN
+
+
+// ============================================================
+// PGEN namespace: PGEN v2 reader (mode 0x02 basic variant-major)
+// Standalone implementation that reads .pgen + .pvar + .psam files
+// Ported from SAIGE/src/PGEN.hpp and PGEN.cpp without pgenlib dependency
+//
+// Supports mode 0x02 (basic variant-major, hard-calls only):
+//   00 = hom ref, 01 = het, 10 = hom alt, 11 = missing
+// This is the most common output of `plink2 --make-pgen` for hard-call data.
+// For dosage data (mode 0x03/0x04/0x10/0x11), the full pgenlib would be needed.
+// ============================================================
+namespace PGEN {
+
+class PgenClass {
+private:
+    // PGEN file paths
+    std::string m_pgenFile, m_pvarFile, m_psamFile;
+
+    // File handle for .pgen binary
+    FILE* m_fin;
+
+    // PGEN header info
+    uint32_t m_M0;       // total variants in .pgen header
+    uint32_t m_N0;       // total samples in .pgen header
+    uint8_t  m_mode;     // storage mode (must be 0x02 for our reader)
+
+    // Offset to first variant record in .pgen file
+    uint64_t m_dataOffset;
+
+    // Bytes per variant record = ceil(N0 / 4)
+    uint64_t m_bytesPerVariant;
+
+    // Information from .pvar file
+    std::vector<std::string> m_chr;
+    std::vector<std::string> m_variantId;
+    std::vector<uint32_t>    m_position;
+    std::vector<std::string> m_ref;
+    std::vector<std::string> m_alt;
+    uint32_t m_M;   // marker count from pvar (should match m_M0)
+
+    // Information from .psam file
+    std::vector<std::string> m_SampleInPgen;   // IID list
+    uint32_t m_N;   // samples in analysis (after subsetting)
+
+    // Sample mapping: model sample index -> pgen sample index
+    std::vector<uint32_t> m_posSampleInPgen;
+
+    // Raw genotype buffer for one variant
+    std::vector<unsigned char> m_OneMarkerRaw;
+
+    // Internal parsers
+    void readPvarFile();
+    void readPsamFile();
+    void readPgenHeader();
+
+    // Extract 2-bit genotype at sample index from raw buffer
+    inline uint8_t getGenotype(uint32_t sampleIdx) const {
+        uint32_t byteIdx = sampleIdx / 4;
+        uint32_t bitShift = (sampleIdx % 4) * 2;
+        return (m_OneMarkerRaw[byteIdx] >> bitShift) & 0x03;
+    }
+
+public:
+    PgenClass(const std::string& t_pgenFile,
+              const std::string& t_psamFile,
+              const std::string& t_pvarFile,
+              std::vector<std::string>& t_SampleInModel);
+
+    ~PgenClass();
+
+    void setPosSampleInPgen(std::vector<std::string>& t_SampleInModel);
+
+    void getOneMarker(
+        uint64_t& t_gIndex,
+        std::string& t_ref,
+        std::string& t_alt,
+        std::string& t_marker,
+        uint32_t& t_pd,
+        std::string& t_chr,
+        double& t_altFreq,
+        double& t_altCounts,
+        double& t_missingRate,
+        double& t_imputeInfo,
+        bool& t_isOutputIndexForMissing,
+        std::vector<uint>& t_indexForMissing,
+        bool& t_isOnlyOutputNonZero,
+        std::vector<uint>& t_indexForNonZero,
+        arma::vec& OneMarkerG1);
+
+    // Convenience overload: simplified getOneMarker
+    void getOneMarker(uint64_t t_gIndex,
+                      double& t_altFreq,
+                      double& t_missingRate,
+                      std::string& t_chr,
+                      arma::vec& OneMarkerG1)
+    {
+        std::string ref, alt, marker;
+        uint32_t pd;
+        double altCounts, imputeInfo;
+        std::vector<uint> indexForMissing, indexForNonZero;
+        bool isOutputIndexForMissing = false;
+        bool isOnlyOutputNonZero = false;
+        getOneMarker(t_gIndex, ref, alt, marker, pd, t_chr,
+                     t_altFreq, altCounts, t_missingRate, imputeInfo,
+                     isOutputIndexForMissing, indexForMissing,
+                     isOnlyOutputNonZero, indexForNonZero, OneMarkerG1);
+    }
+
+    // Convenience overload: with indexForMissing output
+    void getOneMarker(uint64_t t_gIndex,
+                      double& t_altFreq,
+                      double& t_missingRate,
+                      std::vector<uint>& t_indexForMissing,
+                      arma::vec& OneMarkerG1)
+    {
+        std::string ref, alt, marker, chr;
+        uint32_t pd;
+        double altCounts, imputeInfo;
+        std::vector<uint> indexForNonZero;
+        bool isOutputIndexForMissing = false;
+        bool isOnlyOutputNonZero = false;
+        getOneMarker(t_gIndex, ref, alt, marker, pd, chr,
+                     t_altFreq, altCounts, t_missingRate, imputeInfo,
+                     isOutputIndexForMissing, t_indexForMissing,
+                     isOnlyOutputNonZero, indexForNonZero, OneMarkerG1);
+    }
+
+    // Thread-safe variant of getOneMarker.
+    // Uses thread_local FILE* + scratch buffer; each OMP thread opens its
+    // own fd to the same .pgen file. Always absolute SEEK_SET.
+    void getOneMarker_ts(uint64_t t_gIndex,
+                         std::string& t_ref,
+                         std::string& t_alt,
+                         std::string& t_marker,
+                         uint32_t& t_pd,
+                         std::string& t_chr,
+                         double& t_altFreq,
+                         double& t_altCounts,
+                         double& t_missingRate,
+                         double& t_imputeInfo,
+                         bool t_isOutputIndexForMissing,
+                         std::vector<uint>& t_indexForMissing,
+                         bool t_isOnlyOutputNonZero,
+                         std::vector<uint>& t_indexForNonZero,
+                         arma::vec& OneMarkerG1);
+
+    // Read-only access to per-file context for the _ts variant.
+    const std::string& getPgenFilePath() const { return m_pgenFile; }
+    uint64_t getDataOffset()      const { return m_dataOffset; }
+    uint64_t getBytesPerVariant() const { return m_bytesPerVariant; }
+    const std::vector<uint32_t>& getPosSampleInPgen() const { return m_posSampleInPgen; }
+    const std::string& getChrAt(uint32_t i)       const { return m_chr[i]; }
+    uint32_t           getPosAt(uint32_t i)       const { return m_position[i]; }
+    const std::string& getRefAt(uint32_t i)       const { return m_ref[i]; }
+    const std::string& getAltAt(uint32_t i)       const { return m_alt[i]; }
+    const std::string& getVariantIdAt(uint32_t i) const { return m_variantId[i]; }
+
+    uint32_t getN0() { return m_N0; }
+    uint32_t getN()  { return m_N; }
+    uint32_t getM()  { return m_M; }
+
+    std::vector<std::string> getChrVec() { return m_chr; }
+
+    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to marker index
+    std::unordered_map<std::string, uint32_t> getMarkerIDToIndex() {
+        std::unordered_map<std::string, uint32_t> idMap;
+        for (uint32_t i = 0; i < m_M; i++) {
+            std::string id1 = m_chr[i] + ":" + std::to_string(m_position[i]) + ":"
+                             + m_ref[i] + ":" + m_alt[i];
+            idMap[id1] = i;
+            std::string id2 = m_chr[i] + ":" + std::to_string(m_position[i]) + ":"
+                             + m_alt[i] + ":" + m_ref[i];
+            if (idMap.find(id2) == idMap.end()) {
+                idMap[id2] = i;
+            }
+        }
+        return idMap;
+    }
+
+    // Build a map from variant ID to marker index
+    std::unordered_map<std::string, uint32_t> getMarkerNameToIndex() {
+        std::unordered_map<std::string, uint32_t> nameMap;
+        for (uint32_t i = 0; i < m_M; i++) {
+            nameMap[m_variantId[i]] = i;
+        }
+        return nameMap;
+    }
+
+    void closegenofile();
+};
+
+} // namespace PGEN
+
+
+// Global checkpoint flag for debugging
+extern bool g_writeCheckpoints;
+extern std::string g_checkpointDir;
+
+// Global pointer to PLINK object (mirrors SAIGE's ptr_gPLINKobj in Main.cpp)
+extern PLINK::PlinkClass* ptr_gPLINKobj;
+
+// Global pointer to VCF object (mirrors SAIGE's ptr_gVCFobj in Main.cpp)
+extern VCF::VcfClass* ptr_gVCFobj;
+
+// Global pointer to BGEN object (mirrors SAIGE's ptr_gBGENobj in Main.cpp)
+extern BGEN::BgenClass* ptr_gBGENobj;
+
+// Global pointer to PGEN object (mirrors SAIGE's ptr_gPGENobj in Main.cpp)
+extern PGEN::PgenClass* ptr_gPGENobj;
+
+// Unified dispatcher (like SAIGE Main.cpp)
+// Supports "plink", "vcf", "bgen", and "pgen" types.
+bool Unified_getOneMarker(std::string& t_genoType,
+                          uint64_t& t_gIndex_prev,
+                          uint64_t& t_gIndex,
+                          std::string& t_ref,
+                          std::string& t_alt,
+                          std::string& t_marker,
+                          uint32_t& t_pd,
+                          std::string& t_chr,
+                          double& t_altFreq,
+                          double& t_altCounts,
+                          double& t_missingRate,
+                          double& t_imputeInfo,
+                          bool& t_isOutputIndexForMissing,
+                          std::vector<uint>& t_indexForMissing,
+                          bool& t_isOnlyOutputNonZero,
+                          std::vector<uint>& t_indexForNonZero,
+                          arma::vec& t_GVec,
+                          bool t_isImputation);
+
+// Thread-safe unified dispatcher. For "plink" and "pgen", dispatches to the
+// _ts variants (which use thread_local FILE* + scratch — no shared mutable
+// state, no lock needed). For "vcf" the caller MUST still wrap this in a
+// critical section because htslib bcf_read is streaming and not parallelizable
+// in our current code path. For "bgen", the BgenStreamer is used instead, so
+// this dispatcher should not be called for bgen. Returns true if a marker
+// was read.
+bool Unified_getOneMarker_ts(std::string& t_genoType,
+                             uint64_t t_gIndex,
+                             std::string& t_ref,
+                             std::string& t_alt,
+                             std::string& t_marker,
+                             uint32_t& t_pd,
+                             std::string& t_chr,
+                             double& t_altFreq,
+                             double& t_altCounts,
+                             double& t_missingRate,
+                             double& t_imputeInfo,
+                             bool t_isOutputIndexForMissing,
+                             std::vector<uint>& t_indexForMissing,
+                             bool t_isOnlyOutputNonZero,
+                             std::vector<uint>& t_indexForNonZero,
+                             arma::vec& t_GVec,
+                             bool t_isImputation);
+
+// Helper: set up PLINK object (mirrors SAIGE Main.cpp::setPLINKobjInCPP)
+void setPLINKobjInCPP(std::string t_bimFile,
+                      std::string t_famFile,
+                      std::string t_bedFile,
+                      std::vector<std::string>& t_SampleInModel,
+                      std::string t_AlleleOrder);
+
+// Helper: set up VCF object (mirrors SAIGE Main.cpp::setVCFobjInCPP)
+void setVCFobjInCPP(const std::string& t_vcfFileName,
+                     const std::string& t_vcfField,
+                     std::vector<std::string>& t_SampleInModel);
+
+// Helper: set up BGEN object (mirrors SAIGE Main.cpp::setBGENobjInCPP)
+void setBGENobjInCPP(const std::string& t_bgenFileName,
+                      const std::vector<std::string>& t_SampleInBgen,
+                      std::vector<std::string>& t_SampleInModel,
+                      const std::string& t_AlleleOrder);
+
+// Helper: set up PGEN object (mirrors SAIGE Main.cpp::setPGENobjInCPP)
+void setPGENobjInCPP(const std::string& t_pgenFile,
+                      const std::string& t_psamFile,
+                      const std::string& t_pvarFile,
+                      std::vector<std::string>& t_SampleInModel);
+
+// Helper: get total marker count from genotype file
+uint32_t Unified_getMarkerCount(std::string& t_genoType);
+
+// Helper: get sample size from genotype file
+uint32_t Unified_getSampleSizeinGeno(std::string& t_genoType);
+
+// Helper: get sample size in analysis (after subsetting)
+uint32_t Unified_getSampleSizeinAnalysis(std::string& t_genoType);
+
+// Helper: close genotype file
+void closeGenoFile(std::string& t_genoType);
+
+// Helper: get marker ID to index map (for region testing)
+std::unordered_map<std::string, uint32_t> Unified_getMarkerIDToIndex(std::string& t_genoType);
+
+// C++ version of which(). Note: start from 0, not 1
+std::vector<unsigned int> whichCPP(std::vector<std::string>& strVec,
+                                   std::string strValue);
+
+#endif

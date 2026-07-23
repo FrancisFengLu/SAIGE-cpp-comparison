@@ -1,0 +1,40 @@
+# SAIGE-GENE+ region/gene-based test — config template.
+# See ../../SAIGE_GENE_STATUS.md for the threading & memory tradeoffs.
+# Region tests need a SPARSE-fit / cate-VR null (NOT a single-VR dense null).
+
+# --- null model (from Step-1, sparse-fit for cate-VR) ---
+modelFile:         /path/to/step1_out_dir          # dir with *.arma + nullmodel.json
+varianceRatioFile: /path/to/step1_out.varianceRatio.txt   # cate-VR (rows: ratio null 1 / null_noXadj / sparse)
+
+# --- genotypes (PLINK/PGEN parallelize; BGEN region path is serialized/TBD) ---
+genoType:   plink
+plinkFile:  /path/to/wes_chrN                       # bed/bim/fam prefix
+
+outputFile: /path/to/region_out.txt
+
+# --- QC ---
+minMAF:      0
+minMAC:      0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first                              # WES: alt-first
+
+# --- REGION / GROUP TEST ---
+groupFile:   /path/to/group_file.txt                # gene definitions (marker + anno lines per gene)
+annotationList:                                     # masks to test (';' = union)
+  - "lof"
+  - "missense;lof"
+  - "missense;lof;synonymous"
+maxMAFList:                                          # max-MAF cutoffs (one result set per cutoff)
+  - 0.0001
+  - 0.001
+  - 0.01
+r_corr: 0                                            # 0 = SKAT; SKAT-O sweeps rho internally
+MACCutoff_to_CollapseUltraRare: 10                   # collapse markers with MAC <= this
+
+# --- performance / memory (SEE SAIGE_GENE_STATUS.md §3) ---
+nThreads: 8                                          # one gene per thread; MEMORY SCALES WITH THIS
+markers_per_chunk_in_groupTest: 500                  # per-thread P1/P2 = this x N x 8B x 2; LOWER to cut memory
+groups_per_chunk: 100                                # regions per I/O batch
+
+isFirth: true
+is_output_moreDetails: true

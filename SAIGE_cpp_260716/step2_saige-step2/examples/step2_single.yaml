@@ -1,0 +1,15 @@
+# Single-variant association test — config template.
+# Needs a SINGLE-VR / dense-fit null (NOT a cate-VR sparse null).
+modelFile:         /path/to/step1_out_dir            # dir with *.arma + nullmodel.json
+varianceRatioFile: /path/to/step1_out.varianceRatio.txt   # single VR (one line: "ratio null 1")
+genoType:   plink
+plinkFile:  /path/to/geno_prefix
+outputFile: /path/to/single_out.txt
+minMAF: 0
+minMAC: 0.5                                           # low for ultra-rare; MAC<=MACCutoffforER -> ER exact test
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+isFirth: true                                         # binary only; ignored for quantitative
+MACCutoffforER: 4                                     # binary: MAC<=this uses ER exact test
+nThreads: 16                                          # flat memory; T=16 robust (see benchmark notes)
