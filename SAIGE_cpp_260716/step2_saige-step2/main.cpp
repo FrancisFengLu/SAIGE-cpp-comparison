@@ -4106,7 +4106,7 @@ int main(int argc, char* argv[])
                 minMAF,
                 minMAC,
                 minINFO,
-                max_markers_region,
+                (unsigned int)markers_per_chunk_in_groupTest,
                 outputFile);
 
             // Build marker ID to index map
@@ -4326,7 +4326,10 @@ int main(int argc, char* argv[])
             // ---- 7b. Set region global variables ----
             setRegion_GlobalVarsInCPP(
                 maxMAFList,
-                max_markers_region,
+                // must equal the P1Mat/P2Mat row allocation below: m1 is the
+                // chunk-flush threshold, and P1Mat.row(i1InChunk) is written
+                // up to it. R passes markers_per_chunk_in_groupTest here.
+                (unsigned int)markers_per_chunk_in_groupTest,
                 MACCutoff_to_CollapseUltraRare,
                 min_gourpmac_for_burdenonly);
 
