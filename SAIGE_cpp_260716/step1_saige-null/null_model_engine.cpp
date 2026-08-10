@@ -296,14 +296,6 @@ void register_quant_solver (QuantSolverFn  fn) { g_quant_solver  = fn; }
 // Provide a single entry point that executes LOCO across chromosomes;
 // If you already have a native LOCO function, wrap it and assign here.
 
-using LocoBatchFn = void (*)(const Paths&,
-                             const FitNullConfig&,
-                             const LocoRanges&,
-                             const Design&,
-                             const std::vector<double>& /*theta*/,
-                             const std::vector<double>& /*alpha*/,
-                             const std::vector<double>& /*offset*/);
-
 static LocoBatchFn g_loco_batch = nullptr;
 void register_loco_batch(LocoBatchFn fn) { g_loco_batch = fn; }
 
@@ -662,6 +654,43 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
   log("glmm solver Called") ;
   //
 
+  // --- LOCO batch -----------------------------------------------------------
+  // Runs BEFORE the QR back-transform below, because Get_Coef_LOCO must solve in
+  // the same basis the GLMM was fit in: design_in.X is the QR-transformed X, so
+  // the alpha we seed it with has to be the QR-space alpha (R keeps alpha in the
+  // transformed basis throughout and only calls Covariate_Transform_Back for
+  // reporting; SAIGE_fitGLMM_fast.R:751-755).
+  //
+  // out.loco reports whether LOCO ACTUALLY RAN, not whether it was configured.
+  {
+    const bool loco_requested = cfg_.loco && chr_.enabled && !chr_.start.empty();
+    out.loco        = false;
+    out.lowmem_loco = cfg_.lowmem_loco;
+
+    if (cfg_.loco && !loco_requested) {
+      log("LOCO was requested but chromosome ranges are unavailable "
+          "(<2 autosomes, no BIM, or sparse-GRM fit) — continuing WITHOUT LOCO.");
+    }
+    if (loco_requested && !g_loco_batch) {
+      log("WARNING: LOCO requested but no LOCO batch implementation is registered "
+          "— continuing WITHOUT LOCO.");
+    }
+    if (loco_requested && g_loco_batch) {
+      log("Running LOCO batch");
+      LocoBatchOut lb;
+      const bool ok = g_loco_batch(paths_, cfg_, chr_, design_in,
+                                   out.theta, out.alpha, offset_glmm, out.eta, lb);
+      if (ok && !lb.chroms.empty()) {
+        out.loco         = true;
+        out.loco_chroms  = std::move(lb.chroms);
+        out.loco_obj_noK = std::move(lb.obj_noK);
+      } else {
+        log("LOCO batch did not produce per-chromosome results — "
+            "nullmodel.json will report loco: false.");
+      }
+    }
+  }
+
   // === Back-transform alpha from QR space to original space ===
   if (cfg_.covariate_qr && qrmap.valid && !out.alpha.empty()) {
     std::cout << "[QR] Back-transforming alpha from QR space to original space\n";
@@ -692,14 +721,7 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
   if (out.offset.empty()) {
     out.offset = std::move(offset_glmm);
   }
-  out.loco        = cfg_.loco && chr_.enabled;
-  out.lowmem_loco = cfg_.lowmem_loco;
-
-  // --- LOCO batch (optional) ---
-  if (out.loco && g_loco_batch) {
-    log("Running LOCO batch");
-    g_loco_batch(paths_, cfg_, chr_, design_in, out.theta, out.alpha, out.offset);
-  }
+  // (LOCO ran above, before the QR back-transform.)
 
   // Patch B: restore the full-covariate X before serializing artifacts.
   // The GLMM solver above ran on the collapsed (intercept-only + offset) design,
@@ -713,6 +735,30 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
     design_in.p = design_in.p_full;
     std::cout << "[step2-export] restored full X: n=" << design_in.n
               << " p=" << design_in.p << " (was collapsed to p=1 for GLMM fit)\n";
+
+    // Patch B2: expand alpha to match the restored p.
+    // On the covariate_offset path the GLMM only ever saw the intercept column,
+    // so out.alpha has length 1 while design_in.p is now p_full. R SAIGE reports
+    // all p coefficients (SAIGE_fitGLMM_fast.R keeps the full mmat and calls
+    // Covariate_Transform_Back before returning), so a length-1 alpha next to
+    // "p": 3 in nullmodel.json is simply wrong — and it also makes the two
+    // legacy `X*alpha` fallbacks below (null_model_engine.cpp and
+    // variance_ratio_compute.cpp:128) read past the end of the vector.
+    // The non-intercept effects were estimated once by the initial GLM and then
+    // frozen inside the offset, so [glmm_intercept, beta_full[1..p-1]] IS the
+    // fitted fixed-effect vector.
+    if (out.alpha.size() == 1u &&
+        design_in.beta_full.size() == static_cast<size_t>(design_in.p_full) &&
+        design_in.p_full > 1)
+    {
+      std::vector<double> alpha_full = design_in.beta_full;
+      alpha_full[0] = out.alpha[0];   // GLMM-refit intercept
+      out.alpha = std::move(alpha_full);
+      std::cout << "[covariate_offset] expanded alpha to p=" << out.alpha.size() << ": [";
+      for (size_t i = 0; i < out.alpha.size(); ++i)
+        std::cout << (i ? ", " : "") << out.alpha[i];
+      std::cout << "]\n";
+    }
   }
 
   // --- Persist a compact JSON stub (optional; replace with your serializer) ---
@@ -732,6 +778,14 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
     for (size_t i = 0; i < out.alpha.size(); ++i) js << (i ? "," : "") << out.alpha[i];
     js << "],\n  \"loco\": " << (out.loco ? "true" : "false")
        << ", \"lowmem_loco\": " << (out.lowmem_loco ? "true" : "false") << ",\n";
+    // LOCO_FORMAT.md: emit the autosomes actually present (ascending). Step 2
+    // must use this list rather than assuming 1..22. Absent/[] when loco=false.
+    js << "  \"loco_chroms\": [";
+    if (out.loco) {
+      for (size_t i = 0; i < out.loco_chroms.size(); ++i)
+        js << (i ? "," : "") << out.loco_chroms[i];
+    }
+    js << "],\n";
     // step2 keys (defaults match step2's hard-coded fallbacks; we just emit them so
     // its parser doesn't print "0 entries"-style noise).
     js << "  \"SPA_Cutoff\": 2,\n";

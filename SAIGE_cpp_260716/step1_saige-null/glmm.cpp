@@ -232,6 +232,70 @@ static inline void irls_gaussian_build(const arma::fvec& eta,
   Y = eta - offset + (y - mu) / mu_eta;   // = y - offset
 }
 
+// ---------- R's Get_Coef: the PQL/IRLS Newton loop on alpha at a FIXED tau ----
+// R reference: SAIGE_isolated/R/SAIGE_fitGLMM_fast.R:117-176 (Get_Coef).
+//
+// This is NOT a single linear solve. R iterates getCoefficients() until
+//   max(|alpha - alpha0| / (|alpha| + |alpha0| + tol.coef)) < tol.coef
+// rebuilding the IRLS working response/weights from the refreshed eta each pass.
+//
+// Both null-model drivers call this AFTER the outer AI-REML tau loop exits
+// (R:967 for binary/survival, R:963-of-the-quant-driver for quantitative) so
+// that mu / Y / W / cov -- and therefore res, V, S_a and every obj.noK matrix --
+// are built from a fixed-effect solve taken AT THE FINAL TAU rather than from
+// whatever the last outer iteration happened to leave behind.
+//
+// The loop shape here is the same one validated against R's
+// loco_newton_iterations.csv in loco_engine.cpp::run_loco_batch (which is the
+// LOCO twin, Get_Coef_LOCO).
+struct GetCoefOut {
+  arma::fvec alpha;   // fixed effects at the final tau
+  arma::fvec eta;     // linear predictor INCLUDING offset and the BLUP
+  arma::fvec mu;      // family$linkinv(eta)
+  arma::fvec W;       // IRLS weights
+  arma::fvec Y;       // IRLS working response
+  CoefficientsOut coef;  // last solve (cov / Sigma_iY / Sigma_iX)
+  int iters{0};
+};
+
+static GetCoefOut run_get_coef(const arma::fvec& y,
+                               const arma::fmat& X,
+                               const arma::fvec& tau,
+                               const arma::fvec& offset,
+                               const arma::fvec& alpha0_in,
+                               const arma::fvec& eta0,
+                               bool is_binary,
+                               int maxiter, int maxiterPCG,
+                               float tolPCG, float tol_coef)
+{
+  GetCoefOut o;
+  arma::fvec eta = eta0, mu, mu_eta, W, Y, alpha;
+  arma::fvec alpha0 = alpha0_in;
+  CoefficientsOut coef;
+
+  // R:127-133 -- pre-loop IRLS build from eta0.
+  if (is_binary) irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
+  else           irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
+
+  const bool have_alpha = (X.n_cols > 0);
+  for (int i = 0; i < std::max(1, maxiter); ++i) {
+    ++o.iters;
+    coef  = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+    alpha = coef.alpha;
+    eta   = coef.eta + offset;
+
+    if (is_binary) irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
+    else           irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
+
+    if (!have_alpha) break;
+    if (rel_change_R_style(alpha, alpha0, tol_coef) < tol_coef) break;
+    alpha0 = alpha;
+  }
+
+  o.alpha = alpha; o.eta = eta; o.mu = mu; o.W = W; o.Y = Y; o.coef = coef;
+  return o;
+}
+
 // ---------- Binary solver (AI-REML on tau[1]; tau[0] fixed=1) ----------
 
 inline arma::fvec sigmoid_stable_f(const arma::fvec& eta_f) {
@@ -493,6 +557,23 @@ check_dims("inputs");
   // Initialize to beta_init (the GLM alpha) to match R's behavior
   arma::fvec alpha_outer_prev = arma::conv_to<arma::fvec>::from(beta_init);
   CoefficientsOut coef;
+
+  // R (SAIGE_fitGLMM_fast.R:967), UNCONDITIONALLY after the outer tau loop:
+  //   re.coef = Get_Coef(y, X, tau, family, alpha, eta, offset, ..., tol.coef=tol)
+  // i.e. once tau stops moving, re-solve the fixed effects at the FINAL tau with
+  // the whole inner Newton loop, and rebuild mu / Y / W / cov from it. Every
+  // exit path below (boundary, converged, maxiter) must go through this so we
+  // never emit a refreshed alpha next to a stale mu.
+  // NOTE binary/survival pass tol.coef = tol (the outer AI-REML tolerance).
+  auto final_refresh = [&]() -> GetCoefOut {
+    GetCoefOut fc = run_get_coef(y, X, tau, offset, alpha_outer_prev, eta,
+                                 /*is_binary=*/true, maxiter, maxiterPCG,
+                                 tolPCG, tol_coef);
+    std::cout << "[final Get_Coef] re-solved fixed effects at final tau=["
+              << tau[0] << ", " << tau[1] << "]  iterations=" << fc.iters
+              << "  mean(mu)=" << arma::mean(fc.mu) << std::endl;
+    return fc;
+  };
 
   for (int it = 0; it < maxiter; ++it) {
     std::cout << "\n" << std::string(70, '=') << std::endl;
@@ -767,7 +848,12 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
       // tau[1]=0), not a failure. Finalize as converged (tau[0] fixed=1).
       std::cout << "[binary_glmm] tau[1] == 0 (genetic VC at boundary); "
                    "finalizing as converged (matches R).\n";
-      arma::fvec mu_final = 1.0f / (1.0f + arma::exp(-eta));
+      // R:967 final Get_Coef at the final tau (R breaks out of the loop here
+      // and still runs the re-solve before building obj.noK).
+      GetCoefOut fc = final_refresh();
+      alpha = fc.alpha;
+      eta   = fc.eta;
+      arma::fvec mu_final = fc.mu;
       auto sn = saige::build_score_null_binary(X, y, mu_final);
 
       FitNullResult out;
@@ -914,8 +1000,11 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
     // R SAIGE: first iteration (conservative update) does NOT check convergence
     // Only check convergence from iteration 1 onwards (after standard AI-REML)
     if (it > 0 && rc_tau < tol_coef) {
-      // finalize + stash score-null
-      arma::fvec mu_final = 1.0f / (1.0f + arma::exp(-eta));
+      // R:967 final Get_Coef at the final tau, then finalize + stash score-null.
+      GetCoefOut fc = final_refresh();
+      alpha = fc.alpha;
+      eta   = fc.eta;
+      arma::fvec mu_final = fc.mu;
       auto sn = saige::build_score_null_binary(X, y, mu_final);
 
       FitNullResult out;
@@ -973,11 +1062,19 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
     alpha_prev = alpha;
   }
 
-  // fallthrough
-  irls_binary_build(eta, y, offset, mu, mu_eta, W, Y);
-  coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+  // fallthrough (maxiter, or the large-variance break)
+  // R:967 -- the same unconditional final Get_Coef. This used to be a SINGLE
+  // getCoefficients_cpp solve, which is not what R does: Get_Coef is the whole
+  // inner Newton loop on alpha, and its refreshed eta/mu were being discarded.
+  {
+    GetCoefOut fc = final_refresh();
+    coef = fc.coef;
+    coef.alpha = fc.alpha;
+    eta = fc.eta;
+    mu = fc.mu; W = fc.W; Y = fc.Y;
+  }
 
-  arma::fvec mu_final = 1.0f / (1.0f + arma::exp(-eta));
+  arma::fvec mu_final = mu;
   auto sn = saige::build_score_null_binary(X, y, mu_final);
 
   FitNullResult out;
@@ -1058,6 +1155,23 @@ FitNullResult quant_glmm_solver(const Paths& paths,
   // Track alpha across outer iterations (matching R's Get_Coef alpha0)
   arma::fvec alpha_outer_prev = arma::conv_to<arma::fvec>::from(beta_init);
   CoefficientsOut coef;
+
+  // R (quantitative driver, SAIGE_fitGLMM_fast.R:963), UNCONDITIONALLY after the
+  // outer tau loop:
+  //   re.coef = Get_Coef(y, X, tau, family, alpha, eta, offset, ...)
+  // The quantitative driver does NOT pass tol.coef, so Get_Coef's default 0.1
+  // applies (the binary driver passes tol.coef = tol). Same choice as
+  // loco_engine.cpp::run_loco_batch.
+  const float tol_coef_final = 0.1f;
+  auto final_refresh = [&]() -> GetCoefOut {
+    GetCoefOut fc = run_get_coef(y, X, tau, offset, alpha_outer_prev, eta,
+                                 /*is_binary=*/false, maxiter, maxiterPCG,
+                                 tolPCG, tol_coef_final);
+    std::cout << "[final Get_Coef] re-solved fixed effects at final tau=["
+              << tau[0] << ", " << tau[1] << "]  iterations=" << fc.iters
+              << "  mean(mu)=" << arma::mean(fc.mu) << std::endl;
+    return fc;
+  };
 
   // ===== Debug: Initial values =====
   std::cout << "\n===== C++ Quantitative GLMM Solver Initial Values =====" << std::endl;
@@ -1262,7 +1376,10 @@ FitNullResult quant_glmm_solver(const Paths& paths,
                                 : "residual VC degenerate, not converged.")
                 << "\n";
       if (boundary_ok) {
-        arma::fvec mu_final = eta;  // identity link
+        // R:963 final Get_Coef at the final tau.
+        GetCoefOut fc = final_refresh();
+        coef = fc.coef; coef.alpha = fc.alpha; eta = fc.eta;
+        arma::fvec mu_final = fc.mu;  // identity link
         float tau0_inv = (tau[0] > 0.0f) ? 1.0f / tau[0] : 0.0f;
         auto sn = saige::build_score_null_quant(X, y, mu_final, tau0_inv);
 
@@ -1320,7 +1437,10 @@ FitNullResult quant_glmm_solver(const Paths& paths,
 
     // Convergence check (only after iteration 1, matching R)
     if (it > 0 && rc_tau < tol_coef) {
-      arma::fvec mu_final = eta;  // identity link
+      // R:963 final Get_Coef at the final tau.
+      GetCoefOut fc = final_refresh();
+      coef = fc.coef; coef.alpha = fc.alpha; eta = fc.eta;
+      arma::fvec mu_final = fc.mu;  // identity link
       float tau0_inv = (tau[0] > 0.0f) ? 1.0f / tau[0] : 0.0f;
       auto sn = saige::build_score_null_quant(X, y, mu_final, tau0_inv);
 
@@ -1367,11 +1487,16 @@ FitNullResult quant_glmm_solver(const Paths& paths,
     alpha_prev = coef.alpha;
   }
 
-  // Fallthrough: max iterations reached
-  irls_gaussian_build(eta, y, offset, mu, mu_eta, W, Y);
-  coef = getCoefficients_cpp(Y, X, W, tau, maxiterPCG, tolPCG);
+  // Fallthrough: max iterations reached (or the large-variance / boundary break)
+  // R:963 -- the same unconditional final Get_Coef. This used to be a SINGLE
+  // getCoefficients_cpp solve whose refreshed eta/mu were then thrown away.
+  {
+    GetCoefOut fc = final_refresh();
+    coef = fc.coef; coef.alpha = fc.alpha;
+    eta = fc.eta; mu = fc.mu; W = fc.W; Y = fc.Y;
+  }
 
-  arma::fvec mu_final = eta;
+  arma::fvec mu_final = mu;
   float tau0_inv = (tau[0] > 0.0f) ? 1.0f / tau[0] : 0.0f;
   auto sn = saige::build_score_null_quant(X, y, mu_final, tau0_inv);
 

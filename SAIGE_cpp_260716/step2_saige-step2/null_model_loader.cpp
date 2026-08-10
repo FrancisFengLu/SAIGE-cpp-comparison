@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <filesystem>
 #include <iomanip>
+#include <cctype>
+#include <set>
+#include <algorithm>
 #include <yaml-cpp/yaml.h>
 
 extern bool g_writeCheckpoints;
@@ -255,8 +258,63 @@ void loadVarianceRatios(const std::string & filepath,
 }
 
 
+// ---------------------------------------------------------------------------
+// LOCO helpers
+// ---------------------------------------------------------------------------
+
+// Mirror of R's getChromNumber (readInGLMM.R:1-22): remove a case-insensitive
+// "chr" prefix, strip non-digits, parse as an integer. Returns -1 for anything
+// that is not an autosome 1..22 (X, Y, MT, empty, garbage).
+int locoChromNumber(const std::string & chrom) {
+    std::string s = chrom;
+    // Drop a leading (case-insensitive) "chr".
+    if (s.size() >= 3) {
+        std::string head = s.substr(0, 3);
+        for (char & c : head) c = static_cast<char>(std::toupper((unsigned char)c));
+        if (head == "CHR") s = s.substr(3);
+    }
+    std::string digits;
+    for (char c : s) {
+        if (c >= '0' && c <= '9') digits.push_back(c);
+    }
+    if (digits.empty()) return -1;
+    int v = -1;
+    try {
+        v = std::stoi(digits);
+    } catch (...) {
+        return -1;
+    }
+    if (v < 1 || v > 22) return -1;
+    return v;
+}
+
+bool locoChromLabelsMatch(const std::string & a, const std::string & b) {
+    auto norm = [](const std::string & in) {
+        std::string s = in;
+        if (s.size() >= 3) {
+            std::string head = s.substr(0, 3);
+            for (char & c : head) c = static_cast<char>(std::toupper((unsigned char)c));
+            if (head == "CHR") s = s.substr(3);
+        }
+        for (char & c : s) c = static_cast<char>(std::toupper((unsigned char)c));
+        // Strip leading zeros on purely numeric labels so "01" == "1".
+        size_t nz = 0;
+        bool allDigit = !s.empty();
+        for (char c : s) { if (c < '0' || c > '9') { allDigit = false; break; } }
+        if (allDigit) {
+            while (nz + 1 < s.size() && s[nz] == '0') nz++;
+            s = s.substr(nz);
+        }
+        return s;
+    };
+    return norm(a) == norm(b);
+}
+
+
 NullModelData loadNullModel(const std::string & model_dir,
-                            const std::string & varianceRatio_file) {
+                            const std::string & varianceRatio_file,
+                            bool t_LOCO,
+                            const std::string & t_chrom) {
 
     NullModelData data;
 
@@ -413,23 +471,117 @@ NullModelData loadNullModel(const std::string & model_dir,
     std::cout << "  sampleIDs: " << data.sampleIDs.size() << " entries" << std::endl;
 
     // =========================================================================
+    // 1b. LOCO: read the model-side flags and decide whether to swap in the
+    //     per-chromosome fixed-effect quantities. Mirrors readInGLMM.R:78-113.
+    // =========================================================================
+    data.model_hasLOCO = false;
+    if (config["loco"]) {
+        data.model_hasLOCO = config["loco"].as<bool>();
+    } else if (config["LOCO"]) {
+        data.model_hasLOCO = config["LOCO"].as<bool>();
+    }
+    if (config["loco_chroms"] && config["loco_chroms"].IsSequence()) {
+        for (size_t i = 0; i < config["loco_chroms"].size(); i++) {
+            data.loco_chroms.push_back(config["loco_chroms"][i].as<int>());
+        }
+        std::sort(data.loco_chroms.begin(), data.loco_chroms.end());
+    }
+
+    data.loco_applied = false;
+    std::string loco_dir;
+
+    if (!t_LOCO) {
+        // LOCO off: ignore any chr<j>/ directories entirely.
+        std::cout << "  LOCO: not applied (LOCO=false in step-2 config)" << std::endl;
+    } else {
+        // Guard 1 (readInGLMM.R:79): requested LOCO but step 1 did not run it.
+        if (!data.model_hasLOCO) {
+            throw std::runtime_error(
+                "LOCO is TRUE but the null model at " + model_dir +
+                " does not contain LOCO results (nullmodel.json has loco=false, and no "
+                "chr<j>/ subdirectories were written). In order to apply "
+                "leave-one-chromosome-out, please re-run Step 1 with LOCO enabled. "
+                "Otherwise, please set LOCO=false in this step (Step 2).");
+        }
+        // Guard 2 (readInGLMM.R:82): chrom must be specified.
+        if (t_chrom.empty()) {
+            throw std::runtime_error(
+                "chrom needs to be specified in order to apply leave-one-chromosome-out. "
+                "Set 'chrom' in the Step 2 config (e.g. chrom: \"1\"), or set LOCO=false.");
+        }
+
+        int chromNum = locoChromNumber(t_chrom);
+        bool inList = false;
+        if (chromNum >= 1) {
+            inList = std::find(data.loco_chroms.begin(), data.loco_chroms.end(), chromNum)
+                     != data.loco_chroms.end();
+        }
+
+        if (!inList) {
+            // Guard 3 (readInGLMM.R:107-113): non-autosome, or an autosome that
+            // step 1 did not emit. SILENT fallback to the full-genome fit --
+            // no error, no non-zero exit. A log line only.
+            std::cout << "  LOCO: chromosome '" << t_chrom
+                      << "' has no LOCO result in the null model; "
+                      << "using the full-genome fit." << std::endl;
+        } else {
+            loco_dir = model_dir + "/chr" + std::to_string(chromNum);
+            if (!std::filesystem::is_directory(loco_dir)) {
+                throw std::runtime_error(
+                    "nullmodel.json lists chromosome " + std::to_string(chromNum) +
+                    " in loco_chroms but the directory " + loco_dir + " does not exist.");
+            }
+            static const char * kLocoStems[] = {
+                "mu", "res", "V", "offset", "XV", "XVX",
+                "XVX_inv", "XVX_inv_XV", "XXVX_inv", "S_a"
+            };
+            for (const char * stem : kLocoStems) {
+                std::string p = loco_dir + "/" + stem + ".arma";
+                if (!std::filesystem::exists(p)) {
+                    throw std::runtime_error(
+                        "LOCO directory " + loco_dir + " is incomplete: missing " + p);
+                }
+            }
+            data.loco_applied = true;
+            std::cout << "  LOCO: leaving chromosome " << chromNum
+                      << " out; per-chromosome fit will be read from "
+                      << loco_dir << std::endl;
+        }
+    }
+
+    // Per-chromosome file set (LOCO_FORMAT.md). X and y are chromosome-invariant
+    // and are never looked for in chr<j>/.
+    static const std::set<std::string> kLocoFileSet = {
+        "mu", "res", "V", "offset", "XV", "XVX",
+        "XVX_inv", "XVX_inv_XV", "XXVX_inv", "S_a"
+    };
+    // Resolve a .arma path: the chr<j>/ copy when LOCO is active and the file is
+    // in the per-chromosome set, otherwise the top-level copy.
+    auto armaPath = [&](const std::string & stem) -> std::string {
+        if (data.loco_applied && kLocoFileSet.count(stem)) {
+            return loco_dir + "/" + stem + ".arma";
+        }
+        return model_dir + "/" + stem + ".arma";
+    };
+
+    // =========================================================================
     // 2. Load .arma vectors
     // =========================================================================
     std::cout << "\n[2/5] Loading .arma vector files..." << std::endl;
 
-    data.mu  = loadArmaVec(model_dir + "/mu.arma");
+    data.mu  = loadArmaVec(armaPath("mu"));
     std::cout << "  mu:  " << data.mu.n_elem << " elements" << std::endl;
 
-    data.res = loadArmaVec(model_dir + "/res.arma");
+    data.res = loadArmaVec(armaPath("res"));
     std::cout << "  res: " << data.res.n_elem << " elements" << std::endl;
 
     data.y   = loadArmaVec(model_dir + "/y.arma");
     std::cout << "  y:   " << data.y.n_elem << " elements" << std::endl;
 
-    data.V   = loadArmaVec(model_dir + "/V.arma");
+    data.V   = loadArmaVec(armaPath("V"));
     std::cout << "  V:   " << data.V.n_elem << " elements" << std::endl;
 
-    data.S_a = loadArmaVec(model_dir + "/S_a.arma");
+    data.S_a = loadArmaVec(armaPath("S_a"));
     std::cout << "  S_a: " << data.S_a.n_elem << " elements" << std::endl;
 
     // Update n from vector size if not set from JSON
@@ -446,19 +598,19 @@ NullModelData loadNullModel(const std::string & model_dir,
     data.X          = loadArmaMat(model_dir + "/X.arma");
     std::cout << "  X:          " << data.X.n_rows << " x " << data.X.n_cols << std::endl;
 
-    data.XVX        = loadArmaMat(model_dir + "/XVX.arma");
+    data.XVX        = loadArmaMat(armaPath("XVX"));
     std::cout << "  XVX:        " << data.XVX.n_rows << " x " << data.XVX.n_cols << std::endl;
 
-    data.XVX_inv    = loadArmaMat(model_dir + "/XVX_inv.arma");
+    data.XVX_inv    = loadArmaMat(armaPath("XVX_inv"));
     std::cout << "  XVX_inv:    " << data.XVX_inv.n_rows << " x " << data.XVX_inv.n_cols << std::endl;
 
-    data.XXVX_inv   = loadArmaMat(model_dir + "/XXVX_inv.arma");
+    data.XXVX_inv   = loadArmaMat(armaPath("XXVX_inv"));
     std::cout << "  XXVX_inv:   " << data.XXVX_inv.n_rows << " x " << data.XXVX_inv.n_cols << std::endl;
 
-    data.XV         = loadArmaMat(model_dir + "/XV.arma");
+    data.XV         = loadArmaMat(armaPath("XV"));
     std::cout << "  XV:         " << data.XV.n_rows << " x " << data.XV.n_cols << std::endl;
 
-    data.XVX_inv_XV = loadArmaMat(model_dir + "/XVX_inv_XV.arma");
+    data.XVX_inv_XV = loadArmaMat(armaPath("XVX_inv_XV"));
     std::cout << "  XVX_inv_XV: " << data.XVX_inv_XV.n_rows << " x " << data.XVX_inv_XV.n_cols << std::endl;
 
     // Update p from matrix dimensions if not set from JSON
@@ -506,7 +658,7 @@ NullModelData loadNullModel(const std::string & model_dir,
     }
 
     // --- offset: try to load, else zeros ---
-    if (!tryLoadArmaVec(model_dir + "/offset.arma", data.offset)) {
+    if (!tryLoadArmaVec(armaPath("offset"), data.offset)) {
         data.offset = arma::vec(n, arma::fill::zeros);
         std::cout << "  offset: not found, using zeros(" << n << ")" << std::endl;
     } else {

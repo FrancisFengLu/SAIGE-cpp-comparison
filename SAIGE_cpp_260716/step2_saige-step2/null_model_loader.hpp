@@ -58,14 +58,43 @@ struct NullModelData {
 
     // --- Condition (optional) ---
     std::vector<uint32_t> condition_genoIndex;
+
+    // --- LOCO (leave-one-chromosome-out) ---
+    // model_hasLOCO: the value of "loco" in nullmodel.json (i.e. step 1 actually
+    //                wrote chr<j>/ subdirectories).
+    // loco_chroms:   the autosomes present as chr<j>/ subdirectories.
+    // loco_applied:  true only if the per-chromosome files were actually swapped
+    //                in. False when LOCO was requested but `chrom` is not in
+    //                loco_chroms (non-autosome fallback), matching R's silent
+    //                fallback to the full-genome fit (readInGLMM.R:107-113).
+    bool model_hasLOCO = false;
+    std::vector<int> loco_chroms;
+    bool loco_applied = false;
 };
+
+// Normalize a chromosome label to R's `getChromNumber` semantics
+// (readInGLMM.R:1-22): drop a case-insensitive "chr" prefix, strip every
+// non-digit character, and interpret the remainder as an integer.
+// Returns -1 when the result is not an autosome in 1..22 (X, Y, MT, ...).
+int locoChromNumber(const std::string & chrom);
+
+// Case-insensitive chromosome-label equality used for marker filtering:
+// "chr1", "CHR1" and "1" all compare equal.
+bool locoChromLabelsMatch(const std::string & a, const std::string & b);
 
 
 // Load null model from Step 1 output directory
 // model_dir should contain nullmodel.json and .arma files
 // varianceRatio_file is the path to varianceRatio.txt
+// t_LOCO / t_chrom implement the step-2 side of leave-one-chromosome-out.
+// When t_LOCO is true the top-level files are read first and then the
+// per-chromosome set (mu, res, V, offset, XV, XVX, XVX_inv, XVX_inv_XV,
+// XXVX_inv, S_a) is overwritten from <model_dir>/chr<t_chrom>/.
+// See LOCO_FORMAT.md and R's readInGLMM.R:78-113.
 NullModelData loadNullModel(const std::string & model_dir,
-                            const std::string & varianceRatio_file);
+                            const std::string & varianceRatio_file,
+                            bool t_LOCO = false,
+                            const std::string & t_chrom = "");
 
 // Load a single armadillo vector from binary file
 arma::vec loadArmaVec(const std::string & filepath);

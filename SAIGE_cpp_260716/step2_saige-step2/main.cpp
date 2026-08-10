@@ -3469,6 +3469,10 @@ int main(int argc, char* argv[])
             std::cerr << "  max_markers_region:    max markers per region (default: 100000)" << std::endl;
             std::cerr << "  min_gourpmac_for_burdenonly: (default: 5)" << std::endl;
             std::cerr << std::endl;
+            std::cerr << "Leave-one-chromosome-out:" << std::endl;
+            std::cerr << "  LOCO:              true/false (default: false)" << std::endl;
+            std::cerr << "  chrom:             chromosome being tested, e.g. \"1\" (required when LOCO=true)" << std::endl;
+            std::cerr << std::endl;
             std::cerr << "LD matrix generation (requires groupFile):" << std::endl;
             std::cerr << "  isLDMatrix:        true/false (default: false)" << std::endl;
             std::cerr << "  ldmat_maxMAF:      max MAF for LD matrix (default: 0.5)" << std::endl;
@@ -3584,6 +3588,13 @@ int main(int argc, char* argv[])
         int fusedMode = config["fusedMode"] ? config["fusedMode"].as<int>() : 0;
         if (fusedMode < 0 || fusedMode > 2) fusedMode = 0;
         SAIGE::g_fusedMode = fusedMode;
+        // ---- LOCO (leave-one-chromosome-out) ----
+        // NOTE: R's step 2 defaults LOCO to TRUE. We default to false here
+        // because the C++ step 1 does not yet emit chr<j>/ LOCO output, and
+        // defaulting to true would break every existing config. Flip this to
+        // true (matching R) once step 1 ships LOCO.
+        bool useLOCO = config["LOCO"] ? config["LOCO"].as<bool>() : false;
+        std::string locoChrom = config["chrom"] ? config["chrom"].as<std::string>() : "";
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
@@ -3707,7 +3718,19 @@ int main(int argc, char* argv[])
             if (maxMAFList.n_elem == 0) {
                 throw std::runtime_error("Region testing requires maxMAFList in config");
             }
+            if (useLOCO && locoChrom.empty()) {
+                throw std::runtime_error(
+                    "LOCO=true requires `chrom` to be set in the config: without it "
+                    "the regions in groupFile cannot be restricted to the chromosome "
+                    "the null model was fitted for, and the p-values would be "
+                    "silently wrong.");
+            }
         }
+        // LOCO chromosome to hand to readRegionChunk(); "" disables the check.
+        // Keyed on the config LOCO flag rather than nullModel.loco_applied, so a
+        // non-autosome (which silently falls back to the full-genome fit) is
+        // still restricted -- same convention as the single-variant path.
+        const std::string regionLocoChrom = useLOCO ? locoChrom : std::string("");
 
         // Print configuration
         std::cout << std::endl;
@@ -3796,7 +3819,8 @@ int main(int argc, char* argv[])
         timing_mark("10_yaml_parsed");  // TIMING_INSTRUMENT_REMOVE_ME
         // ---- 3. Load null model from Step 1 ----
         std::cout << "===== Loading null model =====" << std::endl;
-        NullModelData nullModel = loadNullModel(modelFile, varianceRatioFile);
+        NullModelData nullModel = loadNullModel(modelFile, varianceRatioFile,
+                                                useLOCO, locoChrom);
         timing_mark("20_null_model_loaded");  // TIMING_INSTRUMENT_REMOVE_ME
 
         std::cout << "  Trait type:   " << nullModel.traitType << std::endl;
@@ -3953,8 +3977,24 @@ int main(int argc, char* argv[])
             numMarkers = ptr_gPLINKobj->getM();
         } else if (genoType == "vcf") {
             setVCFobjInCPP(vcfFile, vcfField, nullModel.sampleIDs);
+            // LOCO: the VCF reader is strictly sequential (getOneMarker ignores
+            // the genoIndex value), so the chromosome restriction has to be
+            // pushed into the reader rather than applied to genoIndex later.
+            // Must be set before the prescan so numMarkers counts only chrom.
+            if (useLOCO) {
+                if (locoChrom.empty()) {
+                    throw std::runtime_error(
+                        "LOCO=true requires `chrom` to be set in the config.");
+                }
+                ptr_gVCFobj->setChromRestriction(locoChrom);
+                std::cout << "  LOCO: VCF reads restricted to chromosome "
+                          << locoChrom << std::endl;
+            }
             // Pre-scan to count markers (needed for index generation)
             numMarkers = ptr_gVCFobj->prescanMarkerCount();
+            if (useLOCO && numMarkers == 0) {
+                throw std::runtime_error("No markers on chrom " + locoChrom + " are found");
+            }
             // Reset to beginning for actual reading
             ptr_gVCFobj->resetFile();
             // Re-set sample mapping after reset
@@ -4113,6 +4153,23 @@ int main(int argc, char* argv[])
             std::cout << "===== Building marker ID to index map =====" << std::endl;
             std::unordered_map<std::string, uint32_t> markerIDToIndex = Unified_getMarkerIDToIndex(genoType);
             std::cout << "  Built map with " << markerIDToIndex.size() << " entries." << std::endl;
+            // Authoritative per-marker chromosome from the genotype file. The
+            // region-level LOCO filter uses this instead of parsing the group
+            // file's variant-ID strings, so group files that do not spell IDs
+            // as "chr:pos:ref:alt" still work. Only built when LOCO is on.
+            std::unordered_map<std::string, std::string> markerIDToChrom;
+            if (!regionLocoChrom.empty()) {
+                markerIDToChrom = Unified_getMarkerIDToChrom(genoType);
+                std::cout << "  Built marker ID -> chromosome map with "
+                          << markerIDToChrom.size() << " entries." << std::endl;
+                if (markerIDToChrom.empty()) {
+                    throw std::runtime_error(
+                        "LOCO is on (chrom=" + regionLocoChrom + ") but the genotype "
+                        "reader reported no per-marker chromosomes, so regions in the "
+                        "group file cannot be restricted to that chromosome. Refusing "
+                        "to run rather than emit p-values from the wrong null model.");
+                }
+            }
             std::cout << std::endl;
 
             // Check group file
@@ -4160,17 +4217,28 @@ int main(int argc, char* argv[])
             unsigned int t_n = (unsigned int)numSamplesAnalysis;
             int regionsProcessed = 0;
             int regionsSkipped = 0;
+            int regionsOffChrom = 0;
 
             while (regionsProcessed + regionsSkipped < nRegions) {
                 int remaining = nRegions - regionsProcessed - regionsSkipped;
                 int nregions_to_read = std::min(groups_per_chunk, remaining);
 
                 std::vector<RegionData> regionChunk = readRegionChunk(
-                    gf, nregions_to_read, nline_per_gene, annotationList, markerIDToIndex);
+                    gf, nregions_to_read, nline_per_gene, annotationList, markerIDToIndex,
+                    markerIDToChrom, regionLocoChrom, &regionsOffChrom);
 
                 for (int r = 0; r < (int)regionChunk.size(); r++) {
                     RegionData& region = regionChunk[r];
                     int totalIdx = regionsProcessed + regionsSkipped + 1;
+
+                    if (region.offLocoChrom) {
+                        std::cout << "  Skipping region " << region.regionName
+                                  << " (" << totalIdx << "/" << nRegions
+                                  << "): not on LOCO chromosome " << regionLocoChrom
+                                  << "." << std::endl;
+                        regionsSkipped++;
+                        continue;
+                    }
 
                     if (region.variantIDs.empty() || region.annoVec.empty()) {
                         std::cout << "  Skipping region " << region.regionName
@@ -4216,6 +4284,15 @@ int main(int argc, char* argv[])
 
             std::cout << "  Total regions processed: " << regionsProcessed << std::endl;
             std::cout << "  Total regions skipped:   " << regionsSkipped << std::endl;
+            if (!regionLocoChrom.empty()) {
+                std::cout << "  LOCO: regions skipped as not on chromosome "
+                          << regionLocoChrom << ": " << regionsOffChrom
+                          << " of " << nRegions << std::endl;
+                if (nRegions > 0 && regionsOffChrom == nRegions) {
+                    throw std::runtime_error(
+                        "No regions on chrom " + regionLocoChrom + " are found");
+                }
+            }
             std::cout << std::endl;
 
             // Close LDmat output files
@@ -4259,7 +4336,91 @@ int main(int argc, char* argv[])
                 }
             }
 
-            std::cout << "  Will test " << numMarkers << " markers." << std::endl;
+            // ---- 7a-LOCO. Restrict markers to `chrom` ----
+            // Mirrors SAIGE_SPATest_Marker.R:44-50:
+            //   genoIndex      = genoIndex[which(CHROM == chrom)]
+            //   genoIndex_prev = genoIndex_prev[which(CHROM == chrom)]
+            // Note this is keyed on the config LOCO flag, not on whether the
+            // per-chromosome fit was actually swapped in -- R does the same, so
+            // a non-autosome still gets its markers filtered while falling back
+            // to the full-genome model.
+            // Per format:
+            //   plink/pgen - genoIndex is a marker row index; subset it directly.
+            //   bgen       - genoIndex is normally all "0" (= "read the next
+            //                variant sequentially"), which cannot be subset.
+            //                Instead we rewrite genoIndex to the .bgi
+            //                file_start_position byte offsets of the retained
+            //                variants; readRawBlock() fseek()s to a nonzero
+            //                offset, so this reads exactly those variants.
+            //                Requires a .bgi index (loaded in setBGENobjInCPP);
+            //                without one we ERROR rather than emit wrong pvals.
+            //   vcf        - already handled at reader setup via
+            //                VcfClass::setChromRestriction(); the reader is
+            //                sequential so genoIndex here is just 0..K-1.
+            if (useLOCO) {
+                std::vector<std::string> chrVecAll;
+                if (genoType == "plink") {
+                    chrVecAll = ptr_gPLINKobj->getChrVec();
+                } else if (genoType == "pgen") {
+                    chrVecAll = ptr_gPGENobj->getChrVec();
+                } else if (genoType == "vcf") {
+                    // Filtering already applied inside the reader. numMarkers
+                    // is the on-chromosome count, and genoIndex was built as
+                    // 0..numMarkers-1 above; nothing further to do.
+                    std::cout << "  LOCO: restricting to chromosome " << locoChrom
+                              << ": " << numMarkers
+                              << " markers retained (filtered in the VCF reader)."
+                              << std::endl;
+                } else if (genoType == "bgen") {
+                    chrVecAll = ptr_gBGENobj->getChrVec();
+                    const std::vector<uint64_t>& offs = ptr_gBGENobj->getByteOffsetVec();
+                    if (chrVecAll.size() != numMarkers || offs.size() != numMarkers) {
+                        throw std::runtime_error(
+                            "LOCO=true with genoType=bgen requires a .bgi index next to "
+                            + bgenFile + " (expected " + bgenFile + ".bgi). Without it the "
+                            "per-variant chromosome and byte offsets are unavailable, so "
+                            "markers cannot be restricted to chromosome " + locoChrom +
+                            " and the results would be silently wrong. Create it with "
+                            "`bgenix -g <file.bgen> -index`.");
+                    }
+                    // Replace the sequential "0" placeholders with real byte
+                    // offsets so the retained subset is seek-addressable.
+                    for (uint32_t i = 0; i < numMarkers; i++) {
+                        genoIndex[i] = std::to_string(offs[i]);
+                        genoIndex_prev[i] = (i > 0 ? std::to_string(offs[i - 1]) : std::string("0"));
+                    }
+                }
+
+                if (chrVecAll.size() == numMarkers) {
+                    std::vector<std::string> gi, gip;
+                    gi.reserve(numMarkers);
+                    gip.reserve(numMarkers);
+                    for (uint32_t i = 0; i < numMarkers; i++) {
+                        if (locoChromLabelsMatch(chrVecAll[i], locoChrom)) {
+                            gi.push_back(genoIndex[i]);
+                            gip.push_back(genoIndex_prev[i]);
+                        }
+                    }
+                    std::cout << "  LOCO: restricting to chromosome " << locoChrom
+                              << ": " << gi.size() << " of " << numMarkers
+                              << " markers retained." << std::endl;
+                    if (gi.empty()) {
+                        throw std::runtime_error("No markers on chrom " + locoChrom + " are found");
+                    }
+                    genoIndex = std::move(gi);
+                    genoIndex_prev = std::move(gip);
+                } else if (genoType != "vcf") {
+                    // Never warn-and-continue: an unfiltered run under LOCO
+                    // tests markers against the wrong chromosome's null model
+                    // and produces silently wrong p-values.
+                    throw std::runtime_error(
+                        "LOCO=true but marker filtering by chromosome could not be applied "
+                        "for genoType=" + genoType + " (no per-marker chromosome available). "
+                        "Refusing to run: results would be silently wrong.");
+                }
+            }
+
+            std::cout << "  Will test " << genoIndex.size() << " markers." << std::endl;
             std::cout << std::endl;
 
             // ---- 8a. Open output file ----
@@ -4337,6 +4498,23 @@ int main(int argc, char* argv[])
             std::cout << "===== Building marker ID to index map =====" << std::endl;
             std::unordered_map<std::string, uint32_t> markerIDToIndex = Unified_getMarkerIDToIndex(genoType);
             std::cout << "  Built map with " << markerIDToIndex.size() << " entries." << std::endl;
+            // Authoritative per-marker chromosome from the genotype file. The
+            // region-level LOCO filter uses this instead of parsing the group
+            // file's variant-ID strings, so group files that do not spell IDs
+            // as "chr:pos:ref:alt" still work. Only built when LOCO is on.
+            std::unordered_map<std::string, std::string> markerIDToChrom;
+            if (!regionLocoChrom.empty()) {
+                markerIDToChrom = Unified_getMarkerIDToChrom(genoType);
+                std::cout << "  Built marker ID -> chromosome map with "
+                          << markerIDToChrom.size() << " entries." << std::endl;
+                if (markerIDToChrom.empty()) {
+                    throw std::runtime_error(
+                        "LOCO is on (chrom=" + regionLocoChrom + ") but the genotype "
+                        "reader reported no per-marker chromosomes, so regions in the "
+                        "group file cannot be restricted to that chromosome. Refusing "
+                        "to run rather than emit p-values from the wrong null model.");
+                }
+            }
             std::cout << std::endl;
 
             // ---- 9b. Check group file ----
@@ -4407,15 +4585,20 @@ int main(int argc, char* argv[])
 
             int regionsProcessed = 0;
             int regionsSkipped = 0;
+            int regionsOffChrom = 0;
 
             while (regionsProcessed + regionsSkipped < nRegions) {
                 // Determine how many regions to read in this chunk
                 int remaining = nRegions - regionsProcessed - regionsSkipped;
                 int nregions_to_read = std::min(groups_per_chunk, remaining);
 
-                // Read a chunk of regions from the group file
+                // Read a chunk of regions from the group file.
+                // regionLocoChrom drops (or, for a chromosome-spanning region,
+                // rejects) regions that are not on the LOCO chromosome, before
+                // any genotype is touched.
                 std::vector<RegionData> regionChunk = readRegionChunk(
-                    gf, nregions_to_read, nline_per_gene, annotationList, markerIDToIndex);
+                    gf, nregions_to_read, nline_per_gene, annotationList, markerIDToIndex,
+                    markerIDToChrom, regionLocoChrom, &regionsOffChrom);
                 int regionChunkBaseIdx = regionsProcessed + regionsSkipped;
                 int chunkSize = (int)regionChunk.size();
 
@@ -4429,6 +4612,19 @@ int main(int argc, char* argv[])
                 for (int r = 0; r < chunkSize; r++) {
                     RegionData& region = regionChunk[r];
                     int totalIdx = regionChunkBaseIdx + r + 1;
+
+                    // Skip regions that are not on the LOCO chromosome
+                    if (region.offLocoChrom) {
+                        #pragma omp critical(region_progress)
+                        {
+                            std::cout << "  Skipping region " << region.regionName
+                                      << " (" << totalIdx << "/" << nRegions
+                                      << "): not on LOCO chromosome " << regionLocoChrom
+                                      << "." << std::endl;
+                            regionsSkipped++;
+                        }
+                        continue;
+                    }
 
                     // Skip regions with no matching variants
                     if (region.variantIDs.empty() || region.annoVec.empty()) {
@@ -4519,6 +4715,15 @@ int main(int argc, char* argv[])
 
             std::cout << "  Total regions processed: " << regionsProcessed << std::endl;
             std::cout << "  Total regions skipped:   " << regionsSkipped << std::endl;
+            if (!regionLocoChrom.empty()) {
+                std::cout << "  LOCO: regions skipped as not on chromosome "
+                          << regionLocoChrom << ": " << regionsOffChrom
+                          << " of " << nRegions << std::endl;
+                if (nRegions > 0 && regionsOffChrom == nRegions) {
+                    throw std::runtime_error(
+                        "No regions on chrom " + regionLocoChrom + " are found");
+                }
+            }
             std::cout << std::endl;
 
             // ---- 13b. Close output files ----

@@ -17,6 +17,10 @@
 #include <sys/stat.h>
 #include "genotype_reader.hpp"
 #include "UTIL.hpp"
+// locoChromLabelsMatch(): the single canonical lenient chromosome-name
+// comparison ("chr1" == "1" == "01"). Reused here so the VCF/BGEN LOCO filters
+// agree exactly with the PLINK/PGEN one in main.cpp.
+#include "null_model_loader.hpp"
 
 #include <string>
 #include <vector>
@@ -708,7 +712,8 @@ VcfClass::VcfClass(const std::string& t_vcfFileName,
                    std::vector<std::string>& t_SampleInModel)
     : m_htsFile(nullptr), m_hdr(nullptr), m_rec(nullptr),
       m_vcfFileName(t_vcfFileName), m_fmtField(t_vcfField),
-      m_N0(0), m_N(0), m_M0(0), m_totalMarkers(0), m_isPreScanned(false)
+      m_N0(0), m_N(0), m_M0(0), m_totalMarkers(0), m_isPreScanned(false),
+      m_metaPrepopulated(false)
 {
     // Open VCF/BCF file
     m_htsFile = hts_open(t_vcfFileName.c_str(), "r");
@@ -864,12 +869,19 @@ bool VcfClass::getOneMarker(
     t_indexForMissing.clear();
     t_indexForNonZero.clear();
 
-    // Read next record
-    int ret = bcf_read(m_htsFile, m_hdr, m_rec);
-    if (ret < 0) {
-        // End of file or error
-        std::cout << "Reach the end of the vcf file" << std::endl;
-        return false;
+    // Read next record. Under a LOCO chromosome restriction, skip forward over
+    // every record on another chromosome (the reader is strictly sequential;
+    // see VcfClass::m_chromRestrict).
+    while (true) {
+        int ret = bcf_read(m_htsFile, m_hdr, m_rec);
+        if (ret < 0) {
+            // End of file or error
+            std::cout << "Reach the end of the vcf file" << std::endl;
+            return false;
+        }
+        if (m_chromRestrict.empty()) break;
+        const char* recChr = bcf_hdr_id2name(m_hdr, m_rec->rid);
+        if (locoChromLabelsMatch(recChr ? recChr : "", m_chromRestrict)) break;
     }
 
     // Unpack the record (we need INFO, FORMAT, and shared fields)
@@ -902,12 +914,40 @@ bool VcfClass::getOneMarker(
         t_marker = t_chr + ":" + std::to_string(t_pd) + ":" + t_ref + ":" + t_alt;
     }
 
-    // Store marker info for later lookup
-    m_chr.push_back(t_chr);
-    m_pd.push_back(t_pd);
-    m_ref.push_back(t_ref);
-    m_alt.push_back(t_alt);
-    m_MarkerInVcf.push_back(t_marker);
+    // Store marker info for later lookup.
+    //
+    // When prescanMarkerCount() has already recorded every record (the normal
+    // case), appending here would duplicate the metadata and break the
+    // index space getMarkerIDToIndex() hands out. Instead, assert that the
+    // record we just streamed IS the one recorded at this position: that is
+    // the run-time proof that the prescan index space and the streamed index
+    // space are the same. A mismatch is fatal -- a silently shifted index
+    // would attribute a variant's genotypes to a different variant.
+    if (m_metaPrepopulated) {
+        if (m_M0 < m_chr.size()) {
+            if (m_chr[m_M0] != t_chr || m_pd[m_M0] != t_pd ||
+                m_ref[m_M0] != t_ref || m_alt[m_M0] != t_alt) {
+                throw std::runtime_error(
+                    "VCF prescan/stream index mismatch at marker index " +
+                    std::to_string(m_M0) + ": prescan recorded " +
+                    m_chr[m_M0] + ":" + std::to_string(m_pd[m_M0]) + ":" +
+                    m_ref[m_M0] + ":" + m_alt[m_M0] + " but the stream returned " +
+                    t_chr + ":" + std::to_string(t_pd) + ":" + t_ref + ":" + t_alt +
+                    ". Marker-ID lookups would point at the wrong variant.");
+            }
+        } else {
+            throw std::runtime_error(
+                "VCF stream returned more markers (" + std::to_string(m_M0 + 1) +
+                ") than the prescan recorded (" + std::to_string(m_chr.size()) +
+                "). The file changed underneath us; refusing to continue.");
+        }
+    } else {
+        m_chr.push_back(t_chr);
+        m_pd.push_back(t_pd);
+        m_ref.push_back(t_ref);
+        m_alt.push_back(t_alt);
+        m_MarkerInVcf.push_back(t_marker);
+    }
     m_M0++;
 
     // Initialize dosage vector
@@ -1060,7 +1100,24 @@ bool VcfClass::getOneMarker(
 }
 
 // ============================================================
-// prescanMarkerCount: count total markers in VCF by scanning
+// prescanMarkerCount: count total markers in VCF by scanning, AND record
+// each retained record's chr/pos/ref/alt/ID.
+//
+// Why the metadata is captured here: VcfClass::getMarkerIDToIndex() is built
+// from m_chr/m_pd/m_ref/m_alt, but those used to be filled only by
+// getOneMarker() as markers stream past. SAIGE-GENE+ region tests need the
+// map BEFORE any streaming (to resolve the group file's variant IDs), so
+// every VCF region run found 0 markers. Same chicken-and-egg BGEN had, which
+// is solved by populateFromBgi(); this prescan is the VCF analogue and it is
+// already walking every record, so it now keeps what it reads.
+//
+// INDEX-SPACE INVARIANT: the k-th entry of m_chr/m_pd/m_ref/m_alt must be the
+// k-th record getOneMarker() returns. Guaranteed by (a) walking the file in
+// the same sequential order with no tabix/seek, (b) applying the SAME
+// m_chromRestrict + locoChromLabelsMatch skip predicate as getOneMarker(),
+// and (c) deriving chr/pos/ref/alt/ID with the same expressions. It is also
+// CHECKED at run time: getOneMarker() compares each record it reads against
+// the prescanned entry at that index and throws on any mismatch.
 // ============================================================
 uint32_t VcfClass::prescanMarkerCount()
 {
@@ -1076,8 +1133,48 @@ uint32_t VcfClass::prescanMarkerCount()
     bcf_hdr_t* countHdr = bcf_hdr_read(countFile);
     bcf1_t* countRec = bcf_init();
 
+    m_chr.clear(); m_pd.clear(); m_ref.clear(); m_alt.clear(); m_MarkerInVcf.clear();
+    m_offChromIDToChrom.clear();
+
     m_totalMarkers = 0;
+    uint32_t nSeen = 0;
     while (bcf_read(countFile, countHdr, countRec) >= 0) {
+        nSeen++;
+        // BCF_UN_STR unpacks ID + REF/ALT only (not INFO/FORMAT), which is the
+        // cheapest level that exposes rec->d.allele / rec->d.id.
+        bcf_unpack(countRec, BCF_UN_STR);
+
+        const char* recChrC = bcf_hdr_id2name(countHdr, countRec->rid);
+        std::string chr = recChrC ? recChrC : "";
+        uint32_t pd = (uint32_t)(countRec->pos + 1);
+        std::string ref = countRec->n_allele > 0 ? countRec->d.allele[0] : ".";
+        std::string alt = countRec->n_allele < 2 ? std::string(".")
+                                                 : std::string(countRec->d.allele[1]);
+
+        if (!m_chromRestrict.empty() && !locoChromLabelsMatch(chr, m_chromRestrict)) {
+            // Filtered out of the index space, but remember its chromosome so
+            // the region-level LOCO check can still see that a group-file
+            // variant lives on another chromosome (rather than mistaking it
+            // for "absent from the genotype file" and silently trimming the
+            // gene's burden statistic).
+            std::string base = chr + ":" + std::to_string(pd) + ":";
+            m_offChromIDToChrom.emplace(base + ref + ":" + alt, chr);
+            m_offChromIDToChrom.emplace(base + alt + ":" + ref, chr);
+            continue;
+        }
+
+        std::string marker;
+        if (countRec->d.id && std::string(countRec->d.id) != ".") {
+            marker = countRec->d.id;
+        } else {
+            marker = chr + ":" + std::to_string(pd) + ":" + ref + ":" + alt;
+        }
+
+        m_chr.push_back(chr);
+        m_pd.push_back(pd);
+        m_ref.push_back(ref);
+        m_alt.push_back(alt);
+        m_MarkerInVcf.push_back(marker);
         m_totalMarkers++;
     }
 
@@ -1086,8 +1183,31 @@ uint32_t VcfClass::prescanMarkerCount()
     hts_close(countFile);
 
     m_isPreScanned = true;
-    std::cout << "Number of markers in VCF file: " << m_totalMarkers << std::endl;
+    m_metaPrepopulated = true;
+    if (!m_chromRestrict.empty()) {
+        std::cout << "Number of markers in VCF file on chromosome "
+                  << m_chromRestrict << ": " << m_totalMarkers
+                  << " (of " << nSeen << ")" << std::endl;
+    } else {
+        std::cout << "Number of markers in VCF file: " << m_totalMarkers << std::endl;
+    }
     return m_totalMarkers;
+}
+
+// ============================================================
+// setChromRestriction: LOCO chromosome filter (see header)
+// ============================================================
+void VcfClass::setChromRestriction(const std::string& t_chrom)
+{
+    m_chromRestrict = t_chrom;
+    // A restriction change invalidates any cached marker count AND any
+    // prescanned metadata: the retained set (hence the index space) changes.
+    m_isPreScanned = false;
+    m_totalMarkers = 0;
+    m_metaPrepopulated = false;
+    m_chr.clear(); m_pd.clear(); m_ref.clear(); m_alt.clear(); m_MarkerInVcf.clear();
+    m_offChromIDToChrom.clear();
+    m_M0 = 0;
 }
 
 // ============================================================
@@ -1109,12 +1229,18 @@ void VcfClass::resetFile()
         m_htsFile = nullptr;
     }
 
-    // Clear accumulated marker info
-    m_chr.clear();
-    m_pd.clear();
-    m_ref.clear();
-    m_alt.clear();
-    m_MarkerInVcf.clear();
+    // Clear accumulated marker info -- but NOT when prescanMarkerCount() has
+    // already populated it for the whole (restricted) file. That metadata is
+    // what getMarkerIDToIndex() serves to the region path, and resetFile() is
+    // called right after the prescan; wiping it would restore the original
+    // "0 markers in every VCF region test" bug.
+    if (!m_metaPrepopulated) {
+        m_chr.clear();
+        m_pd.clear();
+        m_ref.clear();
+        m_alt.clear();
+        m_MarkerInVcf.clear();
+    }
     m_M0 = 0;
 
     // Re-open
@@ -1161,6 +1287,23 @@ std::unordered_map<std::string, uint32_t> VcfClass::getMarkerNameToIndex()
         nameMap[m_MarkerInVcf[i]] = i;
     }
     return nameMap;
+}
+
+// ============================================================
+// getMarkerIDToChrom: variant ID -> CHROM, same keys as getMarkerIDToIndex().
+// Also includes the records the LOCO restriction filtered out of the index
+// space, so the region-level LOCO check can distinguish "this variant is on
+// another chromosome" from "this variant is not in the genotype file".
+// ============================================================
+std::unordered_map<std::string, std::string> VcfClass::getMarkerIDToChrom()
+{
+    std::unordered_map<std::string, std::string> chrMap = m_offChromIDToChrom;
+    for (uint32_t i = 0; i < m_chr.size(); i++) {
+        std::string base = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":";
+        chrMap[base + m_ref[i] + ":" + m_alt[i]] = m_chr[i];
+        chrMap.emplace(base + m_alt[i] + ":" + m_ref[i], m_chr[i]);
+    }
+    return chrMap;
 }
 
 // ============================================================
@@ -2165,6 +2308,21 @@ std::unordered_map<std::string, uint32_t> BgenClass::getMarkerNameToIndex()
         nameMap[m_MarkerInBgen[i]] = static_cast<uint32_t>(v);
     }
     return nameMap;
+}
+
+// ============================================================
+// getMarkerIDToChrom: variant ID -> CHROM, same keys as getMarkerIDToIndex().
+// Populated from the .bgi index (populateFromBgi); empty if none was loaded.
+// ============================================================
+std::unordered_map<std::string, std::string> BgenClass::getMarkerIDToChrom()
+{
+    std::unordered_map<std::string, std::string> chrMap;
+    for (uint32_t i = 0; i < m_chr.size(); i++) {
+        std::string base = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":";
+        chrMap[base + m_ref[i] + ":" + m_alt[i]] = m_chr[i];
+        chrMap.emplace(base + m_alt[i] + ":" + m_ref[i], m_chr[i]);
+    }
+    return chrMap;
 }
 
 // ============================================================
@@ -3222,6 +3380,38 @@ std::unordered_map<std::string, uint32_t> Unified_getMarkerIDToIndex(std::string
     } else {
         throw std::runtime_error(
             "Unified_getMarkerIDToIndex: Unsupported type: " + t_genoType);
+    }
+}
+
+
+// ============================================================
+// Unified_getMarkerIDToChrom: get marker ID -> CHROM map
+// ============================================================
+std::unordered_map<std::string, std::string> Unified_getMarkerIDToChrom(std::string& t_genoType)
+{
+    if (t_genoType == "plink") {
+        if (ptr_gPLINKobj == nullptr) {
+            throw std::runtime_error("Unified_getMarkerIDToChrom: PLINK object not initialized.");
+        }
+        return ptr_gPLINKobj->getMarkerIDToChrom();
+    } else if (t_genoType == "vcf") {
+        if (ptr_gVCFobj == nullptr) {
+            throw std::runtime_error("Unified_getMarkerIDToChrom: VCF object not initialized.");
+        }
+        return ptr_gVCFobj->getMarkerIDToChrom();
+    } else if (t_genoType == "bgen") {
+        if (ptr_gBGENobj == nullptr) {
+            throw std::runtime_error("Unified_getMarkerIDToChrom: BGEN object not initialized.");
+        }
+        return ptr_gBGENobj->getMarkerIDToChrom();
+    } else if (t_genoType == "pgen") {
+        if (ptr_gPGENobj == nullptr) {
+            throw std::runtime_error("Unified_getMarkerIDToChrom: PGEN object not initialized.");
+        }
+        return ptr_gPGENobj->getMarkerIDToChrom();
+    } else {
+        throw std::runtime_error(
+            "Unified_getMarkerIDToChrom: Unsupported type: " + t_genoType);
     }
 }
 

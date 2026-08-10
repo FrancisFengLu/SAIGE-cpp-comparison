@@ -8,6 +8,15 @@
 *.dylib
 *.o.tmp
 code_copy/cpp_standalone/saige-null
+# Never track built binaries: a stale committed binary makes `make` think it is
+# up to date, so regression runs silently compare against the wrong build.
+SAIGE_cpp_260716/step1_saige-null/saige-null
+SAIGE_cpp_260716/step2_saige-step2/saige-step2
+*.pre-loco
+
+# Benchmark and diagnostic raw artifacts (100s of MB)
+SAIGE_cpp_260716/step2_saige-step2/tools/bench_timing_*/
+SAIGE_cpp_260716/step2_saige-step2/tools/evidence/
 
 # Backup files
 *.bak

@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cctype>
+#include <iostream>
 #include "SAIGE_step1_fast.hpp"
 
 namespace saige {
@@ -55,12 +56,15 @@ PreOut PreprocessEngine::run(const Design& design_in) {
     bin_event_time_if_needed_(d);
   }
 
-  // 5) LOCO chromosome ranges
+  // 5) LOCO chromosome ranges (compacted/post-QC marker index space)
   LocoRanges lr;
-  lr.enabled = cfg_.loco;
+  lr.enabled = false;
   if (cfg_.loco && !paths_.bim.empty()) {
     lr = compute_chr_ranges_from_bim_();
-    lr.enabled = !lr.start.empty();
+    lr.enabled = lr.enabled && !lr.start.empty();
+  } else if (cfg_.loco) {
+    std::cerr << "[loco] WARNING: LOCO requested but no BIM file is available; "
+                 "continuing WITHOUT LOCO.\n";
   }
 
   return PreOut{ std::move(d), lr, cfg_ };
@@ -222,6 +226,16 @@ void PreprocessEngine::bin_event_time_if_needed_(Design& d) const {
 }
 
 // --------- LOCO from BIM ----------
+//
+// Mirrors R's SAIGE_fitGLMM_fast.R:299-302 + Util.R::updateChrStartEndIndexVec.
+//
+//   MsubIndVec = getQCdMarkerIndex()
+//   chrVec     = bimChr[which(MsubIndVec == TRUE)]
+//   ranges     = per-chromosome [min,max] index into chrVec (0-based)
+//
+// The indices MUST be in COMPACTED (post-QC) marker space, because that is the
+// space geno.alleleFreqVec / the CorssProd worker index in. Using raw BIM row
+// indices would excise the wrong marker block.
 LocoRanges PreprocessEngine::compute_chr_ranges_from_bim_() const {
   LocoRanges lr;
   lr.enabled = false;
@@ -230,31 +244,76 @@ LocoRanges PreprocessEngine::compute_chr_ranges_from_bim_() const {
   std::ifstream in(paths_.bim);
   if (!in) throw std::runtime_error("Failed to open BIM: " + paths_.bim);
 
-  // 0-based marker index across entire BIM
-  // Identify first/last index for chr 1..22 (numeric only)
-  std::vector<int> first(23, -1), last(23, -1);
-  std::string line; int idx = 0;
+  // chromosome label per raw BIM row (0 == non-autosomal / non-numeric)
+  std::vector<int> bim_chr;
+  bim_chr.reserve(1u << 16);
+  std::string line;
   while (std::getline(in, line)) {
     if (line.empty()) continue;
     auto toks = split_ws_(line);
     if (toks.empty()) continue;
     const std::string& chr_s = toks[0];
-    if (!is_number_(chr_s)) { ++idx; continue; }
-    int chr = std::stoi(chr_s);
-    if (chr < 1 || chr > 22) { ++idx; continue; }
-    if (first[chr] == -1) first[chr] = idx;
-    last[chr] = idx;
-    ++idx;
+    int chr = 0;
+    if (is_number_(chr_s)) {
+      chr = std::stoi(chr_s);
+      if (chr < 1 || chr > 22) chr = 0;
+    }
+    bim_chr.push_back(chr);
   }
+
+  // Map raw BIM rows -> compacted (post-QC) marker indices.
+  std::vector<bool> keep;
+  try {
+    keep = getQCdMarkerIndex();
+  } catch (...) {
+    keep.clear();
+  }
+  const bool have_qc = (keep.size() == bim_chr.size()) && !keep.empty();
+  if (!have_qc) {
+    std::cerr << "[loco] WARNING: QC marker indicator unavailable or size mismatch ("
+              << keep.size() << " vs " << bim_chr.size() << " bim rows); "
+                 "falling back to raw BIM indices. LOCO ranges may be wrong if any "
+                 "marker was dropped by MAF/missingness QC.\n";
+  }
+
+  std::vector<int> first(23, -1), last(23, -1);
+  int compacted = 0;
+  for (size_t i = 0; i < bim_chr.size(); ++i) {
+    if (have_qc && !keep[i]) continue;          // dropped by QC: not in the array
+    const int idx = have_qc ? compacted : static_cast<int>(i);
+    const int chr = bim_chr[i];
+    if (chr >= 1 && chr <= 22) {
+      if (first[chr] == -1) first[chr] = idx;
+      last[chr] = idx;
+    }
+    ++compacted;
+  }
+
+  int n_present = 0;
   for (int c = 1; c <= 22; ++c) {
     if (first[c] != -1 && last[c] != -1) {
       lr.start.push_back(first[c]);
       lr.end.push_back(last[c]);
+      ++n_present;
     } else {
       lr.start.push_back(-1);
       lr.end.push_back(-1);
     }
   }
+
+  // R (Util.R:53-57): LOCO cannot be conducted with fewer than 2 autosomes.
+  if (n_present <= 1) {
+    std::cerr << "[loco] WARNING: The number of autosomal chromosomes is " << n_present
+              << " (<2) and leave-one-chromosome-out can't be conducted. "
+                 "Continuing WITHOUT LOCO.\n";
+    lr.start.clear();
+    lr.end.clear();
+    lr.enabled = false;
+    return lr;
+  }
+
+  std::cout << "[loco] autosomes present: " << n_present
+            << " (compacted marker index space, M_qc=" << compacted << ")\n";
   lr.enabled = true;
   return lr;
 }

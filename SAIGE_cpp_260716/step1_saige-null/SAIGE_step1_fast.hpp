@@ -115,12 +115,22 @@ void setisUseSparseSigmaforNullModelFitting(bool isUseSparseSigmaforModelFitting
 void setisUsePCGwithSparseSigma(bool isUsePCGwithSparseSigma0);
 
 // LOCO (Leave One Chromosome Out) functions
-void setChromosomeIndicesforLOCO(std::vector<int> chromosomeStartIndexVec, 
-                                 std::vector<int> chromosomeEndIndexVec, 
-                                 std::vector<int> chromosomeVecVec);
+// NOTE: setChromosomeIndicesforLOCO was declared here but its definition in
+// SAIGE_step1_fast.cpp was inside a comment block, so any caller would have
+// failed to link. Declaration and dead definition removed; re-add both together
+// when LOCO is actually implemented.
 void setStartEndIndex(int startIndex, int endIndex, int chromIndex);
 void setStartEndIndexVec(arma::ivec & startIndex_vec, arma::ivec & endIndex_vec);
 void set_Diagof_StdGeno_LOCO();
+
+// Per-marker QC indicator over the ORIGINAL bim marker order (length = #bim rows).
+// true  => marker passed the MAF / missingness filters and therefore occupies a
+//          slot in the compacted in-memory genotype array.
+// LOCO chromosome ranges must be expressed in COMPACTED marker indices, i.e.
+// indices into the subsequence of bim rows for which this is true. R does the
+// same: chrVec = bimChr[which(getQCdMarkerIndex() == TRUE)]
+// (R/SAIGE_fitGLMM_fast.R:299-302).
+std::vector<bool> getQCdMarkerIndex();
 
 // Utility functions
 void freqOverStd(arma::fcolvec& freqOverStdVec);

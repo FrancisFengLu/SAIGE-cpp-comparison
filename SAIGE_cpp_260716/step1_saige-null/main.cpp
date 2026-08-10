@@ -17,6 +17,7 @@
 #include "saige_null.hpp"     // Paths, FitNullConfig, Design, FitNullResult, register_default_solvers()
 #include "covariate_offset.hpp"
 #include "glmm.hpp"
+#include "loco_engine.hpp"
 #include <dlfcn.h>
 #include <cstdlib>
 #include <thread>
@@ -558,27 +559,11 @@ static double probit(double p) {
   }
 }
 
-// ------------------ LOCO: scan BIM for per-chr ranges ------------------
-static std::vector<std::pair<size_t,size_t>> scan_bim_chr_ranges(const std::string& bim) {
-  std::ifstream in(bim);
-  if (!in) throw std::runtime_error("Failed to open BIM: " + bim);
-  std::string chr,id,c3,pos,a1,a2;
-  struct R { size_t lo=SIZE_MAX, hi=0; bool any=false; };
-  std::unordered_map<std::string,R> map;
-  size_t idx=0;
-  while (in >> chr >> id >> c3 >> pos >> a1 >> a2) {
-    auto &r = map[chr];
-    r.any=true; r.lo = std::min(r.lo, idx); r.hi = std::max(r.hi, idx);
-    ++idx;
-  }
-  std::vector<std::pair<size_t,size_t>> out; out.reserve(map.size());
-  auto push = [&](const std::string& c){
-    auto it=map.find(c); if (it!=map.end() && it->second.any) out.emplace_back(it->second.lo, it->second.hi);
-  };
-  for (int c=1;c<=22;++c) push(std::to_string(c));
-  push("X"); push("Y"); push("MT");
-  return out;
-}
+// NOTE: scan_bim_chr_ranges() used to live here. It scanned the BIM for raw
+// per-chromosome marker ranges, printed a count and threw the result away, and
+// its indices were in raw-BIM space rather than the compacted post-QC space the
+// genotype object uses. LOCO ranges are now computed once in
+// PreprocessEngine::compute_chr_ranges_from_bim_() and flow through PreOut::chr.
 
 // ------------------ Design helpers ------------------
 static bool is_missing(const std::string& s){
@@ -1072,6 +1057,7 @@ int main(int argc, char** argv) {
   }
 
   saige::register_default_solvers();
+  saige::register_default_loco_batch();
 
   // Load design path (CLI > YAML)
   std::string design_csv;
@@ -1302,6 +1288,9 @@ int main(int argc, char** argv) {
     // restore the full X at the .arma-save block in null_model_engine.cpp.
     design.X_full = design.X;
     design.p_full = design.p;
+    // Keep the full-length initial-GLM beta so nullmodel.json can report a
+    // p-length alpha (the GLMM below only re-fits the intercept).
+    design.beta_full = cor.beta;
     design.X.assign(design.n, 1.0);
     design.p = 1;
     std::cout << "[design] covariate_offset=true → added Xβ(covariates) to offset, "
@@ -1313,13 +1302,10 @@ int main(int argc, char** argv) {
   ensure_parent_dir(paths.out_prefix + ".touch");
   ensure_parent_dir(paths.out_prefix_vr + ".touch");
 
-  // LOCO: precompute ranges (pass into solver/VR if your engines accept it)
-  std::vector<std::pair<size_t,size_t>> loco_ranges;
-  if (cfg.loco) {
-    loco_ranges = scan_bim_chr_ranges(paths.bim);
-    std::cout << "[loco] ranges=" << loco_ranges.size() << "\n";
-    // TODO: plumb loco_ranges to your engine via cfg or a setter.
-  }
+  // LOCO ranges are computed inside PreprocessEngine::compute_chr_ranges_from_bim_()
+  // (post-QC/compacted marker index space, which is what the genotype object
+  // indexes in) and flow to NullModelEngine via PreOut::chr. There used to be a
+  // duplicate raw-BIM scan here whose result was discarded; it has been removed.
 
   // FAM alignment (IID->1-based index)
   // FIXED: indicatorWithPheno should have N elements (FAM size), not design.n elements
@@ -1701,7 +1687,14 @@ int main(int argc, char** argv) {
   std::cout << "Model artifact: " << out.model_rda_path << "\n";
   if (!out.vr_path.empty())           std::cout << "Variance ratio: " << out.vr_path << "\n";
   if (!out.markers_out_path.empty())  std::cout << "Marker results: " << out.markers_out_path << "\n";
+  // out.loco is set by the engine only when the LOCO batch actually ran, so this
+  // no longer claims "on" for a run that quietly skipped LOCO.
   std::cout << "LOCO: " << (out.loco ? "on" : "off")
-            << "  LowMem: " << (out.lowmem_loco ? "yes" : "no") << "\n";
+            << "  LowMem: " << (out.lowmem_loco ? "yes" : "no");
+  if (out.loco) {
+    std::cout << "  chroms:";
+    for (int c : out.loco_chroms) std::cout << " " << c;
+  }
+  std::cout << "\n";
   return 0;
 }
