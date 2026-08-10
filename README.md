@@ -109,31 +109,8 @@ test data -- and you will chase ghosts.
   own unseeded random vectors. Closing the gap further would mean making the
   trace estimator deterministic and identical on both sides.
 
-## Performance
-
-Measured on 4 cores / 16 GB against R SAIGE 1.5.1. Dataset: N=10,000 samples,
-300 genes, 16,422 rare markers, quantitative trait. Both sides were given the
-same null model and verified to process identical marker and gene counts.
-Median of 3 runs with `OPENBLAS_NUM_THREADS=1`.
-
-| stage | C++ | R | ratio |
-|---|---|---|---|
-| Step 2 region, 1 thread | 270.8 s | 383.8 s | 1.42x |
-| Step 2 region, 4 threads | 116.0 s | 383.8 s | 3.31x |
-| Step 2 single-variant, compute only | 2.2 s | 7.0 s | 3.1x |
-| **Step 1, 4 threads** | **159 s** | **118 s** | **0.74x (slower)** |
-
-**Step 1 is currently slower than R**, and also burns more CPU to get there
-(530 s user versus 418 s). Step 2 region tests spend 40-45% of wall clock in
-system time versus R's 23-26%. Both are open items, not settled results.
-
-Full methodology, the BLAS-threading variant of these tables, and the raw
-per-run numbers are in
-`SAIGE_cpp_260716/step2_saige-step2/tools/BENCH_CPP_VS_R.md`.
-
 ## Known issues
 
-- Step 1 is slower than R; see above.
 - Survival traits do not support LOCO.
 - Region tests force the off-diagonal variance blocks to be symmetric, but `V`
   is genuinely asymmetric because `P2Vec` switches operator at MAC 20.5. This
