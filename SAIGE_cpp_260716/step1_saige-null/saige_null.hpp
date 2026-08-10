@@ -20,6 +20,12 @@ struct FitNullConfig {
   std::string trait{"binary"};            // "binary" | "quantitative" | "survival"
 
   // Feature flags
+  // Matches R SAIGE's default (LOCO=TRUE in R/SAIGE_fitGLMM_fast.R:1199 and
+  // R/SAIGE_Test_main.R). LOCO auto-disables, with a log message, when it
+  // cannot be conducted: fewer than 2 autosomes in the BIM (R/Util.R:53-57),
+  // no BIM at all, or a sparse GRM used to fit the null model (main.cpp).
+  // nullmodel.json's "loco" field reports what ACTUALLY happened, never the
+  // config flag.
   bool loco{true};
   bool lowmem_loco{false};
   bool use_sparse_grm_to_fit{false};
@@ -138,6 +144,14 @@ struct Design {
   std::vector<double> X_full;
   int p_full{0};
 
+  // Initial-GLM fixed-effect coefficients on the FULL (uncollapsed) design,
+  // length p_full. Only populated on the covariate_offset path. On that path
+  // the GLMM re-estimates the INTERCEPT ONLY (all other covariate effects are
+  // frozen inside the offset), so this is what lets us report a full-length
+  // alpha in nullmodel.json instead of just the intercept. Reporting only —
+  // nothing numerical is derived from it.
+  std::vector<double> beta_full;
+
   std::vector<double> y;          // length n
   std::vector<double> offset;     // optional, length n or empty
   std::vector<double> event_time; // optional, length n or empty
@@ -166,6 +180,13 @@ struct ScoreNullPack {
   std::vector<double> XXVX_inv;   // n x p
   std::vector<double> XVX_inv_XV; // n x p
   std::vector<double> X;          // n x p (design matrix)
+};
+
+// Result of a LOCO batch run. `chroms` lists the autosomes (1-based) for which
+// a chr<j>/ directory was actually written; `obj_noK` is parallel to it.
+struct LocoBatchOut {
+  std::vector<int>           chroms;
+  std::vector<ScoreNullPack> obj_noK;
 };
 
 struct FitNullResult {
@@ -198,9 +219,13 @@ struct FitNullResult {
   // Baseline score-null (R's obj.noK) in pure C++
   ScoreNullPack obj_noK;
 
-  // Optional: per-chromosome LOCO score-nulls (only if you populate them)
-  // Convention: index 0..21 => chr 1..22; entries may be empty (n=0) when not computed.
+  // Per-chromosome LOCO score-nulls, parallel to `loco_chroms`. Populated only
+  // when the LOCO batch actually ran.
   std::vector<ScoreNullPack> loco_obj_noK;
+
+  // Autosomes (1-based, ascending) for which chr<j>/ artifacts were written.
+  // Empty when `loco` is false. Serialized to nullmodel.json as "loco_chroms".
+  std::vector<int> loco_chroms;
 };
 
 

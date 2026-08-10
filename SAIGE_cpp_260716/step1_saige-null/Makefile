@@ -244,6 +244,15 @@ callgrind: profile
 clean:
 	rm -f $(OBJECTS) $(DEPS) $(TARGET)
 
-.PHONY: all clean profile callgrind
+# -------------------------
+# Tests
+# -------------------------
+# LOCO regression suite (tests/run_loco_tests.sh).
+# Set SAIGE_NULL_REF=<path to a pre-change binary> to make the byte-identity
+# test compare builds rather than just re-running the same binary twice.
+test: $(TARGET)
+	SAIGE_NULL_BIN=$(CURDIR)/$(TARGET) tests/run_loco_tests.sh
+
+.PHONY: all clean profile callgrind test
 
 -include $(DEPS)

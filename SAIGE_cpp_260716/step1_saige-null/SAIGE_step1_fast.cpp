@@ -5742,19 +5742,19 @@ arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& wVec_in,
     // configured globally via setStartEndIndex*()/set_Diagof_StdGeno_LOCO()
     // and is honored by the legacy helpers below.
 
-    // Preconditioner
-    if (!isUsePrecondM) {
-        // diagonal preconditioner M^{-1} = 1/diag(Sigma)
-        minvVec = 1.0f / getDiagOfSigma(wVec, tauVec);   // legacy: non-const refs
-        if (minvVec.n_elem != n)
-            throw std::runtime_error("PCG_LOCO: getDiagOfSigma returned wrong length");
-        zVec = minvVec % rVec;
-    } else {
-        // sparse preconditioner using (LOCO-aware) sparse Sigma
-        zVec = gen_spsolve_v4(wVec, tauVec, rVec);       // legacy: non-const refs
-        if (zVec.n_elem != n)
-            throw std::runtime_error("PCG_LOCO: gen_spsolve_v4 returned wrong length");
-    }
+    // Preconditioner.
+    // R (src/SAIGE_fitGLMM_fast.cpp::getPCG1ofSigmaAndVector_LOCO) has NO sparse
+    // branch here: it always uses the diagonal preconditioner built from the
+    // LOCO diagonal. Mirror that exactly. (LOCO is disabled whenever the sparse
+    // GRM is used to fit the null model, so the sparse branch is unreachable.)
+    //
+    // BUG FIX: this used to call the non-LOCO getDiagOfSigma()/getCrossprod(),
+    // which made the "LOCO" solve numerically identical to the full-genome
+    // solve — i.e. LOCO silently did nothing.
+    minvVec = 1.0f / getDiagOfSigma_LOCO(wVec, tauVec);
+    if (minvVec.n_elem != n)
+        throw std::runtime_error("PCG_LOCO: getDiagOfSigma_LOCO returned wrong length");
+    zVec = minvVec % rVec;
 
     arma::fvec pVec = zVec;
     float sumr2 = arma::dot(rVec, rVec);
@@ -5763,24 +5763,18 @@ arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& wVec_in,
     while (sumr2 > tolPCG && iter < maxiterPCG) {
         ++iter;
 
-        // Ap = Sigma * p  (LOCO should be respected inside this op)
-        arma::fcolvec ApVec = getCrossprod(pVec, wVec, tauVec); // legacy: non-const refs
+        // Ap = Sigma_LOCO * p (the excluded chromosome block is subtracted
+        // inside parallelCrossProd_LOCO)
+        arma::fcolvec ApVec = getCrossprod_LOCO(pVec, wVec, tauVec);
         if (ApVec.n_elem != n)
-            throw std::runtime_error("PCG_LOCO: getCrossprod returned wrong length");
+            throw std::runtime_error("PCG_LOCO: getCrossprod_LOCO returned wrong length");
 
         float a = arma::as_scalar((rVec.t() * zVec) / (pVec.t() * ApVec));
         xVec += a * pVec;
 
         arma::fvec r1Vec = rVec - a * ApVec;
 
-        arma::fvec z1Vec;
-        if (!isUsePrecondM) {
-            z1Vec = minvVec % r1Vec;
-        } else {
-            z1Vec = gen_spsolve_v4(wVec, tauVec, r1Vec); // legacy: non-const refs
-            if (z1Vec.n_elem != n)
-                throw std::runtime_error("PCG_LOCO: gen_spsolve_v4 (z1) wrong length");
-        }
+        arma::fvec z1Vec = minvVec % r1Vec;
 
         float beta = arma::as_scalar((z1Vec.t() * r1Vec) / (zVec.t() * rVec));
         pVec = z1Vec + beta * pVec;
@@ -5804,15 +5798,9 @@ arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& wVec_in,
 
 // REMOVED: nb() - use nb() from src/UTIL.cpp instead (takes unsigned int parameter)
 
-/*
-// INTERNAL: Set chromosome indices for LOCO analysis
-void setChromosomeIndicesforLOCO(vector<int> chromosomeStartIndexVec, vector<int> chromosomeEndIndexVec, vector<int> chromosomeVecVec){
-  LOCO = true;
-  chromosomeStartIndex = chromosomeStartIndexVec;
-  chromosomeEndIndexV = chromosomeEndIndexVec;
-  chromosomeVec = chromosomeVecVec;
-}
-*/
+// REMOVED: setChromosomeIndicesforLOCO() - the definition here was commented out
+// while the header still declared it, so any caller would have failed to link.
+// Restore definition + declaration together when LOCO is implemented.
 
 // INTERNAL: Set start and end indices for chromosome analysis
 void setStartEndIndex(int startIndex, int endIndex, int chromIndex){

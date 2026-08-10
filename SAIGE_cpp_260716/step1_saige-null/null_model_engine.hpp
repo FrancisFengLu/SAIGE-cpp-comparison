@@ -21,15 +21,22 @@ using QuantSolverFn = FitNullResult (*)(const Paths&,
                                         const std::vector<double>& /*offset*/,
                                         const std::vector<double>& /*beta_init (optional)*/);
 
-// Batched LOCO runner across chromosomes (optional).
-// Provide an implementation and register via register_loco_batch().
-using LocoBatchFn = void (*)(const Paths&,
+// Batched LOCO runner across chromosomes.
+// Provide an implementation and register via register_loco_batch();
+// loco_engine.cpp supplies the default (saige::run_loco_batch).
+//
+// Returns true iff LOCO actually ran and the chr<j>/ artifacts were written.
+// `alpha` is in the SAME space as `design.X` (i.e. before any QR back-transform)
+// and `eta` is the converged full-genome linear predictor.
+using LocoBatchFn = bool (*)(const Paths&,
                              const FitNullConfig&,
                              const LocoRanges&,
                              const Design&,
                              const std::vector<double>& /*theta*/,
-                             const std::vector<double>& /*alpha*/,
-                             const std::vector<double>& /*offset*/);
+                             const std::vector<double>& /*alpha (fit space)*/,
+                             const std::vector<double>& /*offset*/,
+                             const std::vector<double>& /*eta (converged)*/,
+                             LocoBatchOut& /*out*/);
 
 // Registration APIs (call these once during initialization).
 void register_binary_solver(BinarySolverFn fn);

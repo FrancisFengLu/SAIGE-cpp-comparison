@@ -111,6 +111,16 @@ test_region: $(TARGET)
 test_ldmat: $(TARGET)
 	./$(TARGET) config_ldmat.yaml
 
-.PHONY: all clean test_region test_ldmat
+# LOCO (leave-one-chromosome-out) regression tests.
+# Optionally set BASELINE=/path/to/pre-change/saige-step2 to also assert that a
+# LOCO=false run is byte-identical to the pre-LOCO build.
+# tests/saige-step2.pre-loco is a checked-in copy of the build immediately
+# before the LOCO change, used as that baseline by default.
+BASELINE ?= $(wildcard tests/saige-step2.pre-loco)
+
+test: $(TARGET)
+	bash tests/run_loco_tests.sh ./$(TARGET) $(BASELINE)
+
+.PHONY: all clean test test_region test_ldmat
 
 -include $(DEPS)

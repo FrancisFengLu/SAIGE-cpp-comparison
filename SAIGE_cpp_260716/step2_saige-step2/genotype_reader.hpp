@@ -231,6 +231,20 @@ public:
         return idMap;
     }
 
+    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to CHROM.
+    // Same key construction as getMarkerIDToIndex(); the value is the
+    // authoritative per-marker chromosome from the genotype file, which the
+    // region-level LOCO filter uses instead of parsing the variant ID string.
+    std::unordered_map<std::string, std::string> getMarkerIDToChrom() {
+        std::unordered_map<std::string, std::string> chrMap;
+        for (uint32_t i = 0; i < m_M0; i++) {
+            std::string base = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":";
+            chrMap[base + m_ref[i] + ":" + m_alt[i]] = m_chr[i];
+            chrMap.emplace(base + m_alt[i] + ":" + m_ref[i], m_chr[i]);
+        }
+        return chrMap;
+    }
+
     // Build a map from rsID (column 2 of .bim, m_MarkerInPlink) to marker index
     // Used by conditional analysis to look up conditioning markers by name
     std::unordered_map<std::string, uint32_t> getMarkerNameToIndex() {
@@ -287,6 +301,29 @@ private:
     uint32_t m_totalMarkers;
     bool m_isPreScanned;
 
+    // LOCO chromosome restriction. When non-empty, both prescanMarkerCount()
+    // and getOneMarker() silently skip every record whose CHROM does not
+    // match (lenient match via locoChromLabelsMatch: "chr1"=="1"=="01").
+    // The VCF reader is strictly sequential (getOneMarker ignores gIndex and
+    // there is no tabix iterator), so subsetting the caller's genoIndex
+    // vector cannot work -- the skip has to happen inside the reader.
+    std::string m_chromRestrict;
+
+    // True once prescanMarkerCount() has filled m_chr/m_pd/m_ref/m_alt/
+    // m_MarkerInVcf for every record the stream will later return. While set,
+    // getOneMarker() must NOT append to those vectors (it would duplicate the
+    // metadata and desynchronise the index space); instead it verifies that
+    // the record it just read is the one the prescan recorded at that index.
+    bool m_metaPrepopulated;
+
+    // Chromosome of every record the prescan SKIPPED because of
+    // m_chromRestrict, keyed by "chr:pos:ref:alt" (and the allele-swapped
+    // spelling), i.e. exactly the keys getMarkerIDToIndex() would have used.
+    // Empty when no restriction is active. Needed so the region-level LOCO
+    // check can still tell that a group-file variant belongs to another
+    // chromosome even though the reader filtered it out of the index space.
+    std::unordered_map<std::string, std::string> m_offChromIDToChrom;
+
     // Internal: read sample IDs from VCF header
     void getSampleIDlist();
 
@@ -326,6 +363,12 @@ public:
     // Pre-scan VCF to count total markers (needed for index generation)
     uint32_t prescanMarkerCount();
 
+    // LOCO: restrict every subsequent read to this chromosome. Pass "" to
+    // clear. Must be called BEFORE prescanMarkerCount() so the returned count
+    // reflects only the retained records.
+    void setChromRestriction(const std::string& t_chrom);
+    const std::string& getChromRestriction() const { return m_chromRestrict; }
+
     // Reset file to beginning for re-reading
     void resetFile();
 
@@ -335,6 +378,11 @@ public:
 
     // Build marker name to index map (ID field -> index)
     std::unordered_map<std::string, uint32_t> getMarkerNameToIndex();
+
+    // Build marker ID -> CHROM map, using exactly the same keys as
+    // getMarkerIDToIndex(). For VCF this additionally covers the records the
+    // LOCO restriction filtered out (see m_offChromIDToChrom).
+    std::unordered_map<std::string, std::string> getMarkerIDToChrom();
 
     std::vector<std::string> getChrVec() { return m_chr; }
 
@@ -497,7 +545,16 @@ public:
     // Build marker name to index map (RSID -> marker read order index)
     std::unordered_map<std::string, uint32_t> getMarkerNameToIndex();
 
+    // Build marker ID -> CHROM map, same keys as getMarkerIDToIndex().
+    std::unordered_map<std::string, std::string> getMarkerIDToChrom();
+
     std::vector<std::string> getChrVec() { return m_chr; }
+
+    // Per-variant byte offsets (.bgi file_start_position), parallel to
+    // getChrVec(). Empty when no .bgi index was loaded. These are exactly the
+    // values getOneMarker()/readRawBlock() seek to, so a caller can build a
+    // filtered genoIndex from them (used for LOCO chromosome restriction).
+    const std::vector<uint64_t>& getByteOffsetVec() const { return m_byteOffset; }
 
     void closegenofile();
 };
@@ -815,6 +872,18 @@ public:
         return nameMap;
     }
 
+    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to CHROM.
+    // Same key construction as getMarkerIDToIndex(); see PlinkClass.
+    std::unordered_map<std::string, std::string> getMarkerIDToChrom() {
+        std::unordered_map<std::string, std::string> chrMap;
+        for (uint32_t i = 0; i < m_M; i++) {
+            std::string base = m_chr[i] + ":" + std::to_string(m_position[i]) + ":";
+            chrMap[base + m_ref[i] + ":" + m_alt[i]] = m_chr[i];
+            chrMap.emplace(base + m_alt[i] + ":" + m_ref[i], m_chr[i]);
+        }
+        return chrMap;
+    }
+
     void closegenofile();
 };
 
@@ -921,6 +990,12 @@ void closeGenoFile(std::string& t_genoType);
 
 // Helper: get marker ID to index map (for region testing)
 std::unordered_map<std::string, uint32_t> Unified_getMarkerIDToIndex(std::string& t_genoType);
+
+// Parallel to Unified_getMarkerIDToIndex: the authoritative per-marker
+// chromosome from the genotype file, keyed by the same variant-ID spellings.
+// Used by the region-level LOCO filter so that the chromosome never has to be
+// parsed out of the group file's variant-ID string.
+std::unordered_map<std::string, std::string> Unified_getMarkerIDToChrom(std::string& t_genoType);
 
 // C++ version of which(). Note: start from 0, not 1
 std::vector<unsigned int> whichCPP(std::vector<std::string>& strVec,

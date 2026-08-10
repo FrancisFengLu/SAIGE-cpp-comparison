@@ -1,0 +1,32 @@
+# Template consumed by tests/run_loco_tests.sh via sed substitution.
+paths:
+  plinkFile:     @PLINK@
+  out_prefix:    @OUT@
+  out_prefix_vr: @OUT@/vr
+  sparse_grm:     "@SPARSE_GRM@"
+  sparse_grm_ids: "@SPARSE_GRM_IDS@"
+  overwrite_varratio: true
+
+design:
+  csv: @PHENO@
+  iid_col: IID
+  y_col: y_binary
+  covar_cols:
+    - x1
+    - x2
+
+fit:
+  trait: binary
+  loco: @LOCO@
+  nthreads: 1
+  maxiter: 20
+  tol: 0.02
+  tolPCG: 1e-5
+  maxiterPCG: 500
+  nrun: 30
+  trace_seed: 10
+  num_markers_for_vr: 0
+  use_sparse_grm_to_fit: @SPARSE_FIT@
+  use_pcg_with_sparse_grm: false
+  relatedness_cutoff: 0.125
+  overwrite_vr: true

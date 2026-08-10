@@ -11,6 +11,10 @@
 //   6. R matrix indexing        -->  arma::imat with row/col access
 
 #include "group_file.hpp"
+// locoChromLabelsMatch(): the single canonical lenient chromosome-name
+// comparator ("chr1" == "CHR1" == "01" == "1"). Same precedent as
+// genotype_reader.cpp -- do not add a second comparator here.
+#include "null_model_loader.hpp"
 
 #include <sstream>
 #include <iostream>
@@ -241,7 +245,10 @@ std::vector<RegionData> readRegionChunk(
     int nregions_to_read,
     int nline_per_gene,
     const std::vector<std::string>& annoVec,
-    const std::unordered_map<std::string, uint32_t>& markerIDToIndex)
+    const std::unordered_map<std::string, uint32_t>& markerIDToIndex,
+    const std::unordered_map<std::string, std::string>& markerIDToChrom,
+    const std::string& locoChrom,
+    int* t_numRegionsOffChrom)
 {
     if (annoVec.empty()) {
         throw std::runtime_error("At least one annotation is required");
@@ -342,6 +349,78 @@ std::vector<RegionData> readRegionChunk(
                         "Invalid weight value '" + tokensWeight[w + 2] +
                         "' for gene " + gene);
                 }
+            }
+        }
+
+        // --- Step 3b: LOCO chromosome restriction ---
+        // Under LOCO the null model loaded for this run was fitted leaving out
+        // exactly one chromosome, so a region may only be tested if it lives on
+        // that chromosome. Nothing downstream detects a violation: a chr2 gene
+        // scored against the chr1 null model just yields a plausible, wrong
+        // p-value.
+        //
+        // The chromosome comes from the GENOTYPE FILE (markerIDToChrom, built
+        // from the reader's own per-marker CHROM), never from parsing the
+        // variant-ID string. Group files in the wild do not have to spell IDs
+        // as "chr:pos:ref:alt" -- rsIDs and "chr1_12345_A_G" are both common --
+        // and a naming convention is not a sound basis for deciding which null
+        // model a marker may be tested against.
+        //
+        // R equivalent (SAIGE_SPATest_Region.R:1360-1365 for the VCF/no-
+        // markerInfo path, plus Geno.R:189-191 / :216-218 and
+        // SAIGE_SPATest_Region.R:133-138 which pre-filter markerInfo by chrom
+        // for plink / pgen / bgen): R drops off-chromosome *variants* silently,
+        // so an all-off-chromosome region ends up empty and is skipped. We match
+        // that for whole regions. We deliberately do NOT match it for a region
+        // whose variants span several chromosomes: R silently trims such a
+        // region and reports a burden statistic computed over a subset of the
+        // gene (its own multi-chromosome check is commented out at
+        // SAIGE_SPATest_Region.R:1470-1472). That is a wrong number emitted
+        // without a signal, so we make it fatal instead.
+        if (!locoChrom.empty()) {
+            // Variants the genotype file does not know about have no
+            // chromosome; they are not an error (R drops them with the
+            // "markers in RegionFile are not in GenoFile" message, which Step 4
+            // below still emits). They simply do not participate in the
+            // on/off-chromosome vote.
+            int nOn = 0, nOff = 0;
+            for (int v = 0; v < nvar; v++) {
+                auto cit = markerIDToChrom.find(varIDs[v]);
+                if (cit == markerIDToChrom.end()) continue;  // not in GenoFile
+                if (locoChromLabelsMatch(cit->second, locoChrom)) {
+                    nOn++;
+                } else {
+                    nOff++;
+                }
+            }
+
+            if (nOn == 0 && nOff > 0) {
+                // Whole region is off-chromosome: drop it, exactly as R would.
+                region.variantIDs.clear();
+                region.annotations.clear();
+                region.weights.clear();
+                region.annoIndicatorMat.reset();
+                region.annoVec.clear();
+                region.genoIndex.clear();
+                region.genoIndex_prev.clear();
+                region.offLocoChrom = true;
+                if (t_numRegionsOffChrom != nullptr) {
+                    (*t_numRegionsOffChrom)++;
+                }
+                results.push_back(std::move(region));
+                continue;
+            }
+
+            if (nOff > 0) {
+                throw std::runtime_error(
+                    "Region " + gene + " in the group file spans more than one "
+                    "chromosome (" + std::to_string(nOn) + " of " +
+                    std::to_string(nOn + nOff) + " markers found in the genotype "
+                    "file are on chromosome " + locoChrom +
+                    "). Under LOCO only markers on chromosome " + locoChrom +
+                    " may be tested, and dropping the rest would change the burden "
+                    "statistic for this gene without any signal in the output. "
+                    "Refusing to run: split the group file by chromosome.");
             }
         }
 
