@@ -171,6 +171,19 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& w,
                                    const arma::fvec& v,
                                    int maxiterPCG, float tolPCG);
 
+// Phase-2 batched-RHS PCG: solves Sigma X = B for all columns of B at once
+// (per-column alpha/beta/convergence, converged columns frozen). Numerically
+// equivalent to per-column getPCG1ofSigmaAndVector up to fp association
+// order in the batched ψ·B.
+arma::fmat getPCGofSigmaAndMatrix(const arma::fvec& w,
+                                  const arma::fvec& tau,
+                                  const arma::fmat& Bmat,
+                                  int maxiterPCG, float tolPCG);
+
+// Phase-2 rollback switch: true when SAIGE_NO_BLOCKPCG=1 (callers restore
+// the serial per-probe / per-marker PCG loops).
+bool isBlockPCGdisabled();
+
 arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& w,
                                         const arma::fvec& tau,
                                         const arma::fvec& v,

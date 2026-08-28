@@ -7,7 +7,11 @@ else
   CXX ?= g++
 endif
 
-CXXFLAGS ?= -std=c++17 -O2 -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=1 -MMD -MP -pthread -fopenmp
+# Phase-2 fix: `?=` was silently defeated by conda activate scripts that export
+# CXXFLAGS (-march=nocona -O2), so most objects were NOT built with the flags
+# below. `:=` makes the Makefile assignment win over the environment (make only
+# lets the environment override `?=`, or any assignment under `make -e`).
+CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=1 -MMD -MP -pthread -fopenmp
 
 # REQUIRED_DEFS are always appended to CXXFLAGS, even when the environment
 # (e.g. a conda/mamba activate script) pre-exports CXXFLAGS — in which case the
@@ -226,6 +230,16 @@ $(GPU_MATVEC_DIR)/gpu_matvec.cu.o: $(GPU_MATVEC_DIR)/gpu_matvec.cu $(GPU_MATVEC_
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# Phase-1 (AVX2 fused decode): the kernels in tools/avx2_kernel/avx2_kernel.hpp
+# require AVX2+FMA. Only this TU gets the ISA flags so every other object stays
+# identical to the Phase-0 baseline (a conda env's exported CXXFLAGS pins
+# -march=nocona, which would otherwise compile the kernels out entirely).
+# -ffp-contract=off: with -mfma GCC defaults to contracting scalar a*b+c into
+# fma, which changes rounding across the whole TU and breaks bit-identity of
+# the scalar fallback path vs the Phase-0 baseline. The AVX2 kernels use
+# explicit _mm256_fmadd_ps intrinsics, which are unaffected by this flag.
+SAIGE_step1_fast.o: CXXFLAGS += -mavx2 -mfma -ffp-contract=off
 
 # Profile build: debug symbols + light optimization for meaningful callgrind output
 profile: CXXFLAGS := $(filter-out -O2,$(CXXFLAGS)) -O1 -g

@@ -339,8 +339,28 @@ void compute_variance_ratio(const Paths& paths,
     };
     std::vector<MarkerResult> markerResults;
 
+    // Phase-2 wave batching: markers of one wave are selected first (the
+    // selection filters — AC>=2, bin assignment — depend only on the
+    // genotype, never on the PCG result, so the selection sequence is
+    // identical to the historical serial loop), then their Σ⁻¹G solves run
+    // as ONE batched block-PCG, then the per-marker ratio computations are
+    // replayed in the original order. SAIGE_NO_BLOCKPCG=1 keeps the wave
+    // structure but solves each column serially in the original order,
+    // which is bit-identical to the historical per-marker loop.
+    struct VrCand {
+        int snpIdx;
+        double AC;
+        double AF;
+        int binId;
+        arma::fvec G;     // covariate-adjusted genotype
+        arma::fvec G0f;   // raw genotype (minor-allele coded), float
+    };
+
     while (ratioCV > ratioCVcutoff) {
-        while (numTestedMarker < numMarkers0 && indexInMarkerList < totalAvailable) {
+        // ---- Phase A: select this wave's markers (no PCG) ----
+        std::vector<VrCand> wave;
+        while (numTestedMarker + (int)wave.size() < numMarkers0
+               && indexInMarkerList < totalAvailable) {
             int snpIdx;
             bool genoInd;
 
@@ -403,40 +423,62 @@ void compute_variance_ratio(const Paths& paths,
             // Covariate-adjusted genotype: G = G0 - XXVX_inv * (XV * G0)
             arma::fvec G = G0f - sn.XXVX_inv * (sn.XV * G0f);
 
+            // Bin assignment depends only on MAC — check now so the wave
+            // only carries markers that will actually be counted (the
+            // historical loop solved PCG for binId<0 markers and then
+            // discarded the result; skipping the solve changes nothing).
+            int binId = bin_of_mac(AC, cfg);
+            if (binId < 0) continue;
+
+            wave.push_back({snpIdx, AC, AF, binId, std::move(G),
+                            std::move(G0f)});
+        }
+
+        // ---- Phase B: Σ⁻¹G for the whole wave ----
+        const int nw = (int)wave.size();
+        arma::fmat Sigma_iG_mat(n, std::max(nw, 1));
+        if (nw > 0) {
+            if (!isBlockPCGdisabled()) {
+                arma::fmat Gmat(n, nw);
+                for (int c = 0; c < nw; ++c) Gmat.col(c) = wave[c].G;
+                Sigma_iG_mat = getPCGofSigmaAndMatrix(W_copy, tau_copy, Gmat,
+                                                      maxiterPCG, tolPCG);
+            } else {
+                // serial fallback: identical per-column solves in the
+                // original marker order
+                for (int c = 0; c < nw; ++c)
+                    Sigma_iG_mat.col(c) = getPCG1ofSigmaAndVector(
+                        W_copy, tau_copy, wave[c].G, maxiterPCG, tolPCG);
+            }
+        }
+
+        // ---- Phase C: per-marker ratios, replayed in selection order ----
+        for (int c = 0; c < nw; ++c) {
+            const int    snpIdx = wave[c].snpIdx;
+            const double AC     = wave[c].AC;
+            const double AF     = wave[c].AF;
+            const int    binId  = wave[c].binId;
+            const arma::fvec& G = wave[c].G;
+
             // Normalized genotype
             arma::fvec g = G / std::sqrt(static_cast<float>(AC));
 
             // Also compute non-X-adjusted version for comparison
-            arma::fvec G_noXadj = G0f - arma::mean(G0f);
+            arma::fvec G_noXadj = wave[c].G0f - arma::mean(wave[c].G0f);
             arma::fvec g_noXadj = G_noXadj / std::sqrt(static_cast<float>(AC));
 
             // --- var1 (exact): Sigma^{-1} based ---
-            // Sigma_iG = PCG solve for Σ^{-1} G
-            arma::fvec G_for_pcg = G0f;  // R uses G (not G0) — but actually R uses G (the raw genotype, not covariate-adjusted)
-            // Actually, looking at R code more carefully:
-            // Line 2850: Sigma_iG = getSigma_G(W, tauVecNew, G, maxiterPCG, tolPCG)
-            // where G was already covariate-adjusted at line 2833.
-            // Wait - R's line 2833: G = G0 - obj.noK$XXVX_inv %*% (obj.noK$XV %*% G0)
-            // And line 2850: Sigma_iG = getSigma_G(W, tauVecNew, G, ...)
-            // So it uses the covariate-adjusted G for PCG solve.
-            // But then line 2861: var1a = t(G)%*%Sigma_iG - t(G)%*%Sigma_iX%*%(solve(t(X)%*%Sigma_iX))%*%t(X)%*%Sigma_iG
-            // This seems redundant (adjusting both G and subtracting projection), but we must match R exactly.
-
-            arma::fvec Sigma_iG = getPCG1ofSigmaAndVector(W_copy, tau_copy, G, maxiterPCG, tolPCG);
+            // R: Sigma_iG = getSigma_G(W, tauVecNew, G, ...) with the
+            // covariate-adjusted G (SAIGE_fitGLMM_fast.R:2850); solved above
+            // for the whole wave.
+            arma::fvec Sigma_iG = Sigma_iG_mat.col(c);
 
             // var1a = G' * Sigma_iG - G' * Sigma_iX * (X' * Sigma_iX)^{-1} * X' * Sigma_iG
             float GtSiG = arma::dot(G, Sigma_iG);
-            arma::fvec XtSiG = Sigma_iX.t() * G;     // p x 1 -- wait, this should be X' * Sigma_iG
-            // Actually R: t(X) %*% Sigma_iG  and  t(G) %*% Sigma_iX
-            // Let me re-read:
             //   var1a = t(G) %*% Sigma_iG
             //         - t(G) %*% Sigma_iX %*% solve(t(X) %*% Sigma_iX) %*% t(X) %*% Sigma_iG
             // where Sigma_iX = Σ^{-1} X
             // So: term2 = G' * (Σ^{-1} X) * (X' Σ^{-1} X)^{-1} * X' * (Σ^{-1} G)
-
-            arma::fvec GtSiX = Sigma_iX.t() * G;     // p x 1: (Σ^{-1}X)' G = X' Σ^{-1} G... no.
-            // Sigma_iX is n x p = Σ^{-1} X
-            // G' Sigma_iX = G' (Σ^{-1} X) which is 1 x p
             arma::fvec GtSiX_vec(p);
             for (int j = 0; j < p; ++j)
                 GtSiX_vec(j) = arma::dot(G, Sigma_iX.col(j));  // G' * col_j of Sigma_iX
@@ -491,11 +533,8 @@ void compute_variance_ratio(const Paths& paths,
             }
 
             // --- Per-bin accumulation (categorical VR) ---
-            int binId = bin_of_mac(AC, cfg);
-            if (binId < 0) {
-                // Marker below the lowest bin — skip without incrementing target counts.
-                continue;
-            }
+            // binId was assigned in Phase A (selection); binId<0 markers
+            // never entered the wave.
 
             // Append to this bin's accumulators (and the legacy flat view).
             auto append_f = [](arma::fvec& v, double x) {

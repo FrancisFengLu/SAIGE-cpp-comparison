@@ -23,6 +23,7 @@
 #include "parallel_decode.hpp" // PR-5: parallel_decode_bed()
 #include "packed_store.hpp"    // option 3: PackedFlat primary storage
 #include "gpu_matvec.hpp"      // G3: optional cuBLAS K·u acceleration
+#include "tools/avx2_kernel/avx2_kernel.hpp"  // Phase-1: fused 2-bit decode kernels
 #include <RcppParallel.h>
 #include <RcppParallel/TBB.h>
 #include <cstdlib>
@@ -95,6 +96,22 @@ public:
           if (packed_flat_released_) return packed_flat_.nbyte();  // size is still known, bytes aren't
           if (use_packed_flat_) return packed_flat_.nbyte();
           return genoVecofPointers[snp_idx]->size();
+        }
+
+        // Phase-1 AVX2 kernel support: contiguous pointer to the packed bytes
+        // of one pass-QC marker. Valid in both storage modes because
+        // numMarkersofEachArray == 1 (each legacy vector holds exactly one
+        // marker's ⌈N/4⌉ bytes). Callers must check packed_rows_contiguous().
+        inline const unsigned char* packed_row_ptr(std::size_t snp_idx) const {
+          if (use_packed_flat_) {
+            return packed_flat_.raw() + snp_idx * packed_flat_.nbyte();
+          }
+          return genoVecofPointers[snp_idx]->data();
+        }
+        inline bool packed_rows_contiguous() const {
+          if (packed_flat_released_) return false;
+          if (use_packed_flat_) return true;
+          return numMarkersofEachArray == 1 && !genoVecofPointers.empty();
         }
 
         // G4: release the host-side packed bytes once the GPU backend has
@@ -973,8 +990,14 @@ public:
 				 // Note: arma::randi uses R's RNG when linked with R, which may not be initialized
 				 // in standalone mode (produces all zeros). Use std::mt19937 instead.
 				 {
-					 std::random_device rd;
-					 std::mt19937 gen(rd());
+					 // 修复：原来用 std::random_device 播种 —— 每次运行选中的 VR marker
+					 // 不同，而 VR marker 会从 GRM 排除，导致 GRM 组成、进而 tau 在
+					 // 运行间漂移 1-3%（单线程也不可复现，回归测试无法逐位比对）。
+					 // 固定种子（可用 SAIGE_VR_MARKER_SEED 覆盖）。这不损失统计性质：
+					 // 上游 R 版同样用固定 RNG 状态选 VR marker。
+					 unsigned vr_seed = 20200814u;
+					 if (const char* e = getenv("SAIGE_VR_MARKER_SEED")) vr_seed = (unsigned)atoi(e);
+					 std::mt19937 gen(vr_seed);
 					 std::uniform_int_distribution<int> dist(0, static_cast<int>(M-1));
 					 g_randMarkerIndforVR_temp.set_size(1000);
 					 for (int di = 0; di < 1000; di++) {
@@ -1771,6 +1794,21 @@ struct CorssProd : public Worker
   	arma::fvec m_bout;
         int Msub_mafge1perc;
 
+	// Phase-1 AVX2 fused-decode state (AVX2_KERNEL_PLAN.md). Set by
+	// parallelCrossProd before the reduce; default 0 keeps the original
+	// scalar path (used by parallelCrossProd_full / LOCO and as the
+	// SAIGE_NO_AVX2=1 fallback).
+	//   mode 0: scalar Get_OneSNP_StdGeno + dot + axpy (original)
+	//   mode 1: AVX2 pass1 (val1 via rank-one identity), scalar axpy
+	//           (validation stage; m_bout stays in natural order)
+	//   mode 2: AVX2 pass1 + pass2 (m_bout accumulates in PERM order and
+	//           omits the uniform -2f·s offset, tracked in m_Coffset;
+	//           caller un-permutes and subtracts after the reduce)
+	int          m_avx2_mode = 0;
+	const float* m_xperm     = nullptr;  // bVec in perm order (shared, read-only)
+	float        m_Sx        = 0.0f;     // Σ bVec (computed once per ψv)
+	float        m_Coffset   = 0.0f;     // Σ_markers 2·freq·sval (worker-local)
+
   	// constructors
   	CorssProd(arma::fcolvec & y)
   		: m_bVec(y) {
@@ -1787,9 +1825,36 @@ struct CorssProd : public Worker
   		m_M = CorssProd.m_M;
   		m_bout.zeros(m_N);
 		Msub_mafge1perc=0;
+		m_avx2_mode = CorssProd.m_avx2_mode;
+		m_xperm     = CorssProd.m_xperm;
+		m_Sx        = CorssProd.m_Sx;
+		m_Coffset   = 0.0f;
   	}
   	// process just the elements of the range I've been asked to
   	void operator()(std::size_t begin, std::size_t end) {
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+		if (m_avx2_mode != 0) {
+			float* boutp = m_bout.memptr();
+			arma::fvec vec;  // mode-1 scratch
+			for (unsigned int i = begin; i < end; i++) {
+				const unsigned char* row = geno.packed_row_ptr(i);
+				const float f = geno.alleleFreqVec[i];
+				const float d = geno.invstdvVec[i];
+				const float raw = saige_avx2::pass1_sum_gx(row, m_xperm, m_N);
+				const float val1 = d * (raw - 2.0f * f * m_Sx);
+				if (m_avx2_mode == 2) {
+					const float sval = val1 * d;
+					saige_avx2::pass2_axpy(row, sval, boutp, m_N);
+					m_Coffset += 2.0f * f * sval;
+				} else {
+					geno.Get_OneSNP_StdGeno(i, &vec);
+					m_bout += val1 * vec;
+				}
+				Msub_mafge1perc += 1;
+			}
+			return;
+		}
+#endif
   	  	arma::fvec vec;
   	  	for(unsigned int i = begin; i < end; i++){
 				geno.Get_OneSNP_StdGeno(i, &vec);
@@ -1803,6 +1868,7 @@ struct CorssProd : public Worker
   	void join(const CorssProd & rhs) {
     		m_bout += rhs.m_bout;
 		Msub_mafge1perc += rhs.Msub_mafge1perc;
+		m_Coffset += rhs.m_Coffset;
   	}
 };
 
@@ -1976,6 +2042,26 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 
 	int Msub_mafge1perc = geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
 
+	// Phase-1: optional psi-v wall-time telemetry (SAIGE_TIME_PSIV=1).
+	// Prints cumulative call count / total / mean every 50 calls.
+	static const bool s_time_psiv = [](){
+		const char* v = std::getenv("SAIGE_TIME_PSIV");
+		return v && std::string(v) == "1"; }();
+	struct PsivTimer {
+		bool on; double t0 = 0;
+		static double& total() { static double t = 0; return t; }
+		static long&   calls() { static long c = 0; return c; }
+		PsivTimer(bool enabled) : on(enabled) { if (on) t0 = get_wall_time(); }
+		~PsivTimer() {
+			if (!on) return;
+			total() += get_wall_time() - t0;
+			if ((++calls()) % 50 == 0)
+				std::cout << "[PSIV] calls=" << calls() << " total=" << total()
+				          << "s avg=" << 1e3 * total() / calls() << "ms"
+				          << std::endl;
+		}
+	} psiv_timer(s_time_psiv);
+
 	// DEBUG: Detailed diagnostics on first call
 	static int debug_call_count = 0;
 	if(debug_call_count == 0) {
@@ -2022,7 +2108,77 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 	}
 
 	CorssProd CorssProd(bVec);
+
+	// ------------------------------------------------------------------
+	// Phase-1 AVX2 fused decode (AVX2_KERNEL_PLAN.md). Default ON when the
+	// binary was built with AVX2+FMA and per-marker rows are contiguous.
+	// Env toggles:
+	//   SAIGE_NO_AVX2=1         -> original scalar path
+	//   SAIGE_AVX2_PASS1_ONLY=1 -> AVX2 val1 only, scalar axpy (validation)
+	//   SAIGE_AVX2_VERIFY=1     -> also run scalar path, print rel-L2 diff
+	// ------------------------------------------------------------------
+	int avx2_mode = 0;
+	arma::fvec xperm;
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+	static const bool s_no_avx2 = [](){
+		const char* v = std::getenv("SAIGE_NO_AVX2");
+		return v && std::string(v) == "1"; }();
+	static const bool s_pass1_only = [](){
+		const char* v = std::getenv("SAIGE_AVX2_PASS1_ONLY");
+		return v && std::string(v) == "1"; }();
+	static const bool s_avx2_verify = [](){
+		const char* v = std::getenv("SAIGE_AVX2_VERIFY");
+		return v && std::string(v) == "1"; }();
+	if (!s_no_avx2 && geno.packed_rows_contiguous()) {
+		const arma::uword N = geno.getNnomissing();
+		xperm.set_size(N);
+		saige_avx2::permute_fwd(bVec.memptr(), xperm.memptr(), (std::size_t)N);
+		double Sx = 0.0;
+		const float* bp = bVec.memptr();
+		for (arma::uword i = 0; i < N; ++i) Sx += bp[i];
+		avx2_mode = s_pass1_only ? 1 : 2;
+		CorssProd.m_avx2_mode = avx2_mode;
+		CorssProd.m_xperm     = xperm.memptr();
+		CorssProd.m_Sx        = (float)Sx;
+		static bool s_announced = false;
+		if (!s_announced) {
+			std::cout << "[parallelCrossProd] AVX2 fused-decode kernel enabled (mode "
+			          << avx2_mode << ")." << std::endl;
+			s_announced = true;
+		}
+	}
+#endif
+
   	parallelReduce(0, Msub_mafge1perc, CorssProd);
+
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+	if (avx2_mode == 2) {
+		const arma::uword N = geno.getNnomissing();
+		arma::fvec out(N);
+		saige_avx2::unpermute_sub(CorssProd.m_bout.memptr(), out.memptr(),
+		                          (std::size_t)N, CorssProd.m_Coffset);
+		out /= static_cast<float>(CorssProd.Msub_mafge1perc);
+		if (s_avx2_verify) {
+			struct CorssProd ref(bVec);
+			parallelReduce(0, Msub_mafge1perc, ref);
+			arma::fvec ref_out =
+			    ref.m_bout / static_cast<float>(ref.Msub_mafge1perc);
+			const double diff = arma::norm(out - ref_out) /
+			                    std::max(1e-30, (double)arma::norm(ref_out));
+			std::cout << "[AVX2 VERIFY] psi-v rel-L2 diff vs scalar = " << diff
+			          << (diff < 1e-5 ? "  OK" : "  **ABOVE 1e-5**") << std::endl;
+		}
+		return out;
+	}
+	if (avx2_mode == 1 && s_avx2_verify) {
+		struct CorssProd ref(bVec);
+		parallelReduce(0, Msub_mafge1perc, ref);
+		const double diff = arma::norm(CorssProd.m_bout - ref.m_bout) /
+		                    std::max(1e-30, (double)arma::norm(ref.m_bout));
+		std::cout << "[AVX2 VERIFY] pass1-only rel-L2 diff vs scalar = " << diff
+		          << (diff < 1e-5 ? "  OK" : "  **ABOVE 1e-5**") << std::endl;
+	}
+#endif
 
 	if(debug_call_count == 1) {
 		// Dump first 3 markers' full genotype vectors to file for R comparison
@@ -2148,6 +2304,235 @@ arma::fvec parallelCrossProd_blocked(arma::fcolvec & bVec) {
 	}
 
 	return out / static_cast<float>(M);
+}
+
+
+// ----------------------------------------------------------------------------
+// Phase-2 multi-RHS ψ·B (block-PCG support). Computes ψ·B for a whole N×k
+// matrix of right-hand sides while streaming the packed genotype matrix
+// (the DRAM-bound resource) only twice — the same traffic as ONE
+// single-column ψv call.
+//
+// Structure per TBB worker (marker range [begin,end)):
+//   sweep 1 (dot):  raw[m][j] = Σ_i g[m,i]·Xp[i,j], sample-blocked so the
+//                   Xp slice (k×SBS floats) stays L2-resident across the
+//                   whole marker range (unblocked, the N×k RHS matrix is
+//                   re-read from L3/DRAM per marker — measured to erase the
+//                   entire batching win at k≳8).
+//   sval[m][j]     = invstd²·(raw − 2f·Sx[j]) per rank-one identity
+//   sweep 2 (axpy): bout[:,j] += sval[m][j]·g[m,:], sample-blocked the same
+//                   way so the bout slice stays L2-resident.
+// bout accumulates in PERM order without the uniform −2f·sval offset
+// (tracked in m_Coffset per column); the caller un-permutes and subtracts.
+//
+// Scalar fallback (mode 0, SAIGE_NO_AVX2=1 or non-contiguous storage):
+// decode each marker once via Get_OneSNP_StdGeno, then k dot/axpy pairs.
+// ----------------------------------------------------------------------------
+struct CorssProdMat : public Worker
+{
+	const arma::fmat& m_Bmat;   // N×k RHS, natural order (scalar mode)
+	unsigned int m_N;
+	unsigned int m_k;
+
+	arma::fmat  m_bout;         // N×k accumulator (perm order in avx2 mode)
+	arma::fvec  m_Coffset;      // k per-column uniform offsets (avx2 mode)
+	int Msub_mafge1perc;
+
+	int          m_avx2_mode = 0;        // 0 scalar, 2 avx2 two-sweep
+	const float* m_xperm     = nullptr;  // N×k perm-order RHS (ldx = N)
+	const float* m_Sx        = nullptr;  // k column sums of Bmat
+	std::size_t  m_sbs       = 4096;     // sample-block size (multiple of 128)
+
+	CorssProdMat(const arma::fmat& B)
+		: m_Bmat(B)
+	{
+		m_N = geno.getNnomissing();
+		m_k = B.n_cols;
+		m_bout.zeros(m_N, m_k);
+		m_Coffset.zeros(m_k);
+		Msub_mafge1perc = 0;
+	}
+	CorssProdMat(const CorssProdMat& other, Split)
+		: m_Bmat(other.m_Bmat)
+	{
+		m_N = other.m_N;
+		m_k = other.m_k;
+		m_bout.zeros(m_N, m_k);
+		m_Coffset.zeros(m_k);
+		Msub_mafge1perc = 0;
+		m_avx2_mode = other.m_avx2_mode;
+		m_xperm     = other.m_xperm;
+		m_Sx        = other.m_Sx;
+		m_sbs       = other.m_sbs;
+	}
+
+	void operator()(std::size_t begin, std::size_t end) {
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+		if (m_avx2_mode != 0) {
+			const std::size_t nm = end - begin;
+			const std::size_t k  = m_k;
+			const std::size_t N  = m_N;
+			// raw dot accumulators + per-marker scale factors, row-major [m][j]
+			std::vector<float> raws(nm * k, 0.0f);
+			std::vector<float> tmp(k);
+
+			// sweep 1: sample-blocked dot products
+			for (std::size_t sb = 0; sb < N; sb += m_sbs) {
+				const std::size_t len = std::min(m_sbs, N - sb);
+				const float* xp_sb = m_xperm + sb;  // col j at + j*N
+				for (std::size_t m = begin; m < end; ++m) {
+					const unsigned char* row =
+					    geno.packed_row_ptr(m) + sb / 4;
+					saige_avx2::pass1_sum_gx_multi(row, xp_sb, N, k, len,
+					                               tmp.data());
+					float* r = raws.data() + (m - begin) * k;
+					for (std::size_t j = 0; j < k; ++j) r[j] += tmp[j];
+				}
+			}
+
+			// rank-one identity: raw -> sval; accumulate Coffset
+			for (std::size_t m = begin; m < end; ++m) {
+				const float f = geno.alleleFreqVec[m];
+				const float d = geno.invstdvVec[m];
+				float* r = raws.data() + (m - begin) * k;
+				for (std::size_t j = 0; j < k; ++j) {
+					const float val1 = d * (r[j] - 2.0f * f * m_Sx[j]);
+					const float sval = val1 * d;
+					r[j] = sval;                        // reuse as sval[m][j]
+					m_Coffset[j] += 2.0f * f * sval;
+				}
+			}
+
+			// sweep 2: sample-blocked axpy into perm-order bout
+			float* boutp = m_bout.memptr();             // col j at + j*N
+			for (std::size_t sb = 0; sb < N; sb += m_sbs) {
+				const std::size_t len = std::min(m_sbs, N - sb);
+				for (std::size_t m = begin; m < end; ++m) {
+					const unsigned char* row =
+					    geno.packed_row_ptr(m) + sb / 4;
+					saige_avx2::pass2_axpy_multi(
+					    row, raws.data() + (m - begin) * k, boutp + sb, N, k,
+					    len);
+				}
+			}
+			Msub_mafge1perc += (int)nm;
+			return;
+		}
+#endif
+		// scalar fallback: decode once per marker, k dot/axpy pairs
+		arma::fvec vec;
+		for (std::size_t m = begin; m < end; ++m) {
+			geno.Get_OneSNP_StdGeno(m, &vec);
+			for (unsigned int j = 0; j < m_k; ++j) {
+				const float val1 = arma::dot(vec, m_Bmat.col(j));
+				m_bout.col(j) += val1 * vec;
+			}
+			Msub_mafge1perc += 1;
+		}
+	}
+
+	void join(const CorssProdMat& rhs) {
+		m_bout += rhs.m_bout;
+		m_Coffset += rhs.m_Coffset;
+		Msub_mafge1perc += rhs.Msub_mafge1perc;
+	}
+};
+
+// ψ·B for an N×k RHS matrix (dense-GRM path). Multi-column analogue of
+// parallelCrossProd; same normalization (division by Msub_mafge1perc).
+arma::fmat parallelCrossProdMat(const arma::fmat& Bmat) {
+	const int Msub_mafge1perc =
+	    geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
+	const arma::uword N = geno.getNnomissing();
+	const arma::uword k = Bmat.n_cols;
+
+	// optional ψ·B wall-time telemetry (SAIGE_TIME_PSIV=1), separate
+	// accumulator from the single-column [PSIV] one.
+	static const bool s_time_psiv = [](){
+		const char* v = std::getenv("SAIGE_TIME_PSIV");
+		return v && std::string(v) == "1"; }();
+	struct PsivMatTimer {
+		bool on; double t0 = 0; arma::uword k;
+		static double& total() { static double t = 0; return t; }
+		static long&   calls() { static long c = 0; return c; }
+		static long&   cols()  { static long c = 0; return c; }
+		PsivMatTimer(bool enabled, arma::uword kk) : on(enabled), k(kk) {
+			if (on) t0 = get_wall_time(); }
+		~PsivMatTimer() {
+			if (!on) return;
+			total() += get_wall_time() - t0;
+			cols()  += (long)k;
+			if ((++calls()) % 10 == 0)
+				std::cout << "[PSIVMAT] calls=" << calls() << " cols=" << cols()
+				          << " total=" << total() << "s avg/col="
+				          << 1e3 * total() / cols() << "ms" << std::endl;
+		}
+	} psivmat_timer(s_time_psiv, k);
+
+	CorssProdMat worker(Bmat);
+
+	arma::fmat xperm;
+	arma::fvec Sx;
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+	static const bool s_no_avx2 = [](){
+		const char* v = std::getenv("SAIGE_NO_AVX2");
+		return v && std::string(v) == "1"; }();
+	if (!s_no_avx2 && geno.packed_rows_contiguous()) {
+		xperm.set_size(N, k);
+		Sx.set_size(k);
+		for (arma::uword j = 0; j < k; ++j) {
+			saige_avx2::permute_fwd(Bmat.colptr(j), xperm.colptr(j),
+			                        (std::size_t)N);
+			double s = 0.0;
+			const float* bp = Bmat.colptr(j);
+			for (arma::uword i = 0; i < N; ++i) s += bp[i];
+			Sx(j) = (float)s;
+		}
+		worker.m_avx2_mode = 2;
+		worker.m_xperm     = xperm.memptr();
+		worker.m_Sx        = Sx.memptr();
+		// sample-block size: keep k×SBS floats (the RHS slice in sweep 1,
+		// the bout slice in sweep 2) within ~96 KB of the 256 KB L2.
+		// SAIGE_BLOCKPCG_SBS overrides (0 = no blocking / whole row).
+		static const long s_sbs_env = [](){
+			const char* v = std::getenv("SAIGE_BLOCKPCG_SBS");
+			return v ? std::atol(v) : -1L; }();
+		std::size_t sbs;
+		if (s_sbs_env == 0) {
+			sbs = (std::size_t)N;  // unblocked
+		} else if (s_sbs_env > 0) {
+			sbs = ((std::size_t)s_sbs_env) & ~(std::size_t)127;
+		} else {
+			sbs = (std::size_t)(24576 / std::max<arma::uword>(k, 1));
+			sbs &= ~(std::size_t)127;                   // multiple of 128
+		}
+		worker.m_sbs = std::max<std::size_t>(sbs, 512); // >= 4 superblocks
+		static bool s_announced = false;
+		if (!s_announced) {
+			std::cout << "[parallelCrossProdMat] AVX2 multi-RHS kernel enabled"
+			          << " (sbs=" << worker.m_sbs << ")." << std::endl;
+			s_announced = true;
+		}
+	}
+#endif
+
+	// coarse grain: sample-blocking amortizes the RHS slice over the marker
+	// range, so avoid tiny TBB chunks.
+	const std::size_t grain =
+	    std::max<std::size_t>(64, (std::size_t)Msub_mafge1perc / 32);
+	parallelReduce(0, Msub_mafge1perc, worker, grain);
+
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+	if (worker.m_avx2_mode == 2) {
+		arma::fmat out(N, k);
+		for (arma::uword j = 0; j < k; ++j)
+			saige_avx2::unpermute_sub(worker.m_bout.colptr(j), out.colptr(j),
+			                          (std::size_t)N, worker.m_Coffset(j));
+		out /= static_cast<float>(worker.Msub_mafge1perc);
+		return out;
+	}
+#endif
+	return worker.m_bout / static_cast<float>(worker.Msub_mafge1perc);
 }
 
 
@@ -2382,8 +2767,9 @@ bool get_isUseSparseSigmaforModelFitting() { return isUseSparseSigmaforModelFitt
 arma::fvec getCrossprodMatAndKin(arma::fcolvec& bVec){
        arma::fvec crossProdVec;
 
-    // Debug: print input/output for first few calls
+    // Debug: print input/output for first few calls (compile with -DSAIGE_DEBUG_IO to enable)
     static int crossprod_call_count = 0;
+#ifdef SAIGE_DEBUG_IO
     if (crossprod_call_count < 3) {
         std::cout << "[getCrossprodMatAndKin call #" << crossprod_call_count << "]"
                   << " input |u|=" << arma::norm(bVec)
@@ -2392,6 +2778,7 @@ arma::fvec getCrossprodMatAndKin(arma::fcolvec& bVec){
                   << " sparse=" << (isUseSparseSigmaforInitTau | isUseSparseSigmaforModelFitting)
                   << std::endl;
     }
+#endif
 
     if(isUseSparseSigmaforInitTau | isUseSparseSigmaforModelFitting){
         //cout << "use sparse kinship to estimate initial tau and for getCrossprodMatAndKin" <<  endl;
@@ -2445,6 +2832,7 @@ arma::fvec getCrossprodMatAndKin(arma::fcolvec& bVec){
         }
    }
 
+#ifdef SAIGE_DEBUG_IO
     if (crossprod_call_count < 3) {
         std::cout << "[C++ getCrossprodMatAndKin call #" << crossprod_call_count << "]"
                   << " |u|=" << arma::norm(bVec)
@@ -2501,13 +2889,52 @@ arma::fvec getCrossprodMatAndKin(arma::fcolvec& bVec){
         }
         crossprod_call_count++;
     }
+#else
+    if (crossprod_call_count < 3) crossprod_call_count++;
+#endif
 
   	return(crossProdVec);
 }
 
 
+// Phase-2: multi-RHS analogue of getCrossprodMatAndKin. ψ·B for N×k B.
+// Sparse-kinship branch does one sparse×dense product; dense branch uses the
+// batched TBB/AVX2 path.
+arma::fmat getCrossprodMatAndKinMat(const arma::fmat& Bmat){
+	if (isUseSparseSigmaforInitTau | isUseSparseSigmaforModelFitting) {
+		arma::sp_mat result(locationMat, valueVec, dimNum, dimNum);
+		arma::mat x = result * arma::conv_to<arma::mat>::from(Bmat);
+		return arma::conv_to<arma::fmat>::from(x);
+	}
+	return parallelCrossProdMat(Bmat);
+}
 
 
+// Phase-2: multi-RHS analogue of getCrossprod. Σ·P for N×k P where
+// Σ = tau0·diag(1/w) + tau1·ψ.
+arma::fmat getCrossprodMat(const arma::fmat& Pmat, arma::fvec& wVec,
+                           arma::fvec& tauVec){
+	if (tauVec(1) == 0) {
+		arma::fmat out = Pmat;
+		out.each_col() %= (tauVec(0) / wVec);
+		return out;
+	}
+	arma::fmat crossProd1 = getCrossprodMatAndKinMat(Pmat);
+	arma::fmat out = Pmat;
+	out.each_col() %= (tauVec(0) / wVec);
+	out += tauVec(1) * crossProd1;
+	return out;
+}
+
+
+// Phase-2 rollback switch: SAIGE_NO_BLOCKPCG=1 restores the serial per-probe
+// (GetTrace/GetTrace_q) and per-marker (VR) PCG loops.
+bool isBlockPCGdisabled() {
+	static const bool v = [](){
+		const char* e = std::getenv("SAIGE_NO_BLOCKPCG");
+		return e && std::string(e) == "1"; }();
+	return v;
+}
 
 
 // INTERNAL: LOCO version of cross product with kinship matrix
@@ -2810,7 +3237,9 @@ arma::fvec Get_OneSNP_StdGeno(int SNPIdx)
 //Sigma = tau[1] * diag(1/W) + tau[2] * kins 
 // INTERNAL: Compute diagonal elements of sigma matrix
 arma::fvec getDiagOfSigma(arma::fvec& wVec, arma::fvec& tauVec){
+#ifdef SAIGE_DEBUG_IO
   fprintf(stderr, "[DBG1b] getDiagOfSigma enter\n"); fflush(stderr);
+#endif
 	int Nnomissing = geno.getNnomissing();
 	//int M = geno.getM();
 	int MminMAF = geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
@@ -4417,10 +4846,14 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
     arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
 
     arma::sp_mat result = gen_sp_Sigma(wVec, tauVec);
+#ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG3] gen_sp_Sigma done nnz=%llu\n", (unsigned long long)result.n_nonzero); fflush(stderr);
+#endif
 
     arma::vec x = arma::spsolve(result, yvec2);
+#ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG4] spsolve done\n"); fflush(stderr);
+#endif
 
 //double wall3in = get_wall_time();
 // double cpu3in  = get_cpu_time();
@@ -4479,10 +4912,12 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& wVec,
                                    const arma::fvec& bVec,
                                    int maxiterPCG, float tolPCG)
 {
+#ifdef SAIGE_DEBUG_IO
     { const char _m[] = "[DBG1] PCG ENTER\n"; write(2, _m, sizeof(_m)-1); }
     fprintf(stderr, "[DBG1] PCG ENTER sparse=%d pcg=%d n=%zu\n",
             (int)isUseSparseSigmaforModelFitting, (int)isUsePCGwithSparseSigma,
             (size_t)bVec.n_elem); fflush(stderr);
+#endif
     const arma::uword n = bVec.n_elem;
     if (n == 0) throw std::invalid_argument("PCG: bVec is empty");
     if (wVec.n_elem != n) throw std::invalid_argument("PCG: wVec.len != bVec.len");
@@ -4510,7 +4945,6 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& wVec,
 
     if (!isUsePrecondM) {
         // legacy takes non-const refs
-        arma::fvec testvec = getDiagOfSigma(w, tau) ; 
         minvVec = 1.0f / getDiagOfSigma(w, tau);
 
         zVec    = minvVec % rVec;
@@ -4558,6 +4992,83 @@ arma::fvec getPCG1ofSigmaAndVector(const arma::fvec& wVec,
         std::cout << "iter from getPCG1ofSigmaAndVector " << iter << "\n";
 
     return xVec;
+}
+
+
+// Phase-2 batched-RHS PCG: solves Sigma X = B for all columns of B at once.
+// Structure mirrors the GPU branch's getPCGofSigmaAndMatrix
+// (SAIGE-work/src/SAIGE_fitGLMM_fast.cpp): every column keeps its own
+// alpha/beta/convergence state (batch of independent CGs, not block-CG), so
+// per column the math is identical to getPCG1ofSigmaAndVector up to fp
+// association order in ψ·B. Converged columns freeze (skip updates) but stay
+// in the batch — the ψ·B cost at k≤64 is dominated by streaming the packed
+// matrix, which shrinking the batch would not reduce.
+arma::fmat getPCGofSigmaAndMatrix(const arma::fvec& wVec,
+                                  const arma::fvec& tauVec,
+                                  const arma::fmat& Bmat,
+                                  int maxiterPCG, float tolPCG)
+{
+    const arma::uword N = Bmat.n_rows;
+    const arma::uword k = Bmat.n_cols;
+
+    // Paths without a batched implementation fall back per column: the
+    // sparse direct solve, and the sparse preconditioner (isUsePrecondM —
+    // silently switching it to Jacobi would change iteration counts and can
+    // hit maxiterPCG).
+    if (isUseSparseSigmaforModelFitting || isUsePrecondM) {
+        arma::fmat X(N, k);
+        for (arma::uword j = 0; j < k; ++j) {
+            arma::fvec b = Bmat.col(j);
+            X.col(j) = getPCG1ofSigmaAndVector(wVec, tauVec, b,
+                                               maxiterPCG, tolPCG);
+        }
+        return X;
+    }
+
+    arma::fvec w   = wVec;
+    arma::fvec tau = tauVec;
+
+    arma::fmat X(N, k, arma::fill::zeros);
+    arma::fmat R = Bmat;
+    arma::fvec minvVec = 1.0f / getDiagOfSigma(w, tau);
+    arma::fmat Z = R.each_col() % minvVec;
+    arma::fmat P = Z;
+
+    arma::fvec rz(k), sumr2(k);
+    for (arma::uword j = 0; j < k; ++j) {
+        rz(j)    = arma::dot(R.col(j), Z.col(j));
+        sumr2(j) = arma::dot(R.col(j), R.col(j));
+    }
+    arma::uvec active(k);
+    for (arma::uword j = 0; j < k; ++j) active(j) = (sumr2(j) > tolPCG);
+
+    int iter = 0;
+    while (arma::any(active) && iter < maxiterPCG) {
+        iter++;
+        arma::fmat AP = getCrossprodMat(P, w, tau);
+        for (arma::uword j = 0; j < k; ++j) {
+            if (!active(j)) continue;
+            const float pAp = arma::dot(P.col(j), AP.col(j));
+            const float a   = rz(j) / pAp;
+            X.col(j) += a * P.col(j);
+            R.col(j) -= a * AP.col(j);
+            Z.col(j)  = minvVec % R.col(j);
+            const float rz_new = arma::dot(R.col(j), Z.col(j));
+            const float bta    = rz_new / rz(j);
+            P.col(j)  = Z.col(j) + bta * P.col(j);
+            rz(j)     = rz_new;
+            sumr2(j)  = arma::dot(R.col(j), R.col(j));
+            if (sumr2(j) <= tolPCG) active(j) = 0;
+        }
+    }
+    if (arma::any(active)) {
+        std::cout << "batched PCG: " << arma::sum(active) << "/" << k
+                  << " columns did not converge in " << maxiterPCG
+                  << " iterations\n";
+    }
+    std::cout << "iter from getPCGofSigmaAndMatrix " << iter << " for " << k
+              << " RHS\n";
+    return X;
 }
 
 
@@ -6001,6 +6512,26 @@ float GetTrace(const arma::fmat& Sigma_iX,
       tempVec.rows(old, nrunEnd - 1).zeros();  // zero new tail
     }
 
+    // ---- Phase-2 batched wave: solve all probes of [nrunStart, nrunEnd)
+    // with one block-PCG + one batched ψ·U. The probe vectors are generated
+    // up front IN THE ORIGINAL ORDER, so the RNG stream (R's rbinom via
+    // rademacher_vec) is consumed identically to the serial loop below.
+    // SAIGE_NO_BLOCKPCG=1 restores the serial loop.
+    if (!isBlockPCGdisabled()) {
+      const int nb_cols = nrunEnd - nrunStart;
+      arma::fmat Umat(n, nb_cols);
+      for (int i = 0; i < nb_cols; ++i)
+        Umat.col(i) = rademacher_vec(n);
+
+      arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
+                                                   maxiterPCG, tolPCG);
+      arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));
+      arma::fmat AU = getCrossprodMatAndKinMat(Umat);
+      if (!AU.is_finite()) throw std::runtime_error("GetTrace: Au non-finite");
+      if (!PU.is_finite()) throw std::runtime_error("GetTrace: Pu non-finite");
+      for (int i = 0; i < nb_cols; ++i)
+        tempVec(nrunStart + i) = arma::dot(AU.col(i), PU.col(i));
+    } else
     for (int i = nrunStart; i < nrunEnd; ++i) {
       // uVec: length n, values in {-1, +1}
       if (i == 0 && nrunStart == 0) std::cout << "DEBUG GetTrace: generating rademacher_vec..." << std::endl << std::flush;
@@ -6015,6 +6546,7 @@ float GetTrace(const arma::fmat& Sigma_iX,
       arma::fvec Au       = getCrossprodMatAndKin(uVec);                                     // n
       if (i == 0 && nrunStart == 0) std::cout << "DEBUG GetTrace: getCrossprodMatAndKin done" << std::endl << std::flush;
 
+#ifdef SAIGE_DEBUG_IO
       // Save C++ Au to file for comparison
       {
         std::string cpp_out = saige_env_path("SAIGE_DEBUG_DIR", "cpp_Au_vec_" + std::to_string(i) + ".txt");
@@ -6062,6 +6594,7 @@ float GetTrace(const arma::fmat& Sigma_iX,
           }
         }
       }
+#endif  // SAIGE_DEBUG_IO
       if ((int)Au.n_rows != n) {
         throw std::runtime_error("GetTrace: Au/Pu bad size");
       }
@@ -6853,6 +7386,23 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
       tempVec0.rows(old, nrunEnd - 1).zeros();
     }
 
+    // ---- Phase-2 batched wave (see GetTrace): one block-PCG + one batched
+    // ψ·U per wave; RNG stream consumed in the original per-probe order.
+    if (!isBlockPCGdisabled()) {
+      const int nb_cols = nrunEnd - nrunStart;
+      arma::fmat Umat(n, nb_cols);
+      for (int i = 0; i < nb_cols; ++i)
+        Umat.col(i) = rademacher_vec(n);
+
+      arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
+                                                   maxiterPCG, tolPCG);
+      arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));
+      arma::fmat AU = getCrossprodMatAndKinMat(Umat);
+      for (int i = 0; i < nb_cols; ++i) {
+        tempVec(nrunStart + i)  = arma::dot(AU.col(i), PU.col(i));
+        tempVec0(nrunStart + i) = arma::dot(Umat.col(i), PU.col(i));
+      }
+    } else
     for (int i = nrunStart; i < nrunEnd; ++i) {
       arma::fvec uVec = rademacher_vec(n);
 
