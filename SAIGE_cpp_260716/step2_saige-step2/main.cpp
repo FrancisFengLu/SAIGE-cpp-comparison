@@ -44,6 +44,7 @@ extern "C" void openblas_set_num_threads(int);
 #include <unordered_map>
 #include <numeric>
 #include <malloc.h>  // mallopt() — glibc heap-hoarding mitigation
+#include <cstdlib>   // getenv (W2 fused-decode rollback switch)
 
 #include <yaml-cpp/yaml.h>
 #include <boost/math/distributions/beta.hpp>
@@ -125,6 +126,14 @@ double g_dosage_zerod_cutoff;
 // B2 (dense-write elimination) carrier-decode A/B validation. b2Check=1 runs the
 // carrier-decode alongside the dense path on every PLINK single-variant marker
 // and compares (flip / altCount / MAC / carrier set+values). Reported after loop.
+// W2: fused single-pass PLINK decode+impute/flip (genotype_reader Stage A/B/C).
+// Rollback switch: SAIGE_STEP2_SCALAR_DECODE=1 restores the legacy
+// getOneMarker_ts + imputeGenoAndFlip two-pass chain.
+bool g_fusedPlinkDecode = [] {
+    const char* e = std::getenv("SAIGE_STEP2_SCALAR_DECODE");
+    return !(e && std::string(e) == "1");
+}();
+
 int    g_b2Check          = 0;
 long   g_b2NCompared       = 0;
 long   g_b2NMismatch       = 0;
@@ -1190,6 +1199,10 @@ void mainMarkerInCPP(
 
         bool flip = false;
 
+        // W2 fused decode state (PLINK only; see g_fusedPlinkDecode)
+        bool usedFusedDecode = false;
+        PLINK::PlinkClass::FusedMarkerStats fsFused;
+
         bool isOutputIndexForMissing = true;
         bool isOnlyOutputNonZero = false;
 
@@ -1248,6 +1261,7 @@ void mainMarkerInCPP(
                 ctx_first.flagSparseGRM_cur = pe.flagSparseGRM_cur;
                 ctx_first.isnoadjCov_cur = pe.isnoadjCov_cur;
                 ctx_first.varRatioVal = pe.varRatioVal;
+                ctx_first.erSeedStream = (uint64_t)i + 1;  // W1-4
                 bool is_region = false;
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
                     Unified_getMarkerPval(
@@ -1293,6 +1307,13 @@ void mainMarkerInCPP(
                             ctx_fast.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
                                 ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
                         }
+                        // W1-1: skip the recompute when its ctx is identical to
+                        // the first pass (pe.*) — same inputs, same result.
+                        bool sameCtx =
+                            (ctx_fast.flagSparseGRM_cur == pe.flagSparseGRM_cur) &&
+                            (ctx_fast.isnoadjCov_cur == pe.isnoadjCov_cur) &&
+                            (ctx_fast.varRatioVal == pe.varRatioVal);
+                        if (!sameCtx)
                         Unified_getMarkerPval(
                             t_GVec, false, indexNonZeroVec_arma, indexZeroVec_arma,
                             Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
@@ -1417,7 +1438,24 @@ void mainMarkerInCPP(
             // VCF: htslib bcf_read is streaming and not thread-safe; the _ts
             //   dispatcher still falls back to the locked path internally, so
             //   we wrap in critical(genoread).
-            if (t_genoType == "vcf") {
+            if (t_genoType == "plink" && g_fusedPlinkDecode) {
+                // W2 fused path Stage A: packed-byte counts only; the dense
+                // decode is deferred (and fused with impute/flip) until after
+                // the pre-impute QC below.
+                usedFusedDecode = true;
+                isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+                if (isReadMarker) {
+                    ref = std::move(fsFused.ref);
+                    alt = std::move(fsFused.alt);
+                    marker = std::move(fsFused.marker);
+                    chr = std::move(fsFused.chr);
+                    pd = fsFused.pd;
+                    altFreq = fsFused.altFreq;
+                    altCounts = fsFused.altCounts;
+                    missingRate = fsFused.missingRate;
+                    imputeInfo = fsFused.imputeInfo;
+                }
+            } else if (t_genoType == "vcf") {
                 #pragma omp critical(genoread)
                 {
                     isReadMarker = Unified_getOneMarker_ts(
@@ -1476,11 +1514,24 @@ void mainMarkerInCPP(
             indexZeroVec.clear();
             indexNonZeroVec.clear();
 
+            if (usedFusedDecode) {
+                // W2 Stage B: table-level impute/flip/clean + counts-based
+                // post stats. Dense fill (Stage C) is deferred past the
+                // post-impute QC below.
+                PLINK::finalizeFusedStats(
+                    fsFused, string_to_case.at(g_impute_method),
+                    g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC);
+                flip = fsFused.flip;
+                altFreq = fsFused.altFreq_post;
+                altCounts = fsFused.altCounts_post;
+                MAC = fsFused.MAC_imp;   // legacy: imputeGenoAndFlip updated MAC in place
+            } else {
             flip = imputeGenoAndFlip(
                 t_GVec, altFreq, altCounts,
                 indexForMissing, g_impute_method,
                 g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff,
                 MAC, indexZeroVec, indexNonZeroVec);
+            }
 
             // === CHECKPOINT OUTPUT BEGIN ===
             if (g_writeCheckpoints && i == 0 && !g_checkpointDir.empty()) {
@@ -1515,8 +1566,15 @@ void mainMarkerInCPP(
                 std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
                 bool isSPAConverge, is_gtilde, is_Firth, is_FirthConverge;
 
+                if (usedFusedDecode) {
+                    // W2 Stage C: single fused pass writes the final GVec and
+                    // both index vectors (only for markers that survived QC).
+                    ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                        fsFused, t_GVec, indexZeroVec_arma, indexNonZeroVec_arma);
+                } else {
                 copy_index_uvec_reuse(indexZeroVec, indexZeroVec_arma);
                 copy_index_uvec_reuse(indexNonZeroVec, indexNonZeroVec_arma);
+                }
 
                 indexZeroVec.clear();
                 indexNonZeroVec.clear();
@@ -1532,6 +1590,7 @@ void mainMarkerInCPP(
                 ctx_first.flagSparseGRM_cur = ptr_gSAIGEobj->m_isFastTest
                     ? false : ptr_gSAIGEobj->m_flagSparseGRM;
                 ctx_first.isnoadjCov_cur = ptr_gSAIGEobj->m_isnoadjCov;
+                ctx_first.erSeedStream = (uint64_t)i + 1;  // W1-4
                 {
                     bool dummyHas;
                     if (isSingleVarianceRatio) {
@@ -1542,6 +1601,42 @@ void mainMarkerInCPP(
                             MAC, ctx_first.flagSparseGRM_cur, ctx_first.isnoadjCov_cur,
                             dummyHas);
                     }
+                }
+
+                // W1-1: the fast-test recompute reruns Unified_getMarkerPval with
+                // a ctx that depends only on MAC and model constants, so it is
+                // computable BEFORE the first pass. When it is identical to
+                // ctx_first (e.g. no sparse GRM loaded and isnoadjCov=false: same
+                // flags, same varRatio), the recompute is a bit-identical repeat
+                // of the first pass — upstream R disables fastTest entirely in
+                // that configuration ("No sparse GRM is specified, so is_fastTest
+                // is not working", SAIGE_parallel_Test_main.R:346-347). Detect it
+                // per marker and skip the second pass; Firth then runs inline in
+                // the first pass instead of deferred to the recompute (A3).
+                bool fastRecomputeSameCtx = false;
+                if (ptr_gSAIGEobj->m_isFastTest &&
+                    ((t_traitType == "binary" && MAC > g_MACCutoffforER) ||
+                     t_traitType != "binary")) {
+                    SAIGE::PerMarkerCtx ctx_probe;
+                    ctx_probe.flagSparseGRM_cur =
+                        (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
+                            ? false : ptr_gSAIGEobj->m_flagSparseGRM;
+                    ctx_probe.isnoadjCov_cur = false;
+                    {
+                        bool dummyHas2;
+                        if (!isSingleVarianceRatio) {
+                            ctx_probe.varRatioVal = ptr_gSAIGEobj->computeVarianceRatio(
+                                MAC, ctx_probe.flagSparseGRM_cur,
+                                ctx_probe.isnoadjCov_cur, dummyHas2);
+                        } else {
+                            ctx_probe.varRatioVal = ptr_gSAIGEobj->computeSingleVarianceRatio(
+                                ctx_probe.flagSparseGRM_cur, ctx_probe.isnoadjCov_cur);
+                        }
+                    }
+                    fastRecomputeSameCtx =
+                        (ctx_probe.flagSparseGRM_cur == ctx_first.flagSparseGRM_cur) &&
+                        (ctx_probe.isnoadjCov_cur == ctx_first.isnoadjCov_cur) &&
+                        (ctx_probe.varRatioVal == ctx_first.varRatioVal);
                 }
 
                 // === CHECKPOINT OUTPUT BEGIN ===
@@ -1568,9 +1663,12 @@ void mainMarkerInCPP(
                 // once in the recompute. ER markers (MAC<=g_MACCutoffforER) never
                 // recompute, and MAC>g_MACCutoffforER is false for them here, so
                 // g_firthDefer stays false and Firth runs inline for ER.
+                // W1-1: when the recompute is skipped (same ctx), Firth must run
+                // inline in the first pass — hence !fastRecomputeSameCtx.
                 g_firthDefer = (ptr_gSAIGEobj->m_isFastTest &&
                                 t_traitType == "binary" &&
-                                MAC > g_MACCutoffforER);
+                                MAC > g_MACCutoffforER &&
+                                !fastRecomputeSameCtx);
 
                 if (MAC <= g_MACCutoffforER && t_traitType == "binary") {
                     Unified_getMarkerPval(
@@ -1626,6 +1724,7 @@ void mainMarkerInCPP(
                     t_traitType != "binary") {
 
                     if (ptr_gSAIGEobj->m_isFastTest &&
+                        !fastRecomputeSameCtx &&  // W1-1: identical ctx => identical result, skip
                         pval_num < (ptr_gSAIGEobj->m_pval_cutoff_for_fastTest)) {
                         // Phase B: build ctx for the fast-test re-eval. The
                         // previous block called set_flagSparseGRM_cur(),
@@ -2373,6 +2472,21 @@ static double get_CCT_pvalue(const std::vector<double>& pvals) {
 // VarMat construction, SPA Phi adjustment, SKAT/BURDEN/SKAT-O,
 // CCT combination, and output writing all happen in one function.
 // ============================================================
+// W1-3a: P1Mat/P2Mat chunk files are only functionally required when a region
+// spills more than one chunk (markers > markers_per_chunk_in_groupTest): the
+// multi-chunk VarMat assembly reads them back. Single-chunk regions (the
+// common case) computed VarMat in memory yet still wrote the files and never
+// deleted them (~1.4 GB per 100-gene run, ~140 GB on real WES). Default now:
+// write only when needed, always clean up. SAIGE_STEP2_DUMP_KERNELS=1
+// restores the old unconditional write-and-keep behavior (debug).
+static bool dumpKernelFiles() {
+    static const bool v = [] {
+        const char* e = std::getenv("SAIGE_STEP2_DUMP_KERNELS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return v;
+}
+
 void mainRegionInCPP(
     std::string t_genoType,
     std::string t_traitType,
@@ -2510,6 +2624,11 @@ void mainRegionInCPP(
     unsigned int i1 = 0;    // non-URV markers
     unsigned int i2 = 0;    // URV markers
     unsigned int jm;
+    // W1-3a: every chunk file written for this region, for guaranteed cleanup.
+    std::vector<std::string> savedChunkFiles;
+    // W1-4: per-region base for deterministic ER RNG streams (independent of
+    // thread assignment; std::hash<std::string> is deterministic in libstdc++).
+    const uint64_t regionSeedBase = (uint64_t)std::hash<std::string>{}(regionName);
 
     // ===== Marker loop =====
     for (unsigned int i = 0; i < q0; i++) {
@@ -2521,8 +2640,12 @@ void mainRegionInCPP(
         bool isOutputIndexForMissing = true;
         bool isOnlyOutputNonZero = false;
 
+        // W2 fused decode state (PLINK only)
+        bool usedFusedDecode = (t_genoType == "plink" && g_fusedPlinkDecode);
+        PLINK::PlinkClass::FusedMarkerStats fsFused;
+
         GVec.resize(t_n);
-        GVec.zeros();
+        if (!usedFusedDecode) GVec.zeros();  // fused Stage C overwrites every element
 
         std::string t_genoIndex_str = t_genoIndex.at(i);
         char* end;
@@ -2545,6 +2668,21 @@ void mainRegionInCPP(
                     isOutputIndexForMissing, indexForMissing,
                     isOnlyOutputNonZero, indexNonZeroVec, GVec, t_isImputation);
             }
+        } else if (usedFusedDecode) {
+            // W2 fused path Stage A (counts + pre-impute stats; dense decode
+            // deferred until after the region QC below).
+            isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+            if (isReadMarker) {
+                ref = std::move(fsFused.ref);
+                alt = std::move(fsFused.alt);
+                marker = std::move(fsFused.marker);
+                chr = std::move(fsFused.chr);
+                pd = fsFused.pd;
+                altFreq = fsFused.altFreq;
+                altCounts = fsFused.altCounts;
+                missingRate = fsFused.missingRate;
+                imputeInfo = fsFused.imputeInfo;
+            }
         } else {
             // PLINK / PGEN — thread-safe variant, no critical.
             isReadMarker = Unified_getOneMarker_ts(t_genoType, gIndex,
@@ -2564,9 +2702,22 @@ void mainRegionInCPP(
         double MAF = std::min(altFreq, 1.0 - altFreq);
         double w0;
         double MAC = MAF * 2 * t_n * (1 - missingRate);
+        if (usedFusedDecode) {
+            // W2 Stage B: table-level impute/flip/clean; dense fill deferred
+            // until after the region QC (most markers fail maxMAF and never
+            // pay the N-length decode).
+            PLINK::finalizeFusedStats(
+                fsFused, string_to_case.at(g_impute_method),
+                g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC);
+            flip = fsFused.flip;
+            altFreq = fsFused.altFreq_post;
+            altCounts = fsFused.altCounts_post;
+            MAC = fsFused.MAC_imp;
+        } else {
         flip = imputeGenoAndFlip(GVec, altFreq, altCounts, indexForMissing,
             g_impute_method, g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff,
             MAC, indexZeroVec, indexNonZeroVec);
+        }
 
         arma::uvec indexZeroVec_arma, indexNonZeroVec_arma;
         MAF = std::min(altFreq, 1.0 - altFreq);
@@ -2597,7 +2748,14 @@ void mainRegionInCPP(
             w0 = boost::math::pdf(beta_dist, MAF);
         }
 
+        if (usedFusedDecode) {
+            // W2 Stage C: only QC-surviving markers pay the dense decode; the
+            // fused pass writes GVec and both index vectors in one sweep.
+            ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                fsFused, GVec, indexZeroVec_arma, indexNonZeroVec_arma);
+        } else {
         indexNonZeroVec_arma = arma::conv_to<arma::uvec>::from(indexNonZeroVec);
+        }
         uint nNonZero = indexNonZeroVec_arma.n_elem;
 
         if (MAC > g_region_minMAC_cutoff) {
@@ -2612,6 +2770,7 @@ void mainRegionInCPP(
             // without touching shared SAIGEobj state.
 
             if (t_regionTestType != "BURDEN" || t_isSingleinGroupTest) {
+                if (!usedFusedDecode)   // fused Stage C already filled it
                 indexZeroVec_arma = arma::conv_to<arma::uvec>::from(indexZeroVec);
 
                 // Phase A: build ctx mirroring the set_flagSparseGRM_cur and
@@ -2623,6 +2782,7 @@ void mainRegionInCPP(
                     (MAC > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
                         ? false : ptr_gSAIGEobj->m_flagSparseGRM;
                 ctx_region.isnoadjCov_cur = false;
+                ctx_region.erSeedStream = regionSeedBase ^ ((uint64_t)i + 1);  // W1-4
                 {
                     bool dummyHas = true;
                     if (!isSingleVarianceRatio) {
@@ -2765,8 +2925,15 @@ void mainRegionInCPP(
                       << " markers are ultra-rare and " << i1
                       << " markers are not ultra-rare." << std::endl;
             if (t_regionTestType != "BURDEN") {
-                P1Mat.save(t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin");
-                P2Mat.save(t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin");
+                // W1-3a: a mid-loop flush means P1Mat is about to be reused for
+                // the next chunk, so the data must go to disk (it will be read
+                // back by the multi-chunk VarMat assembly).
+                std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                P1Mat.save(p1f);
+                P2Mat.save(p2f);
+                savedChunkFiles.push_back(p1f);
+                savedChunkFiles.push_back(p2f);
             }
             mPassCVVec.push_back(m1);
             ichunk += 1;
@@ -2781,10 +2948,20 @@ void mainRegionInCPP(
                   << " markers are ultra-rare and " << i1
                   << " markers are not ultra-rare." << std::endl;
         if (t_regionTestType != "BURDEN") {
-            P1Mat = P1Mat.rows(0, i1InChunk - 1);
-            P2Mat = P2Mat.cols(0, i1InChunk - 1);
-            P1Mat.save(t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin");
-            P2Mat.save(t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin");
+            // W1-3: no truncating reassignment (P1Mat keeps its full capacity
+            // for reuse across regions; only rows 0..i1InChunk-1 are valid).
+            // The chunk file is only ever read back by the multi-chunk VarMat
+            // assembly, which is already decidable here: another chunk exists
+            // (ichunk > 0) or the ultra-rare pass may add one (i2 > 0). The
+            // single-chunk case multiplies in memory and never reads the file.
+            if (ichunk > 0 || i2 > 0 || dumpKernelFiles()) {
+                std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                arma::mat(P1Mat.head_rows(i1InChunk)).save(p1f);
+                arma::mat(P2Mat.head_cols(i1InChunk)).save(p2f);
+                savedChunkFiles.push_back(p1f);
+                savedChunkFiles.push_back(p2f);
+            }
         }
         ichunk += 1;
         mPassCVVec.push_back(i1InChunk);
@@ -2857,6 +3034,7 @@ void mainRegionInCPP(
                             (MAC_ur > ptr_gSAIGEobj->m_cateVarRatioMinMACVecExclude.back())
                                 ? false : ptr_gSAIGEobj->m_flagSparseGRM;
                         ctx_ur.isnoadjCov_cur = false;
+                        ctx_ur.erSeedStream = regionSeedBase ^ ((uint64_t)i_ur + 1);  // W1-4
                         {
                             bool dummyHas;
                             if (!isSingleVarianceRatio) {
@@ -2956,10 +3134,16 @@ void mainRegionInCPP(
         if (i1InChunk != 0) {
             nchunks += 1;
             if (t_regionTestType != "BURDEN") {
-                P1Mat = P1Mat.rows(0, i1InChunk - 1);
-                P2Mat = P2Mat.cols(0, i1InChunk - 1);
-                P1Mat.save(t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin");
-                P2Mat.save(t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin");
+                // W1-3: file needed only when earlier chunks exist (final
+                // assembly will be multi-chunk and reads all chunks back).
+                if (!mPassCVVec.empty() || dumpKernelFiles()) {
+                    std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                    std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
+                    arma::mat(P1Mat.head_rows(i1InChunk)).save(p1f);
+                    arma::mat(P2Mat.head_cols(i1InChunk)).save(p2f);
+                    savedChunkFiles.push_back(p1f);
+                    savedChunkFiles.push_back(p2f);
+                }
             }
             ichunk += 1;
             mPassCVVec.push_back(i1InChunk);
@@ -2974,20 +3158,25 @@ void mainRegionInCPP(
     if (t_regionTestType != "BURDEN") {
         VarMat.resize(i1, i1);
         if (nchunks == 1) {
-            VarMat = P1Mat * P2Mat;
+            // W1-3b: P1Mat/P2Mat are persistent full-capacity buffers now
+            // (never truncated) — multiply only the valid i1 rows/cols.
+            VarMat = P1Mat.head_rows(i1) * P2Mat.head_cols(i1);
         }
         if (nchunks > 1) {
+            // W1-3b: load into locals so the persistent P1Mat/P2Mat buffers
+            // keep their capacity for the next region on this thread.
+            arma::mat P1chunk, P2chunk;
             int first_row = 0, first_col = 0, last_row = 0, last_col = 0;
             for (unsigned int index1 = 0; index1 < nchunks; index1++) {
                 last_row = first_row + mPassCVVec.at(index1) - 1;
                 std::string P1MatFile = t_outputFile + "_P1Mat_Chunk_" + std::to_string(index1) + ".bin";
-                P1Mat.load(P1MatFile);
-                if (P1Mat.n_cols == 0) continue;
+                P1chunk.load(P1MatFile);
+                if (P1chunk.n_cols == 0) continue;
 
                 for (unsigned int index2 = 0; index2 < index1; index2++) {
-                    P2Mat.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index2) + ".bin");
-                    if (P2Mat.n_cols == 0) continue;
-                    arma::mat offVarMat = P1Mat * P2Mat;
+                    P2chunk.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index2) + ".bin");
+                    if (P2chunk.n_cols == 0) continue;
+                    arma::mat offVarMat = P1chunk * P2chunk;
                     last_col = first_col + mPassCVVec.at(index2) - 1;
                     VarMat.submat(first_row, first_col, last_row, last_col) = offVarMat;
                     VarMat.submat(first_col, first_row, last_col, last_row) = offVarMat.t();
@@ -2995,20 +3184,21 @@ void mainRegionInCPP(
                 }
 
                 last_col = first_col + mPassCVVec.at(index1) - 1;
-                P2Mat.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index1) + ".bin");
-                arma::mat diagVarMat = P1Mat * P2Mat;
+                P2chunk.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index1) + ".bin");
+                arma::mat diagVarMat = P1chunk * P2chunk;
                 VarMat.submat(first_row, first_col, last_row, last_col) = diagVarMat;
                 first_row = last_row + 1;
                 first_col = 0;
             }
+        }
+    }
 
-            // Clean up chunk files
-            for (unsigned int index1 = 0; index1 < nchunks; index1++) {
-                std::string P1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(index1) + ".bin";
-                std::string P2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(index1) + ".bin";
-                std::remove(P1f.c_str());
-                std::remove(P2f.c_str());
-            }
+    // W1-3a: guaranteed cleanup of every chunk file this region wrote
+    // (previously only the nchunks>1 path deleted, and only the files it
+    // enumerated). SAIGE_STEP2_DUMP_KERNELS=1 keeps them for debugging.
+    if (!dumpKernelFiles()) {
+        for (const std::string& f : savedChunkFiles) {
+            std::remove(f.c_str());
         }
     }
 
@@ -4646,16 +4836,20 @@ int main(int argc, char* argv[])
                                   << std::endl;
                     }
 
-                    // Per-region (=> per-thread) scratch buffers. Each region
-                    // gets fresh P1Mat/P2Mat; sized for the SKAT-O path,
-                    // 1x1 placeholder for BURDEN.
-                    arma::mat P1Mat_local, P2Mat_local;
+                    // W1-3b: persistent per-thread scratch buffers, reused
+                    // across regions. Previously each region allocated + zeroed
+                    // fresh 2 x (m1 x N) matrices (2x200 MB at N=50k, m1=500):
+                    // the page-fault/zeroing cost was ~30% of gene time. Rows
+                    // are always written before being read (mainRegionInCPP
+                    // only touches head_rows(i1InChunk)), so no zeroing is
+                    // needed; set_size() is a no-op after the first region.
+                    thread_local arma::mat P1Mat_local, P2Mat_local;
                     if (regionTestType != "BURDEN") {
-                        P1Mat_local.zeros(markers_per_chunk_in_groupTest, t_n);
-                        P2Mat_local.zeros(t_n, markers_per_chunk_in_groupTest);
+                        P1Mat_local.set_size(markers_per_chunk_in_groupTest, t_n);
+                        P2Mat_local.set_size(t_n, markers_per_chunk_in_groupTest);
                     } else {
-                        P1Mat_local.zeros(1, 1);
-                        P2Mat_local.zeros(1, 1);
+                        P1Mat_local.set_size(1, 1);
+                        P2Mat_local.set_size(1, 1);
                     }
 
                     // Per-region weight vector

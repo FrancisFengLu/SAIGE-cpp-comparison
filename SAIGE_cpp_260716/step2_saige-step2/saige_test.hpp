@@ -29,6 +29,10 @@ struct PerMarkerCtx {
     bool flagSparseGRM_cur = false;
     bool isnoadjCov_cur = false;
     double varRatioVal = 1.0;
+    // W1-4: deterministic RNG stream id for the ER (efficient resampling)
+    // branch. Derived from the marker's position in the input (never from
+    // thread id / schedule) so ER p-values are reproducible run-to-run.
+    uint64_t erSeedStream = 0;
 };
 
 // Fused-kernel mode + A/B validation accumulators (Pillar 1).

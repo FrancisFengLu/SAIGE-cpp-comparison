@@ -57,22 +57,41 @@ void SL_free(void * ptr){
 //  Standalone branch: thread-safe std::mt19937 (one engine per thread)
 // ============================================================
 
+// W1-4 (reproducibility fix): the previous scheme seeded one engine per
+// thread with (base ^ omp_get_thread_num()). Under schedule(dynamic) the
+// marker->thread assignment differs between runs, so ER-resampled p-values
+// for MAC<=cutoff markers were NOT reproducible run-to-run. Now the caller
+// declares a per-marker stream id (derived from the marker's position in the
+// input, independent of thread/schedule) via SL_set_stream(); the engine is
+// reseeded deterministically from (base seed, stream id) before each ER call.
 static std::atomic<uint64_t> g_er_base_seed{1};
 static std::atomic<uint64_t> g_er_seed_epoch{0};
+static thread_local uint64_t t_er_stream = 0;
+static thread_local bool t_er_reseed = true;
+
+static inline uint64_t er_splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+void SL_set_stream(uint64_t id) {
+    t_er_stream = id;
+    t_er_reseed = true;
+}
 
 static std::mt19937& er_rng() {
     thread_local std::mt19937 engine;
     thread_local uint64_t local_epoch = (uint64_t)-1;
     uint64_t cur_epoch = g_er_seed_epoch.load(std::memory_order_relaxed);
-    if (local_epoch != cur_epoch) {
-#ifdef _OPENMP
-        int tid = omp_get_thread_num();
-#else
-        int tid = 0;
-#endif
-        uint64_t s = g_er_base_seed.load(std::memory_order_relaxed) ^ (uint64_t)tid;
+    if (t_er_reseed || local_epoch != cur_epoch) {
+        uint64_t s = er_splitmix64(
+            g_er_base_seed.load(std::memory_order_relaxed) ^
+            er_splitmix64(t_er_stream));
         engine.seed((uint32_t)(s & 0xFFFFFFFFu));
         local_epoch = cur_epoch;
+        t_er_reseed = false;
     }
     return engine;
 }

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <numeric>
 
 // ============================================================
@@ -30,6 +31,9 @@ void   SL_free(void * ptr);
 double SL_runif_double();
 int    SL_runif_INT(int max);
 void   SL_setseed(int seed);
+// W1-4: declare the deterministic per-marker RNG stream for the calling
+// thread; must be called before SKATExactBin_Work for reproducible results.
+void   SL_set_stream(uint64_t id);
 void   SL_out();
 void   SL_Sample(int k, int n, std::vector<int> & y, std::vector<int> & x);
 void   SL_GetSample(int n, int k, std::vector<int> & y, std::vector<int> & x);

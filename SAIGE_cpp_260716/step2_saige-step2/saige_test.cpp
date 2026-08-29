@@ -1219,6 +1219,9 @@ if(!t_isER){
         resout_er = arma::mat(m_resout.n_elem, 1);
         resout_er.col(0) = m_resout;
     }
+    // W1-4: seed the ER resampling RNG from the marker's own stream id so the
+    // result does not depend on which thread the marker landed on.
+    ER::SL_set_stream(ctx.erSeedStream);
     double pval_ER = ER::SKATExactBin_Work(Z_er, res_er, pi1_er, m_n_case, iIndex, iIndexComVec, resout_er, 2e+6, 1e+4, 1e-6, 1);
     // P2 fix (2026-05-09): ER can return NaN/inf on degenerate ultra-rare configs
     // (e.g. all carriers in same case/control group → variance 0 in resampling).

@@ -13,6 +13,7 @@
 //   9. Rcpp BGEN                   -->  standalone BGEN with zstd/zlib
 
 #include <armadillo>
+#include <cstring>
 #include <sqlite3.h>
 #include <sys/stat.h>
 #include "genotype_reader.hpp"
@@ -255,6 +256,15 @@ void PlinkClass::setPosSampleInPlink(std::vector<std::string>& t_SampleInModel)
         }
         m_posSampleInPlink[i] = it->second;  // already 0-based
     }
+
+    // W2: detect identity mapping (fam order == model order) for the fused
+    // byte-granular decode fast path.
+    m_posIsIdentity = true;
+    for (uint32_t i = 0; i < m_N; i++) {
+        if (m_posSampleInPlink[i] != i) { m_posIsIdentity = false; break; }
+    }
+    std::cout << "  Fused decode fast path (identity sample mapping): "
+              << (m_posIsIdentity ? "yes" : "no (per-sample gather)") << std::endl;
 
     std::cout << "Number of samples in analysis: " << m_N << std::endl;
 }
@@ -509,6 +519,271 @@ bool PlinkClass::getOneMarker_carriers_ts(uint64_t t_gIndex,
     else      { out.altFreq = altFreq_post;       out.altCount = sumG; }
     out.MAC = std::min(out.altCount, 2.0 * (double)m_N - out.altCount);
     return true;
+}
+
+// ============================================================
+// W2: fused decode + impute/flip (see genotype_reader.hpp for the design).
+// ============================================================
+
+// Thread-local packed-byte cache shared by Stage A and Stage C.
+namespace {
+    thread_local FILE* tlsFusedFin = nullptr;
+    thread_local std::vector<unsigned char> tlsFusedBuf;
+    thread_local uint64_t tlsFusedIdx = 0;
+    thread_local bool tlsFusedValid = false;
+    // non-identity fallback: per-sample raw codes gathered in Stage A
+    thread_local std::vector<uint8_t> tlsFusedCodes;
+    // Stage C scratch for index emission (grow-once, no per-marker zeroing)
+    thread_local std::vector<arma::uword> tlsFusedZeroIdx, tlsFusedNonZeroIdx;
+}
+
+bool PlinkClass::getOneMarkerFusedStats_ts(uint64_t t_gIndex,
+                                           FusedMarkerStats& fs)
+{
+    if (tlsFusedFin == nullptr) {
+        tlsFusedFin = fopen(m_bedFile.c_str(), "rb");
+        if (!tlsFusedFin) {
+            throw std::runtime_error(
+                "PlinkClass::getOneMarkerFusedStats_ts: cannot open .bed file: "
+                + m_bedFile);
+        }
+    }
+    if (tlsFusedBuf.size() < m_numBytesofEachMarker0) {
+        tlsFusedBuf.resize(m_numBytesofEachMarker0);
+    }
+    tlsFusedValid = false;
+
+    uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
+    fseek(tlsFusedFin, posSeek, SEEK_SET);
+    if (fread((char*)tlsFusedBuf.data(), 1, m_numBytesofEachMarker0, tlsFusedFin)
+        != m_numBytesofEachMarker0) {
+        return false;
+    }
+
+    fs = FusedMarkerStats();
+    fs.gIndex = t_gIndex;
+    fs.N = m_N;
+    fs.marker = m_MarkerInPlink[t_gIndex];
+    fs.pd     = m_pd[t_gIndex];
+    fs.chr    = m_chr[t_gIndex];
+    const std::vector<int8_t>* genoMaps;
+    if (m_AlleleOrder == "ref-first") {
+        fs.ref = m_alt[t_gIndex]; fs.alt = m_ref[t_gIndex];
+        genoMaps = &m_genoMaps_ref_first;
+    } else {
+        fs.ref = m_ref[t_gIndex]; fs.alt = m_alt[t_gIndex];
+        genoMaps = &m_genoMaps_alt_first;
+    }
+    for (int c = 0; c < 4; c++) fs.dmap[c] = (*genoMaps)[c];
+
+    // ---- raw 2-bit code counts ----
+    uint64_t cnt[4] = {0, 0, 0, 0};
+    const unsigned char* buf = tlsFusedBuf.data();
+    if (m_posIsIdentity) {
+        const uint32_t nbFull = m_N >> 2;       // bytes fully inside [0, m_N)
+        const uint64_t M55 = 0x5555555555555555ULL;
+        uint32_t b = 0;
+        uint64_t c_mis = 0, c_het = 0, c_homref = 0;
+        for (; b + 8 <= nbFull; b += 8) {
+            uint64_t w;
+            std::memcpy(&w, buf + b, 8);
+            const uint64_t hib = (w >> 1) & M55;   // high bit of each 2-bit code
+            const uint64_t lob = w & M55;          // low bit
+            c_mis    += (uint64_t)__builtin_popcountll(lob & ~hib);  // 01
+            c_het    += (uint64_t)__builtin_popcountll(hib & ~lob);  // 10
+            c_homref += (uint64_t)__builtin_popcountll(hib & lob);   // 11
+        }
+        for (; b < nbFull; ++b) {
+            const unsigned v = buf[b];
+            const unsigned hib = (v >> 1) & 0x55u;
+            const unsigned lob = v & 0x55u;
+            c_mis    += (uint64_t)__builtin_popcount(lob & ~hib & 0x55u);
+            c_het    += (uint64_t)__builtin_popcount(hib & ~lob & 0x55u);
+            c_homref += (uint64_t)__builtin_popcount(hib & lob);
+        }
+        cnt[MISSING] = c_mis;
+        cnt[HET]     = c_het;
+        cnt[HOM_REF] = c_homref;
+        // tail samples in the last (partial) byte
+        for (uint32_t i = nbFull * 4; i < m_N; ++i) {
+            const unsigned code = (buf[i >> 2] >> ((i & 3u) * 2)) & 3u;
+            if (code != HOM_ALT) cnt[code]++;
+        }
+        cnt[HOM_ALT] = (uint64_t)m_N - cnt[MISSING] - cnt[HET] - cnt[HOM_REF];
+    } else {
+        // subset / reordered samples: gather codes once, cache for Stage C
+        if (tlsFusedCodes.size() < m_N) tlsFusedCodes.resize(m_N);
+        uint8_t* codes = tlsFusedCodes.data();
+        for (uint32_t i = 0; i < m_N; ++i) {
+            const uint32_t ind = m_posSampleInPlink[i];
+            const uint8_t code = (buf[ind >> 2] >> ((ind & 3u) * 2)) & 3u;
+            codes[i] = code;
+            cnt[code]++;
+        }
+    }
+    for (int c = 0; c < 4; c++) fs.counts[c] = cnt[c];
+
+    // ---- pre-impute stats: EXACT expressions of getOneMarker_ts ----
+    const int numMissing = (int)cnt[MISSING];
+    const int count = (int)m_N - numMissing;
+    fs.nMissing    = (uint32_t)numMissing;
+    fs.missingRate = (double)numMissing / (double)m_N;
+    fs.imputeInfo  = 1;
+    double altCounts = (double)(cnt[HET] + 2 * cnt[HOM_ALT]);
+    double altFreq;
+    if (count > 0) {
+        altFreq = altCounts / (double)count / 2;
+    } else {
+        altFreq = 0;
+    }
+    if (m_AlleleOrder == "ref-first") {
+        altFreq = 1 - altFreq;
+        altCounts = 2 * (double)count * altFreq;
+    }
+    fs.altFreq = altFreq;
+    fs.altCounts = altCounts;
+
+    tlsFusedIdx = t_gIndex;
+    tlsFusedValid = true;
+    return true;
+}
+
+// Stage B (pure). Mirrors UTIL.cpp::imputeGenoAndFlip on the 4-entry table.
+void finalizeFusedStats(PlinkClass::FusedMarkerStats& fs,
+                        int t_impute_case,
+                        double t_dosage_zerod_cutoff,
+                        double t_dosage_zerod_MAC_cutoff,
+                        double t_MAC_pre)
+{
+    // legacy: flip decided on the reader's (pre-impute) altFreq, strictly >
+    fs.flip = (fs.altFreq > 0.5);
+    double af = fs.altFreq;
+    if (fs.flip) af = 1 - af;
+
+    double imputeG = 0;
+    double MAC = t_MAC_pre;
+    if (fs.nMissing > 0) {
+        switch (t_impute_case) {
+            case 1: imputeG = std::round(2 * af); break;   // best_guess
+            case 2: imputeG = 2 * af;             break;   // mean
+            case 3: imputeG = 0;                  break;   // minor
+        }
+        MAC = MAC + imputeG * (double)fs.nMissing;
+    }
+    fs.imputeG = imputeG;
+    fs.MAC_imp = MAC;
+
+    // .clean(cutoff) gate — arma semantics: |x| <= cutoff -> 0
+    const bool doClean = (t_dosage_zerod_cutoff > 0) &&
+                         (MAC <= t_dosage_zerod_MAC_cutoff);
+
+    static const unsigned char kMissingCode = 0x1;  // PlinkClass::MISSING
+    for (int c = 0; c < 4; c++) {
+        double d;
+        if ((unsigned char)c == kMissingCode) {
+            d = imputeG;   // written AFTER the flip in the legacy chain
+        } else {
+            const double d0 = (double)fs.dmap[c];
+            d = fs.flip ? (2 - d0) : d0;
+        }
+        if (doClean && std::abs(d) <= t_dosage_zerod_cutoff) d = 0;
+        fs.fd[c] = d;
+    }
+
+    // post-impute stats. Legacy: altCount = arma::sum(GVec) (sequential, adds
+    // imputeG nMissing times); here the counts-based dot in fixed order —
+    // identical when imputeG is an integer (best_guess / no missing), last-ulp
+    // otherwise. Deterministic across runs/threads either way.
+    double sum = fs.fd[0] * (double)fs.counts[0]
+               + fs.fd[1] * (double)fs.counts[1]
+               + fs.fd[2] * (double)fs.counts[2]
+               + fs.fd[3] * (double)fs.counts[3];
+    double afp = sum / (2 * (double)fs.N);
+    if (fs.flip) {
+        afp = 1 - afp;
+        sum = 2 * (double)fs.N - sum;
+    }
+    fs.altFreq_post   = afp;
+    fs.altCounts_post = sum;
+    fs.finalized = true;
+}
+
+void PlinkClass::fillOneMarkerFusedDense_ts(const FusedMarkerStats& fs,
+                                            arma::vec& t_GVec,
+                                            arma::uvec& t_indexZero,
+                                            arma::uvec& t_indexNonZero)
+{
+    if (!tlsFusedValid || tlsFusedIdx != fs.gIndex) {
+        throw std::runtime_error(
+            "fillOneMarkerFusedDense_ts: thread-local packed cache does not "
+            "hold marker " + std::to_string(fs.gIndex) +
+            " (Stage A must precede Stage C on the same thread).");
+    }
+    if (!fs.finalized) {
+        throw std::runtime_error(
+            "fillOneMarkerFusedDense_ts: finalizeFusedStats was not called.");
+    }
+    if (t_GVec.n_elem != (arma::uword)m_N) t_GVec.set_size(m_N);
+    if (tlsFusedZeroIdx.size() < m_N)    tlsFusedZeroIdx.resize(m_N);
+    if (tlsFusedNonZeroIdx.size() < m_N) tlsFusedNonZeroIdx.resize(m_N);
+
+    double* g = t_GVec.memptr();
+    arma::uword* pz  = tlsFusedZeroIdx.data();
+    arma::uword* pnz = tlsFusedNonZeroIdx.data();
+    size_t cz = 0, cnz = 0;
+
+    if (m_posIsIdentity) {
+        // byte -> 4 final dosages LUT (8 KB, L1-resident) + zero-pattern mask
+        alignas(64) double lut[256][4];
+        uint8_t nzmask[256];
+        const bool nzc[4] = { fs.fd[0] != 0.0, fs.fd[1] != 0.0,
+                              fs.fd[2] != 0.0, fs.fd[3] != 0.0 };
+        for (int v = 0; v < 256; v++) {
+            const int c0 = v & 3, c1 = (v >> 2) & 3,
+                      c2 = (v >> 4) & 3, c3 = (v >> 6) & 3;
+            lut[v][0] = fs.fd[c0];
+            lut[v][1] = fs.fd[c1];
+            lut[v][2] = fs.fd[c2];
+            lut[v][3] = fs.fd[c3];
+            nzmask[v] = (uint8_t)(nzc[c0] | (nzc[c1] << 1) |
+                                  (nzc[c2] << 2) | (nzc[c3] << 3));
+        }
+        const unsigned char* buf = tlsFusedBuf.data();
+        const uint32_t nbFull = m_N >> 2;
+        for (uint32_t b = 0; b < nbFull; b++) {
+            const unsigned v = buf[b];
+            std::memcpy(g + 4 * (size_t)b, lut[v], 4 * sizeof(double));
+            const unsigned m = nzmask[v];
+            const arma::uword base = 4 * (arma::uword)b;
+            // branchless zero/nonzero index emission
+            pnz[cnz] = base;     cnz +=  m       & 1u;
+            pz[cz]   = base;     cz  += (~m)     & 1u;
+            pnz[cnz] = base + 1; cnz += (m >> 1) & 1u;
+            pz[cz]   = base + 1; cz  += (~m >> 1) & 1u;
+            pnz[cnz] = base + 2; cnz += (m >> 2) & 1u;
+            pz[cz]   = base + 2; cz  += (~m >> 2) & 1u;
+            pnz[cnz] = base + 3; cnz += (m >> 3) & 1u;
+            pz[cz]   = base + 3; cz  += (~m >> 3) & 1u;
+        }
+        for (uint32_t i = nbFull * 4; i < m_N; ++i) {
+            const unsigned code = (buf[i >> 2] >> ((i & 3u) * 2)) & 3u;
+            const double d = fs.fd[code];
+            g[i] = d;
+            if (d != 0.0) pnz[cnz++] = i; else pz[cz++] = i;
+        }
+    } else {
+        const uint8_t* codes = tlsFusedCodes.data();
+        for (uint32_t i = 0; i < m_N; ++i) {
+            const double d = fs.fd[codes[i]];
+            g[i] = d;
+            if (d != 0.0) pnz[cnz++] = i; else pz[cz++] = i;
+        }
+    }
+
+    t_indexZero.set_size(cz);
+    t_indexNonZero.set_size(cnz);
+    std::memcpy(t_indexZero.memptr(),    pz,  cz  * sizeof(arma::uword));
+    std::memcpy(t_indexNonZero.memptr(), pnz, cnz * sizeof(arma::uword));
 }
 
 // ============================================================

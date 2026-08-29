@@ -6,7 +6,18 @@ else
   CXX ?= g++
 endif
 
-CXXFLAGS ?= -std=c++17 -O3 -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -fopenmp -pthread
+# W1-2 (same fix as step1 Phase 1/2): `?=` was silently defeated by conda
+# activate scripts that export CXXFLAGS (-march=nocona -O2, no -fopenmp!), so
+# objects were built WITHOUT -O3/-fopenpm — OpenMP pragmas compiled to no-ops.
+# `:=` makes the Makefile assignment win over the environment (make only lets
+# the environment override `?=`, or any assignment under `make -e`).
+# -march=native / -funroll-loops / -DARMA_NO_DEBUG mirror the step1 flags.
+CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -fopenmp -pthread
+
+# REQUIRED_DEFS are always appended, protecting the mandatory defines even if
+# CXXFLAGS is force-overridden (make -e / make CXXFLAGS=...).
+REQUIRED_DEFS := -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1
+override CXXFLAGS += $(REQUIRED_DEFS)
 
 PKG_CONFIG   := $(shell command -v pkg-config 2>/dev/null)
 
@@ -37,6 +48,13 @@ ifeq ($(UNAME_S),Darwin)
               -I/opt/homebrew/Cellar/zstd/1.5.7/include
 else
   INCLUDES := -I/usr/local/include
+  # W1-2: headers (armadillo, boost, yaml-cpp, ...) live in the conda env on
+  # the build machines; previously they were only found via the -isystem that
+  # the conda-exported CXXFLAGS carried. Now that CXXFLAGS is `:=`, add the
+  # env include path explicitly (same pattern as step1's Makefile).
+  ifneq ($(strip $(CONDA_PREFIX)),)
+    INCLUDES += -isystem $(CONDA_PREFIX)/include
+  endif
 endif
 
 ifneq ($(strip $(YAML_CFLAGS)),)
@@ -73,6 +91,10 @@ else
           -lz \
           -lsqlite3 \
           -fopenmp -pthread
+  # W1-2: link against the conda env libs and bake the rpath (step1 pattern).
+  ifneq ($(strip $(CONDA_PREFIX)),)
+    LIBS += -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+  endif
 endif
 
 ifneq ($(strip $(YAML_LIBS)),)

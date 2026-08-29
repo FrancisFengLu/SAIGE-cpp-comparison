@@ -53,6 +53,11 @@ private:
     // PLINK files
     std::string m_bimFile, m_famFile, m_bedFile;
     std::vector<uint32_t> m_posSampleInPlink;
+    // W2: true iff m_posSampleInPlink[i] == i for all i (fam order == model
+    // order, no subsetting/reordering). Enables the byte-granular fused
+    // decode fast path; otherwise the fused path falls back to a per-sample
+    // gather (still single-pass).
+    bool m_posIsIdentity = true;
 
     // https://www.cog-genomics.org/plink/1.9/formats#bed
     // PLINK format
@@ -159,6 +164,67 @@ public:
                                   int t_impute_case,   // 1=bestguess 2=mean 3=none
                                   CarrierMarker& out);
 
+    // ============================================================
+    // W2 (fused decode + impute/flip): three-stage replacement for
+    //   getOneMarker_ts + imputeGenoAndFlip
+    // that touches the dense N-vector exactly ONCE.
+    //
+    //   Stage A  getOneMarkerFusedStats_ts : read packed bytes into a
+    //            thread_local cache and compute the raw 2-bit code counts
+    //            (popcount over 64-bit words when the sample mapping is the
+    //            identity). Emits marker meta + the pre-impute stats
+    //            bit-identically to getOneMarker_ts (they were counts-based
+    //            there too). No dense vector is written.
+    //   Stage B  finalizeFusedStats (free function, pure): replays the
+    //            imputeGenoAndFlip semantics (flip on altFreq>0.5, missing ->
+    //            imputeG, MAC-gated .clean()) on the 4-entry code->dosage
+    //            table instead of on the N-vector, and derives the
+    //            post-impute altFreq/altCounts from the counts.
+    //   Stage C  fillOneMarkerFusedDense_ts : single pass over the cached
+    //            packed buffer through a 256-entry byte -> 4-double LUT,
+    //            writing the final GVec and the zero / nonzero index vectors
+    //            in one go. GVec values are bit-identical to the legacy
+    //            two-function chain; only altCounts (previously a sequential
+    //            arma::sum including nMissing additions of imputeG) can
+    //            differ in the last ulp when missing genotypes are imputed
+    //            with a non-integer value.
+    //
+    // Callers may skip Stage C entirely for markers that fail QC (the legacy
+    // chain always paid the dense decode first).
+    // ============================================================
+    struct FusedMarkerStats {
+        // marker meta
+        std::string ref, alt, marker, chr;
+        uint32_t pd = 0;
+        // pre-impute stats (bit-identical to getOneMarker_ts outputs)
+        double altFreq = 0;       // pre-impute (allele-order adjusted)
+        double altCounts = 0;     // pre-impute
+        double missingRate = 0;
+        double imputeInfo = 1;
+        uint32_t nMissing = 0;
+        // raw plink 2-bit code counts, indexed by code (00,01,10,11)
+        uint64_t counts[4] = {0, 0, 0, 0};
+        int8_t dmap[4] = {0, 0, 0, 0};   // code -> pre-flip dosage (-1 = missing)
+        uint32_t N = 0;                  // samples in analysis (m_N)
+        uint64_t gIndex = 0;
+        // finalize outputs
+        bool finalized = false;
+        bool flip = false;
+        double imputeG = 0;
+        double MAC_imp = 0;              // MAC_pre + imputeG*nMissing (clean gate value)
+        double fd[4] = {0, 0, 0, 0};     // code -> FINAL dosage (flip+impute+clean)
+        double altFreq_post = 0, altCounts_post = 0;
+    };
+
+    bool getOneMarkerFusedStats_ts(uint64_t t_gIndex, FusedMarkerStats& fs);
+
+    // Stage C. Requires the immediately preceding Stage A call on the SAME
+    // thread with the same gIndex (packed bytes are cached thread_local).
+    void fillOneMarkerFusedDense_ts(const FusedMarkerStats& fs,
+                                    arma::vec& t_GVec,
+                                    arma::uvec& t_indexZero,
+                                    arma::uvec& t_indexNonZero);
+
     // Convenience overload: simplified getOneMarker (like SAIGE PLINK.hpp inline overloads)
     void getOneMarker(uint64_t t_gIndex_prev,
                       uint64_t t_gIndex,
@@ -257,6 +323,16 @@ public:
 
     void closegenofile();
 };
+
+// W2 Stage B (pure, no file access): replay imputeGenoAndFlip on the 4-entry
+// code->dosage table. t_MAC_pre must be the caller-computed pre-impute MAC
+// (each caller keeps its own expression so the .clean() gate stays
+// bit-identical to the legacy chain).
+void finalizeFusedStats(PlinkClass::FusedMarkerStats& fs,
+                        int t_impute_case,   // 1=best_guess 2=mean 3=minor
+                        double t_dosage_zerod_cutoff,
+                        double t_dosage_zerod_MAC_cutoff,
+                        double t_MAC_pre);
 
 } // namespace PLINK
 
