@@ -12,3 +12,5 @@ extdata/input/nfam_100_nindep_0_step1_includeMoreRareVariants_poly.raw
 pixi.lock
 /plink-ng
 core*
+plink-ng/
+plink2_includes.a
