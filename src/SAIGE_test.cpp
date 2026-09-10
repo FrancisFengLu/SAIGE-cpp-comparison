@@ -1658,6 +1658,24 @@ void SAIGEClass::assign_for_itrait_sampleIndices(unsigned int t_itrait){
         m_sampleindices_vec = sampleindices_sub_vec.subvec(0, (m_sampleIndexLenVec[t_itrait]-1));
 }
 
+// 该 trait 是否用全部样本且顺序恒等（si == 0..N-1）。是的话 marker 级的
+// 填补/flip/零索引结果对该 trait 原样成立，逐 trait 的子集重扫可以整个跳过。
+bool SAIGEClass::trait_uses_all_samples(unsigned int t_itrait){
+        if(m_fullset_flag.size() < m_traitType_vec.size())
+                m_fullset_flag.assign(m_traitType_vec.size(), -1);
+        if(m_fullset_flag[t_itrait] < 0){
+                unsigned int N = m_res_mt.n_rows;
+                char ok = 0;
+                if(m_sampleIndexLenVec[t_itrait] == N){
+                        arma::uvec si_full = m_sampleindices_mt.col(t_itrait);
+                        arma::uvec si = si_full.subvec(0, N-1);
+                        ok = arma::all(si == arma::regspace<arma::uvec>(0, N-1)) ? 1 : 0;
+                }
+                m_fullset_flag[t_itrait] = ok;
+        }
+        return m_fullset_flag[t_itrait] == 1;
+}
+
 arma::vec SAIGEClass::getPCG1ofSigmaAndGtilde_wo_precomp(arma::sp_mat & m_spSigmaMat, arma::vec & m_diagSigma, arma::vec& bVec, int maxiterPCG, double tolPCG) {
     int Nnomissing = m_spSigmaMat.n_rows;
     arma::vec xVec(Nnomissing, arma::fill::zeros); // Initialize xVec to zeros

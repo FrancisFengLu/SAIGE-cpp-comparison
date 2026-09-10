@@ -142,6 +142,7 @@ std::vector<arma::mat>  m_cache_XVX;         // m_XVX_mt.cols(m_ip).rows(0, p-1)
 std::vector<arma::vec>  m_cache_y, m_cache_res, m_cache_mu, m_cache_mu2, m_cache_resout;
 std::vector<arma::uvec> m_cache_si, m_cache_ipvec;
 std::vector<char>       m_cache_ok;          // 该 trait 的缓存是否已建
+std::vector<char>       m_fullset_flag;      // -1 未判定 / 0 子集 / 1 全样本恒等
 arma::uvec m_colXvec;
 
 arma::umat m_sparseSigmaLocationMtx;
@@ -394,6 +395,7 @@ void scoreTestFast_noadjCov_multiTrait(arma::vec & t_GVec,
                      double &t_var2); 
 
 void assign_for_itrait_sampleIndices(unsigned int t_itrait);
+bool trait_uses_all_samples(unsigned int t_itrait);
 
 arma::vec getPCG1ofSigmaAndGtilde_wo_precomp(arma::sp_mat & m_spSigmaMat, arma::vec & m_diagSigma, arma::vec& bVec, int maxiterPCG, double tolPCG);
 

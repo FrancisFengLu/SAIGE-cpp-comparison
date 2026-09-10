@@ -29,6 +29,19 @@
 #include "getMem.hpp"
 
 #include <boost/math/distributions/beta.hpp>
+#include <chrono>
+
+// SAIGE_MT_TIMING=1 时打印 marker 循环各阶段的累计耗时（每 chunk 一次）
+static double g_mtT_decode = 0, g_mtT_impsub = 0, g_mtT_assign = 0, g_mtT_pval = 0;
+static inline double mt_now(){
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static inline bool mt_timing_on(){
+    static int on = -1;
+    if(on < 0){ const char *e = getenv("SAIGE_MT_TIMING"); on = (e && *e=='1') ? 1 : 0; }
+    return on == 1;
+}
 
 // global objects for different genotype formats
 
@@ -364,11 +377,13 @@ void mainMarkerInCPP(
    //t_GVec.clear();
    //arma::vec timeoutput1 = getTime();
    //std::cout << "mainMarker2" << std::endl;
+   double mt_t0 = mt_timing_on() ? mt_now() : 0;
    bool isReadMarker = Unified_getOneMarker(t_genoType, gIndex_prev, gIndex, ref, alt, marker, pd, chr, altFreq, altCounts, missingRate, imputeInfo,
                                           isOutputIndexForMissing, // bool t_isOutputIndexForMissing,
                                           indexForMissing,
                                           isOnlyOutputNonZero, // bool t_isOnlyOutputNonZero,
                                           indexNonZeroVec, t_GVec, t_isImputation);
+   if(mt_timing_on()) g_mtT_decode += mt_now() - mt_t0;
    //arma::vec timeoutput2 = getTime();   
    //printTime(timeoutput1, timeoutput2, "Unified_getOneMarker"); 
 /*
@@ -435,9 +450,13 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
 
     //std::cout << "info " << info << std::endl;
      //std::cout << "t_traitType.size() " << t_traitType.size() << std::endl;
+   // marker 级零/非零索引转 arma，只转一次，全样本 trait 共用
+   arma::uvec idxZero_all, idxNonZero_all;
+   bool idx_all_done = false;
+
    for(int i_mt0 = 0; i_mt0 < t_traitType.size(); i_mt0++){
      //std::cout << "i_mt0 " << i_mt0 << std::endl;
-     
+
      int j_mt0 = i_mt0*t_genoIndex.size()+i;
      chrVec.at(j_mt0) = chr;
      posVec.at(j_mt0) = pds;
@@ -449,13 +468,34 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
      ptr_gSAIGEobj->assign_for_itrait_sampleIndices(i_mt0);
      //ptr_gSAIGEobj->assign_for_itrait(i_mt0);
 
-     arma::uvec include_indices = ptr_gSAIGEobj->m_sampleindices_vec;
      arma::vec t_GVec_sub;
      arma::uvec indexZeroVec_arma, indexNonZeroVec_arma;
      arma::uvec indexForMissing_sub;
      double MAC, MAF;
      //flip=false;
-     bool fakeflip = imputeGenoAndFlip_sub(t_GVec, t_GVec_sub, altFreq, altCounts, indexForMissing_sub, indexForMissing_all, g_impute_method, g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC, indexZeroVec_arma, indexNonZeroVec_arma, include_indices);
+     double mt_t1 = mt_timing_on() ? mt_now() : 0;
+     bool fullset = ptr_gSAIGEobj->trait_uses_all_samples(i_mt0);
+     if(fullset){
+       // 全样本恒等子集：marker 级的填补/flip/索引/频率对该 trait 原样成立，
+       // 不再复制向量、不再重扫。altFreq/altCounts 保持 marker 级值。
+       if(!idx_all_done){
+         idxZero_all    = arma::conv_to<arma::uvec>::from(indexZeroVec);
+         idxNonZero_all = arma::conv_to<arma::uvec>::from(indexNonZeroVec);
+         // flip 后 marker 级 altFreq/altCounts 还停在 flip 前的侧别，
+         // _sub 是从翻转后的向量重算的 —— 这里保持同一语义（求和序也相同）
+         altCounts = arma::accu(t_GVec);
+         altFreq = altCounts / (2.0*(double)t_GVec.n_elem);
+         idx_all_done = true;
+       }
+       MAC = std::min(altCounts, 2*(double)t_GVec.n_elem - altCounts);
+     }else{
+       arma::uvec include_indices = ptr_gSAIGEobj->m_sampleindices_vec;
+       imputeGenoAndFlip_sub(t_GVec, t_GVec_sub, altFreq, altCounts, indexForMissing_sub, indexForMissing_all, g_impute_method, g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC, indexZeroVec_arma, indexNonZeroVec_arma, include_indices);
+     }
+     arma::vec  & GV  = fullset ? t_GVec : t_GVec_sub;
+     arma::uvec & izv = fullset ? idxZero_all : indexZeroVec_arma;
+     arma::uvec & inz = fullset ? idxNonZero_all : indexNonZeroVec_arma;
+     if(mt_timing_on()) g_mtT_impsub += mt_now() - mt_t1;
 
      //std::cout << "mainMarker5" << std::endl;
      //indexZeroVec_arma = arma::conv_to<arma::uvec>::from(indexZeroVec);
@@ -532,7 +572,9 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
     t_P2Vec.clear();
     G1tilde_P_G2tilde_Vec.clear();    
     //arma::vec timeoutput5 = getTime(); 
+   double mt_t2 = mt_timing_on() ? mt_now() : 0;
    ptr_gSAIGEobj->assign_for_itrait(i_mt0);
+   if(mt_timing_on()) g_mtT_assign += mt_now() - mt_t2;
 
     //set_varianceRatio(MAC, isSingleVarianceRatio);
    if(g_isgxe && ptr_gSAIGEobj->m_isCondition){
@@ -580,17 +622,18 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
       }
 
 
+    double mt_t3 = mt_timing_on() ? mt_now() : 0;
     if(MAC <= g_MACCutoffforER && ptr_gSAIGEobj->m_traitType == "binary"){
-      Unified_getMarkerPval( 
-		    t_GVec_sub, 
+      Unified_getMarkerPval(
+		    GV,
                           false, // bool t_isOnlyOutputNonZero, 
-                          indexNonZeroVec_arma, indexZeroVec_arma, Beta, seBeta, pval, pval_noSPA,  Tstat, gy, varT,   
+                          inz, izv, Beta, seBeta, pval, pval_noSPA,  Tstat, gy, varT,   
 			  altFreq, isSPAConverge, gtildeVec, is_gtilde, is_region, t_P2Vec, isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c, G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge, true,  ptr_gSAIGEobj->m_isnoadjCov, ptr_gSAIGEobj->m_flagSparseGRM_cur);
     }else{
       Unified_getMarkerPval( 
-		    t_GVec_sub, 
+		    GV, 
                           false, // bool t_isOnlyOutputNonZero, 
-                          indexNonZeroVec_arma, indexZeroVec_arma, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,   
+                          inz, izv, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,   
 			  altFreq, isSPAConverge, gtildeVec, is_gtilde, is_region, t_P2Vec, isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c, G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge, false,  ptr_gSAIGEobj->m_isnoadjCov, ptr_gSAIGEobj->m_flagSparseGRM_cur);
     }
 
@@ -627,21 +670,22 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
       }
      //if(MAC > g_MACCutoffforER){
       Unified_getMarkerPval(
-                    t_GVec_sub,
+                    GV,
                           false, // bool t_isOnlyOutputNonZero,
-                          indexNonZeroVec_arma, indexZeroVec_arma, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
+                          inz, izv, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
                           altFreq, isSPAConverge, gtildeVec, is_gtilde, is_region, t_P2Vec, isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c, G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge, false,  ptr_gSAIGEobj->m_isnoadjCov_cur, ptr_gSAIGEobj->m_flagSparseGRM_cur);
      //}else{
      /* Unified_getMarkerPval(
-                    t_GVec_sub,
+                    GV,
                           false, // bool t_isOnlyOutputNonZero,
-                          indexNonZeroVec_arma, indexZeroVec_arma, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
+                          inz, izv, Beta, seBeta, pval, pval_noSPA, Tstat, gy, varT,
                           altFreq, isSPAConverge, gtildeVec, is_gtilde, is_region, t_P2Vec, isCondition, Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c, G1tilde_P_G2tilde_Vec, is_Firth, is_FirthConverge, true, ptr_gSAIGEobj->m_isnoadjCov_cur, ptr_gSAIGEobj->m_flagSparseGRM_cur);
  */
  
         //}     
      }
 }//    if((t_traitType == "binary" && MAC > g_MACCutoffforER) || t_traitType != "binary"){
+    if(mt_timing_on()) g_mtT_pval += mt_now() - mt_t3;
 
 
    if(t_traitType.at(i_mt0) == "binary"){
@@ -678,8 +722,8 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
        //if(t_traitType.size() > 1){
            ptr_gSAIGEobj->assign_for_itrait_binaryindices(i_mt0);
        //}	
-      arma::vec dosage_case = t_GVec_sub.elem(ptr_gSAIGEobj->m_case_indices);
-      arma::vec dosage_ctrl = t_GVec_sub.elem(ptr_gSAIGEobj->m_ctrl_indices);
+      arma::vec dosage_case = GV.elem(ptr_gSAIGEobj->m_case_indices);
+      arma::vec dosage_ctrl = GV.elem(ptr_gSAIGEobj->m_ctrl_indices);
       AF_case = arma::mean(dosage_case) /2;
       AF_ctrl = arma::mean(dosage_ctrl) /2;
       N_case = dosage_case.n_elem;
@@ -777,6 +821,12 @@ for(unsigned int j_mt = 0; j_mt < t_traitType.size(); j_mt++){
   t_genoIndex.size());
 
 }//for(unsigned int j_mt = 0; j_mt < t_traitType.size(); j_mt++){
+if(mt_timing_on()){
+    std::cout << "MT_TIMING decode=" << g_mtT_decode
+              << " impute_sub=" << g_mtT_impsub
+              << " assign=" << g_mtT_assign
+              << " pval=" << g_mtT_pval << " (secs, cumulative)" << std::endl;
+}
 }
 
 
