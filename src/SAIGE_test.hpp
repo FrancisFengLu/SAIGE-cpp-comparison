@@ -130,6 +130,18 @@ arma::umat m_sampleindices_mt;
 
 arma::uvec m_sampleindices_vec;
 arma::uvec m_sampleIndexLenVec;
+
+// 逐 trait 的子集缓存：assign_for_itrait / getadjG(Fast) / scoreTestFast 里那些
+// submat/col+elem 只依赖 trait，不依赖 marker，却在每个 (marker, trait) 重做。
+// 首次遇到该 trait 时构建一次，之后按引用复用。
+std::vector<arma::mat>  m_cache_XV;          // m_XV_mt.submat(m_ip, si)          p x N_k
+std::vector<arma::mat>  m_cache_XXVX_inv;    // m_XXVX_inv_mt.submat(si, m_ip)    N_k x p
+std::vector<arma::mat>  m_cache_X;           // m_X_mt.submat(si, m_ip)           N_k x p
+std::vector<arma::mat>  m_cache_XVX_inv_XV;  // m_XVX_inv_XV_mt.submat(si, m_ip)  N_k x p
+std::vector<arma::mat>  m_cache_XVX;         // m_XVX_mt.cols(m_ip).rows(0, p-1)  p x p
+std::vector<arma::vec>  m_cache_y, m_cache_res, m_cache_mu, m_cache_mu2, m_cache_resout;
+std::vector<arma::uvec> m_cache_si, m_cache_ipvec;
+std::vector<char>       m_cache_ok;          // 该 trait 的缓存是否已建
 arma::uvec m_colXvec;
 
 arma::umat m_sparseSigmaLocationMtx;

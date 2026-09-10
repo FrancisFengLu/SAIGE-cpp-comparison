@@ -295,11 +295,9 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
                      double &t_var2){
 
     arma::vec g1 = t_GVec.elem(t_indexForNonZero);
-    arma::mat m_X_submat = m_X_mt.submat(m_sampleindices_vec, m_ip);
-        arma::mat X1 = m_X_submat.rows(t_indexForNonZero);
+    arma::mat X1 = m_cache_X[m_itrait].rows(t_indexForNonZero);
     //arma::mat X1 = m_X.rows(t_indexForNonZero);
-    arma::mat m_XVX_inv_XV_submat = m_XVX_inv_XV_mt.submat(m_sampleindices_vec, m_ip);
-    arma::mat A1 = m_XVX_inv_XV_submat.rows(t_indexForNonZero);
+    arma::mat A1 = m_cache_XVX_inv_XV[m_itrait].rows(t_indexForNonZero);
     //arma::mat A1 = m_XVX_inv_XV.rows(t_indexForNonZero);
     arma::vec mu21;
     arma::vec res1 = m_res.elem(t_indexForNonZero);
@@ -314,9 +312,7 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
 	//std::cout << "m_XVX_mt " << m_XVX_mt.n_cols << " " << m_XVX_mt.n_rows << std::endl;
 	//m_ip.print("m_ip");
 	//std::cout << "m_p " << m_p << std::endl;
-    arma::mat XVX_submat = m_XVX_mt.cols(m_ip);
-
-    arma::mat XVX_submat2 = XVX_submat.rows(0, (m_p-1));
+    const arma::mat & XVX_submat2 = m_cache_XVX[m_itrait];
     //arma::mat  ZtXVXZ = Z.t() * m_XVX * Z;
     //std::cout << "e " << std::endl;
 
@@ -484,13 +480,9 @@ void SAIGEClass::getadjG(arma::vec & t_GVec, arma::vec & g){
    //    arma::mat subMat = inputMat.submat(arma::span(rowStart, rowEnd), colIndices);
 
    
-   g = m_XV_mt.submat(m_ip, m_sampleindices_vec) * t_GVec;
-   
-   //t_GVec.t().print("t_GVec");
-   //std::cout << "sum(t_GVec) " << arma::accu(t_GVec) << std::endl;
-   //      m_XV.print("m_XV");
+   g = m_cache_XV[m_itrait] * t_GVec;
   // g = t_GVec - m_XXVX_inv * g;
-  g = t_GVec - m_XXVX_inv_mt.submat(m_sampleindices_vec, m_ip) * g;
+  g = t_GVec - m_cache_XXVX_inv[m_itrait] * g;
     //m_XXVX_inv.print("m_XXVX_inv");
     //g.t().print("g");
 }
@@ -508,19 +500,9 @@ void SAIGEClass::getadjGFast(arma::vec & t_GVec, arma::vec & g, arma::uvec & iIn
   
   // To increase computational efficiency when lots of GVec elements are 0
 // std::cout << "m_p " << m_p << std::endl;
- arma::mat XV_submat = m_XV_mt.submat(m_ip, m_sampleindices_vec);
-	/*m_ip.print("m_ip");
-
-	std::cout << "m_XV_submat.n_cols " << XV_submat.n_cols << std::endl;
-  	std::cout << "m_XV_submat.n_rows " << XV_submat.n_rows << std::endl;
-
-std::cout << "XV_submat(0,0) " << XV_submat[0,0] << std::endl;
-std::cout << "XV_submat(0,1) " << XV_submat[0,1] << std::endl;
-std::cout << "XV_submat(1,0) " << XV_submat[1,0] << std::endl;
-std::cout << "XV_submat(1,1) " << XV_submat[1,1] << std::endl;
-*/
+ const arma::mat & XV_submat = m_cache_XV[m_itrait];
   arma::vec m_XVG(XV_submat.n_rows, arma::fill::zeros);
-  arma::mat m_XXVX_inv_submat = m_XXVX_inv_mt.submat(m_sampleindices_vec, m_ip);
+  const arma::mat & m_XXVX_inv_submat = m_cache_XXVX_inv[m_itrait];
   //std::cout << "m_XXVX_inv_submat(0,0) " << m_XXVX_inv_submat[0,0] << std::endl;
   //std::cout << "m_XXVX_inv_submat(0,1) " << m_XXVX_inv_submat[0,1] << std::endl;
   //std::cout << "m_XXVX_inv_submat(1,0) " << m_XXVX_inv_submat[1,0] << std::endl;
@@ -1441,57 +1423,67 @@ void SAIGEClass::set_flagSparseGRM_cur(bool t_flagSparseGRM_cur){
 void SAIGEClass::assign_for_itrait(unsigned int t_itrait){
         m_itrait = t_itrait;
         m_traitType = m_traitType_vec.at(m_itrait);
-	arma::uvec sampleindices_sub_vec = m_sampleindices_mt.col(t_itrait);
-	m_sampleindices_vec = sampleindices_sub_vec.subvec(0, (m_sampleIndexLenVec[t_itrait]-1));
 
-	if(t_itrait == 0){
-		m_startip = 0;
-	}else{
-		m_startip = arma::sum(m_colXvec.subvec(0, t_itrait - 1));
-	}
-        m_p = m_colXvec(t_itrait);
-	//std::cout << "assign_for_itrait 1 " << std::endl;	
-	m_endip =  m_startip + m_colXvec[t_itrait]-1;
-        
-	m_ip.set_size(m_endip - m_startip + 1);
-        unsigned int diff = m_endip - m_startip + 1;
-	    
-	//std::cout << "assign_for_itrait 2 " << std::endl;	
-        // Populate m_ip with values from m_startip to m_endip
-        for (unsigned int i = 0; i < m_ip.size(); ++i) {
-            m_ip(i) = m_startip + i;
-        }	
-	
-            //std::cout << "assign_for_itrait5 " << std::endl;	
-            //std::cout << "m_y_mt.n_cols " << m_y_mt.n_cols << " " << m_itrait <<std::endl;	
-	
-       arma::vec  m_y_sub = m_y_mt.col(m_itrait);
-          //  std::cout << "m_y_mt.n_cols " << m_y_mt.n_cols << " " << m_itrait <<std::endl;
-	//m_sampleindices_vec.print("m_sampleindices_vec");
-	//std::cout << "m_sampleindices_vec.n_elem " << m_sampleindices_vec.n_elem << std::endl;
-       m_y = m_y_sub.elem(m_sampleindices_vec);
-       
-            //       std::cout << "assign_for_itrait5a " << std::endl;
-       
-       
-       arma::vec  m_res_sub = m_res_mt.col(m_itrait);
-          //         std::cout << "assign_for_itrait5a1 " << std::endl;
-       m_res = m_res_sub.elem(m_sampleindices_vec);
-       //m_res = m_res_mt_vec.at(m_itrait);
-	//std::cout << "assign_for_itrait5b " << std::endl;
+        if(m_cache_ok.size() < m_traitType_vec.size()){
+            size_t P = m_traitType_vec.size();
+            m_cache_XV.resize(P);         m_cache_XXVX_inv.resize(P);
+            m_cache_X.resize(P);          m_cache_XVX_inv_XV.resize(P);
+            m_cache_XVX.resize(P);
+            m_cache_y.resize(P);          m_cache_res.resize(P);
+            m_cache_mu.resize(P);         m_cache_mu2.resize(P);
+            m_cache_resout.resize(P);
+            m_cache_si.resize(P);         m_cache_ipvec.resize(P);
+            m_cache_ok.assign(P, 0);
+        }
 
-       arma::vec  m_mu2_sub = m_mu2_mt.col(m_itrait);
-       m_mu2 = m_mu2_sub.elem(m_sampleindices_vec);
-       arma::vec  m_mu_sub = m_mu_mt.col(m_itrait);
-       m_mu = m_mu_sub.elem(m_sampleindices_vec);
-       //std::cout << "assign_for_itrait5c " << std::endl;	
+        if(!m_cache_ok[t_itrait]){
+            arma::uvec sampleindices_sub_vec = m_sampleindices_mt.col(t_itrait);
+            arma::uvec si = sampleindices_sub_vec.subvec(0, (m_sampleIndexLenVec[t_itrait]-1));
+
+            unsigned int startip = (t_itrait == 0) ? 0
+                                 : (unsigned int)arma::sum(m_colXvec.subvec(0, t_itrait - 1));
+            unsigned int p  = m_colXvec(t_itrait);
+            arma::uvec ip(p);
+            for (unsigned int i = 0; i < p; ++i) ip(i) = startip + i;
+
+            m_cache_si[t_itrait]    = si;
+            m_cache_ipvec[t_itrait] = ip;
+            arma::vec ysub   = m_y_mt.col(t_itrait);
+            m_cache_y[t_itrait]   = ysub.elem(si);
+            arma::vec ressub = m_res_mt.col(t_itrait);
+            m_cache_res[t_itrait] = ressub.elem(si);
+            arma::vec mu2sub = m_mu2_mt.col(t_itrait);
+            m_cache_mu2[t_itrait] = mu2sub.elem(si);
+            arma::vec musub  = m_mu_mt.col(t_itrait);
+            m_cache_mu[t_itrait]  = musub.elem(si);
+            // ER 路径读 m_resout：上游把这行注释掉导致空向量进 SKATExactBin_Work
+            if(m_traitType == "binary" && m_resout_mt.n_cols > t_itrait
+                                       && m_resout_mt.n_rows == m_res_mt.n_rows){
+                arma::vec resoutsub = m_resout_mt.col(t_itrait);
+                m_cache_resout[t_itrait] = resoutsub.elem(si);
+            }
+            m_cache_XV[t_itrait]         = m_XV_mt.submat(ip, si);
+            m_cache_XXVX_inv[t_itrait]   = m_XXVX_inv_mt.submat(si, ip);
+            m_cache_X[t_itrait]          = m_X_mt.submat(si, ip);
+            m_cache_XVX_inv_XV[t_itrait] = m_XVX_inv_XV_mt.submat(si, ip);
+            arma::mat XVXc = m_XVX_mt.cols(ip);
+            m_cache_XVX[t_itrait]        = XVXc.rows(0, p-1);
+            m_cache_ok[t_itrait] = 1;
+        }
+
+        m_sampleindices_vec = m_cache_si[m_itrait];
+        m_ip     = m_cache_ipvec[m_itrait];
+        m_startip = m_ip(0);
+        m_p      = m_colXvec(m_itrait);
+        m_endip  = m_startip + m_p - 1;
+        m_y      = m_cache_y[m_itrait];
+        m_res    = m_cache_res[m_itrait];
+        m_mu2    = m_cache_mu2[m_itrait];
+        m_mu     = m_cache_mu[m_itrait];
+        m_resout = m_cache_resout[m_itrait];
 
 	m_startic = m_itrait*m_numMarker_cond;
         m_endic = m_startic + m_numMarker_cond - 1;
-	//m_resout_mt.print("m_resout_mt");
-	//if(m_traitType == "binary"){
-	//	m_resout = m_resout_mt.col(m_itrait);
-	//}
 
             //std::cout << "assign_for_itrait6 " << std::endl;	
         //m_startip = m_itrait*m_p;
