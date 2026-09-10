@@ -29,6 +29,7 @@
 #include "getMem.hpp"
 
 #include <boost/math/distributions/beta.hpp>
+#include <boost/math/distributions/chi_squared.hpp>
 #include <chrono>
 
 // SAIGE_MT_TIMING=1 时打印 marker 循环各阶段的累计耗时（每 chunk 一次）
@@ -328,6 +329,204 @@ void mainMarkerInCPP(
   int mFirth = 0;
   int mFirthConverge = 0;
 
+  // ==== SAIGE_MT_BATCH=1：分块 GEMM 批量 normal 近似（多 trait 层 2）====
+  // 把 QC 通过的 marker 攒成 N x B 块，对所有 trait 用 3 类 GEMM 一次算完
+  // S 与 var（S = g'res − (X'res)'Z，var 见各分支），normal 近似出 p。
+  // 触发 SPA/Firth 的 (marker, trait) 对回落到原 getMarkerPval 逐个精确重算，
+  // 所以显著位点与上游逐字节可比；批量部分只有 GEMM 求和序的 ~1e-12 级差异。
+  // 前提（不满足即整体退回原路径）：全 trait 全样本恒等、单一 varRatio、
+  // 无 conditional/gxe/sparseGRM/noadjCov/fastTest/moreOutput。
+  bool mtb_on = false;
+  {
+    const char *e = getenv("SAIGE_MT_BATCH");
+    if(e && *e == '1'){
+      mtb_on = !isCondition && !g_isgxe && isSingleVarianceRatio
+               && !ptr_gSAIGEobj->m_flagSparseGRM && !ptr_gSAIGEobj->m_isnoadjCov
+               && !ptr_gSAIGEobj->m_isFastTest && !t_isMoreOutput;
+      for(unsigned int t = 0; mtb_on && t < t_traitType.size(); t++){
+        if(t_traitType.at(t) != "binary" && t_traitType.at(t) != "quantitative") mtb_on = false;
+        else if(!ptr_gSAIGEobj->trait_uses_all_samples(t)) mtb_on = false;
+      }
+      if(e && *e=='1' && !mtb_on)
+        std::cout << "SAIGE_MT_BATCH=1 但前提不满足，退回逐 (marker,trait) 路径" << std::endl;
+    }
+  }
+  const unsigned int MTB = 256;
+  const unsigned int P_mt = t_traitType.size();
+  bool mtb_hasBin = false;
+  for(unsigned int t = 0; t < P_mt; t++)
+    if(t_traitType.at(t) == "binary") mtb_hasBin = true;
+  const size_t Mq_mt = t_genoIndex.size();
+  arma::mat mtb_G;
+  std::vector<int>    mtb_mi(MTB);
+  std::vector<double> mtb_af(MTB), mtb_ac(MTB);
+  std::vector<char>   mtb_flip(MTB);
+  std::vector<arma::uvec> mtb_nz(MTB), mtb_z(MTB);
+  unsigned int mtb_n = 0;
+  bool mtb_pre_done = false;
+  std::vector<arma::mat> mtb_W;                 // binary: mu2 ∘ X_t
+  std::vector<arma::vec> mtb_case, mtb_ctrl;    // 0/1 指示向量
+  arma::vec mtb_vr, mtb_tau0;
+  arma::uvec mtb_ncase, mtb_nctrl;
+  bool mtb_anyBin = false;
+  if(mtb_on){
+    mtb_G.set_size(n, MTB);
+    mtb_vr.set_size(P_mt); mtb_tau0.set_size(P_mt);
+    mtb_ncase.zeros(P_mt); mtb_nctrl.zeros(P_mt);
+  }
+
+  // 回落对：原路径逐个精确重算（含 SPA/Firth），写输出与 legacy 完全一致
+  auto mtb_fallback = [&](unsigned int b, unsigned int t, size_t j){
+    ptr_gSAIGEobj->assign_for_itrait(t);
+    ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
+    ptr_gSAIGEobj->assignSingleVarianceRatio(false, ptr_gSAIGEobj->m_isnoadjCov);
+    arma::vec GVcol = mtb_G.col(b);
+    double Beta, seBeta, Tstat, varT, gy;
+    double Beta_c, seBeta_c, Tstat_c, varT_c;
+    std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+    bool isSPAConverge = false, is_gtilde = false, is_Firth = false, is_FirthConverge = false;
+    arma::vec P2Vec, gtl(n);
+    arma::rowvec G1t_P_G2t;
+    Unified_getMarkerPval(GVcol, false, mtb_nz[b], mtb_z[b], Beta, seBeta, pval, pval_noSPA,
+                          Tstat, gy, varT, mtb_af[b], isSPAConverge, gtl, is_gtilde, false,
+                          P2Vec, false, Beta_c, seBeta_c, pval_c, pval_noSPA_c, Tstat_c, varT_c,
+                          G1t_P_G2t, is_Firth, is_FirthConverge, false, false, false);
+    char fs = mtb_flip[b];
+    BetaVec.at(j)  = Beta  * (1 - 2*fs);
+    seBetaVec.at(j)= seBeta;
+    pvalVec.at(j)  = pval;
+    pvalNAVec.at(j)= pval_noSPA;
+    TstatVec.at(j) = Tstat * (1 - 2*fs);
+    varTVec.at(j)  = varT;
+    if(t_traitType.at(t) == "binary"){
+      if(is_Firth){ mFirth++; if(is_FirthConverge) mFirthConverge++; }
+      ptr_gSAIGEobj->assign_for_itrait_binaryindices(t);
+      arma::vec dc = GVcol.elem(ptr_gSAIGEobj->m_case_indices);
+      arma::vec dt = GVcol.elem(ptr_gSAIGEobj->m_ctrl_indices);
+      double afc = arma::mean(dc)/2, aft = arma::mean(dt)/2;
+      if(fs){ afc = 1-afc; aft = 1-aft; }
+      isSPAConvergeVec.at(j) = isSPAConverge;
+      AF_caseVec.at(j) = afc;  AF_ctrlVec.at(j) = aft;
+      N_caseVec.at(j) = dc.n_elem;  N_ctrlVec.at(j) = dt.n_elem;
+    }else{
+      N_Vec.at(j) = n;
+    }
+  };
+
+  auto mtb_flush = [&](){
+    if(mtb_n == 0) return;
+    if(!mtb_pre_done){
+      mtb_W.resize(P_mt); mtb_case.resize(P_mt); mtb_ctrl.resize(P_mt);
+      for(unsigned int t = 0; t < P_mt; t++){
+        ptr_gSAIGEobj->assign_for_itrait(t);   // 触发缓存构建
+        mtb_vr(t)   = ptr_gSAIGEobj->m_varRatio_null_mt(0, t);
+        mtb_tau0(t) = ptr_gSAIGEobj->m_tauvec_mt(0, t);
+        if(t_traitType.at(t) == "binary"){
+          mtb_anyBin = true;
+          arma::mat W = ptr_gSAIGEobj->m_cache_X[t];
+          W.each_col() %= ptr_gSAIGEobj->m_cache_mu2[t];
+          mtb_W[t] = W;
+          ptr_gSAIGEobj->assign_for_itrait_binaryindices(t);
+          arma::vec cs(n, arma::fill::zeros), ct(n, arma::fill::zeros);
+          cs.elem(ptr_gSAIGEobj->m_case_indices).ones();
+          ct.elem(ptr_gSAIGEobj->m_ctrl_indices).ones();
+          mtb_case[t] = cs;  mtb_ctrl[t] = ct;
+          mtb_ncase(t) = (ptr_gSAIGEobj->m_case_indices).n_elem;
+          mtb_nctrl(t) = (ptr_gSAIGEobj->m_ctrl_indices).n_elem;
+        }
+      }
+      mtb_pre_done = true;
+    }
+    arma::mat Gb = mtb_G.cols(0, mtb_n - 1);              // N x B
+    arma::mat GR = Gb.t() * ptr_gSAIGEobj->m_res_mt;      // B x P
+    arma::vec Gsq;
+    arma::mat G2Mu2;
+    bool anyQuant = false;
+    for(unsigned int t = 0; t < P_mt; t++) if(t_traitType.at(t) == "quantitative") anyQuant = true;
+    if(anyQuant) Gsq = arma::sum(arma::square(Gb), 0).t();
+    if(mtb_anyBin) G2Mu2 = arma::square(Gb).t() * ptr_gSAIGEobj->m_mu2_mt;   // B x P
+
+    for(unsigned int t = 0; t < P_mt; t++){
+      bool isBin = (t_traitType.at(t) == "binary");
+      const arma::mat &A   = ptr_gSAIGEobj->m_cache_XVX_inv_XV[t];
+      const arma::mat &Xt  = ptr_gSAIGEobj->m_cache_X[t];
+      const arma::mat &XVX = ptr_gSAIGEobj->m_cache_XVX[t];
+      unsigned int p = XVX.n_rows;
+      arma::mat Zt = A.t() * Gb;                          // p x B
+      arma::mat GW = isBin ? arma::mat(Gb.t() * mtb_W[t]) // B x p
+                           : arma::mat(Gb.t() * Xt);
+      arma::vec Sa_full = ptr_gSAIGEobj->m_S_a_mt.col(t);
+      arma::vec Sa = Sa_full.subvec(0, p - 1);            // X'res
+      arma::vec ACc, ACt;
+      if(isBin){ ACc = Gb.t() * mtb_case[t];  ACt = Gb.t() * mtb_ctrl[t]; }
+
+      for(unsigned int b = 0; b < mtb_n; b++){
+        size_t j = (size_t)t * Mq_mt + (size_t)mtb_mi[b];
+        arma::vec Zb = Zt.col(b);
+        double S = (GR(b, t) - arma::dot(Sa, Zb)) / mtb_tau0(t);
+        double zxz = arma::as_scalar(Zb.t() * XVX * Zb);
+        double var2;
+        if(isBin){
+          var2 = G2Mu2(b, t) - 2.0 * arma::dot(GW.row(b).t(), Zb) + zxz;
+        }else{
+          var2 = zxz * mtb_tau0(t) + Gsq(b) - 2.0 * arma::dot(GW.row(b).t(), Zb);
+        }
+        double var1 = var2 * mtb_vr(t);
+        double stat = S * S / var1;
+        double pval_d;
+        bool statbad = false;
+        if(var1 <= std::numeric_limits<double>::min()){
+          pval_d = 1; stat = 0; statbad = true;
+        }else if(std::isnan(stat) || !std::isfinite(stat)){
+          pval_d = 1; stat = 0; statbad = true;
+        }else{
+          boost::math::chi_squared chisq_dist(1);
+          pval_d = boost::math::cdf(complement(chisq_dist, stat));
+        }
+        if(isBin && !statbad){
+          double Std = std::abs(S) / sqrt(var1);
+          bool needSPA   = (!std::isnan(Std)) && (Std > ptr_gSAIGEobj->m_SPA_Cutoff);
+          bool needFirth = ptr_gSAIGEobj->m_is_Firth_beta && (pval_d <= ptr_gSAIGEobj->m_pCutoffforFirth);
+          if(needSPA || needFirth){ mtb_fallback(b, t, j); continue; }
+        }
+        char fs = mtb_flip[b];
+        char buf[100];
+        std::string pstr;
+        if(pval_d != 0){
+          sprintf(buf, "%.6E", pval_d);
+          pstr = buf;
+        }else{
+          double logp = R::pchisq(stat, 1, false, true);
+          double log10p = logp / (log(10));
+          int expnt = floor(log10p);
+          double frac = pow(10.0, log10p - expnt);
+          if(frac >= 9.95){ frac = 1; expnt++; }
+          sprintf(buf, "%.1fE%d", frac, expnt);
+          pstr = buf;
+        }
+        double Beta = S / var1;
+        BetaVec.at(j)  = Beta * (1 - 2*fs);
+        seBetaVec.at(j)= fabs(Beta) / sqrt(fabs(stat));
+        pvalVec.at(j)  = pstr;
+        pvalNAVec.at(j)= pstr;
+        TstatVec.at(j) = S * (1 - 2*fs);
+        varTVec.at(j)  = var1;
+        if(isBin){
+          double afc = ACc(b) / (2.0 * mtb_ncase(t));
+          double aft = ACt(b) / (2.0 * mtb_nctrl(t));
+          if(fs){ afc = 1 - afc; aft = 1 - aft; }
+          isSPAConvergeVec.at(j) = false;
+          AF_caseVec.at(j) = afc;  AF_ctrlVec.at(j) = aft;
+          N_caseVec.at(j) = mtb_ncase(t);  N_ctrlVec.at(j) = mtb_nctrl(t);
+        }else{
+          N_Vec.at(j) = n;
+        }
+      }
+    }
+    mtb_n = 0;
+  };
+  // ==== 批量通道定义结束 ====
+
   for(int i = 0; i < t_genoIndex.size(); i++){
     if((i+1) % g_marker_chunksize == 0){
       std::cout << "Completed " << (i+1) << "/" << q << " markers in the chunk." << std::endl;
@@ -450,6 +649,32 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
 
     //std::cout << "info " << info << std::endl;
      //std::cout << "t_traitType.size() " << t_traitType.size() << std::endl;
+   // 批量通道：QC 通过且不需要 ER 的 marker 直接入块，跳过整个 trait 循环
+   if(mtb_on){
+     bool qc_ok = !((missingRate > g_missingRate_cutoff) || (MAF < g_marker_minMAF_cutoff)
+                    || (MAC < g_marker_minMAC_cutoff) || (imputeInfo < g_marker_minINFO_cutoff));
+     bool er_needed = mtb_hasBin && (MAC <= g_MACCutoffforER);
+     if(qc_ok && !er_needed){
+       double ac_f = arma::accu(t_GVec);
+       double af_f = ac_f / (2.0*(double)n);
+       for(unsigned int t = 0; t < P_mt; t++){
+         size_t j = (size_t)t * Mq_mt + (size_t)i;
+         chrVec.at(j) = chr;  posVec.at(j) = pds;  refVec.at(j) = ref;  altVec.at(j) = alt;
+         markerVec.at(j) = marker;  infoVec.at(j) = info;
+         altFreqVec.at(j) = af_f;  altCountsVec.at(j) = ac_f;
+         missingRateVec.at(j) = missingRate;  imputationInfoVec.at(j) = imputeInfo;
+       }
+       mtb_G.col(mtb_n) = t_GVec;
+       mtb_mi[mtb_n] = i;  mtb_af[mtb_n] = af_f;  mtb_ac[mtb_n] = ac_f;
+       mtb_flip[mtb_n] = flip ? 1 : 0;
+       mtb_nz[mtb_n] = arma::conv_to<arma::uvec>::from(indexNonZeroVec);
+       mtb_z[mtb_n]  = arma::conv_to<arma::uvec>::from(indexZeroVec);
+       mtb_n++;
+       if(mtb_n == MTB) mtb_flush();
+       continue;
+     }
+   }
+
    // marker 级零/非零索引转 arma，只转一次，全样本 trait 共用
    arma::uvec idxZero_all, idxNonZero_all;
    bool idx_all_done = false;
@@ -774,6 +999,8 @@ std::cout << "t_GVec.size() " << t_GVec.size() << std::endl;
     
     //t_GVec.clear();
   }
+
+  if(mtb_on) mtb_flush();   // 批量通道收尾
 
 //std::cout << "end" << std::endl;
 
