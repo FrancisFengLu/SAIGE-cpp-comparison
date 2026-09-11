@@ -235,6 +235,40 @@ static void mtb_SPA_ts(arma::vec &mu, arma::vec &g, double q, double qinv,
 }
 // ==== 线程安全 SPA 定义结束 ====
 
+// ==== GPU SPA 接口（spa_gpu.cu）====
+extern "C" {
+  int spa_gpu_available();
+  int spa_gpu_solve(int njob, long total_elems, const double *G, const double *MU,
+                    const void *jobs, double tol, double *pout,
+                    unsigned char *okroot, unsigned char *oksaddle);
+}
+struct SpaJobH {              // 与 spa_gpu.cu 的 SpaJob 二进制一致
+  int off, len;
+  double q, namu, nasig, gpos, gneg;
+};
+static inline bool mtb_gpuspa_on(){
+  static int on = -1;
+  if(on < 0){
+    const char *e = getenv("SAIGE_MT_GPUSPA");
+    on = (e && *e=='1' && spa_gpu_available()) ? 1 : 0;
+    if(e && *e=='1' && !on)
+      std::cout << "SAIGE_MT_GPUSPA=1 但没有可用 GPU，SPA 走 CPU" << std::endl;
+  }
+  return on == 1;
+}
+// 回落对的两段之间传递的上下文
+struct MtbFbCtx {
+  bool done = false;         // 段1已完成全部（无需 SPA 或走了 CPU SPA）
+  // 段2需要的中间量
+  double pval_noadj = 0;  bool ispvallog = false;
+  std::string pval_noSPA;
+  double var1 = 0, var2 = 0, S = 0;
+  arma::vec gtilde;          // Firth 用
+  // GPU SPA 输入
+  arma::vec arrG, arrMU;     // NB 段（fast）或全长（非 fast）
+  double q = 0, qinv = 0, namu = 0, nasig = 0, gpos = 0, gneg = 0, tol = 0;
+};
+
 // ==== 可重入回落（OpenMP 用）====
 // 复刻 getMarkerPval 的受限路径：binary、非 ER、无条件分析、fastTest 关、
 // 稠密 GRM、adjCov。只读 trait 缓存，无成员写 —— 可多线程并发调用。
@@ -245,9 +279,18 @@ struct MtbFbOut {
   bool isSPAConverge=false, isFirth=false, isFirthConverge=false;
 };
 
+static void mtb_fb_finish_spa(SAIGE::SAIGEClass *so, unsigned int t,
+                              arma::vec &gtilde, double SPApval,
+                              bool isSPAConverge, double pval_noadj,
+                              bool ispvallog, const std::string &pval_noSPA,
+                              MtbFbOut &o);
+
+// ctx == nullptr：完整执行（含 CPU SPA）。
+// ctx != nullptr 且该对需要 SPA 且 logp=false：填 ctx 后提前返回（done=false），
+// GPU 批量解完后由 mtb_fb_finish_spa 收尾；其余情形本函数跑完（done=true）。
 static void mtb_fb_reentrant(SAIGE::SAIGEClass *so, unsigned int t,
                              const arma::vec &GVec, const arma::uvec &inz,
-                             const arma::uvec &izv, MtbFbOut &o)
+                             const arma::uvec &izv, MtbFbOut &o, MtbFbCtx *ctx = nullptr)
 {
   const arma::mat &Xc    = so->m_cache_X[t];
   const arma::mat &Ac    = so->m_cache_XVX_inv_XV[t];
@@ -262,6 +305,14 @@ static void mtb_fb_reentrant(SAIGE::SAIGEClass *so, unsigned int t,
   double tau0 = so->m_tauvec_mt(0, t);
   double vr   = so->m_varRatio_null_mt(0, t);
   unsigned int N = GVec.n_elem;
+
+  // AF：与 legacy 相同的 elem+mean 求和序（提前算，段1提前返回也要有）
+  {
+    arma::uvec ci = arma::find(yv == 1), ti = arma::find(yv == 0);
+    arma::vec dc = GVec.elem(ci), dt = GVec.elem(ti);
+    o.AFcase = arma::mean(dc)/2;
+    o.AFctrl = arma::mean(dt)/2;
+  }
 
   // ---- scoreTestFast 复刻（运算与求和序逐项一致）----
   arma::vec g1 = GVec.elem(inz);
@@ -350,6 +401,26 @@ static void mtb_fb_reentrant(SAIGE::SAIGEClass *so, unsigned int t,
       NAsigma = var2 - arma::sum(muNB % (1-muNB) % arma::pow(gNB,2));
     double tol0 = std::numeric_limits<double>::epsilon();
     double tol1 = std::pow(tol0, 0.25);
+    if(ctx != nullptr && !ispvallog){
+      // GPU 批量：把两条尾要解的东西存进 ctx，段2收尾
+      ctx->done = false;
+      ctx->pval_noadj = pval_noadj;  ctx->ispvallog = ispvallog;
+      ctx->pval_noSPA = pval_noSPA;
+      ctx->var1 = var1;  ctx->var2 = var2;  ctx->S = S;
+      ctx->q = q;  ctx->qinv = qinv;  ctx->tol = tol1;
+      // getroot 的早退判据用全长 gtilde（fast 与否都一样）
+      ctx->gpos = arma::accu( gtilde.elem( arma::find(gtilde > 0) ) );
+      ctx->gneg = arma::accu( gtilde.elem( arma::find(gtilde < 0) ) );
+      if(p_com >= 0.5){
+        ctx->arrG = gNB;  ctx->arrMU = muNB;
+        ctx->namu = NAmu;  ctx->nasig = NAsigma;
+      }else{
+        ctx->arrG = gtilde;  ctx->arrMU = muv;
+        ctx->namu = 0;  ctx->nasig = 0;
+      }
+      ctx->gtilde = std::move(gtilde);
+      return;
+    }
     double SPApval = 0;
     arma::vec mu_nc = muv;
     if(p_com >= 0.5){
@@ -358,66 +429,74 @@ static void mtb_fb_reentrant(SAIGE::SAIGEClass *so, unsigned int t,
     }else{
       mtb_SPA_ts(mu_nc, gtilde, q, qinv, pval_noadj, tol1, ispvallog, SPApval, isSPAConverge);
     }
-    if(isSPAConverge){
-      try {
-        double t_qval = R::qnorm(SPApval/2, 0, 1, false, ispvallog);
-        t_qval = fabs(t_qval);
-        o.seBeta = fabs(o.Beta)/t_qval;
-      }catch(const std::overflow_error&){
-        isSPAConverge = false;
-      }
-    }
-    if(!ispvallog && SPApval == 0) isSPAConverge = false;
-    char bufS[100];
-    if(isSPAConverge){
-      if(!ispvallog){
-        sprintf(bufS, "%.6E", SPApval);
-      }else{
-        double l10 = SPApval/(log(10));
-        int expnt = floor(l10);
-        double frac = pow(10.0, l10 - expnt);
-        if(frac >= 9.95){ frac = 1; expnt++; }
-        sprintf(bufS, "%.1fE%d", frac, expnt);
-      }
-      pval_str = bufS; pval = SPApval;
-    }else{
-      pval_str = pval_noSPA; pval = pval_noadj;
-    }
-    double t_qval_Firth = 0;
-    if(!ispvallog){
-      if(so->m_is_Firth_beta && pval <= so->m_pCutoffforFirth){
-        o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, false);
-      }
-    }else{
-      if(so->m_is_Firth_beta && pval <= std::log(so->m_pCutoffforFirth)){
-        o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, true);
-      }
-    }
-    if(o.isFirth){
-      if(!have_gtilde){
-        arma::vec XVG(XVc.n_rows, arma::fill::zeros);
-        for(unsigned int k = 0; k < inz.n_elem; k++)
-          XVG += XVc.col(inz(k)) * GVec(inz(k));
-        gtilde = GVec - XXVXi * XVG;
-      }
-      arma::mat x(N, 2, arma::fill::ones);
-      x.col(1) = gtilde;
-      arma::vec init(2, arma::fill::zeros);
-      arma::vec y_nc = yv;
-      arma::vec offset_empty;   // 复刻上游：m_offset 从未赋值
-      so->fast_logistf_fit_simple(x, y_nc, offset_empty, true, init, 50, 15, 15,
-                                  1e-5, 1e-5, 1e-5, o.Beta, o.seBeta, o.isFirthConverge);
-      o.seBeta = fabs(o.Beta)/fabs(t_qval_Firth);
-    }
+    mtb_fb_finish_spa(so, t, gtilde, SPApval, isSPAConverge, pval_noadj,
+                      ispvallog, pval_noSPA, o);
+    if(ctx) ctx->done = true;
+    return;
   }
   o.isSPAConverge = isSPAConverge;
   o.pval = pval_str;
   o.pvalNA = pval_noSPA;
-  // AF：与 legacy 相同的 elem+mean 求和序
-  arma::uvec ci = arma::find(yv == 1), ti = arma::find(yv == 0);
-  arma::vec dc = GVec.elem(ci), dt = GVec.elem(ti);
-  o.AFcase = arma::mean(dc)/2;
-  o.AFctrl = arma::mean(dt)/2;
+  if(ctx) ctx->done = true;
+}
+
+// SPA 之后的收尾：seBeta 校正、p 值字符串、Firth。gtilde 已算好传入。
+static void mtb_fb_finish_spa(SAIGE::SAIGEClass *so, unsigned int t,
+                              arma::vec &gtilde, double SPApval,
+                              bool isSPAConverge, double pval_noadj,
+                              bool ispvallog, const std::string &pval_noSPA,
+                              MtbFbOut &o)
+{
+  double pval;
+  std::string pval_str;
+  if(isSPAConverge){
+    try {
+      double t_qval = R::qnorm(SPApval/2, 0, 1, false, ispvallog);
+      t_qval = fabs(t_qval);
+      o.seBeta = fabs(o.Beta)/t_qval;
+    }catch(const std::overflow_error&){
+      isSPAConverge = false;
+    }
+  }
+  if(!ispvallog && SPApval == 0) isSPAConverge = false;
+  char bufS[100];
+  if(isSPAConverge){
+    if(!ispvallog){
+      sprintf(bufS, "%.6E", SPApval);
+    }else{
+      double l10 = SPApval/(log(10));
+      int expnt = floor(l10);
+      double frac = pow(10.0, l10 - expnt);
+      if(frac >= 9.95){ frac = 1; expnt++; }
+      sprintf(bufS, "%.1fE%d", frac, expnt);
+    }
+    pval_str = bufS; pval = SPApval;
+  }else{
+    pval_str = pval_noSPA; pval = pval_noadj;
+  }
+  double t_qval_Firth = 0;
+  if(!ispvallog){
+    if(so->m_is_Firth_beta && pval <= so->m_pCutoffforFirth){
+      o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, false);
+    }
+  }else{
+    if(so->m_is_Firth_beta && pval <= std::log(so->m_pCutoffforFirth)){
+      o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, true);
+    }
+  }
+  if(o.isFirth){
+    arma::mat x(gtilde.n_elem, 2, arma::fill::ones);
+    x.col(1) = gtilde;
+    arma::vec init(2, arma::fill::zeros);
+    arma::vec y_nc = so->m_cache_y[t];
+    arma::vec offset_empty;   // 复刻上游：m_offset 从未赋值
+    so->fast_logistf_fit_simple(x, y_nc, offset_empty, true, init, 50, 15, 15,
+                                1e-5, 1e-5, 1e-5, o.Beta, o.seBeta, o.isFirthConverge);
+    o.seBeta = fabs(o.Beta)/fabs(t_qval_Firth);
+  }
+  o.isSPAConverge = isSPAConverge;
+  o.pval = pval_str;
+  o.pvalNA = pval_noSPA;
 }
 // ==== 可重入回落定义结束 ====
 
@@ -950,14 +1029,71 @@ void mainMarkerInCPP(
     }
     if(!mtb_fbq.empty()){
       double mt_tfb = mt_timing_on() ? mt_now() : 0;
-      std::vector<MtbFbOut> fbo(mtb_fbq.size());
+      size_t NF = mtb_fbq.size();
+      std::vector<MtbFbOut> fbo(NF);
+      bool usegpu = mtb_gpuspa_on();
+      std::vector<MtbFbCtx> ctxs(usegpu ? NF : 0);
       #ifdef _OPENMP
       #pragma omp parallel for schedule(dynamic)
       #endif
-      for(long k = 0; k < (long)mtb_fbq.size(); k++){
+      for(long k = 0; k < (long)NF; k++){
         const MtbFbPair &pr = mtb_fbq[k];
         arma::vec GVcol = mtb_G.col(pr.b);
-        mtb_fb_reentrant(ptr_gSAIGEobj, pr.t, GVcol, mtb_nz[pr.b], mtb_z[pr.b], fbo[k]);
+        mtb_fb_reentrant(ptr_gSAIGEobj, pr.t, GVcol, mtb_nz[pr.b], mtb_z[pr.b], fbo[k],
+                         usegpu ? &ctxs[k] : nullptr);
+      }
+      if(usegpu){
+        std::vector<size_t> gk;
+        long tot = 0;
+        for(size_t k = 0; k < NF; k++)
+          if(!ctxs[k].done){ gk.push_back(k); tot += ctxs[k].arrG.n_elem; }
+        if(!gk.empty()){
+          int nj = 2 * (int)gk.size();
+          std::vector<double> hG(tot), hMU(tot), pj(nj);
+          std::vector<SpaJobH> jobs(nj);
+          std::vector<unsigned char> okr(nj), oks(nj);
+          long off = 0;
+          for(size_t i = 0; i < gk.size(); i++){
+            MtbFbCtx &c = ctxs[gk[i]];
+            int len = (int)c.arrG.n_elem;
+            memcpy(&hG[off],  c.arrG.memptr(),  (size_t)len*8);
+            memcpy(&hMU[off], c.arrMU.memptr(), (size_t)len*8);
+            SpaJobH j1; j1.off=(int)off; j1.len=len; j1.q=c.q;    j1.namu=c.namu; j1.nasig=c.nasig; j1.gpos=c.gpos; j1.gneg=c.gneg;
+            SpaJobH j2 = j1; j2.q = c.qinv;
+            jobs[2*i] = j1;  jobs[2*i+1] = j2;
+            off += len;
+          }
+          int rc = spa_gpu_solve(nj, tot, hG.data(), hMU.data(), jobs.data(),
+                                 ctxs[gk[0]].tol, pj.data(), okr.data(), oks.data());
+          if(rc != 0){
+            std::cout << "spa_gpu_solve rc=" << rc << "，回退 CPU SPA" << std::endl;
+          }
+          #ifdef _OPENMP
+          #pragma omp parallel for schedule(dynamic)
+          #endif
+          for(long i = 0; i < (long)gk.size(); i++){
+            size_t k = gk[i];
+            MtbFbCtx &c = ctxs[k];
+            MtbFbOut &o = fbo[k];
+            double SPApval; bool Isconv = true;
+            if(rc != 0){
+              // GPU 报错兜底：按"SPA 未收敛"语义退化到 normal 近似（legacy 同款失败路径）
+              SPApval = c.pval_noadj; Isconv = false;
+            }else{
+              bool conv1 = okr[2*i], conv2 = okr[2*i+1];
+              double p1, p2;
+              if(conv1 && conv2){
+                if(oks[2*i]){ p1 = pj[2*i]; } else { Isconv = false; p1 = c.pval_noadj/2; }
+                if(oks[2*i+1]){ p2 = pj[2*i+1]; } else { Isconv = false; p2 = c.pval_noadj/2; }
+                SPApval = std::abs(p1) + std::abs(p2);
+              }else{
+                SPApval = c.pval_noadj; Isconv = false;
+              }
+            }
+            mtb_fb_finish_spa(ptr_gSAIGEobj, mtb_fbq[k].t, c.gtilde, SPApval, Isconv,
+                              c.pval_noadj, false, c.pval_noSPA, o);
+          }
+        }
       }
       for(size_t k = 0; k < mtb_fbq.size(); k++){
         const MtbFbPair &pr = mtb_fbq[k];

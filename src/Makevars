@@ -9,7 +9,14 @@ PKG_LIBS = $(ZLIB_LIB) $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS) -lsuperlu -lzstd -ll
 PKG_CPPFLAGS += -I${CONDA_PREFIX}/include -I../plink-ng/2.0/include
 PKG_LIBS += -L.. -l:plink2_includes.a -ldeflate
 
-OBJECTS = RcppExports.o SAIGE_fitGLMM_fast.o getMem.o VCF.o BGEN.o PLINK.o PGEN.o SAIGE_test.o SPA_binary.o SPA.o SPA_survival.o UTIL.o Main.o test.o CCT.o Binary_HyperGeo.o Binary_ComputeExact.o Binary_global.o Binary_ComputeExactSKATO.o Binary_resampling.o Binary_Permu_SKAT.o ER_binary_func.o LDmat.o 
+OBJECTS = RcppExports.o SAIGE_fitGLMM_fast.o getMem.o VCF.o BGEN.o PLINK.o PGEN.o SAIGE_test.o SPA_binary.o SPA.o SPA_survival.o UTIL.o Main.o test.o CCT.o Binary_HyperGeo.o Binary_ComputeExact.o Binary_global.o Binary_ComputeExactSKATO.o Binary_resampling.o Binary_Permu_SKAT.o ER_binary_func.o LDmat.o spa_gpu.o
+
+NVCC = /usr/local/cuda-12.9/bin/nvcc
+PKG_LIBS += -L/usr/local/cuda-12.9/lib64 -lcudart -Wl,-rpath=/usr/local/cuda-12.9/lib64
+
+%.o: %.cu
+	$(NVCC) -O2 -x cu -c -arch=sm_70 -Xcompiler "-fPIC" $< -o $@
+
 
 all: $(SHLIB)
 $(SHLIB): ${OBJECTS} Makevars
