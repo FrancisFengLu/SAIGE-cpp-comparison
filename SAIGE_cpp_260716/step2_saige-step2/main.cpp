@@ -2494,6 +2494,12 @@ void mainRegionInCPP(
     arma::vec& maxMAFVec,
     std::string t_outputFile,
     unsigned int t_n,
+    // W3-1: P1Mat is (t_n x m1), NOT (m1 x t_n). Marker j occupies COLUMN j,
+    // holding sqrt(varRatio)*gtilde_j -- i.e. the same content as before, stored
+    // transposed. P2Mat is unchanged at (t_n x m1), marker j in column j.
+    // Both are therefore column-major-contiguous per marker, and VarMat is
+    // formed as P1Mat.head_cols(i1).t() * P2Mat.head_cols(i1) (one dgemm with
+    // transA='T'; armadillo aliases both subviews, no transpose is materialised).
     arma::mat& P1Mat,
     arma::mat& P2Mat,
     std::string t_regionTestType,  // "SKATO", "SKAT", or "BURDEN"
@@ -2822,7 +2828,9 @@ void mainRegionInCPP(
                 isSPAConvergeVec.at(i) = isSPAConverge;
 
                 if (t_regionTestType != "BURDEN") {
-                    P1Mat.row(i1InChunk) = std::sqrt(ctx_region.varRatioVal) * gtildeVec.t();
+                    // W3-1: column write (t_n contiguous doubles) instead of a
+                    // row write (t_n scattered 8-byte stores, stride m1*8).
+                    P1Mat.col(i1InChunk) = std::sqrt(ctx_region.varRatioVal) * gtildeVec;
                     P2Mat.col(i1InChunk) = std::sqrt(ctx_region.varRatioVal) * P2Vec;
                 }
             }
@@ -2928,6 +2936,8 @@ void mainRegionInCPP(
                 // W1-3a: a mid-loop flush means P1Mat is about to be reused for
                 // the next chunk, so the data must go to disk (it will be read
                 // back by the multi-chunk VarMat assembly).
+                // W3-1: i1InChunk == m1 == P1Mat.n_cols here, so the whole
+                // (t_n x m1) buffer is valid and can be saved without a copy.
                 std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
                 std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
                 P1Mat.save(p1f);
@@ -2949,7 +2959,7 @@ void mainRegionInCPP(
                   << " markers are not ultra-rare." << std::endl;
         if (t_regionTestType != "BURDEN") {
             // W1-3: no truncating reassignment (P1Mat keeps its full capacity
-            // for reuse across regions; only rows 0..i1InChunk-1 are valid).
+            // for reuse across regions; only cols 0..i1InChunk-1 are valid).
             // The chunk file is only ever read back by the multi-chunk VarMat
             // assembly, which is already decidable here: another chunk exists
             // (ichunk > 0) or the ultra-rare pass may add one (i2 > 0). The
@@ -2957,7 +2967,8 @@ void mainRegionInCPP(
             if (ichunk > 0 || i2 > 0 || dumpKernelFiles()) {
                 std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
                 std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
-                arma::mat(P1Mat.head_rows(i1InChunk)).save(p1f);
+                // W3-1: P1 chunk files are now (t_n x k), matching P2.
+                arma::mat(P1Mat.head_cols(i1InChunk)).save(p1f);
                 arma::mat(P2Mat.head_cols(i1InChunk)).save(p2f);
                 savedChunkFiles.push_back(p1f);
                 savedChunkFiles.push_back(p2f);
@@ -2973,7 +2984,8 @@ void mainRegionInCPP(
     if (i2 > 0) {
         int m1new = std::max(m1, q_anno_maf);
         if (t_regionTestType != "BURDEN") {
-            P1Mat.resize(m1new, P1Mat.n_cols);
+            // W3-1: P1Mat grows along columns now (it is t_n x m1).
+            P1Mat.resize(P1Mat.n_rows, m1new);
             P2Mat.resize(P2Mat.n_rows, m1new);
         }
 
@@ -3110,7 +3122,8 @@ void mainRegionInCPP(
                         }
 
                         if (t_regionTestType != "BURDEN") {
-                            P1Mat.row(i1InChunk) = std::sqrt(ctx_ur.varRatioVal) * gtildeVec.t();
+                            // W3-1: column write, see the note at the marker loop.
+                            P1Mat.col(i1InChunk) = std::sqrt(ctx_ur.varRatioVal) * gtildeVec;
                             P2Mat.col(i1InChunk) = std::sqrt(ctx_ur.varRatioVal) * P2Vec;
                         }
                     } else {
@@ -3139,7 +3152,8 @@ void mainRegionInCPP(
                 if (!mPassCVVec.empty() || dumpKernelFiles()) {
                     std::string p1f = t_outputFile + "_P1Mat_Chunk_" + std::to_string(ichunk) + ".bin";
                     std::string p2f = t_outputFile + "_P2Mat_Chunk_" + std::to_string(ichunk) + ".bin";
-                    arma::mat(P1Mat.head_rows(i1InChunk)).save(p1f);
+                    // W3-1: P1 chunk files are now (t_n x k), matching P2.
+                    arma::mat(P1Mat.head_cols(i1InChunk)).save(p1f);
                     arma::mat(P2Mat.head_cols(i1InChunk)).save(p2f);
                     savedChunkFiles.push_back(p1f);
                     savedChunkFiles.push_back(p2f);
@@ -3159,8 +3173,12 @@ void mainRegionInCPP(
         VarMat.resize(i1, i1);
         if (nchunks == 1) {
             // W1-3b: P1Mat/P2Mat are persistent full-capacity buffers now
-            // (never truncated) — multiply only the valid i1 rows/cols.
-            VarMat = P1Mat.head_rows(i1) * P2Mat.head_cols(i1);
+            // (never truncated) — multiply only the valid i1 columns.
+            // W3-1: P1 is stored transposed, so this is one dgemm with
+            // transA='T'. Both head_cols() views are subview_cols, which
+            // armadillo's partial_unwrap aliases in place (no copy, no
+            // materialised transpose).
+            VarMat = P1Mat.head_cols(i1).t() * P2Mat.head_cols(i1);
         }
         if (nchunks > 1) {
             // W1-3b: load into locals so the persistent P1Mat/P2Mat buffers
@@ -3171,12 +3189,14 @@ void mainRegionInCPP(
                 last_row = first_row + mPassCVVec.at(index1) - 1;
                 std::string P1MatFile = t_outputFile + "_P1Mat_Chunk_" + std::to_string(index1) + ".bin";
                 P1chunk.load(P1MatFile);
-                if (P1chunk.n_cols == 0) continue;
+                // W3-1: P1 chunks are (t_n x k) now, so the old "n_cols == 0"
+                // load-failure guard becomes n_elem == 0 (same intent).
+                if (P1chunk.n_elem == 0) continue;
 
                 for (unsigned int index2 = 0; index2 < index1; index2++) {
                     P2chunk.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index2) + ".bin");
                     if (P2chunk.n_cols == 0) continue;
-                    arma::mat offVarMat = P1chunk * P2chunk;
+                    arma::mat offVarMat = P1chunk.t() * P2chunk;
                     last_col = first_col + mPassCVVec.at(index2) - 1;
                     VarMat.submat(first_row, first_col, last_row, last_col) = offVarMat;
                     VarMat.submat(first_col, first_row, last_col, last_row) = offVarMat.t();
@@ -3185,7 +3205,7 @@ void mainRegionInCPP(
 
                 last_col = first_col + mPassCVVec.at(index1) - 1;
                 P2chunk.load(t_outputFile + "_P2Mat_Chunk_" + std::to_string(index1) + ".bin");
-                arma::mat diagVarMat = P1chunk * P2chunk;
+                arma::mat diagVarMat = P1chunk.t() * P2chunk;
                 VarMat.submat(first_row, first_col, last_row, last_col) = diagVarMat;
                 first_row = last_row + 1;
                 first_col = 0;
@@ -4677,9 +4697,10 @@ int main(int argc, char* argv[])
             // ---- 7b. Set region global variables ----
             setRegion_GlobalVarsInCPP(
                 maxMAFList,
-                // must equal the P1Mat/P2Mat row allocation below: m1 is the
-                // chunk-flush threshold, and P1Mat.row(i1InChunk) is written
-                // up to it. R passes markers_per_chunk_in_groupTest here.
+                // must equal the P1Mat/P2Mat marker-axis allocation below: m1
+                // is the chunk-flush threshold, and P1Mat.col(i1InChunk) /
+                // P2Mat.col(i1InChunk) are written up to it. R passes
+                // markers_per_chunk_in_groupTest here.
                 (unsigned int)markers_per_chunk_in_groupTest,
                 MACCutoff_to_CollapseUltraRare,
                 min_gourpmac_for_burdenonly);
@@ -4757,8 +4778,10 @@ int main(int argc, char* argv[])
             //          per thread per region) to avoid sharing across threads.
             unsigned int t_n = (unsigned int)nullModel.n;
             if (regionTestType != "BURDEN") {
-                std::cout << "  P1Mat per-thread size: " << markers_per_chunk_in_groupTest
-                          << " x " << t_n << std::endl;
+                // W3-1: P1Mat is stored transposed (t_n x m1) so that each
+                // marker is one contiguous column, same as P2Mat.
+                std::cout << "  P1Mat per-thread size: " << t_n
+                          << " x " << markers_per_chunk_in_groupTest << std::endl;
                 std::cout << "  P2Mat per-thread size: " << t_n
                           << " x " << markers_per_chunk_in_groupTest << std::endl;
             }
@@ -4839,13 +4862,20 @@ int main(int argc, char* argv[])
                     // W1-3b: persistent per-thread scratch buffers, reused
                     // across regions. Previously each region allocated + zeroed
                     // fresh 2 x (m1 x N) matrices (2x200 MB at N=50k, m1=500):
-                    // the page-fault/zeroing cost was ~30% of gene time. Rows
-                    // are always written before being read (mainRegionInCPP
-                    // only touches head_rows(i1InChunk)), so no zeroing is
-                    // needed; set_size() is a no-op after the first region.
+                    // the page-fault/zeroing cost was ~30% of gene time.
+                    // Columns are always written before being read
+                    // (mainRegionInCPP only touches head_cols(i1InChunk)), so
+                    // no zeroing is needed; set_size() is a no-op after the
+                    // first region.
+                    // W3-1: P1Mat is now (t_n x m1) like P2Mat. Marker j is
+                    // column j of both, so only the columns a region actually
+                    // uses are ever touched and the resident set scales with
+                    // the real markers-per-gene instead of with m1 (RSS at
+                    // N=50k, T=8: 1.74 GB -> ~0.2 GB; the virtual reservation
+                    // is unchanged).
                     thread_local arma::mat P1Mat_local, P2Mat_local;
                     if (regionTestType != "BURDEN") {
-                        P1Mat_local.set_size(markers_per_chunk_in_groupTest, t_n);
+                        P1Mat_local.set_size(t_n, markers_per_chunk_in_groupTest);
                         P2Mat_local.set_size(t_n, markers_per_chunk_in_groupTest);
                     } else {
                         P1Mat_local.set_size(1, 1);
