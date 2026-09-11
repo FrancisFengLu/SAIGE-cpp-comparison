@@ -2531,8 +2531,33 @@ void mainRegionInCPP(
     unsigned int q_anno = annoIndicatorMat_input.n_cols;
     unsigned int q_maf = maxMAFVec.n_elem;
     unsigned int q_anno_maf = q_anno * q_maf;
-    arma::mat genoURMat(t_n, q_anno_maf, arma::fill::zeros);
-    arma::mat genoURMat_noweights(t_n, q_anno_maf, arma::fill::zeros);
+
+    // W3-2: genoURMat / genoURMat_noweights / genoSumMat are (t_n x q_anno_maf)
+    // per-region scratch. They used to be freshly constructed here every region,
+    // which for anything over the malloc mmap threshold means mmap + munmap +
+    // a first-touch page fault per 4 KiB on every gene: 3 x 800 KB per gene at
+    // N=50k, 3 x 28.8 MB per gene on real WES (N=400k, 3 anno x 3 MAF).
+    // Made per-thread persistent: set_size() is a no-op once the shape settles
+    // (q_anno_maf is annotationList x maxMAFList, constant across regions), so
+    // only the memset survives -- at ~10 GB/s that is 2-3x cheaper than the
+    // fault-in path it replaces.
+    //
+    // The zeros() are MANDATORY, not optional as they are for P1Mat/P2Mat:
+    // all three accumulate with += (:2871, :3026, :3032) or std::max (:2912-2922)
+    // over a sparse set of rows, and are then read back as whole dense columns
+    // (:3004, :3263, :3501). Leaving stale rows in place would silently mix the
+    // previous gene's dosages into this gene's burden score.
+    thread_local arma::mat genoURMat_tls, genoURMat_noweights_tls, genoSumMat_tls;
+    genoURMat_tls.set_size(t_n, q_anno_maf);
+    genoURMat_tls.zeros();
+    genoURMat_noweights_tls.set_size(t_n, q_anno_maf);
+    genoURMat_noweights_tls.zeros();
+    genoSumMat_tls.set_size(t_n, q_anno_maf);
+    genoSumMat_tls.zeros();
+    arma::mat& genoURMat = genoURMat_tls;
+    arma::mat& genoURMat_noweights = genoURMat_noweights_tls;
+    arma::mat& genoSumMat = genoSumMat_tls;
+
     unsigned int q = q0 + q_anno_maf;
     arma::imat annoMAFIndicatorMat(q, q_anno_maf, arma::fill::zeros);
     arma::ivec annoMAFIndicatorVec(q_anno_maf);
@@ -2546,7 +2571,7 @@ void mainRegionInCPP(
 
     bool isCondition = ptr_gSAIGEobj->m_isCondition;
 
-    arma::mat genoSumMat(t_n, q_anno_maf, arma::fill::zeros);
+    // W3-2: genoSumMat is declared and zeroed with the other two above.
     arma::vec genoSumcount_noweight(q_anno_maf, arma::fill::zeros);
 
     // Group-level stats
@@ -2996,8 +3021,17 @@ void mainRegionInCPP(
         for (unsigned int j = 0; j < q_anno; j++) {
             for (unsigned int m = 0; m < q_maf; m++) {
                 jm = j * q_maf + m;
-                arma::vec genoURVec = genoURMat.col(jm);
-                arma::vec genoURVec_noweights = genoURMat_noweights.col(jm);
+                // W3-2: genoURVec must stay a copy (imputeGenoAndFlip and
+                // getMarkerPval both take it by non-const reference and mutate
+                // it), but it can reuse one per-thread buffer instead of
+                // malloc'ing t_n doubles per (anno, MAF) group. Assigning a
+                // same-sized column into it is a straight memcpy, no realloc.
+                thread_local arma::vec genoURVec_tls;
+                genoURVec_tls = genoURMat.col(jm);
+                arma::vec& genoURVec = genoURVec_tls;
+                // W3-2: read-only, so take a view instead of copying t_n doubles.
+                const arma::subview_col<double> genoURVec_noweights =
+                    genoURMat_noweights.col(jm);
                 arma::uvec indexForNonZero = arma::find(genoURVec != 0);
                 i_ur = q0 + jm;
                 markerVec.at(i_ur) = "UR";
@@ -3030,10 +3064,14 @@ void mainRegionInCPP(
                     }
 
                     if (t_regionTestType != "BURDEN") {
-                        arma::vec genoSumMatvec1 = genoSumMat.col(jm);
-                        arma::vec genoSumMatvec2 = XV * genoSumMatvec1;
-                        arma::vec genoSumMatvec3 = genoSumMatvec1 - XXVX_inv * genoSumMatvec2;
-                        genoSumMat.col(jm) = genoSumMatvec3;
+                        // W3-2: same arithmetic (g := g - XXVX_inv*(XV*g)),
+                        // two fewer t_n-long temporaries. XV*col(jm) is the
+                        // identical dgemv -- armadillo aliases the subview_col
+                        // in place -- and the only remaining t_n temporary is
+                        // XXVX_inv*genoSumMatvec2, subtracted elementwise in
+                        // the same order as before.
+                        arma::vec genoSumMatvec2 = XV * genoSumMat.col(jm);   // length p, not t_n
+                        genoSumMat.col(jm) -= XXVX_inv * genoSumMatvec2;
                     }
 
                     MAC_ur = MAF_ur * 2 * t_n;
@@ -3255,7 +3293,12 @@ void mainRegionInCPP(
                 jm = j * q_maf + m;
                 unsigned int i_b = jm;
                 if (m <= q_maf_m) {
-                    arma::vec genoSumVec = genoSumMat.col(jm);
+                    // W3-2: getMarkerPval takes t_GVec by non-const reference,
+                    // so this still has to be a copy -- but a reused per-thread
+                    // one rather than a fresh t_n allocation per (anno, MAF).
+                    thread_local arma::vec genoSumVec_tls;
+                    genoSumVec_tls = genoSumMat.col(jm);
+                    arma::vec& genoSumVec = genoSumVec_tls;
                     arma::uvec indexNZ = arma::find(genoSumVec != 0);
                     arma::uvec indexZ = arma::find(genoSumVec == 0);
                     double altCounts_b = genoSumcount_noweight(i_b);
@@ -3493,7 +3536,13 @@ void mainRegionInCPP(
                             for (unsigned int a = 0; a < nSub; a++) {
                                 p_new(a) = adjPVec(tempPos[a]);
                             }
-                            arma::vec g_sum = genoSumMat.col(jm);
+                            // W3-2: reused per-thread buffer; the callee takes
+                            // it as const arma::vec& (and copies internally
+                            // when it needs to), so a view would just force the
+                            // same materialisation at the call site.
+                            thread_local arma::vec g_sum_tls;
+                            g_sum_tls = genoSumMat.col(jm);
+                            arma::vec& g_sum = g_sum_tls;
                             double q_sum = 0.0;
                             for (unsigned int a = 0; a < nSub; a++) {
                                 q_sum += gyVecSub(tempPos[a]) * AnnoWeights(tempPos[a]);
