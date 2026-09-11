@@ -34,6 +34,7 @@
 
 // SAIGE_MT_TIMING=1 时打印 marker 循环各阶段的累计耗时（每 chunk 一次）
 static double g_mtT_decode = 0, g_mtT_impsub = 0, g_mtT_assign = 0, g_mtT_pval = 0;
+static double g_mtT_batch = 0, g_mtT_fb = 0;
 static inline double mt_now(){
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -364,6 +365,10 @@ void mainMarkerInCPP(
   std::vector<arma::uvec> mtb_nz(MTB), mtb_z(MTB);
   unsigned int mtb_n = 0;
   bool mtb_pre_done = false;
+  arma::mat mtb_Astack, mtb_WXstack, mtb_CCM;   // trait 维拼接（一次 GEMM 用）
+  arma::uvec mtb_off;                           // 各 trait 的列偏移
+  std::vector<unsigned int> mtb_binmap_v;
+  std::map<unsigned int, unsigned int> mtb_binidx_of;
   std::vector<arma::mat> mtb_W;                 // binary: mu2 ∘ X_t
   std::vector<arma::vec> mtb_case, mtb_ctrl;    // 0/1 指示向量
   arma::vec mtb_vr, mtb_tau0;
@@ -377,6 +382,7 @@ void mainMarkerInCPP(
 
   // 回落对：原路径逐个精确重算（含 SPA/Firth），写输出与 legacy 完全一致
   auto mtb_fallback = [&](unsigned int b, unsigned int t, size_t j){
+    double mt_tfb = mt_timing_on() ? mt_now() : 0;
     ptr_gSAIGEobj->assign_for_itrait(t);
     ptr_gSAIGEobj->set_flagSparseGRM_cur(false);
     ptr_gSAIGEobj->assignSingleVarianceRatio(false, ptr_gSAIGEobj->m_isnoadjCov);
@@ -411,10 +417,12 @@ void mainMarkerInCPP(
     }else{
       N_Vec.at(j) = n;
     }
+    if(mt_timing_on()) g_mtT_fb += mt_now() - mt_tfb;
   };
 
   auto mtb_flush = [&](){
     if(mtb_n == 0) return;
+    double mt_tf = mt_timing_on() ? mt_now() : 0;
     if(!mtb_pre_done){
       mtb_W.resize(P_mt); mtb_case.resize(P_mt); mtb_ctrl.resize(P_mt);
       for(unsigned int t = 0; t < P_mt; t++){
@@ -435,6 +443,34 @@ void mainMarkerInCPP(
           mtb_nctrl(t) = (ptr_gSAIGEobj->m_ctrl_indices).n_elem;
         }
       }
+      // trait 维拼接：一次 GEMM 流读 Gb 一遍，替代逐 trait 重复流读
+      {
+        unsigned int totp = 0;
+        mtb_off.set_size(P_mt + 1);
+        for(unsigned int t = 0; t < P_mt; t++){
+          mtb_off(t) = totp;
+          totp += ptr_gSAIGEobj->m_cache_XVX[t].n_rows;
+        }
+        mtb_off(P_mt) = totp;
+        mtb_Astack.set_size(n, totp);
+        mtb_WXstack.set_size(n, totp);
+        unsigned int nbin = 0;
+        for(unsigned int t = 0; t < P_mt; t++)
+          if(t_traitType.at(t) == "binary") mtb_binmap_v.push_back(t), nbin++;
+        mtb_CCM.set_size(n, 2*nbin);
+        unsigned int bi = 0;
+        for(unsigned int t = 0; t < P_mt; t++){
+          unsigned int o = mtb_off(t), p = mtb_off(t+1) - o;
+          mtb_Astack.cols(o, o+p-1)  = ptr_gSAIGEobj->m_cache_XVX_inv_XV[t];
+          mtb_WXstack.cols(o, o+p-1) = (t_traitType.at(t) == "binary") ? mtb_W[t]
+                                       : ptr_gSAIGEobj->m_cache_X[t];
+          if(t_traitType.at(t) == "binary"){
+            mtb_CCM.col(2*bi)   = mtb_case[t];
+            mtb_CCM.col(2*bi+1) = mtb_ctrl[t];
+            mtb_binidx_of[t] = bi; bi++;
+          }
+        }
+      }
       mtb_pre_done = true;
     }
     arma::mat Gb = mtb_G.cols(0, mtb_n - 1);              // N x B
@@ -446,32 +482,43 @@ void mainMarkerInCPP(
     if(anyQuant) Gsq = arma::sum(arma::square(Gb), 0).t();
     if(mtb_anyBin) G2Mu2 = arma::square(Gb).t() * ptr_gSAIGEobj->m_mu2_mt;   // B x P
 
+    arma::mat Zall  = mtb_Astack.t() * Gb;    // (Σp) x B，Gb 只流读一遍
+    arma::mat GWall = Gb.t() * mtb_WXstack;   // B x (Σp)
+    arma::mat ACall;                          // B x 2*nbin
+    if(mtb_anyBin) ACall = Gb.t() * mtb_CCM;
+
     for(unsigned int t = 0; t < P_mt; t++){
       bool isBin = (t_traitType.at(t) == "binary");
-      const arma::mat &A   = ptr_gSAIGEobj->m_cache_XVX_inv_XV[t];
-      const arma::mat &Xt  = ptr_gSAIGEobj->m_cache_X[t];
       const arma::mat &XVX = ptr_gSAIGEobj->m_cache_XVX[t];
       unsigned int p = XVX.n_rows;
-      arma::mat Zt = A.t() * Gb;                          // p x B
-      arma::mat GW = isBin ? arma::mat(Gb.t() * mtb_W[t]) // B x p
-                           : arma::mat(Gb.t() * Xt);
+      unsigned int o = mtb_off(t);
+      arma::mat Zt = Zall.rows(o, o+p-1);                 // p x B
+      arma::mat GW = GWall.cols(o, o+p-1);                // B x p
       arma::vec Sa_full = ptr_gSAIGEobj->m_S_a_mt.col(t);
       arma::vec Sa = Sa_full.subvec(0, p - 1);            // X'res
       arma::vec ACc, ACt;
-      if(isBin){ ACc = Gb.t() * mtb_case[t];  ACt = Gb.t() * mtb_ctrl[t]; }
+      if(isBin){
+        unsigned int bi = mtb_binidx_of[t];
+        ACc = ACall.col(2*bi);  ACt = ACall.col(2*bi+1);
+      }
+
+      // 逐对标量运算全部向量化：消掉每对的临时分配（这曾是 batch 段的大头）
+      arma::rowvec Svec = (GR.col(t).t() - Sa.t() * Zt) / mtb_tau0(t);
+      arma::rowvec zxzv = arma::sum(Zt % (XVX * Zt), 0);
+      arma::rowvec gwzv = arma::sum(GW.t() % Zt, 0);
+      arma::rowvec var2v;
+      if(isBin){
+        var2v = G2Mu2.col(t).t() - 2.0 * gwzv + zxzv;
+      }else{
+        var2v = zxzv * mtb_tau0(t) + Gsq.t() - 2.0 * gwzv;
+      }
+      arma::rowvec var1v = var2v * mtb_vr(t);
 
       for(unsigned int b = 0; b < mtb_n; b++){
         size_t j = (size_t)t * Mq_mt + (size_t)mtb_mi[b];
-        arma::vec Zb = Zt.col(b);
-        double S = (GR(b, t) - arma::dot(Sa, Zb)) / mtb_tau0(t);
-        double zxz = arma::as_scalar(Zb.t() * XVX * Zb);
-        double var2;
-        if(isBin){
-          var2 = G2Mu2(b, t) - 2.0 * arma::dot(GW.row(b).t(), Zb) + zxz;
-        }else{
-          var2 = zxz * mtb_tau0(t) + Gsq(b) - 2.0 * arma::dot(GW.row(b).t(), Zb);
-        }
-        double var1 = var2 * mtb_vr(t);
+        double S = Svec(b);
+        double var1 = var1v(b);
+        double var2 = var2v(b);
         double stat = S * S / var1;
         double pval_d;
         bool statbad = false;
@@ -524,6 +571,7 @@ void mainMarkerInCPP(
       }
     }
     mtb_n = 0;
+    if(mt_timing_on()) g_mtT_batch += mt_now() - mt_tf;
   };
   // ==== 批量通道定义结束 ====
 
@@ -1052,7 +1100,9 @@ if(mt_timing_on()){
     std::cout << "MT_TIMING decode=" << g_mtT_decode
               << " impute_sub=" << g_mtT_impsub
               << " assign=" << g_mtT_assign
-              << " pval=" << g_mtT_pval << " (secs, cumulative)" << std::endl;
+              << " pval=" << g_mtT_pval
+              << " batch=" << g_mtT_batch << " (incl fb=" << g_mtT_fb
+              << ") (secs, cumulative)" << std::endl;
 }
 }
 
