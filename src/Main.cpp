@@ -5,7 +5,11 @@
 
 #include <vector>
 #include <thread>         // std::this_thread::sleep_for
-#include <chrono>         // std::chrono::seconds
+#include <chrono>
+#include "SPA.hpp"
+#ifdef _OPENMP
+#include <omp.h>
+#endif         // std::chrono::seconds
 // std::this_thread::sleep_for (std::chrono::seconds(1));
 #include <cstdio>         // std::remove
 #include <fstream>
@@ -31,6 +35,10 @@
 #include <boost/math/distributions/beta.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
 #include <chrono>
+#include "SPA.hpp"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 // SAIGE_MT_TIMING=1 时打印 marker 循环各阶段的累计耗时（每 chunk 一次）
 static double g_mtT_decode = 0, g_mtT_impsub = 0, g_mtT_assign = 0, g_mtT_pval = 0;
@@ -44,6 +52,374 @@ static inline bool mt_timing_on(){
     if(on < 0){ const char *e = getenv("SAIGE_MT_TIMING"); on = (e && *e=='1') ? 1 : 0; }
     return on == 1;
 }
+
+// ==== 线程安全 SPA（binary 专用）====
+// 原 SPA/SPA_fast 用 Rcpp::List 传中间结果（碰 R 的 GC 堆，多线程段错误）。
+// 这里逐行复刻二值分支，容器换成 out 参数；标量数学函数
+// (Korg/K1_adj/K2 及 _fast 变体、R::pnorm、add_logp) 本身线程安全，直接复用。
+#include "SPA_binary.hpp"
+#include "UTIL.hpp"
+
+static void mtb_getroot_fast(arma::vec &mu, arma::vec &g, double q,
+    arma::vec &gNA, arma::vec &gNB, arma::vec &muNA, arma::vec &muNB,
+    double NAmu, double NAsigma, double tol, double &root, bool &Isconverge)
+{
+  int maxiter = 1000;
+  double K1_eval, K2_eval, t, tnew, newK1, prevJump;
+  double gpos = arma::accu( g.elem( find(g > 0) ) );
+  double gneg = arma::accu( g.elem( find(g < 0) ) );
+  if(q >= gpos || q <= gneg){
+    root = std::numeric_limits<double>::infinity();
+    Isconverge = true;
+  }else{
+    t = 0;
+    K1_eval = K1_adj_fast_Binom(t,mu,g,q,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+    prevJump = std::numeric_limits<double>::infinity();
+    int rep = 1;  bool conv = true;
+    while(rep <= maxiter){
+      K2_eval = K2_fast_Binom(t,mu,g,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+      tnew = t - K1_eval/K2_eval;
+      if(tnew == NA_REAL){ conv = false; break; }
+      if(std::abs(tnew-t) < tol){ conv = true; break; }
+      if(rep == maxiter){ conv = false; break; }
+      newK1 = K1_adj_fast_Binom(tnew,mu,g,q,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+      if((K1_eval * newK1) < 0){
+        if(std::abs(tnew-t) > (prevJump-tol)){
+          tnew = t + (arma::sign(newK1-K1_eval))*prevJump/2;
+          newK1 = K1_adj_fast_Binom(tnew,mu,g,q,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+          prevJump = prevJump/2;
+        }else{
+          prevJump = std::abs(tnew-t);
+        }
+      }
+      rep = rep + 1;
+      t = tnew;  K1_eval = newK1;
+    }
+    root = t;  Isconverge = conv;
+  }
+}
+
+static void mtb_saddle_fast(double zeta, arma::vec &mu, arma::vec &g, double q,
+    arma::vec &gNA, arma::vec &gNB, arma::vec &muNA, arma::vec &muNB,
+    double NAmu, double NAsigma, bool logp, double &pval, bool &isSaddle)
+{
+  double k1 = Korg_fast_Binom(zeta,mu,g,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+  double k2 = K2_fast_Binom(zeta,mu,g,gNA,gNB,muNA,muNB,NAmu,NAsigma);
+  double temp1, w, v, Ztest;
+  double negative_infinity = - std::numeric_limits<double>::infinity();
+  temp1 = zeta * q - k1;
+  isSaddle = false;
+  bool flagrun = false;
+  if(std::isfinite(k1) && std::isfinite(k2) && temp1 >= 0 && k2 >= 0){
+    w = arma::sign(zeta) * std::sqrt(2*temp1);
+    v = zeta * std::sqrt(k2);
+    if(w != 0) flagrun = true;
+  }
+  if(flagrun){
+    Ztest = w + (1/w) * std::log(v/w);
+    double pval0;
+    if(Ztest > 0){ pval0 = R::pnorm(Ztest,0,1,false,logp); pval = pval0; }
+    else         { pval0 = R::pnorm(Ztest,0,1,true, logp); pval = -pval0; }
+    isSaddle = true;
+  }else{
+    pval = logp ? negative_infinity : 0;
+  }
+}
+
+static void mtb_getroot(arma::vec &mu, arma::vec &g, double q, double tol,
+                        double &root, bool &Isconverge)
+{
+  int maxiter = 1000;
+  double K1_eval, K2_eval, t, tnew, newK1, prevJump;
+  double gpos = arma::accu( g.elem( find(g > 0) ) );
+  double gneg = arma::accu( g.elem( find(g < 0) ) );
+  if(q >= gpos || q <= gneg){
+    root = std::numeric_limits<double>::infinity();
+    Isconverge = true;
+  }else{
+    t = 0;
+    K1_eval = K1_adj_Binom(t,mu,g,q);
+    prevJump = std::numeric_limits<double>::infinity();
+    int rep = 1;  bool conv = true;
+    while(rep <= maxiter){
+      K2_eval = K2_Binom(t,mu,g);
+      tnew = t - K1_eval/K2_eval;
+      if(tnew == NA_REAL){ conv = false; break; }
+      if(std::abs(tnew-t) < tol){ conv = true; break; }
+      if(rep == maxiter){ conv = false; break; }
+      newK1 = K1_adj_Binom(tnew,mu,g,q);
+      if((K1_eval * newK1) < 0){
+        if(std::abs(tnew-t) > (prevJump-tol)){
+          tnew = t + (arma::sign(newK1-K1_eval))*prevJump/2;
+          newK1 = K1_adj_Binom(tnew,mu,g,q);
+          prevJump = prevJump/2;
+        }else{
+          prevJump = std::abs(tnew-t);
+        }
+      }
+      rep = rep + 1;
+      t = tnew;  K1_eval = newK1;
+    }
+    root = t;  Isconverge = conv;
+  }
+}
+
+static void mtb_saddle(double zeta, arma::vec &mu, arma::vec &g, double q,
+                       bool logp, double &pval, bool &isSaddle)
+{
+  double k1 = Korg_Binom(zeta,mu,g);
+  double k2 = K2_Binom(zeta,mu,g);
+  double temp1, w, v, Ztest;
+  double negative_infinity = - std::numeric_limits<double>::infinity();
+  temp1 = zeta * q - k1;
+  isSaddle = false;
+  bool flagrun = false;
+  if(std::isfinite(k1) && std::isfinite(k2) && temp1 >= 0 && k2 >= 0){
+    w = arma::sign(zeta) * std::sqrt(2*temp1);
+    v = zeta * std::sqrt(k2);
+    if(w != 0) flagrun = true;
+  }
+  if(flagrun){
+    Ztest = w + (1/w) * std::log(v/w);
+    double pval0;
+    if(Ztest > 0){ pval0 = R::pnorm(Ztest,0,1,false,logp); pval = pval0; }
+    else         { pval0 = R::pnorm(Ztest,0,1,true, logp); pval = -pval0; }
+    isSaddle = true;
+  }else{
+    pval = logp ? negative_infinity : 0;
+  }
+}
+
+static void mtb_SPA_fast_ts(arma::vec &mu, arma::vec &g, double q, double qinv,
+    double pval_noadj, bool logp, arma::vec &gNA, arma::vec &gNB,
+    arma::vec &muNA, arma::vec &muNB, double NAmu, double NAsigma, double tol,
+    double &pval, bool &isSPAConverge)
+{
+  double p1, p2, root1, root2;
+  bool conv1, conv2, Isconverge = true;
+  mtb_getroot_fast(mu, g, q,    gNA,gNB,muNA,muNB,NAmu,NAsigma, tol, root1, conv1);
+  mtb_getroot_fast(mu, g, qinv, gNA,gNB,muNA,muNB,NAmu,NAsigma, tol, root2, conv2);
+  if(conv1 && conv2){
+    double sp1, sp2;  bool is1, is2;
+    mtb_saddle_fast(root1, mu, g, q,    gNA,gNB,muNA,muNB,NAmu,NAsigma, logp, sp1, is1);
+    mtb_saddle_fast(root2, mu, g, qinv, gNA,gNB,muNA,muNB,NAmu,NAsigma, logp, sp2, is2);
+    if(is1){ p1 = sp1; } else { Isconverge = false; p1 = logp ? pval_noadj-std::log(2) : pval_noadj/2; }
+    if(is2){ p2 = sp2; } else { Isconverge = false; p2 = logp ? pval_noadj-std::log(2) : pval_noadj/2; }
+    if(logp) pval = add_logp(p1,p2);
+    else     pval = std::abs(p1)+std::abs(p2);
+  }else{
+    pval = pval_noadj;  Isconverge = false;
+  }
+  isSPAConverge = Isconverge;
+}
+
+static void mtb_SPA_ts(arma::vec &mu, arma::vec &g, double q, double qinv,
+    double pval_noadj, double tol, bool logp, double &pval, bool &isSPAConverge)
+{
+  double p1, p2, root1, root2;
+  bool conv1, conv2, Isconverge = true;
+  mtb_getroot(mu, g, q, tol, root1, conv1);
+  mtb_getroot(mu, g, qinv, tol, root2, conv2);
+  if(conv1 && conv2){
+    double sp1, sp2;  bool is1, is2;
+    mtb_saddle(root1, mu, g, q,    logp, sp1, is1);
+    mtb_saddle(root2, mu, g, qinv, logp, sp2, is2);
+    if(is1){ p1 = sp1; } else { Isconverge = false; p1 = logp ? pval_noadj-std::log(2) : pval_noadj/2; }
+    if(is2){ p2 = sp2; } else { Isconverge = false; p2 = logp ? pval_noadj-std::log(2) : pval_noadj/2; }
+    if(logp) pval = add_logp(p1,p2);
+    else     pval = std::abs(p1)+std::abs(p2);
+  }else{
+    pval = pval_noadj;  Isconverge = false;
+  }
+  isSPAConverge = Isconverge;
+}
+// ==== 线程安全 SPA 定义结束 ====
+
+// ==== 可重入回落（OpenMP 用）====
+// 复刻 getMarkerPval 的受限路径：binary、非 ER、无条件分析、fastTest 关、
+// 稠密 GRM、adjCov。只读 trait 缓存，无成员写 —— 可多线程并发调用。
+// m_offset 上游从未赋值（Firth 一直拿空向量当 offset），此处忠实复刻。
+struct MtbFbOut {
+  double Beta=0, seBeta=0, Tstat=0, varT=0, AFcase=0, AFctrl=0;
+  std::string pval, pvalNA;
+  bool isSPAConverge=false, isFirth=false, isFirthConverge=false;
+};
+
+static void mtb_fb_reentrant(SAIGE::SAIGEClass *so, unsigned int t,
+                             const arma::vec &GVec, const arma::uvec &inz,
+                             const arma::uvec &izv, MtbFbOut &o)
+{
+  const arma::mat &Xc    = so->m_cache_X[t];
+  const arma::mat &Ac    = so->m_cache_XVX_inv_XV[t];
+  const arma::mat &XVX   = so->m_cache_XVX[t];
+  const arma::mat &XVc   = so->m_cache_XV[t];
+  const arma::mat &XXVXi = so->m_cache_XXVX_inv[t];
+  const arma::vec &resv  = so->m_cache_res[t];
+  const arma::vec &muv   = so->m_cache_mu[t];
+  const arma::vec &mu2v  = so->m_cache_mu2[t];
+  const arma::vec &yv    = so->m_cache_y[t];
+  unsigned int p = XVX.n_rows;
+  double tau0 = so->m_tauvec_mt(0, t);
+  double vr   = so->m_varRatio_null_mt(0, t);
+  unsigned int N = GVec.n_elem;
+
+  // ---- scoreTestFast 复刻（运算与求和序逐项一致）----
+  arma::vec g1 = GVec.elem(inz);
+  arma::mat X1 = Xc.rows(inz);
+  arma::mat A1 = Ac.rows(inz);
+  arma::vec res1 = resv.elem(inz);
+  arma::vec Z = A1.t() * g1;
+  arma::vec B = X1 * Z;
+  arma::vec g1_tilde = g1 - B;
+  arma::vec mu21 = mu2v.elem(inz);
+  double g1tildemu2 = dot(arma::square(g1_tilde), mu21);
+  double Bmu2 = arma::dot(arma::square(B), mu21);
+  arma::mat ZtXVXZ = Z.t() * XVX * Z;
+  double var2 = ZtXVXZ(0,0) - Bmu2 + g1tildemu2;
+  double var1 = var2 * vr;
+  double S1 = dot(res1, g1_tilde);
+  arma::mat res1X1_temp = (res1.t()) * X1;
+  arma::vec res1X1 = res1X1_temp.t();
+  arma::vec Sa_full = so->m_S_a_mt.col(t);
+  arma::vec S_a2 = Sa_full.subvec(0, p-1) - res1X1;
+  double S2 = - arma::dot(S_a2, Z);
+  double S = (S1 + S2) / tau0;
+  double stat = S*S/var1;
+  double pval_noadj; bool ispvallog = false;
+  std::string pval_noSPA;
+  {
+    char buf[100];
+    if (var1 <= std::numeric_limits<double>::min()){
+      pval_noadj = 1;
+    }else if(!std::isnan(stat) && std::isfinite(stat)){
+      boost::math::chi_squared chisq_dist(1);
+      pval_noadj = boost::math::cdf(complement(chisq_dist, stat));
+    }else{
+      pval_noadj = 1; stat = 0.0;
+    }
+    if (pval_noadj != 0){
+      sprintf(buf, "%.6E", pval_noadj); ispvallog = false;
+    }else{
+      double logp = R::pchisq(stat,1,false,true);
+      double log10p = logp/(log(10));
+      int expnt = floor(log10p);
+      double frac = pow(10.0, log10p - expnt);
+      if(frac >= 9.95){ frac = 1; expnt++; }
+      sprintf(buf, "%.1fE%d", frac, expnt);
+      pval_noadj = logp; ispvallog = true;
+    }
+    pval_noSPA = buf;
+  }
+  o.Beta = S/var1;
+  o.seBeta = fabs(o.Beta) / sqrt(fabs(stat));
+  o.Tstat = S;
+  o.varT = var1;
+
+  double StdStat = std::abs(S) / sqrt(var1);
+  double pval = pval_noadj;
+  std::string pval_str = pval_noSPA;
+  bool isSPAConverge = false;
+  arma::vec gtilde;
+  bool have_gtilde = false;
+
+  if(!std::isnan(StdStat) && StdStat > so->m_SPA_Cutoff){
+    // getadjGFast 复刻
+    {
+      arma::vec XVG(XVc.n_rows, arma::fill::zeros);
+      for(unsigned int k = 0; k < inz.n_elem; k++)
+        XVG += XVc.col(inz(k)) * GVec(inz(k));
+      gtilde = GVec - XXVXi * XVG;
+      have_gtilde = true;
+    }
+    double p_com = double(izv.n_elem) / N;
+    double m1 = dot(muv, gtilde);
+    arma::vec gNB, gNA, muNB, muNA;
+    double NAmu = 0, NAsigma = 0;
+    if(p_com >= 0.5){
+      gNB = gtilde(inz);  gNA = gtilde(izv);
+      muNB = muv(inz);    muNA = muv(izv);
+      double gmuNB = dot(gNB, muNB);
+      NAmu = m1 - gmuNB;
+    }
+    double q = S/sqrt(var1/var2) + m1;
+    double qinv;
+    if((q-m1) > 0)      qinv = -1 * std::abs(q-m1) + m1;
+    else if((q-m1)==0)  qinv = m1;
+    else                qinv = std::abs(q-m1) + m1;
+    if(p_com >= 0.5)
+      NAsigma = var2 - arma::sum(muNB % (1-muNB) % arma::pow(gNB,2));
+    double tol0 = std::numeric_limits<double>::epsilon();
+    double tol1 = std::pow(tol0, 0.25);
+    double SPApval = 0;
+    arma::vec mu_nc = muv;
+    if(p_com >= 0.5){
+      mtb_SPA_fast_ts(mu_nc, gtilde, q, qinv, pval_noadj, ispvallog, gNA, gNB, muNA, muNB,
+               NAmu, NAsigma, tol1, SPApval, isSPAConverge);
+    }else{
+      mtb_SPA_ts(mu_nc, gtilde, q, qinv, pval_noadj, tol1, ispvallog, SPApval, isSPAConverge);
+    }
+    if(isSPAConverge){
+      try {
+        double t_qval = R::qnorm(SPApval/2, 0, 1, false, ispvallog);
+        t_qval = fabs(t_qval);
+        o.seBeta = fabs(o.Beta)/t_qval;
+      }catch(const std::overflow_error&){
+        isSPAConverge = false;
+      }
+    }
+    if(!ispvallog && SPApval == 0) isSPAConverge = false;
+    char bufS[100];
+    if(isSPAConverge){
+      if(!ispvallog){
+        sprintf(bufS, "%.6E", SPApval);
+      }else{
+        double l10 = SPApval/(log(10));
+        int expnt = floor(l10);
+        double frac = pow(10.0, l10 - expnt);
+        if(frac >= 9.95){ frac = 1; expnt++; }
+        sprintf(bufS, "%.1fE%d", frac, expnt);
+      }
+      pval_str = bufS; pval = SPApval;
+    }else{
+      pval_str = pval_noSPA; pval = pval_noadj;
+    }
+    double t_qval_Firth = 0;
+    if(!ispvallog){
+      if(so->m_is_Firth_beta && pval <= so->m_pCutoffforFirth){
+        o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, false);
+      }
+    }else{
+      if(so->m_is_Firth_beta && pval <= std::log(so->m_pCutoffforFirth)){
+        o.isFirth = true; t_qval_Firth = R::qnorm(pval/2, 0, 1, false, true);
+      }
+    }
+    if(o.isFirth){
+      if(!have_gtilde){
+        arma::vec XVG(XVc.n_rows, arma::fill::zeros);
+        for(unsigned int k = 0; k < inz.n_elem; k++)
+          XVG += XVc.col(inz(k)) * GVec(inz(k));
+        gtilde = GVec - XXVXi * XVG;
+      }
+      arma::mat x(N, 2, arma::fill::ones);
+      x.col(1) = gtilde;
+      arma::vec init(2, arma::fill::zeros);
+      arma::vec y_nc = yv;
+      arma::vec offset_empty;   // 复刻上游：m_offset 从未赋值
+      so->fast_logistf_fit_simple(x, y_nc, offset_empty, true, init, 50, 15, 15,
+                                  1e-5, 1e-5, 1e-5, o.Beta, o.seBeta, o.isFirthConverge);
+      o.seBeta = fabs(o.Beta)/fabs(t_qval_Firth);
+    }
+  }
+  o.isSPAConverge = isSPAConverge;
+  o.pval = pval_str;
+  o.pvalNA = pval_noSPA;
+  // AF：与 legacy 相同的 elem+mean 求和序
+  arma::uvec ci = arma::find(yv == 1), ti = arma::find(yv == 0);
+  arma::vec dc = GVec.elem(ci), dt = GVec.elem(ti);
+  o.AFcase = arma::mean(dc)/2;
+  o.AFctrl = arma::mean(dt)/2;
+}
+// ==== 可重入回落定义结束 ====
 
 // global objects for different genotype formats
 
@@ -365,6 +741,8 @@ void mainMarkerInCPP(
   std::vector<arma::uvec> mtb_nz(MTB), mtb_z(MTB);
   unsigned int mtb_n = 0;
   bool mtb_pre_done = false;
+  struct MtbFbPair { unsigned int b, t; size_t j; };
+  std::vector<MtbFbPair> mtb_fbq;
   arma::mat mtb_Astack, mtb_WXstack, mtb_CCM;   // trait 维拼接（一次 GEMM 用）
   arma::uvec mtb_off;                           // 各 trait 的列偏移
   std::vector<unsigned int> mtb_binmap_v;
@@ -534,7 +912,7 @@ void mainMarkerInCPP(
           double Std = std::abs(S) / sqrt(var1);
           bool needSPA   = (!std::isnan(Std)) && (Std > ptr_gSAIGEobj->m_SPA_Cutoff);
           bool needFirth = ptr_gSAIGEobj->m_is_Firth_beta && (pval_d <= ptr_gSAIGEobj->m_pCutoffforFirth);
-          if(needSPA || needFirth){ mtb_fallback(b, t, j); continue; }
+          if(needSPA || needFirth){ mtb_fbq.push_back({b, t, j}); continue; }
         }
         char fs = mtb_flip[b];
         char buf[100];
@@ -569,6 +947,37 @@ void mainMarkerInCPP(
           N_Vec.at(j) = n;
         }
       }
+    }
+    if(!mtb_fbq.empty()){
+      double mt_tfb = mt_timing_on() ? mt_now() : 0;
+      std::vector<MtbFbOut> fbo(mtb_fbq.size());
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(dynamic)
+      #endif
+      for(long k = 0; k < (long)mtb_fbq.size(); k++){
+        const MtbFbPair &pr = mtb_fbq[k];
+        arma::vec GVcol = mtb_G.col(pr.b);
+        mtb_fb_reentrant(ptr_gSAIGEobj, pr.t, GVcol, mtb_nz[pr.b], mtb_z[pr.b], fbo[k]);
+      }
+      for(size_t k = 0; k < mtb_fbq.size(); k++){
+        const MtbFbPair &pr = mtb_fbq[k];
+        const MtbFbOut &r = fbo[k];
+        char fs = mtb_flip[pr.b];
+        BetaVec.at(pr.j)  = r.Beta  * (1 - 2*fs);
+        seBetaVec.at(pr.j)= r.seBeta;
+        pvalVec.at(pr.j)  = r.pval;
+        pvalNAVec.at(pr.j)= r.pvalNA;
+        TstatVec.at(pr.j) = r.Tstat * (1 - 2*fs);
+        varTVec.at(pr.j)  = r.varT;
+        if(r.isFirth){ mFirth++; if(r.isFirthConverge) mFirthConverge++; }
+        double afc = r.AFcase, aft = r.AFctrl;
+        if(fs){ afc = 1-afc; aft = 1-aft; }
+        isSPAConvergeVec.at(pr.j) = r.isSPAConverge;
+        AF_caseVec.at(pr.j) = afc;  AF_ctrlVec.at(pr.j) = aft;
+        N_caseVec.at(pr.j) = mtb_ncase(pr.t);  N_ctrlVec.at(pr.j) = mtb_nctrl(pr.t);
+      }
+      mtb_fbq.clear();
+      if(mt_timing_on()) g_mtT_fb += mt_now() - mt_tfb;
     }
     mtb_n = 0;
     if(mt_timing_on()) g_mtT_batch += mt_now() - mt_tf;
