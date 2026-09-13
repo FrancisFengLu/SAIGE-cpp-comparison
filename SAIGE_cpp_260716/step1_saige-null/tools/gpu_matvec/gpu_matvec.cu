@@ -20,7 +20,13 @@
 // NOTE: this tier streams blocks FROM HOST per matvec. That's fine for
 // correctness and a ~4× gain, but it hits PCIe every matvec. G5 (tier-3)
 // keeps the packed form resident on the device.
+// Tier 4 (G6) lives in gemv2bit.cu: the packed bytes stay on the device AND
+// the standardization is lifted out of the inner product by a rank-one
+// decomposition, so the GEMM body only touches raw {0,1,2}. It supersedes
+// tier 3 whenever it fits; tier 3 is kept as the per-element-standardizing
+// cross-check baseline.
 #include "gpu_matvec.hpp"
+#include "gemv2bit.hpp"
 #include "packed_store.hpp"
 
 #include <cuda_runtime.h>
@@ -114,7 +120,9 @@ struct Handle {
   int    nbyte      = 0;   // ⌈N/4⌉
   int    n_blocks   = 0;
   int    Mblk_max   = 0;   // max markers per block we sized for
-  int    tier       = 1;   // 1=streamed cuBLAS, 2=resident float A, 3=packed custom kernel
+  int    tier       = 1;   // 1=streamed cuBLAS, 2=resident float A,
+                           // 3=packed custom kernel (per-element standardize),
+                           // 4=packed + rank-one decomposition (gemv2bit.cu)
 
   // Device resources (tier 1/2: cuBLAS float A)
   cublasHandle_t cublas  = nullptr;
@@ -140,6 +148,9 @@ struct Handle {
   // upload it once at create() and set this flag so matvec() can skip the
   // per-call host-side expansion.
   bool           A_resident = false;
+
+  // Tier-4 context (gemv2bit.cu). Owns its own device buffers.
+  saige::gpu::g2b::Ctx* g2b = nullptr;
 };
 
 // -------- G5: custom kernels operating on packed 2-bit bytes --------------
@@ -246,6 +257,20 @@ static bool init_handle(Handle* h,
   h->freq    = freq;
   h->invstd  = invstd;
 
+  // Bind the device BEFORE the first cudaMalloc/cudaMemGetInfo, otherwise the
+  // runtime picks device 0 implicitly and SAIGE_GPU_DEVICE has no effect.
+  // (Ported from bind_device_for_rank() in the R package's gpuSymMatMult.cu,
+  // minus the MPI rank: this binary is single-process.)
+  {
+    int dev = 0;
+    if (const char* dv = std::getenv("SAIGE_GPU_DEVICE")) dev = std::atoi(dv);
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    if (count <= 0) return false;
+    if (dev < 0 || dev >= count) dev = 0;
+    CUDA_CHECK(cudaSetDevice(dev));
+  }
+
   size_t free_b = 0, total_b = 0;
   CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
 
@@ -257,10 +282,46 @@ static bool init_handle(Handle* h,
                               + 2 * per_col_float                              // d_u, d_Au
                               + static_cast<size_t>(h->M) * sizeof(float);     // d_y
   const size_t tier3_need = packed_bytes + aux_bytes + 256 * 1024 * 1024;
+  // Tier 4 carries the same packed bytes plus the two partial-reduction
+  // buffers (Ypart ≈ ⌈W32/128⌉·M·4, Zpart ≈ ⌈M/256⌉·Npad·4); at UKB scale
+  // Zpart is ~690 MB, so it is NOT a rounding term — ask gemv2bit for the
+  // exact figure rather than re-deriving it here.
+  const size_t tier4_need =
+      saige::gpu::g2b::need_bytes(h->N, h->M) + 256 * 1024 * 1024;
 
   int chosen_tier = 1;
-  if ((tier_override == 3 || (tier_override == 0 && tier3_need <= free_b * 90 / 100))) {
+  if (tier_override == 4 || (tier_override == 0 && tier4_need <= free_b * 90 / 100)) {
+    chosen_tier = 4;
+  } else if (tier_override == 3 || (tier_override == 0 && tier3_need <= free_b * 90 / 100)) {
     chosen_tier = 3;
+  }
+
+  if (chosen_tier == 4) {
+    // PackedFlat is one contiguous buffer with row stride == nbyte(), so the
+    // upload is a single cudaMemcpy2D straight off raw() — no gather into a
+    // staging buffer, no host-side fp32 expansion. (The R package had to
+    // gather because its store was a vector of per-block pointers; that copy
+    // is what made host RSS 23.2/29 GiB at UKB scale.)
+    h->g2b = saige::gpu::g2b::create(packed.raw(), packed.nbyte(),
+                                     h->N, h->M, freq.data(), invstd.data());
+    if (!h->g2b) {
+      std::fprintf(stderr, "[gpu_matvec] tier-4 create failed"
+                           " (need %zu MB, free %zu MB)\n",
+                   tier4_need >> 20, free_b >> 20);
+      return false;
+    }
+    h->tier       = 4;
+    h->n_blocks   = 1;
+    h->Mblk_max   = h->M;
+    h->A_resident = false;
+
+    std::printf("[gpu_matvec] tier=4 N=%d  M=%d  nbyte=%d  device=%zu MB "
+                "(packed %zu MB + scratch)  VRAM free=%zu MB  "
+                "(2-BIT RESIDENT, rank-one standardization)\n",
+                h->N, h->M, h->nbyte,
+                saige::gpu::g2b::ctx_bytes(h->g2b) >> 20,
+                packed_bytes >> 20, free_b >> 20);
+    return true;
   }
 
   CUBLAS_CHECK(cublasCreate(&h->cublas));
@@ -333,7 +394,19 @@ static void free_handle(Handle* h) {
   if (h->d_freq)        cudaFree(h->d_freq);
   if (h->d_invstd)      cudaFree(h->d_invstd);
   if (h->cublas)        cublasDestroy(h->cublas);
-  std::memset(h, 0, sizeof(*h));
+  if (h->g2b)           saige::gpu::g2b::destroy(h->g2b);
+  // No memset(h, 0, sizeof(*h)) here: Handle holds two std::vector<float>
+  // members, and zeroing them out from under the destructor leaked their
+  // buffers (2 × M × 4 bytes per handle). Null the raw pointers explicitly so
+  // a double destroy() is still safe.
+  h->h_Ablk_pinned = nullptr;
+  h->d_Ablk = h->d_u = h->d_y = h->d_Au = nullptr;
+  h->d_freq = h->d_invstd = nullptr;
+  h->d_packed = nullptr;
+  h->cublas   = nullptr;
+  h->g2b      = nullptr;
+  h->packed   = nullptr;
+  h->tier     = 0;
 }
 
 // ---------------------------------------------------------------- API
@@ -372,6 +445,14 @@ int tier(const Handle* h) { return h ? h->tier : 0; }
 
 bool matvec(Handle* h, const float* u, float* out_Au) {
   if (!h || !u || !out_Au) return false;
+
+  // ---- tier 4: 2-bit resident + rank-one standardization ----
+  // Whole-GRM range [0, M); gemv2bit uploads u and applies 1/M itself.
+  if (h->tier == 4) {
+    return saige::gpu::g2b::matvec_range(h->g2b, 0, h->M,
+                                         1.0f / static_cast<float>(h->M),
+                                         u, out_Au);
+  }
 
   // Push u once to the device.
   const size_t per_col = static_cast<size_t>(h->N) * sizeof(float);

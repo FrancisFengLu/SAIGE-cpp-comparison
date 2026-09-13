@@ -87,8 +87,19 @@ int main() {
 
   std::mt19937 rng(202604);
   std::vector<unsigned char> row(nbyte);
+  // Only emit the three codes the real packer can produce: 0b00 HOM_REF,
+  // 0b10 HET, 0b11 HOM_ALT. 0b01 (MISSING) is filled in with round(2·altFreq)
+  // by marker_decoder BEFORE packing, so it never reaches the device — and the
+  // two backends disagree on it by construction (tier 1/3 substitute
+  // round(2f), tier 4's g = 2 − popc(field) would call it a het). Feeding
+  // random bytes here would therefore test a state that cannot occur.
+  const unsigned char kCodes[3] = {0x0, 0x2, 0x3};
   for (int m = 0; m < M; ++m) {
-    for (int b = 0; b < nbyte; ++b) row[b] = static_cast<unsigned char>(rng());
+    for (int b = 0; b < nbyte; ++b) {
+      unsigned char byte = 0;
+      for (int k = 0; k < 4; ++k) byte |= (unsigned char)(kCodes[rng() % 3] << (2*k));
+      row[b] = byte;
+    }
     packed.write(m, row.data());
     // Alt allele freq between 0.03 and 0.4.
     freq[m]   = 0.03f + (m % 100) * 0.0037f;
@@ -113,42 +124,64 @@ int main() {
     return 0;
   }
 
-  auto* h = saige::gpu::create(packed, freq, invstd, N);
-  if (!h) { std::fprintf(stderr, "gpu::create failed\n"); return 1; }
-  std::printf("GPU handle created (tier=%d)\n", saige::gpu::tier(h));
+  // Exercise every tier the facade can be forced into. 2 is not selectable
+  // (it is what 1 becomes when A happens to fit resident), so 1 covers both.
+  const int   tiers[]  = {1, 3, 4};
+  const float tol_rel  = 1e-4f;
+  int         failures = 0;
 
-  std::vector<float> Au_gpu(N, 0.0f);
-  if (!saige::gpu::matvec(h, u.data(), Au_gpu.data())) {
-    std::fprintf(stderr, "gpu::matvec failed\n");
+  for (int t : tiers) {
+    auto* h = saige::gpu::create(packed, freq, invstd, N, t);
+    if (!h) {
+      std::fprintf(stderr, "gpu::create(tier_override=%d) failed\n", t);
+      ++failures;
+      continue;
+    }
+    const int got = saige::gpu::tier(h);
+    std::printf("\n-- tier_override=%d -> tier=%d --\n", t, got);
+
+    std::vector<float> Au_gpu(N, 0.0f);
+    if (!saige::gpu::matvec(h, u.data(), Au_gpu.data())) {
+      std::fprintf(stderr, "gpu::matvec failed (tier %d)\n", got);
+      saige::gpu::destroy(h);
+      ++failures;
+      continue;
+    }
+    std::printf("GPU result    : Au_gpu[0:5]= %.6g %.6g %.6g %.6g %.6g\n",
+                Au_gpu[0], Au_gpu[1], Au_gpu[2], Au_gpu[3], Au_gpu[4]);
+
+    // Diff
+    float max_abs_diff = 0.0f;
+    for (int i = 0; i < N; ++i)
+      max_abs_diff = std::max(max_abs_diff, std::fabs(Au_cpu[i] - Au_gpu[i]));
+    const float rel = max_abs_diff / std::max(1e-12f, max_abs_cpu);
+    std::printf("Δ (CPU vs GPU): max|d|=%.4g  max|d|/max|Au_cpu|=%.4g\n",
+                max_abs_diff, rel);
+
+    // Inter-run determinism check (GPU vs GPU on two matvec calls with same u)
+    std::vector<float> Au_gpu2(N, 0.0f);
+    saige::gpu::matvec(h, u.data(), Au_gpu2.data());
+    int bitdiff = 0;
+    for (int i = 0; i < N; ++i)
+      if (std::memcmp(&Au_gpu[i], &Au_gpu2[i], sizeof(float)) != 0) ++bitdiff;
+    std::printf("GPU inter-run: %d/%d words differ  %s\n",
+                bitdiff, N, bitdiff == 0 ? "bit-identical" : "NONDETERMINISTIC");
+    if (bitdiff != 0) ++failures;
+
     saige::gpu::destroy(h);
+
+    if (rel > tol_rel) {
+      std::fprintf(stderr, "FAIL tier %d: rel diff %.4g > %.4g\n", got, rel, tol_rel);
+      ++failures;
+    } else {
+      std::printf("OK tier %d (rel diff %.4g < %.4g)\n", got, rel, tol_rel);
+    }
+  }
+
+  if (failures) {
+    std::fprintf(stderr, "\n%d tier(s) FAILED\n", failures);
     return 1;
   }
-  std::printf("GPU result    : Au_gpu[0:5]= %.6g %.6g %.6g %.6g %.6g\n",
-              Au_gpu[0], Au_gpu[1], Au_gpu[2], Au_gpu[3], Au_gpu[4]);
-
-  // Diff
-  float max_abs_diff = 0.0f;
-  for (int i = 0; i < N; ++i)
-    max_abs_diff = std::max(max_abs_diff, std::fabs(Au_cpu[i] - Au_gpu[i]));
-  const float rel = max_abs_diff / std::max(1e-12f, max_abs_cpu);
-  std::printf("Δ (CPU vs GPU): max|d|=%.4g  max|d|/max|Au_cpu|=%.4g\n",
-              max_abs_diff, rel);
-
-  // Inter-run determinism check (GPU vs GPU on two matvec calls with same u)
-  std::vector<float> Au_gpu2(N, 0.0f);
-  saige::gpu::matvec(h, u.data(), Au_gpu2.data());
-  float inter = 0.0f;
-  for (int i = 0; i < N; ++i) inter = std::max(inter, std::fabs(Au_gpu[i] - Au_gpu2[i]));
-  std::printf("GPU inter-run: max|Δ|=%.4g  %s\n",
-              inter, (inter < 1e-6f) ? "deterministic" : "nondet");
-
-  saige::gpu::destroy(h);
-
-  const float tol_rel = 1e-4f;
-  if (rel > tol_rel) {
-    std::fprintf(stderr, "FAIL: rel diff %.4g > %.4g\n", rel, tol_rel);
-    return 1;
-  }
-  std::printf("OK (rel diff %.4g < %.4g)\n", rel, tol_rel);
+  std::printf("\nAll tiers OK\n");
   return 0;
 }

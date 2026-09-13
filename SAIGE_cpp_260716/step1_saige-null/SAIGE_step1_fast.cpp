@@ -1981,7 +1981,10 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 	// packed_flat_. Silent CPU fallback on any failure.
 	static saige::gpu::Handle* s_gpu_handle = nullptr;
 	static int   s_gpu_state = 0;  // 0=unknown, 1=use, 2=cpu-fallback
-	if (s_gpu_state == 0) {
+	// Set while re-entering this function to produce the CPU reference under
+	// SAIGE_GPU_VERIFY=1 — makes the GPU blocks below no-ops for that one call.
+	static bool  s_gpu_in_verify = false;
+	if (s_gpu_state == 0 && !s_gpu_in_verify) {
 		const char* env = std::getenv("SAIGE_USE_GPU");
 		const bool want_gpu = (env != nullptr && std::string(env) == "1");
 		if (want_gpu && geno.use_packed_flat_ && geno.packed_flat_.n_stored() > 0 &&
@@ -1991,7 +1994,10 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 			std::vector<float> freq_h(geno.alleleFreqVec.begin(), geno.alleleFreqVec.end());
 			std::vector<float> invstd_h(geno.invstdvVec.begin(),  geno.invstdvVec.end());
 			const int N = (int)geno.getNnomissing();
-			// Allow forcing tier via SAIGE_GPU_TIER={1,3}; default 0 = auto.
+			// Allow forcing tier via SAIGE_GPU_TIER={1,3,4}; default 0 = auto
+			// (auto prefers 4 = 2-bit resident + rank-one standardization,
+			//  then 3 = 2-bit resident + per-element standardization,
+			//  then 1/2 = fp32 cuBLAS). Also honored: SAIGE_GPU_DEVICE.
 			int tier_override = 0;
 			if (const char* tv = std::getenv("SAIGE_GPU_TIER")) {
 				tier_override = std::atoi(tv);
@@ -2001,6 +2007,19 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 				s_gpu_state = 1;
 				std::cout << "[parallelCrossProd] GPU tier="
 				          << saige::gpu::tier(s_gpu_handle) << " enabled.\n";
+				// The GPU divides by packed_flat_.n_stored(); the CPU path
+				// divides by Msub_mafge1perc. Both come from the same passQC
+				// count, but a mismatch would be a SILENT scale error in tau,
+				// so print all three once and let the log prove it.
+				std::cout << "[parallelCrossProd] M_pass check: packed_flat_.n_stored()="
+				          << geno.packed_flat_.n_stored()
+				          << "  numberofMarkerswithMAFge_minMAFtoConstructGRM="
+				          << geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM()
+				          << "  freq/invstd len=" << freq_h.size() << "/" << invstd_h.size()
+				          << (geno.packed_flat_.n_stored() ==
+				                  (std::size_t)geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM()
+				              ? "  OK" : "  **MISMATCH**")
+				          << std::endl;
 			} else {
 				s_gpu_state = 2;
 				std::cerr << "[parallelCrossProd] GPU unavailable — falling back to CPU.\n";
@@ -2016,6 +2035,9 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 	// that need the host-side memory for other allocations. Note: this
 	// does NOT reduce PEAK RSS, because the peak is set during BED load +
 	// GPU upload (both buffers live simultaneously).
+	// Only legal for tiers 3/4: those upload once and never dereference the
+	// host buffer again. Tiers 1/2 re-read packed_flat_ on every matvec, so
+	// releasing it there would be a use-after-free.
 	{
 		static int  s_success_count = 0;
 		static bool s_released      = false;
@@ -2023,10 +2045,32 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 			const char* v = std::getenv("SAIGE_GPU_RELEASE_HOST");
 			return v && std::string(v) == "1";
 		}();
-		if (s_gpu_state == 1 && s_gpu_handle) {
+		// SAIGE_GPU_VERIFY=1: run the CPU path too and print the rel-L2 gap.
+		// Mirrors SAIGE_GEMV_VERIFY / SAIGE_AVX2_VERIFY. Roughly halves
+		// throughput, so it is a debugging switch, not a production one.
+		static const bool s_gpu_verify = [](){
+			const char* v = std::getenv("SAIGE_GPU_VERIFY");
+			return v && std::string(v) == "1";
+		}();
+		if (s_gpu_state == 1 && s_gpu_handle && !s_gpu_in_verify) {
 			arma::fvec out((arma::uword)geno.getNnomissing());
 			if (saige::gpu::matvec(s_gpu_handle, bVec.memptr(), out.memptr())) {
-				if (s_release_enabled && !s_released && ++s_success_count >= 4) {
+				if (s_gpu_verify) {
+					s_gpu_in_verify = true;
+					arma::fvec ref = parallelCrossProd(bVec);   // CPU reference
+					s_gpu_in_verify = false;
+					const double rn = arma::norm(ref);
+					const double rel = arma::norm(out - ref) / std::max(1e-30, rn);
+					static long s_vcalls = 0;
+					std::cout << "[GPU VERIFY call#" << (++s_vcalls)
+					          << "] |ref|=" << rn
+					          << "  max_abs=" << arma::abs(out - ref).max()
+					          << "  rel_l2=" << rel
+					          << (rel < 1e-5 ? "  OK" : "  **ABOVE 1e-5**")
+					          << std::endl;
+				}
+				if (s_release_enabled && !s_released && ++s_success_count >= 4 &&
+				    saige::gpu::tier(s_gpu_handle) >= 3) {
 					geno.release_packed_flat_host();
 					s_released = true;
 				}

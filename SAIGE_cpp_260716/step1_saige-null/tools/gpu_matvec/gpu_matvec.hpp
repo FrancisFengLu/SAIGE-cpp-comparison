@@ -16,8 +16,9 @@
 //   out_Au and u are length N, float32, host memory.
 //
 // Numerics: single precision throughout, matches CPU parallelCrossProd's
-// final output. Inter-run determinism depends on kernel launch order and
-// atomic reductions (see §7 of GPU_INTEGRATION_PLAN_2026-04-22.md).
+// final output. All tiers reduce through partial buffers, never atomicAdd, so
+// for a fixed tier two runs of the same binary are bit-identical. Switching
+// tiers changes the summation order and therefore the last few ulps.
 #pragma once
 
 #include <cstddef>
@@ -38,9 +39,15 @@ bool available();
 //   freq          : length packed.n_stored() — alt allele frequency per marker
 //   invstd        : length packed.n_stored() — 1/√(2 f (1−f)), 0 where f ∈ {0,1}
 //   N             : number of phenotyped samples (packed.nbyte() ≥ ⌈N/4⌉)
-//   tier_override : 0 (auto), 1 (stream cuBLAS), 3 (packed-resident custom)
+//   tier_override : 0 (auto — prefers 4, then 3, then 1/2)
+//                   1 = stream fp32 blocks from host per matvec (cuBLAS)
+//                   3 = packed-resident, standardize per element in-kernel
+//                   4 = packed-resident, rank-one standardization (gemv2bit.cu)
+//                   (2 is not selectable: it is what tier 1 becomes when the
+//                    whole fp32 A happens to fit in one resident block.)
 // Returns nullptr on failure (no CUDA, OOM, device error). Inputs are NOT
-// retained after return; caller can free them.
+// retained after return; caller can free them — EXCEPT for tiers 1/2, which
+// keep reading `packed` on every matvec (tiers 3/4 do not).
 Handle* create(const saige::PackedFlat& packed,
                const std::vector<float>& freq,
                const std::vector<float>& invstd,
@@ -55,7 +62,8 @@ bool matvec(Handle* h, const float* u, float* out_Au);
 // Release all device buffers held by h.
 void destroy(Handle* h);
 
-// Reflection: which tier the handle actually runs. 0 means "not created".
+// Reflection: which tier the handle actually runs (1/2/3/4, see create()).
+// 0 means "not created".
 int  tier(const Handle* h);
 
 }  // namespace saige::gpu
