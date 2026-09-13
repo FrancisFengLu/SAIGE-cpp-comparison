@@ -155,6 +155,11 @@ arma::umat g_X_PARregion_mat;
 std::ofstream OutFile;
 std::ofstream OutFile_singleInGroup;
 std::ofstream OutFile_singleInGroup_temp;
+// <region output>.markerList.txt -- which variants ended up in each mask,
+// split into the rare ones and the ones that were collapsed as ultra-rare.
+// Enabled by isOutputMarkerList (R: is_output_markerList_in_groupTest).
+std::ofstream OutFile_markerList;
+bool g_isOutputMarkerList = false;
 
 // Single-variant output: one stream and one TraitMeta per trait, in the order
 // the config wrote them (MULTITRAIT_DESIGN.md section 4.4). Both are length 1
@@ -1960,6 +1965,35 @@ void setRegion_GlobalVarsInCPP(
 
 
 // ============================================================
+// openOutfile_markerList
+//
+// R writes "<OutputFile>.markerList.txt" whenever
+// is_output_markerList_in_groupTest is TRUE (SAIGE_SPATest_Region.R:1172-1215):
+// one row per (region, annotation, max_MAF) mask that contains at least one
+// variant, listing the mask's rare variants and its ultra-rare (collapsed)
+// variants as two comma-separated fields.  It is the only record of WHICH
+// variants a gene-level p-value was actually computed from, so without it a
+// region result cannot be audited.
+//
+// The C++ parsed isOutputMarkerList and printed it back in the config echo, but
+// no code ever read it and no such file was ever produced -- silently, with no
+// warning.  This opens the file and writes R's header.
+// ============================================================
+bool openOutfile_markerList(bool isappend) {
+    std::string path = g_outputFilePrefixGroup + ".markerList.txt";
+    if (!isappend) {
+        OutFile_markerList.open(path.c_str());
+        if (!OutFile_markerList.is_open()) return false;
+        OutFile_markerList << "Region\tGroup\tmax_MAF\tRare_Variants\tUltra_Rare_Variants\n";
+    } else {
+        OutFile_markerList.open(path.c_str(), std::ofstream::out | std::ofstream::app);
+        if (!OutFile_markerList.is_open()) return false;
+    }
+    return true;
+}
+
+
+// ============================================================
 // openOutfile (region/gene output)
 // Direct port from SAIGE/src/Main.cpp lines 2503-2528
 // ============================================================
@@ -3279,6 +3313,49 @@ void mainRegionInCPP(
         q_maf_for_anno(j) = jtemp.min();
     }
 
+    // ===== markerList output =====
+    // R: SAIGE_SPATest_Region.R:1039-1085.  One row per (region, annotation,
+    // max_MAF) mask holding at least one variant; the mask's rare variants and
+    // its collapsed ultra-rare variants as two comma-separated fields.  Emitted
+    // for every regionTestType (R builds Output_MarkerList outside its
+    // `regionTestType != "BURDEN"` block), so this sits before the BURDEN /
+    // SKAT-O split.  indicatorVec, annoMAFIndicatorMat and markerVec are all
+    // final by this point -- the ultra-rare collapse above has already written
+    // its pseudo-marker rows.
+    if (g_isOutputMarkerList && OutFile_markerList.is_open()) {
+        #pragma omp critical(outwrite_markerlist)
+        {
+            for (unsigned int j = 0; j < q_anno; j++) {
+                for (unsigned int m = 0; m < q_maf; m++) {
+                    unsigned int jm = j * q_maf + m;
+                    std::string rare, ultrarare;
+                    bool anyInMask = false;
+                    for (unsigned int i = 0; i < q; i++) {
+                        if (annoMAFIndicatorMat(i, jm) <= 0) continue;
+                        anyInMask = true;
+                        // The collapsed pseudo-markers carry an indicator of 0
+                        // and belong to neither list (R's markerIndcatorVec
+                        // likewise only marks real markers 1 or 2).
+                        if (i >= q0) continue;
+                        if (indicatorVec.at(i) == 1) {
+                            if (!rare.empty()) rare += ",";
+                            rare += markerVec.at(i);
+                        } else if (indicatorVec.at(i) == 2) {
+                            if (!ultrarare.empty()) ultrarare += ",";
+                            ultrarare += markerVec.at(i);
+                        }
+                    }
+                    if (!anyInMask) continue;
+                    OutFile_markerList << regionName << "\t"
+                                       << annoStringVec[j] << "\t"
+                                       << maxMAFVec(m) << "\t"
+                                       << rare << "\t"
+                                       << ultrarare << "\n";
+                }
+            }
+        }
+    }
+
     // ===== BURDEN-only path =====
     if (t_regionTestType == "BURDEN") {
         std::vector<std::string> BURDEN_pval_Vec(q_anno_maf, "NA");
@@ -3694,6 +3771,7 @@ int main(int argc, char* argv[])
     OutFile.imbue(std::locale());
     OutFile_singleInGroup.imbue(std::locale());
     OutFile_singleInGroup_temp.imbue(std::locale());
+    OutFile_markerList.imbue(std::locale());
 
     g_timing_start = TimingClock::now();  // TIMING_INSTRUMENT_REMOVE_ME
     g_timing_last = g_timing_start;  // TIMING_INSTRUMENT_REMOVE_ME
@@ -4948,6 +5026,16 @@ int main(int argc, char* argv[])
                 std::cout << "  Region output file opened: " << g_outputFilePrefixGroup << std::endl;
             }
 
+            g_isOutputMarkerList = isOutputMarkerList;
+            if (g_isOutputMarkerList) {
+                if (!openOutfile_markerList(false)) {
+                    throw std::runtime_error("Cannot open marker-list output file: "
+                                             + g_outputFilePrefixGroup + ".markerList.txt");
+                }
+                std::cout << "  Marker-list output file opened: "
+                          << g_outputFilePrefixGroup << ".markerList.txt" << std::endl;
+            }
+
             if (isSingleInGroupTest) {
                 std::cout << "  Single-variant results within groups will be output." << std::endl;
                 bool isOpenSingle = openOutfile_singleinGroup(
@@ -5142,6 +5230,9 @@ int main(int argc, char* argv[])
             OutFile.close();
             if (isSingleInGroupTest) {
                 OutFile_singleInGroup.close();
+            }
+            if (OutFile_markerList.is_open()) {
+                OutFile_markerList.close();
             }
 
         } // end of region testing path
