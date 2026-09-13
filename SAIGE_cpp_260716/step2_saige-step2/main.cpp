@@ -3806,7 +3806,7 @@ int main(int argc, char* argv[])
             std::cerr << "  pvarFile:          Path to .pvar file [for genoType=pgen]" << std::endl;
             std::cerr << "  psamFile:          Path to .psam file [for genoType=pgen]" << std::endl;
             std::cerr << "  genoType:          'plink', 'vcf', 'bgen', or 'pgen' (default: 'plink')" << std::endl;
-            std::cerr << "  vcfField:          'GT' or 'DS' (default: 'GT', for genoType=vcf)" << std::endl;
+            std::cerr << "  vcfField:          'GT' or 'DS' (default: 'DS', matching R; for genoType=vcf)" << std::endl;
             std::cerr << "  isImputation:      true/false (default: false)" << std::endl;
             std::cerr << "  isMoreOutput:      true/false (default: false)" << std::endl;
             std::cerr << "  marker_chunksize:  markers per progress report (default: 10000)" << std::endl;
@@ -3903,7 +3903,18 @@ int main(int argc, char* argv[])
         std::string varianceRatioFile = modelSpecs[0].varianceRatioFile;
         std::string plinkPrefix = config["plinkFile"] ? config["plinkFile"].as<std::string>() : "";
         std::string vcfFile = config["vcfFile"] ? config["vcfFile"].as<std::string>() : "";
-        std::string vcfField = config["vcfField"] ? config["vcfField"].as<std::string>() : "GT";
+        // R's default is "DS" -- extdata/step2_SPAtests.R:18 (CLI),
+        // R/SAIGE_Test_main.R:68 and R/Geno.R:26,133 (function).  This port
+        // defaulted to "GT", which is not a cosmetic disagreement: on one
+        // plink2-exported dosage VCF, reading GT gives MissingRate 0.80 and
+        // reading DS gives 0.01, because the hard call is "./." wherever the
+        // dosage is not near-integer.  A config that omitted the key therefore
+        // analysed a completely different set of genotypes than R would.
+        // R also rejects anything other than DS or GT (Geno.R:111-112).
+        std::string vcfField = config["vcfField"] ? config["vcfField"].as<std::string>() : "DS";
+        if (genoType_early == "vcf" && vcfField != "DS" && vcfField != "GT") {
+            throw std::runtime_error("vcfField has to be DS or GT, got '" + vcfField + "'");
+        }
         std::string bgenFile = config["bgenFile"] ? config["bgenFile"].as<std::string>() : "";
         std::string bgenSampleFile = config["bgenSampleFile"] ? config["bgenSampleFile"].as<std::string>() : "";
         std::string pgenFile = config["pgenFile"] ? config["pgenFile"].as<std::string>() : "";
