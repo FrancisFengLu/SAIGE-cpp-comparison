@@ -54,6 +54,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "null_model_loader.hpp"
 #include "genotype_reader.hpp"
 #include "saige_test.hpp"
+#include "saige_mt.hpp"
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
@@ -3749,15 +3750,19 @@ int main(int argc, char* argv[])
         // ---- 2. Read YAML config ----
         YAML::Node config = YAML::LoadFile(configFile);
 
-        // Required keys
-        if (!config["modelFile"]) {
-            throw std::runtime_error("Config missing required key: modelFile");
-        }
-        if (!config["varianceRatioFile"]) {
-            throw std::runtime_error("Config missing required key: varianceRatioFile");
-        }
-        if (!config["outputFile"]) {
-            throw std::runtime_error("Config missing required key: outputFile");
+        // Required keys. Either the legacy scalar trio (modelFile /
+        // varianceRatioFile / outputFile) or the `models:` sequence; the two
+        // forms are mutually exclusive. A one-entry `models:` is the same run
+        // as the scalar trio -- P == 1 never touches any multi-trait code.
+        // MULTITRAIT_DESIGN.md sections 4.1 and 5.
+        std::vector<SAIGE::MTModelSpec> modelSpecs = SAIGE::parseModelSpecs(config);
+        const int numTraits = static_cast<int>(modelSpecs.size());
+        if (numTraits > 1) {
+            throw std::runtime_error(
+                "Config lists " + std::to_string(numTraits) + " models, but "
+                "multi-trait testing (P > 1) is not implemented yet: this build "
+                "carries the Phase 0 skeleton only. Run one model per config for "
+                "now -- refusing rather than silently testing only the first.");
         }
 
         // Determine genotype type early (needed for input file validation)
@@ -3794,8 +3799,8 @@ int main(int argc, char* argv[])
                                      ". Supported types: plink, vcf, bgen, pgen");
         }
 
-        std::string modelFile = config["modelFile"].as<std::string>();
-        std::string varianceRatioFile = config["varianceRatioFile"].as<std::string>();
+        std::string modelFile = modelSpecs[0].modelFile;
+        std::string varianceRatioFile = modelSpecs[0].varianceRatioFile;
         std::string plinkPrefix = config["plinkFile"] ? config["plinkFile"].as<std::string>() : "";
         std::string vcfFile = config["vcfFile"] ? config["vcfFile"].as<std::string>() : "";
         std::string vcfField = config["vcfField"] ? config["vcfField"].as<std::string>() : "GT";
@@ -3804,7 +3809,7 @@ int main(int argc, char* argv[])
         std::string pgenFile = config["pgenFile"] ? config["pgenFile"].as<std::string>() : "";
         std::string pvarFile = config["pvarFile"] ? config["pvarFile"].as<std::string>() : "";
         std::string psamFile = config["psamFile"] ? config["psamFile"].as<std::string>() : "";
-        std::string outputFile = config["outputFile"].as<std::string>();
+        std::string outputFile = modelSpecs[0].outputFile;
 
         // Optional keys with defaults
         double minMAF = config["minMAF"] ? config["minMAF"].as<double>() : 0.0;
@@ -3994,6 +3999,10 @@ int main(int argc, char* argv[])
         // Print configuration
         std::cout << std::endl;
         std::cout << "Configuration:" << std::endl;
+        if (config["models"]) {
+            std::cout << "  models:            " << numTraits
+                      << " (traitName: " << modelSpecs[0].traitName << ")" << std::endl;
+        }
         std::cout << "  modelFile:         " << modelFile << std::endl;
         std::cout << "  varianceRatioFile: " << varianceRatioFile << std::endl;
         if (genoType == "plink") {
@@ -4166,6 +4175,50 @@ int main(int argc, char* argv[])
         if (config["isnoadjCov"]) {
             nullModel.isnoadjCov = config["isnoadjCov"].as<bool>();
             std::cout << "  isnoadjCov overridden from config: " << std::boolalpha << nullModel.isnoadjCov << std::endl;
+        }
+
+        // ---- Per-model overrides (`models:` form only) ----
+        // Design section 4.1: a key written inside a models[] entry applies to
+        // that trait only and beats the top-level value, which is why this runs
+        // after the top-level block above. The legacy scalar form never
+        // populates ModelOverrides, so nothing here executes on that path and
+        // P == 1 stays byte-identical.
+        {
+            const SAIGE::ModelOverrides& ov = modelSpecs[0].ov;
+            if (ov.has_is_Firth_beta) {
+                nullModel.is_Firth_beta = ov.is_Firth_beta;
+                g_is_Firth_beta = nullModel.is_Firth_beta;
+                std::cout << "  [" << modelSpecs[0].traitName
+                          << "] is_Firth_beta overridden per model: "
+                          << std::boolalpha << g_is_Firth_beta << std::endl;
+            }
+            if (ov.has_pCutoffforFirth) {
+                nullModel.pCutoffforFirth = ov.pCutoffforFirth;
+                g_pCutoffforFirth = nullModel.pCutoffforFirth;
+                std::cout << "  [" << modelSpecs[0].traitName
+                          << "] pCutoffforFirth overridden per model: "
+                          << g_pCutoffforFirth << std::endl;
+            }
+            if (ov.has_isnoadjCov) {
+                nullModel.isnoadjCov = ov.isnoadjCov;
+                std::cout << "  [" << modelSpecs[0].traitName
+                          << "] isnoadjCov overridden per model: "
+                          << std::boolalpha << nullModel.isnoadjCov << std::endl;
+            }
+            if (ov.has_cateVarRatioMinMACVecExclude) {
+                nullModel.cateVarRatioMinMACVecExclude =
+                    arma::vec(ov.cateVarRatioMinMACVecExclude);
+                std::cout << "  [" << modelSpecs[0].traitName
+                          << "] cateVarRatioMinMACVecExclude overridden per model."
+                          << std::endl;
+            }
+            if (ov.has_cateVarRatioMaxMACVecInclude) {
+                nullModel.cateVarRatioMaxMACVecInclude =
+                    arma::vec(ov.cateVarRatioMaxMACVecInclude);
+                std::cout << "  [" << modelSpecs[0].traitName
+                          << "] cateVarRatioMaxMACVecInclude overridden per model."
+                          << std::endl;
+            }
         }
 
         // ---- Set isCondition from YAML condition markers ----

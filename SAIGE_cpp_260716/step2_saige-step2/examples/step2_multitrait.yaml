@@ -1,0 +1,49 @@
+# Multi-trait single-variant testing — config template.
+#
+# The `models:` sequence replaces the scalar modelFile / varianceRatioFile /
+# outputFile trio. The two forms are MUTUALLY EXCLUSIVE: writing both is an
+# error, never a silent preference for one.
+#
+# One entry == one trait == one output file, with exactly the columns and
+# header a single-trait run of that model would produce. Row sets are identical
+# across the files (QC is per marker and shared), so the files line up row for
+# row without any alignment step.
+#
+# A one-entry `models:` is just a single-trait run: it takes the same code path
+# and produces byte-identical output to the scalar form.
+
+genoType:   plink
+plinkFile:  /path/to/geno_prefix
+
+models:
+  - traitName: y1                                    # optional; defaults to the model dir name
+    modelFile:         /path/to/step1_y1_out_dir     # dir with *.arma + nullmodel.json
+    varianceRatioFile: /path/to/step1_y1.varianceRatio.txt
+    outputFile:        /path/to/single_out.y1.txt
+  - traitName: y2
+    modelFile:         /path/to/step1_y2_out_dir
+    varianceRatioFile: /path/to/step1_y2.varianceRatio.txt
+    outputFile:        /path/to/single_out.y2.txt
+    # These five keys may be written at the top level (all traits) or inside one
+    # model (that trait only, beating the top-level value):
+    #   is_Firth_beta, pCutoffforFirth, isnoadjCov,
+    #   cateVarRatioMinMACVecExclude, cateVarRatioMaxMACVecInclude
+    is_Firth_beta: true
+    pCutoffforFirth: 0.05
+
+# Everything below is per run, shared by every trait.
+minMAF: 0
+minMAC: 0.5
+maxMissRate: 0.15
+AlleleOrder: alt-first
+isMoreOutput: true
+isFirth: true
+MACCutoffforER: 4
+nThreads: 16
+
+# Constraints (see MULTITRAIT_DESIGN.md section 4.3):
+#   - all models must share the same sample IDs, in the same order
+#   - all models must agree on impute_method
+#   - covariate count p may differ per trait; trait types may be mixed
+#   - LOCO: `chrom` is global; each trait reads its own <modelDir>/chr<N>/
+#   - region / gene-based testing with P > 1 is not supported
