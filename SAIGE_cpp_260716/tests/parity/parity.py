@@ -63,6 +63,36 @@ DATASETS = {
     "mid2k": dict(kind="plink", prefix="/opt/saige/data/mid2k"),
     # 50k samples, 40k markers
     "mid":   dict(kind="plink", prefix="/opt/saige/data/mid"),
+    # 50k samples (the SAME individuals as mid), 3000 markers with a WES-like
+    # rare spectrum: 600 with MAC<=4, 1500 with MAC<=10, 2100 with MAC<=20.
+    # Built by tests/parity/make_rare.py.  `mid` is plink2 --dummy with a flat
+    # MAF spectrum and has NOTHING at MAC<=10, so the ultra-rare-collapse and
+    # binary-ER branches are unreachable there.
+    "rare":  dict(kind="plink", prefix="/opt/saige/data/rare"),
+    # `mid` with the .bim ID column rewritten to chr:pos:a2:a1 (bed/fam are
+    # symlinks to mid's).  Needed because R resolves group-file variants for
+    # PLINK only through the .bim ID column while the C++ resolves them only
+    # through chr:pos:ref:alt -- with mid's own snp<N> IDs no single group
+    # file can feed both sides.  See case region_mid_rsid.
+    "midids": dict(kind="plink", prefix="/opt/saige/data/midids"),
+}
+
+# group files (region tests).  Marker IDs are spelled chr:pos:a1:a2 so that
+# R (merge on markerInfo$ID / $ID2) and C++ (chr:pos:ref:alt map, either allele
+# order) resolve the same variants.
+GROUPS = {
+    # 100 genes x 400 markers off `mid`, single annotation "lof"
+    "mid400":  "/opt/saige/logs/step2/mid_group_400.txt",
+    # 30 genes x 100 markers off `rare`, annotations cycling
+    # lof / missense / synonymous
+    "rare100": "/opt/saige/data/rare.group.txt",
+    # same genes plus a per-marker `weight` line (3 lines per gene): both
+    # sides then bypass Beta(MAF,a,b) and use the supplied weights
+    "rare100w": "/opt/saige/data/rare.groupw.txt",
+    # the mid400 genes with every variant renamed to the .bim ID column
+    # (snp<pos>) instead of chr:pos:a1:a2 -- the two sides resolve group-file
+    # variant IDs differently for PLINK input, see region_mid_rsid
+    "mid400rsid": "/opt/saige/data/mid_group_400_rsid.txt",
 }
 
 MODELS = {
@@ -74,6 +104,14 @@ MODELS = {
         rda="/opt/saige/logs/mp/single_y4.rda",
         arma="/opt/saige/logs/step2/null_y4_arma",
         vr="/opt/saige/logs/mp/single_y4.varianceRatio.txt"),
+    # quantitative counterpart: step-1 fit on mid + mid.q8.pheno.txt column q1,
+    # non-LOCO, single VR, n=50000 p=3 theta=[1.00222361, 0.03788873].
+    # `arma` produced from `rda` by tools/rda_to_arma.R -- same fit.
+    "q1_quant": dict(
+        trait="quantitative",
+        rda="/opt/saige/logs/step2mt/models_q8/q1.rda",
+        arma="/opt/saige/logs/step2/null_q1_arma",
+        vr="/opt/saige/logs/step2mt/models_q8/q1.varianceRatio.txt"),
 }
 
 # ---------------------------------------------------------------------------
@@ -107,14 +145,13 @@ BASE = dict(
 )
 
 REGION_BASE = dict(
-    r_corr=0.0,
     maxMAF_in_groupTest=[0.0001, 0.001, 0.01],
     MACCutoff_to_CollapseUltraRare=10.0,
     markers_per_chunk_in_groupTest=100,   # R default; cpp default is 500
     groups_per_chunk=100,
     is_single_in_groupTest=True,          # forced TRUE anyway when r_corr=0
     is_output_markerList_in_groupTest=False,
-    **{"weights.beta": [1, 25]},
+    **{"weights.beta": [1, 25], "r.corr": 0.0},
 )
 
 CASES = {
@@ -151,6 +188,116 @@ CASES = {
     "binary_single_bestguess": dict(
         desc="impute_method=best_guess on both sides (R's own default)",
         data="mid2k", model="y4_binary", set=dict(impute_method="best_guess")),
+
+    # ---------------- region / gene-based ---------------------------------
+    # `rare` is the primary region dataset: it is the only one that reaches the
+    # ultra-rare collapse and (binary) ER branches.
+    "region_binary_skato": dict(
+        desc="binary SKAT-O (r.corr=0) on the rare set, 3 masks x 3 maxMAF "
+             "cutoffs -- the documented default region configuration",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof", "missense;lof",
+                                          "missense;lof;synonymous"])),
+    "region_binary_burden": dict(
+        desc="binary burden-only (r.corr=1), same masks",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof", "missense;lof",
+                                          "missense;lof;synonymous"],
+                 **{"r.corr": 1.0})),
+    "region_binary_nocollapse": dict(
+        desc="collapse cutoff 0 -- ultra-rare collapsing OFF, isolates the "
+             "collapse branch's contribution to any residual difference",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"], MACCutoff_to_CollapseUltraRare=0.0,
+                 annotation_in_groupTest=["lof"])),
+    "region_binary_collapse20": dict(
+        desc="collapse cutoff 20 -- twice the default, moves the rare/ultra-rare "
+             "split across ~600 more markers",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"], MACCutoff_to_CollapseUltraRare=20.0,
+                 annotation_in_groupTest=["lof"])),
+    "region_binary_flatweights": dict(
+        desc="weights.beta=1,1 (flat) instead of Beta(MAF,1,25)",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof"],
+                 **{"weights.beta": [1, 1]}),),
+    "region_binary_chunk500": dict(
+        desc="markers_per_chunk_in_groupTest=500 on both sides (cpp's own "
+             "default) -- a pure summation-blocking change",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof"],
+                 markers_per_chunk_in_groupTest=500)),
+    "region_binary_markerlist": dict(
+        desc="is_output_markerList_in_groupTest -- the per-mask marker list",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof"],
+                 is_output_markerList_in_groupTest=True)),
+    "region_binary_nosingle": dict(
+        desc="burden-only with is_single_in_groupTest=FALSE (R's default). "
+             "Only reachable at r.corr=1: both sides force TRUE at r.corr=0.",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof"],
+                 is_single_in_groupTest=False, **{"r.corr": 1.0})),
+    "region_binary_mid": dict(
+        desc="binary SKAT-O on the COMMON-variant set (mid, 100 genes x 400 "
+             "markers) -- no marker is ultra-rare there, so this is the "
+             "collapse-free regime",
+        data="midids", model="y4_binary",
+        set=dict(groupFile=GROUPS["mid400"],
+                 annotation_in_groupTest=["lof"],
+                 maxMAF_in_groupTest=[0.001, 0.01])),
+    "region_quant_skato": dict(
+        desc="quantitative SKAT-O on the rare set (no SPA, no ER; Gaussian "
+             "score test all the way through)",
+        data="rare", model="q1_quant",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof", "missense;lof",
+                                          "missense;lof;synonymous"])),
+    "region_quant_burden": dict(
+        desc="quantitative burden-only (r.corr=1)",
+        data="rare", model="q1_quant",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof", "missense;lof",
+                                          "missense;lof;synonymous"],
+                 **{"r.corr": 1.0})),
+    "region_binary_weightsfile": dict(
+        desc="group file WITH a per-marker weight line (3 lines/gene) -- the "
+             "supplied weights replace Beta(MAF,1,25)",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100w"],
+                 annotation_in_groupTest=["lof"])),
+    "region_binary_mingroupmac": dict(
+        desc="burden-only with minGroupMAC_in_BurdenTest=50 -- drops the "
+             "burden pseudo-marker for masks whose total MAC is below it "
+             "(the 1e-4 masks here sit around MAC 40-60, so the branch "
+             "actually fires for some genes and not others)",
+        data="rare", model="y4_binary",
+        set=dict(groupFile=GROUPS["rare100"],
+                 annotation_in_groupTest=["lof"],
+                 minGroupMAC_in_BurdenTest=50.0, **{"r.corr": 1.0})),
+    "region_mid_rsid": dict(
+        desc="same genes as region_binary_mid but the group file spells every "
+             "variant as the .bim ID (snp<pos>). MEASURED: R resolves group "
+             "variants for PLINK only through markerInfo$ID = bim column 2 "
+             "(Geno.R:182-196, no ID2 for plink), while the C++ resolves them "
+             "only through chr:pos:ref:alt (genotype_reader.hpp:283). So the "
+             "SAME group file cannot work on both sides.",
+        data="mid", model="y4_binary",
+        set=dict(groupFile=GROUPS["mid400rsid"],
+                 annotation_in_groupTest=["lof"],
+                 maxMAF_in_groupTest=[0.001, 0.01])),
+    "region_quant_mid": dict(
+        desc="quantitative SKAT-O on the common-variant set",
+        data="midids", model="q1_quant",
+        set=dict(groupFile=GROUPS["mid400"],
+                 annotation_in_groupTest=["lof"],
+                 maxMAF_in_groupTest=[0.001, 0.01])),
 }
 
 BOOLS = {True: "TRUE", False: "FALSE"}

@@ -90,8 +90,24 @@ def compare(r_path, c_path, rtol=1e-6, atol=0.0):
         return rep
     rep["key"] = key
 
+    def canon(v):
+        """Canonicalise a key field so that R's 1e-04 and cpp's 0.0001 join.
+
+        The two writers format the numeric key column max_MAF differently
+        (R: %g-style 1e-04, cpp: 0.0001).  Comparing those as strings splits
+        every 1e-4 row into "only in R" + "only in cpp" and hides the real
+        column-wise diff behind a ROW_SET_MISMATCH.  It is still a genuine
+        (cosmetic) output difference, so it is reported separately as
+        key_format_differs rather than silently dropped.
+        """
+        s = v.strip()
+        try:
+            return repr(float(s))
+        except ValueError:
+            return s
+
     def mk(cols, n):
-        return ["\t".join(cols[k][i] for k in key) for i in range(n)]
+        return ["\t".join(canon(cols[k][i]) for k in key) for i in range(n)]
 
     rkeys, ckeys = mk(rc, rn), mk(cc, cn)
     rindex = {k: i for i, k in enumerate(rkeys)}
@@ -107,6 +123,19 @@ def compare(r_path, c_path, rtol=1e-6, atol=0.0):
     rep["rows_only_in_cpp"] = rep["rows_only_in_cpp"][:20]
     if len(set(rkeys)) != rn or len(set(ckeys)) != cn:
         rep["warn_duplicate_keys"] = True
+
+    # cosmetic check: do the two sides SPELL the key columns the same way?
+    fmt = []
+    for k in key:
+        rv = set(v.strip() for v in rc[k])
+        cv = set(v.strip() for v in cc[k])
+        if rv != cv:
+            ex_r = sorted(rv - cv)[:3]
+            ex_c = sorted(cv - rv)[:3]
+            fmt.append({"column": k, "only_in_r_spelling": ex_r,
+                        "only_in_cpp_spelling": ex_c})
+    if fmt:
+        rep["key_format_differs"] = fmt
 
     ri = np.array([rindex[k] for k in common], dtype=int)
     ci = np.array([cindex[k] for k in common], dtype=int)
@@ -124,9 +153,20 @@ def compare(r_path, c_path, rtol=1e-6, atol=0.0):
             entry["type"] = "numeric"
             both_nan = np.isnan(ra) & np.isnan(ca)
             one_nan = np.isnan(ra) ^ np.isnan(ca)
-            m = ~(np.isnan(ra) | np.isnan(ca))
-            entry["n_nan_mismatch"] = int(one_nan.sum())
+            # +/-Inf on one side only: |inf - x| is inf and inf/inf is nan, so
+            # the relative test below silently passes such a pair.  Count them
+            # explicitly (R writes Inf for SE_Burden when the burden p is 1).
+            rinf, cinf = np.isinf(ra), np.isinf(ca)
+            one_inf = (rinf ^ cinf) | (rinf & cinf & (np.sign(ra) != np.sign(ca)))
+            m = ~(np.isnan(ra) | np.isnan(ca) | rinf | cinf)
+            entry["n_nan_mismatch"] = int(one_nan.sum()) + int(one_inf.sum())
+            entry["n_inf_mismatch"] = int(one_inf.sum())
             entry["n_both_nan"] = int(both_nan.sum())
+            if one_inf.any():
+                j = int(np.flatnonzero(one_inf)[0])
+                entry["inf_row"] = common[j]
+                entry["inf_r"] = float(ra[j])
+                entry["inf_cpp"] = float(ca[j])
             if m.sum():
                 d = np.abs(ra[m] - ca[m])
                 den = np.maximum(np.abs(ra[m]), np.abs(ca[m]))
@@ -187,6 +227,11 @@ def print_report(rep):
     print("key : %s   common rows: %d   only-in-R: %d   only-in-cpp: %d"
           % ("+".join(rep["key"]), rep["rows_common"],
              rep["n_only_in_r"], rep["n_only_in_cpp"]))
+    for f in rep.get("key_format_differs", []):
+        print("NOTE: key column %s is spelled differently by the two writers "
+              "(R: %s ... / cpp: %s ...) -- joined numerically"
+              % (f["column"], ",".join(f["only_in_r_spelling"]),
+                 ",".join(f["only_in_cpp_spelling"])))
     if rep["header_only_in_r"]:
         print("columns only in R  : %s" % ", ".join(rep["header_only_in_r"]))
     if rep["header_only_in_cpp"]:
@@ -207,6 +252,10 @@ def print_report(rep):
             ("%.3e" % c["max_abs"]) if "max_abs" in c else "-",
             ("%.3e" % c["max_rel"]) if "max_rel" in c else "-",
             ("%.2e" % c["max_abs_log10_p"]) if "max_abs_log10_p" in c else "-"))
+        if c.get("n_inf_mismatch"):
+            print("     INF/FINITE mismatch on %d row(s), e.g. %s  R=%s  cpp=%s"
+                  % (c["n_inf_mismatch"], c.get("inf_row"), c.get("inf_r"),
+                     c.get("inf_cpp")))
         if star == "*" and "worst_row" in c:
             print("     worst: %s  R=%s  cpp=%s"
                   % (c["worst_row"], c["worst_r"], c["worst_cpp"]))
