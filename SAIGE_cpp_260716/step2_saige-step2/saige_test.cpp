@@ -940,7 +940,38 @@ if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
 
   t_isSPAConverge = false;
 
-  double q, qinv, m1, NAmu, NAsigma, tol1, p_iIndexComVecSize;
+  double q, qinv;
+
+  // ---------------------------------------------------------------------
+  // Shared SPA inputs.
+  //
+  // These are consumed by TWO blocks: the unconditional SPA below, and the
+  // conditional SPA further down (`if (t_isCondition)`).  R declares them the
+  // same way (SAIGE_test.cpp:525,534-537) and fills them ONLY inside the
+  // unconditional block, then reads them unconditionally from the conditional
+  // one -- so R reads uninitialised stack whenever a marker reaches the
+  // conditional SPA without having gone through the unconditional SPA first.
+  // Two ways in, both observed on real data:
+  //   (a) |StdStat| <= SPAcutoff < |StdStat_c|  (snp1819: 1.99621 vs 2.00515)
+  //   (b) the marker took the ER branch, which skips the whole non-ER block,
+  //       while stat_c still exceeds cutoff^2 (1:1271, 1:2588, MAC=4)
+  // The consequences are not rounding-level: chr1:3275000 came out
+  // 1.371413E-95 in R against 4.384698E-02 here, and chr1:3550000
+  // 1.913526E-01 against 9.862770E-284.  Both sides were byte-reproducible
+  // run to run and disagreed with each other, which is the signature of UB,
+  // not of numerical drift.  Decisive check: lowering SPAcutoff to 1.9 so the
+  // unconditional block runs first and fills these variables made snp1819's
+  // SE_c / p.value_c agree exactly.
+  //
+  // Fix: compute them in one place, on demand, from quantities that are final
+  // by this point (m_mu, t_gtilde, t_var2, iIndex/iIndexComVec).  Every
+  // expression below is copied verbatim from the unconditional block, so a
+  // marker that DOES take that block sees bit-identical values and its output
+  // cannot move; the only behaviour change is for markers that previously read
+  // garbage.
+  // ---------------------------------------------------------------------
+  double m1 = 0.0, NAmu = 0.0, NAsigma = 0.0, tol1 = 0.0;
+  double p_iIndexComVecSize = 0.0;
 
 
   unsigned int iIndexComVecSize = iIndexComVec.n_elem;
@@ -950,8 +981,31 @@ if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
   arma::vec muNB(iIndexSize, arma::fill::none);
   arma::vec muNA(iIndexComVecSize, arma::fill::none);
 
-
-  double gmuNB;
+  bool spa_inputs_ready = false;
+  auto prepare_spa_inputs = [&]() {
+      if (spa_inputs_ready) return;
+      if (!is_gtilde) {
+          t_gtilde.resize(m_n);
+          getadjGFast(t_GVec, t_gtilde, iIndex);
+          is_gtilde = true;
+      }
+      p_iIndexComVecSize = double(iIndexComVecSize) / m_n;
+      m1 = dot(m_mu, t_gtilde);
+      if (p_iIndexComVecSize >= 0.5) {
+          gNB  = t_gtilde(iIndex);
+          gNA  = t_gtilde(iIndexComVec);
+          muNB = m_mu(iIndex);
+          muNA = m_mu(iIndexComVec);
+          NAmu = m1 - dot(gNB, muNB);
+          if (m_traitType == "binary") {
+              NAsigma = t_var2 - arma::sum(muNB % (1 - muNB) % arma::pow(gNB, 2));
+          } else if (m_traitType == "survival") {
+              NAsigma = t_var2 - arma::sum(muNB % arma::pow(gNB, 2));
+          }
+      }
+      tol1 = std::pow(std::numeric_limits<double>::epsilon(), 0.25);
+      spa_inputs_ready = true;
+  };
 
 
 if((StdStat > m_SPA_Cutoff || std::isnan(StdStat)) && m_traitType != "quantitative" && t_isER){
@@ -966,25 +1020,9 @@ if(!t_isER){
 
   if(!std::isnan(StdStat) && (StdStat > m_SPA_Cutoff) && m_traitType != "quantitative"){
 
-       if(!is_gtilde){
-          t_gtilde.resize(m_n);
-          getadjGFast(t_GVec, t_gtilde, iIndex);
-	  is_gtilde = true;
-       }
-        p_iIndexComVecSize = double(iIndexComVecSize)/m_n;
-   	m1 = dot(m_mu, t_gtilde);
-
-	if(p_iIndexComVecSize >= 0.5){
-
-	gNB = t_gtilde(iIndex);
-	gNA = t_gtilde(iIndexComVec);
-   	muNB = m_mu(iIndex);
-   	muNA = m_mu(iIndexComVec);
-
-  	gmuNB = dot(gNB,muNB);
-   	NAmu= m1-gmuNB;
-
-   }
+        // gtilde, p_iIndexComVecSize, m1, gNA/gNB/muNA/muNB, NAmu, NAsigma,
+        // tol1 -- one definition, shared with the conditional SPA block below.
+        prepare_spa_inputs();
 
    	if(m_traitType == "binary"){
                 q = t_Tstat/sqrt(t_var1/t_var2) + m1;
@@ -996,18 +1034,13 @@ if(!t_isER){
                 }else{
                         qinv = std::abs(q-m1) + m1;
                 }
-		if(p_iIndexComVecSize >= 0.5){
-           		NAsigma = t_var2 - arma::sum(muNB % (1-muNB) % arma::pow(gNB,2));
-		}
         }else if(m_traitType == "survival"){
                 q = t_Tstat/sqrt(t_var1/t_var2);
                 qinv = -q;
-  		if(p_iIndexComVecSize >= 0.5){
-           		NAsigma = t_var2 - arma::sum(muNB % arma::pow(gNB,2));
-		}
   }
-	double tol0 = std::numeric_limits<double>::epsilon();
-	tol1 = std::pow(tol0, 0.25);
+	// NAsigma and tol1 used to be recomputed here with exactly the same
+	// expressions prepare_spa_inputs() now uses; the duplicates are gone, not
+	// the arithmetic.
 	if(p_iIndexComVecSize >= 0.5 && !ctx.flagSparseGRM_cur){
         	SPA_fast(m_mu, t_gtilde, q, qinv, pval_noadj, ispvallog, gNA, gNB, muNA, muNB, NAmu, NAsigma, tol1, m_traitType, t_SPApval, t_isSPAConverge);
 
@@ -1234,6 +1267,13 @@ if(!t_isER){
 
     bool t_isSPAConverge_c;
     if(m_traitType != "quantitative" && stat_c > std::pow(m_SPA_Cutoff,2)){
+	// The unconditional SPA block above may never have run for this marker
+	// (|StdStat| below cutoff, or the marker took the ER branch), in which
+	// case m1 / p_iIndexComVecSize / tol1 / gNA / gNB / muNA / muNB / NAmu /
+	// NAsigma are still at their initial values.  R reads them uninitialised
+	// here; we compute them.  If the block above DID run, this is a no-op.
+	prepare_spa_inputs();
+
 	double q_c, qinv_c, pval_noadj_c, SPApval_c;
 	if(m_traitType == "binary"){
                 q_c = t_Tstat_c/sqrt(t_varT_c/t_var2) + m1;
@@ -1246,6 +1286,12 @@ if(!t_isER){
                 }
         }else if(m_traitType == "survival"){
                 q_c = t_Tstat_c/sqrt(t_varT_c/t_var2);
+                // NOTE: assigns qinv, not qinv_c -- so the SPA call below gets an
+                // uninitialised qinv_c on the survival+conditional path.  R has
+                // the identical typo (SAIGE-upstream/src/SAIGE_test.cpp:854) and
+                // survival is explicitly out of scope for this port
+                // (spa.hpp:7), so it is left byte-compatible with R rather than
+                // silently diverging.  Fix both together if survival is ported.
                 qinv = -q_c;
         }
 
