@@ -88,10 +88,27 @@ make clean && make -j8
    **`SAIGE_GENE_STATUS.md` §3** for the threading/memory tradeoffs.
 
 ## Reference / provenance
-- R comparison reference: **SAIGE 1.3.0** (Docker `wzhou88/saige:1.3.0`) with
-  `--impute_method=mean`. Do NOT use 1.5.x as reference — it has an AF>0.5
-  score-variance regression (`scoreTestFast_noadjCov` centers on `2·altFreq`,
-  inconsistent with the flip; cpp is correct). 1.1.3/1.3.0 agree with cpp to r≈1.0.
+- **R comparison reference: SAIGE 1.5.2**, run with `--impute_method=mean`.
+  (This supersedes the earlier "use 1.3.0, do NOT use 1.5.x" note. That note was
+  written around a single real defect and over-generalised from it; the defect
+  itself is unchanged and is recorded below.)
+- **Documented exception — `is_noadjCov=TRUE` with AF > 0.5.** R 1.5.x's
+  `scoreTestFast_noadjCov` centres on `2·altFreq` while the genotype has already
+  been flipped to `2−g` (`SAIGE-upstream/src/UTIL.cpp:75-122` flips, then flips
+  `altFreq` back), so the two are inconsistent. Under a flip-invariance test
+  50/50 markers violate invariance with `is_noadjCov=TRUE` and 0/50 with
+  `FALSE`; the score variance is inflated by up to 35× (MAF 0.05) and p-values
+  are up to 10.5 orders of magnitude too conservative. The defect entered
+  upstream at commit `ff650722` (2025-06-20), first shipped in 1.4.7/1.4.9;
+  1.1.3 and 1.3.0 do not have the option at all. This port reproduces R's
+  arithmetic **exactly** when the flag is set (bit-identical over 2000 markers)
+  but **defaults it off** (`tools/rda_to_arma.R:93` writes `isnoadjCov: false`),
+  where R's CLI defaults it on. Do not compare the two sides with this flag
+  enabled and do not enable it in production. Full argument in
+  [`R_PARITY.md`](R_PARITY.md).
+- **Every other known cpp↔R difference**, with its classification (cpp bug /
+  R bug / acceptable), evidence and magnitude, is catalogued in
+  [`R_PARITY.md`](R_PARITY.md).
 - Validated state: Step-1 nulls match R (LDL tau ~5 dp; T2D tau within MC noise);
   Step-2 single-variant bit-exact cpp↔R (incl. WES ultra-rare, r=1.00000);
   SAIGE-GENE+ region matches R for LDL(LDLR) + T2D(TCF7L2).
