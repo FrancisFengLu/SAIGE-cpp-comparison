@@ -6,6 +6,7 @@
 #include <armadillo>
 
 #include "saige_test.hpp"
+#include "score_format.hpp"
 #include "spa.hpp"
 #include "er_binary.hpp"
 #include "UTIL.hpp"
@@ -26,30 +27,9 @@ std::atomic<std::uint64_t> g_firthFitCalls{0};
 
 namespace SAIGE {
 
-// P1 fix (2026-05-09): direct log P(X > stat) for chi-square(df=1) without
-// underflow. The previous code computed log(boost::math::cdf(...)) which
-// underflows to -inf when the cdf itself underflows below ~1e-300 (i.e. at
-// genuinely significant markers). This matches R's pchisq(q, 1, lower.tail=FALSE,
-// log.p=TRUE).
-//
-// chi-square(df=1) upper tail: P(X > stat) = erfc(sqrt(stat/2))
-// Boost provides erfc; for very large argument it underflows too, so use
-// the asymptotic expansion log(erfc(z)) ≈ -z² - log(z) - 0.5*log(π) for z > 6.
-static inline double log_chisq1_uppertail(double stat) {
-    if (!std::isfinite(stat) || stat <= 0.0) return 0.0;  // log(p=1) = 0
-    const double z = std::sqrt(stat / 2.0);
-    if (z > 6.0) {
-        // first-order asymptotic for erfc(z), accurate to ~1e-3 already at z=4
-        // and machine precision at z=10+.
-        return -z * z - std::log(z) - 0.5 * std::log(boost::math::constants::pi<double>());
-    }
-    const double e = boost::math::erfc(z);
-    if (e <= 0.0 || !std::isfinite(e)) {
-        // fallback: same asymptotic if boost's erfc itself returned 0
-        return -z * z - std::log(z) - 0.5 * std::log(boost::math::constants::pi<double>());
-    }
-    return std::log(e);
-}
+// log_chisq1_uppertail moved verbatim to score_format.hpp (2026-09-13) so the
+// multi-trait batch kernel can share it. Same namespace (SAIGE), same body;
+// only `static inline` -> `inline`.
 
 // Fused-kernel mode + A/B validation accumulators (Pillar 1). See saige_test.hpp.
 int    g_fusedMode        = 0;
@@ -243,45 +223,10 @@ void SAIGEClass::scoreTest(arma::vec & t_GVec,
     var2 = var2m(0,0);
     double var1 = var2 * ctx.varRatioVal;
 
-    double stat = S*S/var1;
-    if (var1 <= std::numeric_limits<double>::min()){
-          t_pval = 1;
-    }else{
-      if(!std::isnan(stat) && std::isfinite(stat)){
-          boost::math::chi_squared chisq_dist(1);
-          t_pval = boost::math::cdf(complement(chisq_dist, stat));
-      }else{
-          t_pval = 1;
-	  stat = 0.0;
-      }
-    }
-    char pValueBuf[100];
-
-    if (t_pval != 0){
-        sprintf(pValueBuf, "%.6E", t_pval);
-	t_islogp = false;
-    }else{
-        // R::pchisq(stat,1,false,true) = log(P(X > stat)) for chi-squared(1)
-        // P1 fix: direct log(upper-tail) avoiding cdf underflow at p<1e-300
-        double logp = log_chisq1_uppertail(stat);
-        double log10p = logp/(log(10));
-        int exponent = floor(log10p);
-        double fraction = pow(10.0, log10p - exponent);
-        if (fraction >= 9.95) {
-          fraction = 1;
-           exponent++;
-        }
-        sprintf(pValueBuf, "%.1fE%d", fraction, exponent);
-	t_pval = logp;
-	t_islogp = true;
-    }
-    std::string buffAsStdStr = pValueBuf;
-    t_pval_str = buffAsStdStr;
-    t_Beta = S/var1;
-    t_seBeta = fabs(t_Beta) / sqrt(fabs(stat));
-    t_Tstat = S;
-    t_var1 = var1;
-    t_var2 = var2;
+    // Extracted verbatim into format_score_result (score_format.hpp), shared
+    // with scoreTestFast / scoreTestFast_noadjCov and the multi-trait kernel.
+    format_score_result(S, var1, var2, t_Beta, t_seBeta, t_pval_str, t_pval,
+                        t_islogp, t_Tstat, t_var1, t_var2);
 }
 
 
@@ -380,44 +325,9 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
     S = S1 + S2;
     S = S/m_tauvec[0];
 
-    double stat = S*S/var1;
-    if (var1 <= std::numeric_limits<double>::min()){
-          t_pval = 1;
-    }else{
-      if(!std::isnan(stat) && std::isfinite(stat)){
-          boost::math::chi_squared chisq_dist(1);
-          t_pval = boost::math::cdf(complement(chisq_dist, stat));
-
-      }else{
-          t_pval = 1;
-	  stat = 0.0;
-      }
-    }
-    char pValueBuf[100];
-    if (t_pval != 0){
-        sprintf(pValueBuf, "%.6E", t_pval);
-	t_islogp = false;
-    }else {
-        // P1 fix: direct log(upper-tail) avoiding cdf underflow at p<1e-300
-	double logp = log_chisq1_uppertail(stat);
-        double log10p = logp/(log(10));
-        int exponent = floor(log10p);
-        double fraction = pow(10.0, log10p - exponent);
-        if (fraction >= 9.95) {
-          fraction = 1;
-           exponent++;
-         }
-        sprintf(pValueBuf, "%.1fE%d", fraction, exponent);
-	t_pval = logp;
-	t_islogp = true;
-    }
-    std::string buffAsStdStr = pValueBuf;
-    t_pval_str = buffAsStdStr;
-    t_Beta = S/var1;
-    t_seBeta = fabs(t_Beta) / sqrt(fabs(stat));
-    t_Tstat = S;
-    t_var1 = var1;
-    t_var2 = var2;
+    // Extracted verbatim into format_score_result (score_format.hpp).
+    format_score_result(S, var1, var2, t_Beta, t_seBeta, t_pval_str, t_pval,
+                        t_islogp, t_Tstat, t_var1, t_var2);
 }
 
 
@@ -467,44 +377,10 @@ void SAIGEClass::scoreTestFast_noadjCov(arma::vec & t_GVec,
     S = S/m_tauvec[0];
 
     double var1 = var2 * ctx.varRatioVal;
-    double stat = S*S/var1;
-    if (var1 <= std::numeric_limits<double>::min()){
-          t_pval = 1;
-    }else{
-      if(!std::isnan(stat) && std::isfinite(stat)){
-          boost::math::chi_squared chisq_dist(1);
-          t_pval = boost::math::cdf(complement(chisq_dist, stat));
-      }else{
-          t_pval = 1;
-          stat = 0.0;
-      }
-    }
-    char pValueBuf[100];
 
-    if (t_pval != 0){
-        sprintf(pValueBuf, "%.6E", t_pval);
-        t_islogp = false;
-    }else{
-        // P1 fix: direct log(upper-tail) avoiding cdf underflow at p<1e-300
-        double logp = log_chisq1_uppertail(stat);
-        double log10p = logp/(log(10));
-        int exponent = floor(log10p);
-        double fraction = pow(10.0, log10p - exponent);
-        if (fraction >= 9.95) {
-          fraction = 1;
-           exponent++;
-        }
-        sprintf(pValueBuf, "%.1fE%d", fraction, exponent);
-        t_pval = logp;
-        t_islogp = true;
-    }
-    std::string buffAsStdStr = pValueBuf;
-    t_pval_str = buffAsStdStr;
-    t_Beta = S/var1;
-    t_seBeta = fabs(t_Beta) / sqrt(fabs(stat));
-    t_Tstat = S;
-    t_var1 = var1;
-    t_var2 = var2;
+    // Extracted verbatim into format_score_result (score_format.hpp).
+    format_score_result(S, var1, var2, t_Beta, t_seBeta, t_pval_str, t_pval,
+                        t_islogp, t_Tstat, t_var1, t_var2);
 }
 
 
