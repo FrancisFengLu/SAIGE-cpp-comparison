@@ -44,6 +44,7 @@ uncertainty stated.
 | A7 | single-variant + region, `--condition` | shared SPA inputs read uninitialised (inherited from R) | p 1.37e-95 vs 4.38e-02 | **(b)** in R, **(a)** as inherited | fixed — `saige_test.cpp` |
 | A8 | all outputs | non-finite doubles spelled `inf`/`nan`, not `Inf`/`NaN` | cells silently lost by `read.table` | **(a)** | fixed — `UTIL.*`, `main.cpp` |
 | A9 | region, PLINK group file | variant IDs resolved through disjoint key spaces; both sides fail silently | row sets completely disjoint | interface split | fixed — C++ now accepts both |
+| A10 | VCF | `vcfField` defaulted to `GT`; R defaults to `DS` | `MissingRate` 0.80 vs 0.01 on the same file | **(a)** | fixed — `main.cpp` |
 | B1 | single-variant + region, PLINK + `--condition` | R misreads the marker at genoIndex 0 | that marker's whole row is another marker's data | **(b)** | C++ keeps the absolute seek |
 | B2 | region, non-default `weights.beta` | R applies it in some places and not others | `BETA_Burden` off by 24–31×, p by up to 0.76 rel | **(b)** | C++ applies it everywhere |
 | B3 | binary ER, `max_MAC_for_ER ≥ 11` | 32-bit factorial overflow → integer division by zero → SIGFPE | R process dies | **(b)** | C++ uses a saturating `C(n,r)` |
@@ -205,8 +206,12 @@ files today.
 
 ### A7 · Conditional SPA read uninitialised variables (R's defect, inherited)
 
-See §3 B-list entry A7 below for the R-side argument; the fix is here because the
-port had copied the structure verbatim.
+Listed under (a) even though the root defect is R's, because the port copied the
+structure verbatim and so had the identical bug. R's side is
+`SAIGE-upstream/src/SAIGE_test.cpp` — `:525,534-537` declare the variables,
+`:555-647` is the only place that fills them, and `:840-860` reads them
+unconditionally. Nothing about R's version is fixable from here, so what follows
+is about this port; the same argument condemns R's.
 
 `m1`, `p_iIndexComVecSize`, `tol1` and the `gNA / gNB / muNA / muNB / NAmu /
 NAsigma` set are consumed by two blocks — the unconditional SPA and the
@@ -307,6 +312,29 @@ Verified: `region_mid_rsid` went from completely disjoint row sets to IDENTICAL
 
 **Not changed:** the BGEN and VCF marker maps are still coordinate-only. The
 region × bgen/vcf path was not compared this round.
+
+### A10 · `vcfField` defaulted to `GT` where R defaults to `DS`
+
+R defaults `vcfField` to `"DS"` — `extdata/step2_SPAtests.R:18` for the CLI,
+`R/SAIGE_Test_main.R:68` and `R/Geno.R:26,133` for the function. This port
+defaulted to `"GT"`.
+
+Not cosmetic: on a `plink2 --export vcf vcf-dosage=DS` file the same records
+read two entirely different ways — `MissingRate` 0.80 under GT against 0.01
+under DS — because plink2 writes the hard call as `./.` wherever the dosage is
+not near-integer. A config that omitted the key analysed a different set of
+genotypes than R would, silently.
+
+This one is worth noting as a methodological point: it never appeared as a
+*measured* difference, because every parity case pinned `vcfField` explicitly on
+both sides. It was hiding in the defaults, and only a source-level comparison
+found it. The same is true of A5.
+
+R additionally rejects anything other than `DS` or `GT` (`Geno.R:111-112`),
+where this port passed the string through to the reader, which would only warn
+that the field was absent and then return all-missing. Both behaviours now
+match. The existing header check and `DS → HDS` fallback
+(`genotype_reader.cpp:1017-1032`) are unchanged.
 
 ---
 
@@ -629,7 +657,39 @@ result does not depend on which thread it landed on
 
 ---
 
-## 5. Input-validation asymmetries (no numerical divergence)
+## 5. Defaults
+
+Three knobs defaulted differently on the two sides. Two were corrected, one was
+deliberately not, and the distinction is worth stating because none of them ever
+showed up as a *measured* difference — every parity case pins these keys
+explicitly on both sides, so they were invisible to the comparison and only a
+source-level reading found them.
+
+| knob | R default | old C++ default | now | why |
+|---|---|---|---|---|
+| `AlleleOrder` (bgen/pgen) | `ref-first`, nothing else accepted | `alt-first` globally | **changed to R's**, and non-`ref-first` refused | the BGEN spec defines the first allele as the reference — `alt-first` is wrong for the format, not merely different (A5) |
+| `vcfField` | `DS` | `GT` | **changed to R's**, non-DS/GT refused | reads a different FORMAT field, so it analyses different genotypes: `MissingRate` 0.80 vs 0.01 on the same file (A10) |
+| `impute_method` | `best_guess` | `mean` | **left as `mean`** | see below |
+
+**Why `impute_method` is treated differently.** `best_guess` and `mean` are both
+legitimate; neither contradicts a format, a spec, or R's own behaviour elsewhere.
+R is not doing anything wrong by defaulting to `best_guess`, so there is no
+correctness argument for a change — only a compatibility one, and changing it
+would silently move the results of every existing user of this tool. It is also
+already an explicit, documented choice here: the README's reference protocol
+specifies `--impute_method=mean`, and `tools/rda_to_arma.R` writes
+`"impute_method": "mean"` into every converted model, so in the normal workflow
+the default is never reached. Recorded as a maintainer decision rather than
+taken unilaterally.
+
+Measured effect of the choice, for whoever makes that decision: on the rare set,
+`mean` vs `best_guess` changes 819 of 3000 single-variant rows (identically on
+both sides), and 11 columns differ with `BETA` moving by up to 1.94 relative.
+The two sides agree exactly under either setting.
+
+---
+
+## 6. Input-validation asymmetries (no numerical divergence)
 
 Configurations R rejects at startup and the C++ runs. These produce no cpp↔R
 numerical difference — R never starts, so there is nothing to compare — but they
@@ -643,11 +703,29 @@ a product decision, not a parity one.
 | `dosage_zerod_MAC_cutoff > 100` | halts | runs (1e6 accepted; snp0's AC moved 69479.4 → 90966 and 5 markers dropped out of the filter) |
 | `SPAcutoff < 0.5` | halts | runs |
 
-`AlleleOrder` used to be on this list; it is now enforced (A5).
+`AlleleOrder` and `vcfField` used to be on this list; both are now enforced
+(A5, A10).
 
 ---
 
-## 6. Coverage — what was compared, and what was not
+## 7. Coverage — what was compared, and what was not
+
+### Suite state at the end of this round
+
+Every registered case re-run against the current build (R 1.5.2 vs C++,
+`nThreads=1`, one shared step-1 fit per model):
+
+| group | cases | IDENTICAL | differing, and why |
+|---|---|---|---|
+| `tests/parity/parity.py` (single + region) | 22 | 17 | 4 burden-only (**C1**, ≤4.9e-6 printing), 1 `region_binary_flatweights` (**B2**) |
+| readers overlay | 38 | 31 | 4 `rd_dos_vcfds_*` + 1 `rd_dosx_vcfds_mean` (**B5**); 2 not comparable by design — `rd_bgen_altfirst` (both sides now refuse, **A5**) and `rd_pgen_mean` (R reads mode 0x10, the C++ refuses, **A6**) |
+| binary overlay incl. LOCO | spot-checked 8 | 8 | — |
+| conditional analysis | 4 | 0 | every differing row accounted for by **B1**, **A7** or **C3**; no unexplained row |
+
+Region `.singleAssoc.txt` output is bit-identical across every region case.
+The four conditional cases are the only place where differing rows remain by
+design, and each row is attributed: the marker at genoIndex 0 (B1), markers on
+R's uninitialised path (A7), and the self-conditioned 0/0 row (C3).
 
 **Compared and IDENTICAL** (R 1.5.2 vs C++, `nThreads=1`, one shared step-1 fit):
 
@@ -724,7 +802,7 @@ a product decision, not a parity one.
 
 ---
 
-## 7. Reproducing
+## 8. Reproducing
 
 ```bash
 source /home/francisfenglu4/miniforge3/etc/profile.d/conda.sh
