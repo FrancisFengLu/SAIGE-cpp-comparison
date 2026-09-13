@@ -1947,9 +1947,17 @@ SKATResult get_SKAT_pvalue(const arma::vec& Score,
         try {
             boost::math::normal norm(0, 1);
             double z = boost::math::quantile(norm, result.pvalue_Burden / 2.0);
-            if (z != 0.0) {
-                result.se_Burden = std::abs(result.beta_Burden / z);
-            }
+            // R (SAIGE_SPATest_Region_Func.R:343,351) computes
+            //     SE_Burden = abs(BETA_Burden / qnorm(p_burden/2))
+            // UNCONDITIONALLY.  At p == 1 exactly, qnorm(0.5) == 0 and R yields
+            // Inf (NaN when BETA_Burden is 0 too).  Skipping the assignment when
+            // z == 0 used to LEAVE THE PREVIOUS VALUE in place; in the SKAT-O
+            // path that stale value came from the chi2(1) burden p computed at
+            // the top of this function, which is NOT the p-value that gets
+            // printed -- a plausible-looking SE with no relation to the reported
+            // Pvalue_Burden.  IEEE division reproduces R's Inf/NaN exactly, so
+            // divide unconditionally.
+            result.se_Burden = std::abs(result.beta_Burden / z);
         } catch (...) {
             result.se_Burden = std::numeric_limits<double>::quiet_NaN();
         }
@@ -2082,9 +2090,9 @@ SKATResult get_SKAT_pvalue(const arma::vec& Score,
             try {
                 boost::math::normal norm(0, 1);
                 double z = boost::math::quantile(norm, result.pvalue_Burden / 2.0);
-                if (z != 0.0) {
-                    result.se_Burden = std::abs(result.beta_Burden / z);
-                }
+                // Same rule as above: unconditional, so the final burden p-value
+                // always owns the SE that is printed next to it.
+                result.se_Burden = std::abs(result.beta_Burden / z);
             } catch (...) {
                 result.se_Burden = std::numeric_limits<double>::quiet_NaN();
             }
