@@ -62,9 +62,9 @@ public:
 	int numMarkersofEachArray;
         int numofGenoArray;
         int numMarkersofLastArray;
-        std::vector< std::vector<unsigned char>* > genoVecofPointers;  // legacy storage, only populated in isVarRatio serial path
+        std::vector< std::vector<unsigned char>* > genoVecofPointers;  // legacy storage, only populated by the serial BED loader (SAIGE_SERIAL_BED=1)
         ///////////
-        std::vector< std::vector<unsigned char>* > genoVecofPointers_forVarRatio;
+        std::vector< std::vector<unsigned char>* > genoVecofPointers_forVarRatio;  // ditto, VR pool
 
         // Option-3 primary storage for pass-QC packed bytes. Populated in the
         // non-VR parallel path (setGenoObj) via std::move from parallel_decode_bed().
@@ -73,6 +73,12 @@ public:
         saige::PackedFlat packed_flat_;
         bool              use_packed_flat_       = false;
         bool              packed_flat_released_  = false;  // G4: host copy freed after GPU upload
+
+        // Same storage trick for the (tiny, ≤1000-marker) variance-ratio pool.
+        // Populated by the parallel BED path; replaces the per-marker
+        // genoVecofPointers_forVarRatio heap vectors the serial path builds.
+        saige::PackedFlat packed_flat_vr_;
+        bool              use_packed_flat_vr_    = false;
 
         // Return the j-th packed byte of the snp-th pass-QC marker, routing
         // between the option-3 flat buffer and the legacy vector-of-pointers.
@@ -92,10 +98,23 @@ public:
           }
           return genoVecofPointers[snp_idx]->at(byte_idx);
         }
+        // Same routing for the variance-ratio pool. Never released to the GPU
+        // (VR estimation is host-side), so no released_ guard is needed.
+        inline unsigned char packed_byte_vr(std::size_t snp_idx, std::size_t byte_idx) const {
+          if (use_packed_flat_vr_) {
+            return packed_flat_vr_.raw()[snp_idx * packed_flat_vr_.nbyte() + byte_idx];
+          }
+          return genoVecofPointers_forVarRatio[snp_idx]->at(byte_idx);
+        }
         inline std::size_t packed_size(std::size_t snp_idx) const {
           if (packed_flat_released_) return packed_flat_.nbyte();  // size is still known, bytes aren't
           if (use_packed_flat_) return packed_flat_.nbyte();
           return genoVecofPointers[snp_idx]->size();
+        }
+        // Number of addressable marker rows in whichever store is live.
+        inline std::size_t packed_n_markers() const {
+          if (use_packed_flat_) return packed_flat_.n_stored();
+          return genoVecofPointers.size();
         }
 
         // Phase-1 AVX2 kernel support: contiguous pointer to the packed bytes
@@ -380,7 +399,7 @@ public:
                 int bufferGeno;
                 for(size_t i=Start_idx; i< Start_idx+m_size_of_esi-1; i++){
                         //geno1 = genoVec[i];
-			geno1 = genoVecofPointers_forVarRatio[indexOfVectorPointer]->at(i); //avoid large continuous memory usage
+			geno1 = packed_byte_vr(indexOfVectorPointer, i);
                         for(int j=0; j<4; j++){
                                 int b = geno1 & 1 ;
                                 geno1 = geno1 >> 1;
@@ -398,7 +417,7 @@ public:
                 }
 
 		size_t i = Start_idx+m_size_of_esi-1;
-		geno1 = genoVecofPointers_forVarRatio[indexOfVectorPointer]->at(i); //avoid large continuous memory usage
+		geno1 = packed_byte_vr(indexOfVectorPointer, i);
                 for(int j=0; j<4; j++){
                                 int b = geno1 & 1 ;
                                 geno1 = geno1 >> 1;
@@ -921,16 +940,27 @@ public:
         	}
 		printf("\nM: %zu, N: %zu\n", M, N);
 
+		// Parallel BED decode is the default for every configuration,
+		// including variance-ratio runs (parallel_decode_bed carries the VR
+		// rule since 2026-09). SAIGE_SERIAL_BED=1 forces the old single-
+		// threaded loop, kept as an A/B reference for numerical comparison.
+		int nthreads_env = 1;
+		if (const char* s = std::getenv("RCPP_PARALLEL_NUM_THREADS"))
+			nthreads_env = std::max(1, std::atoi(s));
+		bool use_parallel_bed = true;
+		if (const char* s = std::getenv("SAIGE_SERIAL_BED"))
+			use_parallel_bed = (std::atoi(s) == 0);
+
 		numMarkersofEachArray = 1;
                         numofGenoArray = M;
 			genoVecofPointers.resize(numofGenoArray);
 			genoVecofPointers_forVarRatio.resize(numofGenoArray);
-                        // In the parallel (non-VR) path we populate packed_flat_ via a
-                        // single std::move from parallel_decode_bed's output. The per-marker
-                        // vectors stay empty stubs (no reserve, no 8.5 GB pre-allocation).
-                        // In the serial VR path we still push bytes into each stub, so they
-                        // grow up to ⌈Nnomissing/4⌉ bytes apiece.
-                        const bool _reserve_each = isVarRatio;
+                        // In the parallel path we populate packed_flat_ (and, for VR runs,
+                        // packed_flat_vr_) via a single std::move from parallel_decode_bed's
+                        // output. The per-marker vectors stay empty stubs (no reserve, no
+                        // 8.5 GB pre-allocation). Only the serial VR fallback pushes bytes
+                        // into each stub, growing them to ⌈Nnomissing/4⌉ bytes apiece.
+                        const bool _reserve_each = isVarRatio && !use_parallel_bed;
                         for (int i = 0; i < numofGenoArray ; i++){
                                 genoVecofPointers[i] = new vector<unsigned char>;
                                 if (_reserve_each) {
@@ -1039,9 +1069,15 @@ public:
 		size_t SNPIdx_vr = 0;
 
 		// =====================================================================
-		// PR-5: parallel BED decode path.
-		// Activated when isVarRatio==false (VR marker pool uses a different
-		// selection logic that's not plumbed into parallel_decode_bed yet).
+		// PR-5: parallel BED decode path — now the default for every run.
+		//
+		// It used to be gated on isVarRatio==false, because the VR marker pool
+		// (mac threshold + random draw, and the resulting GRM/VR exclusion) was
+		// only implemented in the serial Get_OneSNP_Geno_atBeginning. That rule
+		// now lives in marker_decoder.cpp (VarRatioRule), so the parallel path
+		// produces both stores and the gate is gone. SAIGE_SERIAL_BED=1 brings
+		// the serial loop back for A/B comparison.
+		//
 		// Thread count comes from RCPP_PARALLEL_NUM_THREADS, which main.cpp's
 		// configure_threads() sets from cfg.nthreads.
 		//
@@ -1050,13 +1086,27 @@ public:
 		// bed_pipeline_test.cpp, benchmark_results/ukb_ldl/cpp_covT/stdout.log)
 		// still match byte-for-byte.
 		// =====================================================================
-		int nthreads_env = 1;
-		if (const char* s = std::getenv("RCPP_PARALLEL_NUM_THREADS"))
-			nthreads_env = std::max(1, std::atoi(s));
-		const bool use_parallel_bed = !isVarRatio;
-
 		if (use_parallel_bed) {
 			test_bedfile.close();  // BedReaderPool opens its own fds
+
+			// Translate g_randMarkerIndforVR (a sorted list of drawn marker
+			// indices) into a length-M bitmap. The serial path re-scans that
+			// list per marker with arma::any(); the bitmap is the same predicate
+			// in O(1), and is built from the exact same (fixed-seed) draw, so
+			// marker selection stays bit-identical.
+			saige::VarRatioRule vr_rule;
+			std::vector<unsigned char> vr_drawn;
+			if (isVarRatio) {
+				vr_rule.enabled = true;
+				vr_rule.min_mac = g_minMACVarRatio;
+				vr_rule.max_mac = g_maxMACVarRatio;
+				vr_drawn.assign(static_cast<std::size_t>(M), 0);
+				for (arma::uword k = 0; k < g_randMarkerIndforVR.n_elem; ++k) {
+					const int idx = g_randMarkerIndforVR(k);
+					if (idx >= 0 && idx < static_cast<int>(M))
+						vr_drawn[static_cast<std::size_t>(idx)] = 1;
+				}
+			}
 
 			saige::BedReaderPool reader(bedfile,
 			                             static_cast<std::size_t>(N),
@@ -1068,7 +1118,9 @@ public:
 			    static_cast<std::size_t>(M),
 			    minMAFtoConstructGRM,
 			    maxMissingRate,
-			    nthreads_env);
+			    nthreads_env,
+			    vr_rule,
+			    vr_drawn.empty() ? nullptr : vr_drawn.data());
 
 			const std::size_t nbyte_new = par_res.store.nbyte();
 			for (int i = 0; i < M; ++i) {
@@ -1094,6 +1146,18 @@ public:
 				} else {
 					MarkerswithMAFge_minMAFtoConstructGRM_indVec.push_back(false);
 				}
+				// Same per-marker bookkeeping the serial loop does for the VR
+				// pool. par_res.vr_orig_idx is in ascending marker order, so
+				// walking i upward keeps the compact VR index in sync with it.
+				if (isVarRatio && par_res.passVR[i]) {
+					const float Std_i = std::sqrt(2.0f * s.altFreq * (1.0f - s.altFreq));
+					const float invStd_i = (Std_i == 0.0f) ? 0.0f : 1.0f / Std_i;
+					invstdvVec0_forVarRatio.push_back(invStd_i);
+					alleleFreqVec0_forVarRatio.push_back(s.altFreq);
+					MACVec0_forVarRatio.push_back(s.mac);
+					markerIndexVec0_forVarRatio.push_back(i);
+					numberofMarkers_varRatio++;
+				}
 			}
 			// Option-3: hand the packed bytes straight to the class (zero-copy).
 			// par_res is a local inside this block — move drains its buffer into
@@ -1101,6 +1165,38 @@ public:
 			// at end-of-scope doesn't re-free anything. Peak RSS ≈ sizeof(packed_flat_).
 			packed_flat_ = std::move(par_res.store);
 			use_packed_flat_ = true;
+			if (isVarRatio) {
+				// Same move for the VR pool: ≤1000 markers, so ~12 MB on mid
+				// and ~110 MB on UKB — but still no second copy.
+				packed_flat_vr_ = std::move(par_res.vr_store);
+				use_packed_flat_vr_ = true;
+				// The compact VR index used by Get_OneSNP_Geno_forVarRatio must
+				// address the same marker that markerIndexVec_forVarRatio names.
+				// That holds because parallel_decode_bed concatenates per-thread
+				// blocks of contiguous ascending marker ranges in thread order,
+				// i.e. globally ascending — the same order the loop above walks.
+				// Cheap to check (≤1000 entries), so check rather than assume.
+				if (static_cast<int>(packed_flat_vr_.n_stored()) != numberofMarkers_varRatio) {
+					throw std::runtime_error(
+					    "parallel BED loader: VR store holds " +
+					    std::to_string(packed_flat_vr_.n_stored()) +
+					    " markers but bookkeeping counted " +
+					    std::to_string(numberofMarkers_varRatio));
+				}
+				for (int k = 0; k < numberofMarkers_varRatio; ++k) {
+					if (par_res.vr_orig_idx[k] !=
+					    static_cast<std::size_t>(markerIndexVec0_forVarRatio[k])) {
+						throw std::runtime_error(
+						    "parallel BED loader: VR store row " + std::to_string(k) +
+						    " holds marker " + std::to_string(par_res.vr_orig_idx[k]) +
+						    " but bookkeeping expects " +
+						    std::to_string(markerIndexVec0_forVarRatio[k]));
+					}
+				}
+				std::cout << "[option-3] use_packed_flat_vr_=true  n_stored="
+				          << packed_flat_vr_.n_stored()
+				          << "  bytes=" << packed_flat_vr_.bytes() << std::endl;
+			}
 			(void)nbyte_new;
 			std::cout << "[option-3] use_packed_flat_=true  packed_flat_.n_stored=" << packed_flat_.n_stored()
 			          << "  packed_flat_.nbyte=" << packed_flat_.nbyte()
@@ -1650,26 +1746,30 @@ void Get_MultiMarkersBySample_StdGeno_Mat(){
                 while(flag == 0){
 //              std::cout << "createSparseKin1e" << std::endl;
                 for(size_t i=Start_idx; i< Start_idx+(geno.m_size_of_esi); i++){
-                        // DEBUG: Check bounds before .at() access
+                        // Bounds check. Must go through packed_size(), not
+                        // genoVecofPointers[...]->size(): under the parallel BED
+                        // loader those per-marker vectors are empty stubs and the
+                        // bytes live in packed_flat_, so the old check reported 0
+                        // and threw on every marker.
                         if(k == 0 && i == Start_idx) {
                             std::cout << "[DEBUG Get_MultiMarkers] k=" << k
                                       << " indexOfVectorPointer=" << indexOfVectorPointer
-                                      << " genoVecofPointers.size()=" << geno.genoVecofPointers.size()
+                                      << " n_markers=" << geno.packed_n_markers()
                                       << " i=" << i
-                                      << " vector_size=" << (indexOfVectorPointer < geno.genoVecofPointers.size() ? geno.genoVecofPointers[indexOfVectorPointer]->size() : -1)
+                                      << " row_size=" << geno.packed_size(indexOfVectorPointer)
                                       << std::endl;
                         }
-                        if(indexOfVectorPointer >= geno.genoVecofPointers.size()) {
+                        if(indexOfVectorPointer >= (int)geno.packed_n_markers()) {
                             std::cerr << "[ERROR] indexOfVectorPointer=" << indexOfVectorPointer
-                                      << " >= genoVecofPointers.size()=" << geno.genoVecofPointers.size()
+                                      << " >= n_markers=" << geno.packed_n_markers()
                                       << " at k=" << k << std::endl;
                             throw std::out_of_range("indexOfVectorPointer out of bounds");
                         }
-                        if(i >= geno.genoVecofPointers[indexOfVectorPointer]->size()) {
+                        if(i >= geno.packed_size(indexOfVectorPointer)) {
                             std::cerr << "[ERROR] i=" << i
-                                      << " >= vector.size()=" << geno.genoVecofPointers[indexOfVectorPointer]->size()
+                                      << " >= row_size=" << geno.packed_size(indexOfVectorPointer)
                                       << " at k=" << k << " indexOfVectorPointer=" << indexOfVectorPointer << std::endl;
-                            throw std::out_of_range("i out of bounds in genoVecofPointers");
+                            throw std::out_of_range("i out of bounds in packed genotype store");
                         }
                         geno1 = geno.packed_byte(indexOfVectorPointer, i);
                         //std::cout << "createSparseKin1f" << std::endl;
@@ -1994,12 +2094,12 @@ saige::gpu::Handle* gpu_handle_or_null() {
 		const char* env = std::getenv("SAIGE_USE_GPU");
 		const bool want_gpu = (env != nullptr && std::string(env) == "1");
 		// Two storage shapes reach us:
-		//   · packed_flat_  — the parallel BED path (isVarRatio == false)
-		//   · genoVecofPointers — the serial BED path, one heap allocation per
-		//     marker, which is what main.cpp:1455 selects whenever VR markers
-		//     are requested (i.e. nearly every real run). Before this, the GPU
-		//     gate only accepted the first, so --gpu silently did nothing on a
-		//     default config.
+		//   · packed_flat_  — the parallel BED path, now the default for
+		//     every configuration including variance-ratio runs.
+		//   · genoVecofPointers — the serial BED path, one heap allocation
+		//     per marker. Only reachable via SAIGE_SERIAL_BED=1 now that the
+		//     VR gate is gone, but still supported so --gpu keeps working
+		//     when the serial loader is forced for an A/B.
 		const std::size_t n_pass =
 		    (std::size_t)geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
 		const bool have_flat = geno.use_packed_flat_ && geno.packed_flat_.n_stored() > 0;
