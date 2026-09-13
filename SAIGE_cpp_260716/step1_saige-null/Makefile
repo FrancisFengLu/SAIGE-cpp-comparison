@@ -213,7 +213,7 @@ endif
 SOURCES         += $(GPU_EXTRA_SRC)
 
 OBJECTS := $(SOURCES:.cpp=.o)
-DEPS    := $(OBJECTS:.o=.d)
+DEPS    := $(OBJECTS:.o=.d) $(GPU_CU_OBJ:.o=.d)
 
 TARGET  ?= saige-null
 
@@ -238,8 +238,13 @@ else
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(LIBS) -o $@
 endif
 
-$(GPU_MATVEC_DIR)/%.cu.o: $(GPU_MATVEC_DIR)/%.cu $(GPU_MATVEC_DIR)/gpu_matvec.hpp
-	$(NVCC) -std=c++17 -O2 -arch=$(GPU_SM) -I$(BED_READER_DIR) -I$(GPU_MATVEC_DIR) -c $< -o $@
+# -MMD -MP, same as the C++ rule. The old hand-written prerequisite list was
+# just gpu_matvec.hpp, so a change to packed_store.hpp did NOT rebuild these
+# objects — they kept the previous PackedFlat layout while the host objects
+# used the new one, and the resulting ODR/ABI mismatch made saige::gpu::create()
+# read M and nbyte from the wrong offsets and silently fall back to CPU.
+$(GPU_MATVEC_DIR)/%.cu.o: $(GPU_MATVEC_DIR)/%.cu
+	$(NVCC) -std=c++17 -O2 -arch=$(GPU_SM) -I$(BED_READER_DIR) -I$(GPU_MATVEC_DIR) -MMD -MP -c $< -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -269,7 +274,7 @@ callgrind: profile
 	         ./$(TARGET) -c $(CONFIG)
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) $(TARGET) $(GPU_MATVEC_DIR)/*.cu.o
+	rm -f $(OBJECTS) $(DEPS) $(TARGET) $(GPU_MATVEC_DIR)/*.cu.o $(GPU_MATVEC_DIR)/*.cu.d
 
 # -------------------------
 # Tests
