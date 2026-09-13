@@ -180,17 +180,30 @@ INCLUDES        += -I$(BED_READER_DIR)
 # as no-ops.
 GPU_MATVEC_DIR  := tools/gpu_matvec
 GPU_MATVEC_TEST := $(GPU_MATVEC_DIR)/gpu_matvec_test.cpp
-NVCC           ?= /usr/bin/nvcc
-GPU_SM         ?= sm_86
+# nvcc location: a CUDA toolkit installed from the .run/.deb puts it under
+# /usr/local/cuda*/bin, NOT /usr/bin (the old default here silently disabled
+# the whole GPU path — HAS_CUDA evaluated to "no" and the stub got linked).
+# Probe the usual spots, still overridable with `make NVCC=...`.
+NVCC           ?= $(firstword $(wildcard /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc /usr/bin/nvcc) nvcc-not-found)
+CUDA_HOME      := $(patsubst %/bin/nvcc,%,$(NVCC))
+# sm_70 = Volta (V100, this dev box). sm_86/sm_89 for Ampere/Ada.
+GPU_SM         ?= sm_70
 HAS_CUDA       := $(shell test -x $(NVCC) && test -f $(GPU_MATVEC_DIR)/gpu_matvec.cu && echo yes)
 INCLUDES       += -I$(GPU_MATVEC_DIR)
+
+# Where libcudart/libcublas actually live for this toolkit. The distro package
+# puts them in /lib/x86_64-linux-gnu; a /usr/local/cuda install puts them in
+# $(CUDA_HOME)/lib64. Pick whichever contains libcudart.so.
+CUDA_LIBDIR    ?= $(firstword $(dir $(wildcard $(CUDA_HOME)/lib64/libcudart.so /lib/x86_64-linux-gnu/libcudart.so)))
 
 ifeq ($(HAS_CUDA),yes)
   CXXFLAGS       += -DSAIGE_WITH_CUDA
   GPU_EXTRA_SRC  := $(filter-out $(GPU_MATVEC_TEST) $(GPU_MATVEC_DIR)/gpu_matvec_cpu_stub.cpp $(GPU_MATVEC_DIR)/gpu_matvec.cu, \
                                   $(wildcard $(GPU_MATVEC_DIR)/*.cpp))
-  GPU_CU_OBJ     := $(GPU_MATVEC_DIR)/gpu_matvec.cu.o
-  GPU_LIBS       := -L/lib/x86_64-linux-gnu -Xlinker -rpath=/lib/x86_64-linux-gnu -lcublas -lcudart
+  # Every .cu under tools/gpu_matvec gets its own object (pattern rule below),
+  # so adding a kernel file no longer means editing the Makefile.
+  GPU_CU_OBJ     := $(patsubst %.cu,%.cu.o,$(wildcard $(GPU_MATVEC_DIR)/*.cu))
+  GPU_LIBS       := -L$(CUDA_LIBDIR) -Xlinker -rpath=$(CUDA_LIBDIR) -lcublas -lcudart
 else
   # stub path: include the noop implementation so saige::gpu::available() links
   GPU_EXTRA_SRC  := $(GPU_MATVEC_DIR)/gpu_matvec_cpu_stub.cpp
@@ -209,7 +222,7 @@ all: $(TARGET)
 $(TARGET): $(OBJECTS) $(GPU_CU_OBJ)
 ifeq ($(HAS_CUDA),yes)
 	# Final link via nvcc on the SYSTEM toolchain so CUDA runtime symbols
-	# resolve correctly (libcublas/libcudart from /lib/x86_64-linux-gnu).
+	# resolve correctly (libcublas/libcudart from $(CUDA_LIBDIR)).
 	# Transform host-compiler flags nvcc doesn't understand:
 	#   -pthread, -fopenmp    → -Xcompiler=<flag>
 	#   -Wl,-rpath,FOO        → -Xlinker -rpath=FOO    (GNU ld accepts =path form)
@@ -225,7 +238,7 @@ else
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(LIBS) -o $@
 endif
 
-$(GPU_MATVEC_DIR)/gpu_matvec.cu.o: $(GPU_MATVEC_DIR)/gpu_matvec.cu $(GPU_MATVEC_DIR)/gpu_matvec.hpp
+$(GPU_MATVEC_DIR)/%.cu.o: $(GPU_MATVEC_DIR)/%.cu $(GPU_MATVEC_DIR)/gpu_matvec.hpp
 	$(NVCC) -std=c++17 -O2 -arch=$(GPU_SM) -I$(BED_READER_DIR) -I$(GPU_MATVEC_DIR) -c $< -o $@
 
 %.o: %.cpp
@@ -256,7 +269,7 @@ callgrind: profile
 	         ./$(TARGET) -c $(CONFIG)
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) $(TARGET)
+	rm -f $(OBJECTS) $(DEPS) $(TARGET) $(GPU_MATVEC_DIR)/*.cu.o
 
 # -------------------------
 # Tests
@@ -266,6 +279,11 @@ clean:
 # test compare builds rather than just re-running the same binary twice.
 test: $(TARGET)
 	SAIGE_NULL_BIN=$(CURDIR)/$(TARGET) tests/run_loco_tests.sh
+
+# Tell make that .cu files are terminal sources; kills the spurious
+# "Circular foo.cu <- foo.cu.o dependency dropped" warning that the builtin
+# suffix rules produce for the %.cu.o pattern above.
+.SUFFIXES: .cu
 
 .PHONY: all clean profile callgrind test
 

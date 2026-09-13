@@ -9,13 +9,13 @@
 #   make clean
 #
 # CUDA knobs:
-#   NVCC   : path to nvcc   (default /usr/bin/nvcc, override if your toolkit lives elsewhere)
-#   SM     : target arch    (default sm_86 = RTX A5000 / 3090 / A10)
+#   NVCC   : path to nvcc   (probed under /usr/local/cuda*/bin then /usr/bin)
+#   SM     : target arch    (default sm_70 = V100; sm_86/sm_89 for Ampere/Ada)
 #   CUDA_LIBS : extra -L paths for libcublas/libcudart if needed
 
 CXX      ?= g++
-NVCC     ?= /usr/bin/nvcc
-SM       ?= sm_86
+NVCC     ?= $(firstword $(wildcard /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc /usr/bin/nvcc) nvcc-not-found)
+SM       ?= sm_70
 
 # The CUDA path is taken only if (a) nvcc is present AND (b) the kernel
 # source exists. G1 ships just the scaffold; G2 adds gpu_matvec.cu and
@@ -30,7 +30,8 @@ NVCCFLAGS += -std=c++17 -O2 -arch=$(SM) --compiler-options "-Wall -Wextra" -I../
 # cuBLAS and cudart are in /lib/x86_64-linux-gnu on this Ubuntu box (Debian
 # packages libcublas12, libcudart12). The conda-env linker has its own
 # sysroot and does NOT search /lib/x86_64-linux-gnu, so point -L there.
-CUDA_LIBDIR ?= /lib/x86_64-linux-gnu
+CUDA_HOME   := $(patsubst %/bin/nvcc,%,$(NVCC))
+CUDA_LIBDIR ?= $(firstword $(dir $(wildcard $(CUDA_HOME)/lib64/libcudart.so /lib/x86_64-linux-gnu/libcudart.so)) /lib/x86_64-linux-gnu)
 CUDA_LIBS   ?= -L$(CUDA_LIBDIR) -Wl,-rpath,$(CUDA_LIBDIR) -lcublas -lcudart
 
 ifeq ($(HAS_NVCC),yes)
@@ -40,8 +41,11 @@ endif
 all: gpu_matvec_test
 
 # --- Build rules ---
+# All .cu units in this dir (gpu_matvec.cu dispatches into the others).
+CU_OBJS := $(patsubst %.cu,%.cu.o,$(wildcard *.cu))
+
 gpu_matvec_test: gpu_matvec_test.o \
-                 $(if $(filter yes,$(HAS_NVCC)),gpu_matvec.cu.o,gpu_matvec_cpu_stub.o) \
+                 $(if $(filter yes,$(HAS_NVCC)),$(CU_OBJS),gpu_matvec_cpu_stub.o) \
                  ../bed_reader/bed_reader.o \
                  ../bed_reader/marker_decoder.o
 ifeq ($(HAS_NVCC),yes)
@@ -56,7 +60,7 @@ else
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lpthread
 endif
 
-gpu_matvec.cu.o: gpu_matvec.cu gpu_matvec.hpp ../bed_reader/packed_store.hpp
+%.cu.o: %.cu gpu_matvec.hpp ../bed_reader/packed_store.hpp
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 gpu_matvec_cpu_stub.o: gpu_matvec_cpu_stub.cpp gpu_matvec.hpp ../bed_reader/packed_store.hpp
