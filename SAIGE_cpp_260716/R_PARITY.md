@@ -352,6 +352,15 @@ dataset. A second, independent confirmation on `condition=snp0,snp1`: R's snp0
 row is bit-identical to snp2's row from the unconditional run, down to snp2's own
 `Allele1/Allele2` being mismatched against the snp0 labels that are printed.
 
+**Minimal reproduction.** Run the same PLINK dataset twice, with and without
+`--condition`, and diff the row for the marker at index 0 of the `.bim`:
+
+```bash
+tests/parity/parity.py base_binary_single                                  # r.txt
+tests/parity/parity.py base_binary_single --set condition=snp100,snp500    # r.txt
+# R's snp0 row in the second run == R's snp501 row in the first, field for field.
+```
+
 The C++ already forces an absolute `SEEK_SET` whenever `t_gIndex_prev == 0`
 (`genotype_reader.cpp:832-845`, done originally so OpenMP threads could request
 any marker) and gives snp0's own correct values in every case.
@@ -378,6 +387,14 @@ goes from ≈24.9 to 1. 116 of 120 rows differ, up to 0.76 relative on p.
 Controlled with a mini group file: not caused by the annotation list or by
 chunking (changing the annotation list from 1 to 2 entries leaves the `lof` rows
 bit-identical).
+
+**Minimal reproduction.**
+
+```bash
+tests/parity/parity.py region_binary_flatweights     # weights.beta = 1,1
+tests/parity/parity.py region_binary_nocollapse      # same masks, default 1,25
+# R's BETA_Burden moves by a constant 1.2322x between the two; the C++ moves by 24-31x.
+```
 
 **Why (b):** R is internally inconsistent, not merely different. The C++ applies
 `weights.beta` uniformly. At the default `1,25` the two sides agree — which is
@@ -433,12 +450,29 @@ R itself half-admits the limit: `ER_binary_func.cpp:25` has
 `int ngroup1 = 10; //use the default value as ER will only be used for variants with MAC <= 10`
 and the run prints `WARNING: Efficient resampling may not work well for MAC > 4!`.
 
-**Why (b):** a crash is not a result. The C++ uses an iterative saturating
-`C(n,r)` (`er_binary.cpp:747-766`) with `n_total` as `long long` (`:789-801`) and
-returns a sensible answer for the same marker: BETA=1.80665, SE=0.727495,
-p=1.301412E-02 (against the non-ER SPA value 9.055404E-03). At
+**Minimal reproduction** (one marker, R only, no C++ needed):
+
+```bash
+# /opt/saige/logs/parity_sb/ermac20dbg/{bisect,cause}.sh are the recorded runs
+Rscript $SAIGE/extdata/step2_SPAtests.R --bedFile=rare.bed ... \
+        --impute_method=mean --max_MAC_for_ER=11 --idstoIncludeFile=<just 1:489:A:B>
+# -> Floating point exception (core dumped), exit 136
+```
+
+**Why (b):** a crash is not a result. The C++ uses an iterative `C(n,r)` that
+saturates at `INT_MAX` instead of wrapping (`er_binary.cpp:747-766`) and a
+`long long` accumulator for `n_total` (`:789-801`). Saturating is safe here
+precisely because it cannot be mistaken for a small number: an over-large
+`n_total` trips the `n_total > NResampling` branch, which is the branch such a
+`k` belongs in anyway, so the marker is answered by resampling rather than by a
+truncated exact enumeration. For `1:489:A:B` that yields BETA=1.80665,
+SE=0.727495, p=1.301412E-02, against the non-ER SPA value 9.055404E-03. At
 `max_MAC_for_ER=20` on the rare set, R dies 45 s in and the C++ completes all
 3000 rows in 234 s.
+
+Note the consequence for C5: on these markers the C++ is already **in** the
+resampling branch, so the RNG difference is live there — it simply cannot be
+compared against R, because R does not survive to produce a number.
 
 ### B4 · `is_noadjCov=TRUE` with AF > 0.5 — centring inconsistent with the flip
 
@@ -459,6 +493,11 @@ Confirmed on quantitative traits too: with both sides set TRUE, 2000 rows are
 bit-identical; turning the flag on within the C++ alone moves p by up to 2.20
 orders of magnitude and var by up to 1038.7× (snp1127, AF=0.99806), and 1022 of
 2000 markers sit past the flip point.
+
+**Minimal reproduction.** Take any marker with AF > 0.5, swap its two alleles
+in the `.bim` (which must not change the score test), and run both codings with
+`--is_noadjCov=TRUE`: the two disagree. Repeat with `--is_noadjCov=FALSE`: they
+agree. 50/50 markers violate invariance in the first case, 0/50 in the second.
 
 **Disposition.** The port reproduces R's arithmetic — defect included — exactly
 when the flag is set, so this is *not* a divergence in the maths. The divergence
@@ -488,6 +527,15 @@ with true missingness 0.71–0.75 are correctly dropped by the C++ at
 `maxMissing=0.15`; R reports missingness 0 and tests all of them. Across the 265
 shared rows, 12 columns differ, `|Δlog10 p|` up to **0.281**, `var` up to 3.3e-2
 relative, and BETA sign flips (Tstat up to 1.93 relative).
+
+**Minimal reproduction.**
+
+```bash
+plink2 --dummy 50000 500 dosage-freq=1 --export vcf vcf-dosage=DS --out dos
+# dos.vcf.gz now writes missing samples as a bare "./." under FORMAT GT:DS
+cd /opt/saige/data/readers && python3 readers_parity.py rd_dos_vcfds_mean
+# R: MissingRate 0 on every marker.  cpp: the true rate.  Row sets disagree.
+```
 
 Three independent confirmations:
 
@@ -543,11 +591,24 @@ row as degenerate; there is no statistical content to disagree about.
 
 ### C4 · Floating-point noise in the region path
 
-After the A1 fix: `Pvalue` ≤2.2e-8 relative (worst case `region_quant_mid`;
-most cases ≤1e-11), `Pvalue_Burden`/`Pvalue_SKAT` ≤6.3e-11, `MAC` ≤3.9e-15,
-`BETA_Burden` ≤1.9e-10. Summation order and LAPACK-level differences.
-`Number_rare` and `Number_ultra_rare` are **exactly** equal in every case, so the
-ultra-rare collapse boundary decisions agree completely.
+Maximum relative difference per column, measured across the nine
+non-burden region cases after the A1 fix (no column exceeds the harness's 1e-6
+tolerance anywhere, i.e. every one of these cases is IDENTICAL):
+
+| column | worst relative | where |
+|---|---|---|
+| `Pvalue` (SKAT-O) | 2.2e-8 | `region_quant_mid`; most cases ≤5e-13 |
+| `Pvalue_Burden` | 6.3e-11 | `region_binary_skato` |
+| `Pvalue_SKAT` | 6.3e-11 | `region_binary_skato` |
+| `SE_Burden` | 1.9e-7 | `region_binary_skato` |
+| `BETA_Burden` | 1.9e-10 | `region_binary_skato` |
+| `MAC` | 1.6e-14 | `region_binary_mid` |
+| `MAC_case`, `MAC_control` | **0** | every case |
+| `Number_rare`, `Number_ultra_rare` | **0** | every case |
+
+Summation order and LAPACK-level differences. The two `Number_*` columns being
+exactly equal everywhere means the ultra-rare collapse boundary decisions agree
+completely — no marker is classified differently by the two sides.
 
 ### C5 · ER resampling RNG — a difference that must exist but cannot be measured yet
 
@@ -556,9 +617,15 @@ i.e. `k ≥ 21`. R uses R's own Mersenne-Twister via `GetRNGstate()`
 (`Binary_resampling.cpp:49-55`); the C++ uses `std::mt19937` reseeded per marker
 from a splitmix64 stream (`er_binary.cpp:60-90`, deliberately so the result does
 not depend on which thread the marker landed on). The two will not agree.
-It is untestable today because R hits B3's SIGFPE long before `k` reaches 21.
-Filed as (c) and flagged as a difference that will appear the moment B3 is fixed
-upstream.
+The C++ reaches this branch today (see B3 — a large `k` saturates `n_total` and
+routes the marker to resampling). R does not: it hits B3's SIGFPE first. So the
+difference is real and live on our side and simply has no R counterpart to be
+measured against. Filed as (c), and flagged as the difference that will surface
+the moment B3 is fixed upstream. If bit-comparability there ever matters, it
+would require porting R's Mersenne-Twister stream and its per-marker seeding
+order, which would in turn give up the current property that a marker's ER
+result does not depend on which thread it landed on
+(`er_binary.cpp:60-90`).
 
 ---
 
@@ -641,8 +708,12 @@ a product decision, not a parity one.
   (BGEN with `B != 8` bits is refused identically by both sides —
   `SAIGE-upstream/src/BGEN.cpp:238` ↔ `genotype_reader.cpp:1858/2233` — verified
   at `bits=16`.)
-- **`nThreads > 1` on the R side** — only the C++ was run multi-threaded (its
-  8-thread single-variant output matched R's single-threaded output exactly).
+- **`nThreads > 1` on the R side** — only the C++ was run multi-threaded.
+  Re-checked against the current build: the C++ at `nThreads=8` reproduces R's
+  single-threaded single-variant output with **0 differing cells** over
+  2000 rows × 19 columns, and the new `.markerList.txt` at `nThreads=4` is
+  row-for-row identical (sorted) to the `nThreads=1` file — 180 rows, no
+  malformed rows, no duplicate keys.
 - **Scale** — 50000 samples, ≤40000 markers, 30–100 genes. Whether A1's trigger
   rate (11–30% of mask rows in this data) varies with gene or mask size is
   untested.
