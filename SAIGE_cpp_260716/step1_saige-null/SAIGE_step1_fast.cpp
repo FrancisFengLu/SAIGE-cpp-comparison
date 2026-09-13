@@ -139,23 +139,9 @@ public:
         // the rest of the run.
         void release_packed_flat_host() {
           if (packed_flat_released_) return;
-          // Free the underlying vector, not just resize: shrink_to_fit then
-          // swap-with-empty guarantees the backing allocation is released.
-          // (We keep .nbyte() addressable via a saved scalar below, since
-          // some call sites still query it for sizing.)
-          std::vector<unsigned char> empty;
-          // Expose nbyte() after release by not touching packed_flat_'s
-          // nbyte_ field (PackedFlat::clear()/set_n_stored would do this too,
-          // but its data_ vector is private so we swap through a temporary
-          // flat by resetting through a move).
-          saige::PackedFlat drained;           // nbyte_=0, n_stored_=0
-          drained.init(packed_flat_.n_stored(), packed_flat_.nbyte());
-          // init() allocates — we want the opposite. Simpler: move-from then
-          // drop the temporary.
-          (void)drained;
-          // Reset by move-assigning a fresh PackedFlat whose data buffer we
-          // immediately clear. PackedFlat's destructor frees data_ on
-          // reassignment.
+          // Move-assign an empty PackedFlat over it: the old buffer is freed
+          // by the assignment. The shell keeps the same nbyte() so the
+          // packed_size() call sites that only want the geometry still work.
           {
             saige::PackedFlat tmp_shell;
             // Preserve the reported nbyte() for packed_size() queries even

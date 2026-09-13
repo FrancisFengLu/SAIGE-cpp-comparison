@@ -2,26 +2,102 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <new>
 #include <stdexcept>
 #include <thread>
+
+#include <sys/mman.h>
 
 namespace saige {
 
 namespace {
+
+// Packed rows are staged in fixed-size blocks rather than one growing vector.
+// Two reasons, both about peak RSS on a buffer that is the size of the whole
+// packed genotype matrix:
+//   · a growing vector reallocs, so old + new are briefly both resident;
+//   · it can only be freed as a whole, so during pass 2 the entire staging
+//     copy stayed live until the last row had been written to the final
+//     PackedFlat — ~2× the matrix at peak.
+// With blocks, pass 2 releases each block right after copying it, so
+// (staging still held) + (final store written so far) stays ≈ one matrix.
+// 64 rows ≈ 0.8 MB on mid, ≈ 7 MB at UKB shape.
+constexpr std::size_t kRowsPerBlock = 64;
+
+// Blocks are mmap'd, not new[]'d. glibc returns a freed large chunk to its own
+// arena rather than to the kernel — and its mmap threshold is *dynamic*, it
+// rises as soon as a big mmap'd chunk is freed — so a malloc-backed block
+// stayed resident after release() and peak RSS was still ~2× the packed
+// matrix. munmap hands the pages back immediately, which is the whole point of
+// draining block by block.
+class MappedBlock {
+ public:
+  explicit MappedBlock(std::size_t n) : n_(n) {
+    void* p = ::mmap(nullptr, n_, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw std::bad_alloc();
+    p_ = static_cast<unsigned char*>(p);
+  }
+  ~MappedBlock() { release(); }
+  MappedBlock(MappedBlock&& o) noexcept : p_(o.p_), n_(o.n_) { o.p_ = nullptr; o.n_ = 0; }
+  MappedBlock& operator=(MappedBlock&& o) noexcept {
+    if (this != &o) { release(); p_ = o.p_; n_ = o.n_; o.p_ = nullptr; o.n_ = 0; }
+    return *this;
+  }
+  MappedBlock(const MappedBlock&) = delete;
+  MappedBlock& operator=(const MappedBlock&) = delete;
+
+  void release() {
+    if (p_) { ::munmap(p_, n_); p_ = nullptr; n_ = 0; }
+  }
+  unsigned char* data() const { return p_; }
+
+ private:
+  unsigned char* p_ = nullptr;
+  std::size_t    n_ = 0;
+};
 
 struct PerThreadState {
   // Pass 1 outputs, indexed by (marker - chunk_lo):
   std::vector<MarkerStats> stats;
   std::vector<char>        passQC_flags;     // 0/1 — char because std::vector<bool> can't be written concurrently
   std::vector<char>        passVR_flags;     // 0/1 — variance-ratio pool
-  // Concatenated packed bytes of this thread's pass-QC markers:
-  std::vector<unsigned char> packed_local;   // size = n_pass_in_chunk * nbyte_out
+  // Packed bytes of this thread's pass-QC markers, kRowsPerBlock rows/block:
+  std::vector<MappedBlock>   packed_blocks;
   std::vector<std::size_t>   pass_orig_idx;  // length = n_pass_in_chunk (marker indices)
   // Same, for the (much smaller) variance-ratio pool:
-  std::vector<unsigned char> vr_packed_local;
+  std::vector<MappedBlock>   vr_blocks;
   std::vector<std::size_t>   vr_orig_idx;
   std::exception_ptr         err;            // first exception (if any)
 };
+
+// Append one packed row to a block list. `count` is the number of rows already
+// in it; the caller keeps the running count.
+inline void push_row(std::vector<MappedBlock>& blocks,
+                     std::size_t count,
+                     const unsigned char* row,
+                     std::size_t nbyte_out) {
+  const std::size_t off = count % kRowsPerBlock;
+  if (off == 0) blocks.emplace_back(kRowsPerBlock * nbyte_out);
+  std::memcpy(blocks.back().data() + off * nbyte_out, row, nbyte_out);
+}
+
+// Copy a block list into `dest` starting at row `base`, releasing each block
+// as soon as it has been copied.
+inline void drain_blocks(std::vector<MappedBlock>& blocks,
+                         std::size_t n_rows,
+                         PackedFlat& dest,
+                         std::size_t base,
+                         std::size_t nbyte_out) {
+  for (std::size_t b = 0; b < blocks.size(); ++b) {
+    const std::size_t first = b * kRowsPerBlock;
+    const std::size_t rows  = std::min(kRowsPerBlock, n_rows - first);
+    for (std::size_t r = 0; r < rows; ++r)
+      dest.write(base + first + r, blocks[b].data() + r * nbyte_out);
+    blocks[b].release();  // munmap now, not at join
+  }
+}
 
 } // namespace
 
@@ -72,8 +148,8 @@ ParallelDecodeResult parallel_decode_bed(
           st.stats.resize(chunk_size);
           st.passQC_flags.assign(chunk_size, 0);
           st.passVR_flags.assign(chunk_size, 0);
-          // Guess capacity ~ 25% pass-QC; realloc on demand is fine.
-          st.packed_local.reserve((chunk_size / 4 + 1) * nbyte_out);
+          // Guess capacity ~ 25% pass-QC; realloc on demand is fine (this one
+          // is 8 bytes per marker, not ⌈N/4⌉).
           st.pass_orig_idx.reserve(chunk_size / 4 + 1);
 
           std::vector<unsigned char> raw(nbyte_in);
@@ -91,13 +167,13 @@ ParallelDecodeResult parallel_decode_bed(
                           lut, vr, drawn, s, passVR, packed.data());
             if (s.passQC) {
               st.passQC_flags[i - lo] = 1;
-              st.packed_local.insert(st.packed_local.end(),
-                                     packed.begin(), packed.end());
+              push_row(st.packed_blocks, st.pass_orig_idx.size(),
+                       packed.data(), nbyte_out);
               st.pass_orig_idx.push_back(i);
             } else if (passVR) {
               st.passVR_flags[i - lo] = 1;
-              st.vr_packed_local.insert(st.vr_packed_local.end(),
-                                        packed.begin(), packed.end());
+              push_row(st.vr_blocks, st.vr_orig_idx.size(),
+                       packed.data(), nbyte_out);
               st.vr_orig_idx.push_back(i);
             }
           }
@@ -154,19 +230,18 @@ ParallelDecodeResult parallel_decode_bed(
     for (int t = 0; t < nthreads; ++t) {
       threads.emplace_back([&, t] {
         try {
-          const auto& st = state[t];
+          auto& st = state[t];
           const std::size_t base = t_offset[t];
-          for (std::size_t k = 0; k < st.pass_orig_idx.size(); ++k) {
-            result.store.write(base + k,
-                               st.packed_local.data() + k * nbyte_out);
+          for (std::size_t k = 0; k < st.pass_orig_idx.size(); ++k)
             result.orig_plink_idx[base + k] = st.pass_orig_idx[k];
-          }
+          drain_blocks(st.packed_blocks, st.pass_orig_idx.size(),
+                       result.store, base, nbyte_out);
+
           const std::size_t vr_base = t_vr_offset[t];
-          for (std::size_t k = 0; k < st.vr_orig_idx.size(); ++k) {
-            result.vr_store.write(vr_base + k,
-                                  st.vr_packed_local.data() + k * nbyte_out);
+          for (std::size_t k = 0; k < st.vr_orig_idx.size(); ++k)
             result.vr_orig_idx[vr_base + k] = st.vr_orig_idx[k];
-          }
+          drain_blocks(st.vr_blocks, st.vr_orig_idx.size(),
+                       result.vr_store, vr_base, nbyte_out);
         } catch (...) {
           state[t].err = std::current_exception();
         }
