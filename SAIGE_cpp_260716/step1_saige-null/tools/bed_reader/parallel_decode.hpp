@@ -42,12 +42,25 @@ struct ParallelDecodeResult {
   std::vector<MarkerStats>   stats;          // length M — per-original-marker stats
   std::vector<bool>          passQC;         // length M — per-original-marker flag
   std::vector<std::size_t>   orig_plink_idx; // length n_pass — original marker i per compact slot
+
+  // Variance-ratio pool (empty unless a VarRatioRule with enabled=true was
+  // passed in). Same layout contract as `store`: markers in ascending original
+  // marker index, one ⌈Nnomissing/4⌉-byte row each. Disjoint from `store` —
+  // a VR marker has passQC forced false.
+  PackedFlat                 vr_store;
+  std::vector<bool>          passVR;         // length M
+  std::vector<std::size_t>   vr_orig_idx;    // length vr_store.n_stored()
 };
 
 // Decode the first `M` markers of the BED in parallel using `nthreads`
 // std::thread workers. `reader` must have been constructed with at least
 // `nthreads` file descriptors. `ptrsub` is length Nnomissing, 1-based FAM
 // indices in ascending-FAM order (matches the production `setGenoObj`).
+//
+// `vr` / `vr_drawn` carry the variance-ratio marker rule (see marker_decoder.hpp).
+// `vr_drawn`, when non-null, is a length-M 0/1 array marking the markers that
+// the random draw (genoClass::g_randMarkerIndforVR) selected; it is only read
+// when vr.enabled is true.
 ParallelDecodeResult parallel_decode_bed(
     BedReaderPool& reader,
     const int*     ptrsub,
@@ -55,6 +68,8 @@ ParallelDecodeResult parallel_decode_bed(
     std::size_t    M,
     float          min_maf,
     float          max_miss,
-    int            nthreads);
+    int            nthreads,
+    const VarRatioRule&  vr       = VarRatioRule{},
+    const unsigned char* vr_drawn = nullptr);
 
 } // namespace saige

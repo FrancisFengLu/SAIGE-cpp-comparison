@@ -41,6 +41,21 @@ struct MarkerStats {
   bool  passQC      = false;  // altFreq-based MAF ≥ min_maf  AND  missingRate ≤ max_miss
 };
 
+// Variance-ratio marker rule — mirrors SAIGE_step1_fast.cpp:518-571
+// (Get_OneSNP_Geno_atBeginning, the isVarRatio block).
+//
+// A marker is claimed for the variance-ratio pool when
+//   max_mac != -1 :  min_mac <= mac <  max_mac                       (categorical bin)
+//               or:  mac >= max_mac  AND  the marker was drawn into the random pool
+//   max_mac == -1 :  mac >= min_mac  AND  the marker was drawn into the random pool
+// A claimed marker is REMOVED from the GRM (passQC forced false) so the GRM
+// and the VR pool never share a marker.
+struct VarRatioRule {
+  bool  enabled = false;
+  float min_mac = 0.0f;    // genoClass::g_minMACVarRatio
+  float max_mac = -1.0f;   // genoClass::g_maxMACVarRatio (-1 == non-categorical)
+};
+
 // Lookup table built once per process: one BED byte → 4 bufferGeno values.
 // Exposed so the pipeline test can verify its contents byte-wise against
 // SAIGE_step1_fast.cpp's version. Values are {0,1,2,3} as documented above.
@@ -68,6 +83,25 @@ void decode_marker(const unsigned char* raw,
                    float min_maf, float max_miss,
                    const BedLut& lut,
                    MarkerStats& stats,
+                   unsigned char* packed_out);
+
+// Variance-ratio aware overload. Identical to the above except that it also
+// applies `vr` (see VarRatioRule):
+//   in      vr_drawn — true when this marker index is in the random VR draw
+//                      (genoClass::g_randMarkerIndforVR). Ignored when
+//                      vr.enabled is false.
+//   out     passVR   — marker claimed for the VR pool
+//   stats.passQC     — forced false when passVR is true
+//   packed_out       — written whenever (stats.passQC || passVR), i.e. a VR
+//                      marker that fails the GRM MAF filter still gets packed
+void decode_marker(const unsigned char* raw,
+                   std::size_t N,
+                   const int* ptrsub, std::size_t Nnomissing,
+                   float min_maf, float max_miss,
+                   const BedLut& lut,
+                   const VarRatioRule& vr, bool vr_drawn,
+                   MarkerStats& stats,
+                   bool& passVR,
                    unsigned char* packed_out);
 
 } // namespace saige

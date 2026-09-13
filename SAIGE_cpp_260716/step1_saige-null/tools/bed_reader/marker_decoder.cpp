@@ -39,6 +39,21 @@ void decode_marker(const unsigned char* raw,
                    const BedLut& lut,
                    MarkerStats& stats,
                    unsigned char* packed_out) {
+  const VarRatioRule no_vr;
+  bool passVR = false;
+  decode_marker(raw, N, ptrsub, Nnomissing, min_maf, max_miss, lut,
+                no_vr, /*vr_drawn=*/false, stats, passVR, packed_out);
+}
+
+void decode_marker(const unsigned char* raw,
+                   std::size_t N,
+                   const int* ptrsub, std::size_t Nnomissing,
+                   float min_maf, float max_miss,
+                   const BedLut& lut,
+                   const VarRatioRule& vr, bool vr_drawn,
+                   MarkerStats& stats,
+                   bool& passVR,
+                   unsigned char* packed_out) {
   const std::size_t nbyte_in  = (N + 3) / 4;
   const std::size_t nbyte_out = (Nnomissing + 3) / 4;
 
@@ -94,7 +109,25 @@ void decode_marker(const unsigned char* raw,
   const float maf = std::min(altFreq, 1.0f - altFreq);
   const int   mac = std::min(alleleCount,
                              static_cast<int>(Nnomissing) * 2 - alleleCount);
-  const bool  passQC = (maf >= min_maf) && (missingRate <= max_miss);
+  bool passQC = (maf >= min_maf) && (missingRate <= max_miss);
+
+  // Variance-ratio claim — byte-for-byte the rule in
+  // SAIGE_step1_fast.cpp:518-571. Note `mac` here is the same post-fill MAC
+  // the serial path tests, so the two paths select the same markers.
+  passVR = false;
+  if (vr.enabled) {
+    if (vr.max_mac != -1.0f) {                       // categorical VR bins
+      if (mac >= vr.min_mac && mac < vr.max_mac) {
+        passVR = true;
+      } else if (mac >= vr.max_mac) {
+        passVR = vr_drawn;
+      }
+    } else {                                         // single common-MAC bin
+      if (mac >= vr.min_mac) passVR = vr_drawn;
+    }
+    // A VR marker never contributes to the GRM.
+    if (passVR) passQC = false;
+  }
 
   stats.altFreq     = altFreq;
   stats.missingRate = missingRate;
@@ -103,7 +136,7 @@ void decode_marker(const unsigned char* raw,
   stats.numMissing  = numMissing;
   stats.passQC      = passQC;
 
-  if (!passQC) {
+  if (!passQC && !passVR) {
     // Don't waste cycles packing; caller won't use packed_out.
     std::memset(packed_out, 0, nbyte_out);
     return;
