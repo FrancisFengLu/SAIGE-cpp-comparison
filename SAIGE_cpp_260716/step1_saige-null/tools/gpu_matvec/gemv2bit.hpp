@@ -51,12 +51,33 @@ std::size_t need_bytes(int N, int M);
 Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
             int N, int M, const float* freq, const float* invstd);
 
+// Same, but the marker rows are scattered: row_ptrs[m] points at marker m's
+// `stride_bytes` packed bytes. Uploads row by row (M small H2D copies, once)
+// rather than gathering into a staging buffer first — so the host-side peak
+// stays exactly the size of the data that is already there.
+// Needed by SAIGE's legacy genoVecofPointers storage, which is one heap
+// allocation per marker and has no contiguous buffer to hand over.
+Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
+                 int N, int M, const float* freq, const float* invstd);
+
 // ret = inv_M · B_std (B_stdᵀ x) over the marker range [j0, j0+jn).
 // x and ret are host float32, length N. inv_M is applied by the last kernel,
 // so no extra host-side pass over N.
 // jn == M and j0 == 0 is the full-GRM case the PCG iteration walks.
 bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
                   const float* x, float* ret);
+
+// Multi-RHS analogue: ret = inv_M · A_std (A_stdᵀ X) over ALL markers.
+// X and ret are host float32, column-major N × ncol (an arma::fmat's memptr()
+// drops straight in). ncol is unbounded — the implementation walks it in
+// chunks of 8 and rounds each chunk up to {2,4,8} with zero columns. ncol == 1
+// forwards to matvec_range.
+// Device scratch for this path is allocated lazily on the first call, so a run
+// that never batches pays nothing for it.
+bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret);
+
+// Device bytes matvec_mat() will lazily allocate on first use, for logging.
+std::size_t mc_scratch_bytes(const Ctx* c);
 
 void destroy(Ctx* c);
 

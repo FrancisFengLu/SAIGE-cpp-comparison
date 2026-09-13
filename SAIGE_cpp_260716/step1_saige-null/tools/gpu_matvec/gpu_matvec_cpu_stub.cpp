@@ -15,7 +15,21 @@ Handle* create(const saige::PackedFlat&,
   return nullptr;
 }
 
+Handle* create_rows(const unsigned char* const*,
+                    std::size_t,
+                    std::size_t,
+                    const std::vector<float>&,
+                    const std::vector<float>&,
+                    int,
+                    int) {
+  return nullptr;
+}
+
 bool matvec(Handle*, const float*, float*) { return false; }
+
+bool matvec_mat_available(const Handle*) { return false; }
+
+bool matvec_mat(Handle*, const float*, int, float*) { return false; }
 
 void destroy(Handle*) {}
 

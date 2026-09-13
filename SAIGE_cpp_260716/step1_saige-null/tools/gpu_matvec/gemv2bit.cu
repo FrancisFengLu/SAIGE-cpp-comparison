@@ -240,6 +240,262 @@ __global__ void gm_pass2_finish(const float* __restrict__ Zpart, int ntile, int 
     Z[i] = (s - (*Cp)) * inv_M;
 }
 
+// ======================= fp32 small-batch path (ncol 2..8) ================
+//
+// Motive: the trunk's block-PCG (getCrossprodMatAndKinMat, used by GetTrace's
+// nrun probes and by the batched VR solves) asks for ψ·B with k columns at
+// once. Served by k separate single-column matvecs, the 2-bit matrix is
+// re-streamed k times; these kernels read it once per chunk of ≤8 columns.
+//
+// The fp16/wmma batch path from the R package is deliberately NOT used here:
+// mm_pack_X rounds the RHS to fp16 and moved tau by ~2e-4. This family is
+// fp32 end to end.
+//
+// Microbenchmark (optimization/bench/12_gemv2bit_mc.cu, V100), speedup vs n
+// separate single-column calls: ncol=2 1.5x / 4 1.9x / 8 2.1x (same on mid and
+// big2). Against an fp64 reference: mc 2.863e-6 vs per-column 2.848e-6 — no
+// extra error, only a different summation order. Two runs bit-identical.
+// The "theoretical 4x" is unreachable: at ncol=8 the FFMA lower bound for both
+// passes is 4.3 ms and the decode (SHF+LOP3+FADD) plus shared/global loads add
+// ~65 % of issue slots on top, so the instruction-bound ceiling is about 2.4x.
+//
+// pass1_mc keeps the warp-per-marker shape of the single-column version, plus:
+//   - shared holds NCOL per-column planes, SPAD=17 skew inside each plane (all
+//     lanes of one instruction read the same column, so the bank analysis is
+//     identical to the single-column case);
+//   - staged loading: STAGE=256/NCOL uint32 per stage (shared stays 17408 B)
+//     while a block covers GMC_CHUNK1=512 uint32, carrying accumulators in
+//     registers across stages. Without staging the tile shrinks with NCOL and
+//     Ypart grows to 1.4 GB at big2/ncol=8; staged it is a flat 90 MB.
+//   - MPW=4 markers per warp: one shared read feeds 4 FMAs (FFMA:LDS = 4:1;
+//     undiluted, the LDS issue slot becomes the new bottleneck at ncol=8).
+//     Accumulators are 4·NCOL ≤ 32. Row pointers are kept as base+index —
+//     storing 4 pointers (8 registers) measurably spilled the kernel.
+// pass2_mc: the single-column version gives each thread one uint32 and 16
+//   accumulators; 16·NCOL would be 128 registers at ncol=8. Instead T=NCOL/2
+//   threads share a uint32 (2 words / 4 half-words / 8 quarter-words) so the
+//   accumulator count is a constant (16/T)·NCOL = 32. T=NCOL/2 rather than
+//   T=NCOL because a warp's coalesced load then still covers 256/NCOL = 32 B
+//   at ncol=8, one whole sector; T=NCOL leaves 16 B and doubles DRAM read
+//   amplification. w is stored marker-major (w[jl*NCOL+c]) so a row of NCOL
+//   weights is one or two float4/float2 loads — pure issue-slot savings.
+//   The marker slice mtile2 is chosen at RUNTIME to fill the GPU (see
+//   gmc_pick_g2y), not as a compile-time constant: a fixed 4096 leaves only
+//   130 blocks on mid, 33 k threads, which does not saturate a V100.
+#define GMC_CHUNK1 512
+#define GMC_MPW    4
+#define GMC_NCMAX  8
+#define GMC_G2YCAP 64      // Zpart tile cap (64·8·Npad·4 B; 410 MB on big2)
+
+template<int NCOL>
+__global__ void __launch_bounds__(G_NTHREAD, 4)
+gm_pass1_mc(const unsigned int* __restrict__ Ap, int W32,
+            const float* __restrict__ X, int Npad, float* __restrict__ Ypart,
+            int j0, int jn, int ypitch)
+{
+    constexpr int STAGE = 256/NCOL;
+    constexpr int PLANE = STAGE*G_SPAD;
+    constexpr int MPW   = GMC_MPW;
+    constexpr int MT    = G_NWARP*MPW;
+    __shared__ float sx[NCOL*PLANE];
+
+    int w0 = blockIdx.y * GMC_CHUNK1;
+    int wend = W32 - w0; if (wend > GMC_CHUNK1) wend = GMC_CHUNK1;
+    if (wend <= 0) return;
+
+    unsigned int magic = 0x4B000000u;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int jb = blockIdx.x * MT + warp*MPW;
+
+    // Out-of-range markers are clamped to jn-1 (legal memory, result never
+    // written). Clamping beats branching: the g[r] load is innermost and a
+    // per-r predicate would break up the coalesced access.
+    const unsigned int *row0 = Ap + (size_t)j0*W32 + w0;
+    int jrow[MPW];
+    #pragma unroll
+    for (int r = 0; r < MPW; ++r) {
+        int jl = jb + r; if (jl >= jn) jl = jn - 1;
+        jrow[r] = jl;
+    }
+
+    float acc[MPW][NCOL];
+    #pragma unroll
+    for (int r = 0; r < MPW; ++r)
+        #pragma unroll
+        for (int c = 0; c < NCOL; ++c) acc[r][c] = 0.f;
+
+    for (int s0 = 0; s0 < wend; s0 += STAGE) {
+        int nw = wend - s0; if (nw > STAGE) nw = STAGE;
+        #pragma unroll
+        for (int c = 0; c < NCOL; ++c)
+            for (int t = threadIdx.x; t < nw*16; t += G_NTHREAD)
+                sx[c*PLANE + (t >> 4)*G_SPAD + (t & 15)] = X[(size_t)c*Npad + (w0 + s0)*16 + t];
+        __syncthreads();
+
+        for (int w = lane; w < nw; w += 32) {
+            unsigned int g[MPW];
+            #pragma unroll
+            for (int r = 0; r < MPW; ++r) g[r] = gm_unpack16(row0[(size_t)jrow[r]*W32 + s0 + w]);
+            const float *xs = sx + w*G_SPAD;
+            #pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                float f[MPW];
+                #pragma unroll
+                for (int r = 0; r < MPW; ++r) f[r] = gm_field2f(g[r], 2*b, magic);
+                #pragma unroll
+                for (int c = 0; c < NCOL; ++c) {
+                    float xv = xs[c*PLANE + b];      // one LDS feeds MPW FMAs
+                    #pragma unroll
+                    for (int r = 0; r < MPW; ++r) acc[r][c] += f[r]*xv;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int r = 0; r < MPW; ++r) {
+        int jl = jb + r;
+        if (jl >= jn) break;
+        #pragma unroll
+        for (int c = 0; c < NCOL; ++c) {
+            float v = acc[r][c];
+            #pragma unroll
+            for (int off = 16; off; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (lane == 0)
+                Ypart[((size_t)blockIdx.y*NCOL + c)*ypitch + jl] = v;
+        }
+    }
+}
+
+template<int NCOL>
+__global__ void __launch_bounds__(G_NTHREAD, 4)
+gm_pass2_mc(const unsigned int* __restrict__ Ap, int W32,
+            const float* __restrict__ w, float* __restrict__ Zpart,
+            int j0, int jn, int Npad, int mtile2)
+{
+    constexpr int T   = NCOL/2 > 0 ? NCOL/2 : 1;
+    constexpr int SPT = 16/T;
+    int tid = blockIdx.x*blockDim.x + threadIdx.x;
+    int wi  = tid / T, sub = tid % T;
+    if (wi >= W32) return;
+    int jl0 = blockIdx.y * mtile2;
+    int jl1 = jl0 + mtile2; if (jl1 > jn) jl1 = jn;
+
+    unsigned int magic = 0x4B000000u;
+    float acc[SPT][NCOL];
+    #pragma unroll
+    for (int s = 0; s < SPT; ++s)
+        #pragma unroll
+        for (int c = 0; c < NCOL; ++c) acc[s][c] = 0.f;
+
+    for (int jl = jl0; jl < jl1; ++jl) {
+        unsigned int g = gm_unpack16(Ap[(size_t)(j0 + jl)*W32 + wi]);
+        float wv[NCOL];
+        if (NCOL == 8) {
+            float4 lo = ((const float4*)(w + (size_t)jl*NCOL))[0];
+            float4 hi = ((const float4*)(w + (size_t)jl*NCOL))[1];
+            wv[0]=lo.x; wv[1]=lo.y; wv[2]=lo.z; wv[3]=lo.w;
+            wv[4]=hi.x; wv[5]=hi.y; wv[6]=hi.z; wv[7]=hi.w;
+        } else if (NCOL == 4) {
+            float4 lo = *(const float4*)(w + (size_t)jl*NCOL);
+            wv[0]=lo.x; wv[1]=lo.y; wv[2]=lo.z; wv[3]=lo.w;
+        } else {
+            float2 lo = *(const float2*)(w + (size_t)jl*NCOL);
+            wv[0]=lo.x; wv[1]=lo.y;
+        }
+        #pragma unroll
+        for (int s = 0; s < SPT; ++s) {
+            float f = gm_field2f(g, 2*(sub*SPT + s), magic);
+            #pragma unroll
+            for (int c = 0; c < NCOL; ++c) acc[s][c] += f*wv[c];
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < NCOL; ++c) {
+        float *out = Zpart + ((size_t)blockIdx.y*NCOL + c)*Npad + wi*16 + sub*SPT;
+        #pragma unroll
+        for (int s = 0; s < SPT; ++s) out[s] = acc[s][c];
+    }
+}
+
+// S[c] = Σ_i X[i,c] (X's tail is zero-filled, so summing to Npad is the same)
+__global__ void gm_colsum_mc(const float* __restrict__ X, int Npad, float* __restrict__ S)
+{
+    __shared__ float s[G_NTHREAD];
+    int c = blockIdx.x;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < Npad; i += G_NTHREAD) acc += X[(size_t)c*Npad + i];
+    s[threadIdx.x] = acc; __syncthreads();
+    for (int k = G_NTHREAD/2; k; k >>= 1) {
+        if (threadIdx.x < k) s[threadIdx.x] += s[threadIdx.x+k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) S[c] = s[0];
+}
+
+// Pass-1 reduction + rank-one correction; emits w marker-major [jl*NCOL+c]
+// (the layout pass 2's vectorized load wants).
+template<int NCOL>
+__global__ void gm_pass1_finish_mc(const float* __restrict__ Ypart, int ntile, int M, int ypitch,
+                                   const float* __restrict__ freq, const float* __restrict__ invStd,
+                                   const float* __restrict__ S, float* __restrict__ w)
+{
+    int t = blockIdx.x*blockDim.x + threadIdx.x;
+    if (t >= M*NCOL) return;
+    int j = t / NCOL, c = t % NCOL;
+    float s = 0.f;
+    for (int ti = 0; ti < ntile; ++ti) s += Ypart[((size_t)ti*NCOL + c)*ypitch + j];
+    float y = invStd[j] * (s - 2.f*freq[j]*S[c]);
+    w[t] = invStd[j] * y;
+}
+
+// C[c] = Σ_j 2 freq[j] w[j,c]
+template<int NCOL>
+__global__ void gm_calcC_mc(const float* __restrict__ freq, const float* __restrict__ w,
+                            int M, float* __restrict__ C)
+{
+    __shared__ float s[G_NTHREAD];
+    int c = blockIdx.x;
+    float acc = 0.f;
+    for (int j = threadIdx.x; j < M; j += G_NTHREAD) acc += 2.f*freq[j]*w[(size_t)j*NCOL + c];
+    s[threadIdx.x] = acc; __syncthreads();
+    for (int k = G_NTHREAD/2; k; k >>= 1) {
+        if (threadIdx.x < k) s[threadIdx.x] += s[threadIdx.x+k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) C[c] = s[0];
+}
+
+// Pass-2 reduction + rank-one correction + the 1/M_pass scale. Z column-major,
+// ld = N. (Same inv_M deviation from the R original as gm_pass2_finish.)
+template<int NCOL>
+__global__ void gm_pass2_finish_mc(const float* __restrict__ Zpart, int ntile, int N, int Npad,
+                                   const float* __restrict__ C, float inv_M,
+                                   float* __restrict__ Z)
+{
+    size_t t = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
+    if (t >= (size_t)N*NCOL) return;
+    int c = t / N, i = t % N;
+    float s = 0.f;
+    for (int ti = 0; ti < ntile; ++ti) s += Zpart[((size_t)ti*NCOL + c)*Npad + i];
+    Z[t] = (s - C[c]) * inv_M;
+}
+
+// Pass-2 marker slice count: g2x is fixed by W32·T, so pad g2y until there are
+// ~1536 blocks to fill the GPU, capped by GMC_G2YCAP (the Zpart buffer size)
+// and by a floor of 256 markers per slice.
+int gmc_pick_g2y(int W32, int T, int jn)
+{
+    int g2x = (int)(((long long)W32*T + G_NTHREAD - 1)/G_NTHREAD);
+    int g2y = (1536 + g2x - 1)/g2x;
+    int maxy = (jn + 255)/256;
+    if (g2y > maxy) g2y = maxy;
+    if (g2y > GMC_G2YCAP) g2y = GMC_G2YCAP;
+    if (g2y < 1) g2y = 1;
+    return g2y;
+}
+
 // ---------------------------------------------------------------- geometry
 struct Geom {
     int W32;    // uint32 per marker row = ⌈N/16⌉
@@ -277,6 +533,18 @@ struct Ctx {
     float*        wv     = nullptr;   // M
     float*        Sd     = nullptr;   // scalar, stays resident
     float*        Cd     = nullptr;   // scalar, stays resident
+
+    // ---- fp32 small-batch scratch, allocated on the first matvec_mat() ----
+    bool   mc_alloc  = false;
+    int    g1y_mc    = 0;   // ⌈W32 / GMC_CHUNK1⌉
+    int    g2y_cap   = 0;   // Zmcp tile capacity
+    float* Xmc       = nullptr;   // Npad × 8, column-major, tail rows always 0
+    float* Wmc       = nullptr;   // M × 8, marker-major [j*NC+c]
+    float* Ymcp      = nullptr;   // g1y_mc × 8 × M
+    float* Zmcp      = nullptr;   // g2y_cap × 8 × Npad
+    float* Zmc       = nullptr;   // N × 8, column-major
+    float* Smc       = nullptr;   // 8
+    float* Cmc       = nullptr;   // 8
 };
 
 std::size_t need_bytes(int N, int M)
@@ -310,13 +578,40 @@ void destroy(Ctx* c)
     if (c->wv)     cudaFree(c->wv);
     if (c->Sd)     cudaFree(c->Sd);
     if (c->Cd)     cudaFree(c->Cd);
+    if (c->Xmc)    cudaFree(c->Xmc);
+    if (c->Wmc)    cudaFree(c->Wmc);
+    if (c->Ymcp)   cudaFree(c->Ymcp);
+    if (c->Zmcp)   cudaFree(c->Zmcp);
+    if (c->Zmc)    cudaFree(c->Zmc);
+    if (c->Smc)    cudaFree(c->Smc);
+    if (c->Cmc)    cudaFree(c->Cmc);
     delete c;
 }
 
-Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
-            int N, int M, const float* freq, const float* invstd)
+std::size_t mc_scratch_bytes(const Ctx* c)
 {
-    if (!packed || !freq || !invstd || N <= 0 || M <= 0) return nullptr;
+    if (!c) return 0;
+    const int g1y_mc = (c->W32 + GMC_CHUNK1 - 1)/GMC_CHUNK1;
+    int g2y_cap = GMC_G2YCAP;
+    const int maxy = (c->M + 255)/256;
+    if (g2y_cap > maxy) g2y_cap = maxy;
+    const std::size_t f = sizeof(float);
+    return (std::size_t)c->Npad * GMC_NCMAX * f              // Xmc
+         + (std::size_t)c->M    * GMC_NCMAX * f              // Wmc
+         + (std::size_t)g1y_mc  * GMC_NCMAX * c->M * f       // Ymcp
+         + (std::size_t)g2y_cap * GMC_NCMAX * c->Npad * f    // Zmcp
+         + (std::size_t)c->N    * GMC_NCMAX * f              // Zmc
+         + 2 * (std::size_t)GMC_NCMAX * f;                   // Smc, Cmc
+}
+
+// Shared by create() and create_rows(): everything except how the packed bytes
+// are copied in. Exactly one of `flat` / `row_ptrs` is non-null.
+static Ctx* create_impl(const unsigned char* flat,
+                        const unsigned char* const* row_ptrs,
+                        std::size_t stride_bytes,
+                        int N, int M, const float* freq, const float* invstd)
+{
+    if ((!flat && !row_ptrs) || !freq || !invstd || N <= 0 || M <= 0) return nullptr;
 
     const Geom g = geom_of(N, M);
     // cudaMemcpy2D would silently truncate/overrun if a source row were wider
@@ -369,11 +664,21 @@ Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
     // byte is equally harmless — xv's tail is permanently 0 (pass 1 multiplies
     // it by zero) and pass 2's Zpart tail is dropped by gm_pass2_finish.
     cudaError_t st = cudaMemset(c->Ap, 0xFF, ap_bytes);
-    if (st == cudaSuccess)
-        st = cudaMemcpy2D(c->Ap, (std::size_t)g.W32 * 4,
-                          packed, stride_bytes,
-                          stride_bytes, (std::size_t)M,
-                          cudaMemcpyHostToDevice);
+    if (st == cudaSuccess) {
+        if (flat) {
+            // One strided copy straight off the caller's buffer.
+            st = cudaMemcpy2D(c->Ap, (std::size_t)g.W32 * 4,
+                              flat, stride_bytes,
+                              stride_bytes, (std::size_t)M,
+                              cudaMemcpyHostToDevice);
+        } else {
+            // Scattered rows: M small copies. Still no host staging buffer.
+            unsigned char* dst = reinterpret_cast<unsigned char*>(c->Ap);
+            for (int m = 0; m < M && st == cudaSuccess; ++m)
+                st = cudaMemcpy(dst + (std::size_t)m * g.W32 * 4, row_ptrs[m],
+                                stride_bytes, cudaMemcpyHostToDevice);
+        }
+    }
     if (st == cudaSuccess)
         st = cudaMemset(c->xv, 0, (std::size_t)g.Npad * sizeof(float));
     if (st == cudaSuccess)
@@ -388,6 +693,18 @@ Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
         return nullptr;
     }
     return c;
+}
+
+Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
+            int N, int M, const float* freq, const float* invstd)
+{
+    return create_impl(packed, nullptr, stride_bytes, N, M, freq, invstd);
+}
+
+Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
+                 int N, int M, const float* freq, const float* invstd)
+{
+    return create_impl(nullptr, row_ptrs, stride_bytes, N, M, freq, invstd);
 }
 
 bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
@@ -426,6 +743,106 @@ bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
     G2B_CHECK_FALSE(cudaGetLastError());   // launch config errors surface here
     G2B_CHECK_FALSE(cudaMemcpy(ret, c->Zv, (std::size_t)c->N * sizeof(float),
                                cudaMemcpyDeviceToHost));
+    return true;
+}
+
+// Z = inv_M · A_std (A_stdᵀ X), X/ret column-major N × ncol, fp32 throughout.
+// ncol == 1 forwards to the single-column kernels; ncol > 8 is walked in
+// chunks of 8; a chunk is rounded up to {2,4,8} with ZERO columns rather than
+// split (5 → 4+1): every call re-reads the whole 2-bit matrix (≈7 ms/pass for
+// big2's 5.7 GB), so padding only costs arithmetic — and arithmetic is not the
+// wall below ncol=8. A zero column contributes 0 to S, to C and to both
+// passes, so the real columns come out bit-identical to the unpadded case.
+bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret)
+{
+    if (!c || !X || !ret || ncol < 0) return false;
+    if (ncol == 0) return true;
+    if (ncol == 1) return matvec_range(c, 0, c->M, inv_M, X, ret);
+
+    const int N = c->N, M = c->M;
+
+    if (!c->mc_alloc) {
+        c->g1y_mc  = (c->W32 + GMC_CHUNK1 - 1)/GMC_CHUNK1;
+        c->g2y_cap = GMC_G2YCAP;
+        const int maxy = (M + 255)/256;
+        if (c->g2y_cap > maxy) c->g2y_cap = maxy;
+        struct { float** p; std::size_t bytes; const char* name; } bufs[] = {
+            {&c->Xmc,  (std::size_t)c->Npad*GMC_NCMAX*sizeof(float),             "Xmc"},
+            {&c->Wmc,  (std::size_t)M*GMC_NCMAX*sizeof(float),                   "Wmc"},
+            {&c->Ymcp, (std::size_t)c->g1y_mc*GMC_NCMAX*M*sizeof(float),         "Ymcp"},
+            {&c->Zmcp, (std::size_t)c->g2y_cap*GMC_NCMAX*c->Npad*sizeof(float),  "Zmcp"},
+            {&c->Zmc,  (std::size_t)N*GMC_NCMAX*sizeof(float),                   "Zmc"},
+            {&c->Smc,  GMC_NCMAX*sizeof(float),                                  "Smc"},
+            {&c->Cmc,  GMC_NCMAX*sizeof(float),                                  "Cmc"},
+        };
+        for (auto& b : bufs) {
+            cudaError_t st = cudaMalloc((void**)b.p, b.bytes);
+            if (st != cudaSuccess) {
+                std::fprintf(stderr, "[gemv2bit] cudaMalloc %s (mc, %zu B) failed: %s\n",
+                             b.name, b.bytes, cudaGetErrorString(st));
+                return false;   // caller falls back; destroy() frees the rest
+            }
+        }
+        // Zero X once: later chunks only overwrite the first N rows of the
+        // first nb columns, so the padded tail rows stay 0 forever. Padding
+        // COLUMNS still need an explicit clear below (they can hold the
+        // previous chunk's data).
+        G2B_CHECK_FALSE(cudaMemset(c->Xmc, 0,
+                                   (std::size_t)c->Npad*GMC_NCMAX*sizeof(float)));
+        c->mc_alloc = true;
+        std::printf("[gemv2bit] fp32 batch path: %zu MB of scratch allocated\n",
+                    mc_scratch_bytes(c) >> 20);
+    }
+
+    for (int c0 = 0; c0 < ncol; c0 += GMC_NCMAX) {
+        const int nb = (c0 + GMC_NCMAX <= ncol) ? GMC_NCMAX : (ncol - c0);
+        const int NC = (nb <= 2) ? 2 : (nb <= 4) ? 4 : 8;
+
+        G2B_CHECK_FALSE(cudaMemcpy2D(c->Xmc, (std::size_t)c->Npad*sizeof(float),
+                                     X + (std::size_t)c0*N, (std::size_t)N*sizeof(float),
+                                     (std::size_t)N*sizeof(float), (std::size_t)nb,
+                                     cudaMemcpyHostToDevice));
+        if (nb < NC)
+            G2B_CHECK_FALSE(cudaMemset(c->Xmc + (std::size_t)nb*c->Npad, 0,
+                                       (std::size_t)(NC - nb)*c->Npad*sizeof(float)));
+
+        const int T      = NC/2;
+        const int g1x    = (M + G_NWARP*GMC_MPW - 1)/(G_NWARP*GMC_MPW);
+        const int g2x    = (int)(((long long)c->W32*T + G_NTHREAD - 1)/G_NTHREAD);
+        const int g2y    = gmc_pick_g2y(c->W32, T, M);
+        const int mtile2 = (M + g2y - 1)/g2y;
+
+        gm_colsum_mc<<<NC, G_NTHREAD>>>(c->Xmc, c->Npad, c->Smc);
+        switch (NC) {
+        case 2:
+            gm_pass1_mc<2><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
+            gm_pass1_finish_mc<2><<<(M*2 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
+            gm_calcC_mc<2><<<2, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass2_mc<2><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
+            gm_pass2_finish_mc<2><<<(int)(((std::size_t)N*2 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            break;
+        case 4:
+            gm_pass1_mc<4><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
+            gm_pass1_finish_mc<4><<<(M*4 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
+            gm_calcC_mc<4><<<4, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass2_mc<4><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
+            gm_pass2_finish_mc<4><<<(int)(((std::size_t)N*4 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            break;
+        default:
+            gm_pass1_mc<8><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
+            gm_pass1_finish_mc<8><<<(M*8 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
+            gm_calcC_mc<8><<<8, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass2_mc<8><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
+            gm_pass2_finish_mc<8><<<(int)(((std::size_t)N*8 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            break;
+        }
+        G2B_CHECK_FALSE(cudaGetLastError());
+
+        // The first nb columns are contiguous in Zmc (column-major, ld = N).
+        G2B_CHECK_FALSE(cudaMemcpy(ret + (std::size_t)c0*N, c->Zmc,
+                                   (std::size_t)nb*N*sizeof(float),
+                                   cudaMemcpyDeviceToHost));
+    }
     return true;
 }
 

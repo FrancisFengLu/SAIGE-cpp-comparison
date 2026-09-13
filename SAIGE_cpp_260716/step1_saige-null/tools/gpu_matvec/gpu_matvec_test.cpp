@@ -178,10 +178,87 @@ int main() {
     }
   }
 
+  // ---- create_rows(): scattered per-marker pointers, no host gather -------
+  // PackedFlat's rows happen to be contiguous, so we can point at them and
+  // still exercise the row-by-row upload used for genoVecofPointers.
+  {
+    std::vector<const unsigned char*> rows(M);
+    for (int m = 0; m < M; ++m)
+      rows[m] = packed.raw() + static_cast<std::size_t>(m) * nbyte;
+    auto* h = saige::gpu::create_rows(rows.data(), nbyte, M, freq, invstd, N, 4);
+    if (!h) {
+      std::fprintf(stderr, "gpu::create_rows failed\n");
+      ++failures;
+    } else {
+      std::printf("\n-- create_rows -> tier=%d --\n", saige::gpu::tier(h));
+      std::vector<float> Au(N, 0.0f);
+      if (!saige::gpu::matvec(h, u.data(), Au.data())) {
+        std::fprintf(stderr, "matvec after create_rows failed\n");
+        ++failures;
+      } else {
+        float d = 0.0f;
+        for (int i = 0; i < N; ++i) d = std::max(d, std::fabs(Au_cpu[i] - Au[i]));
+        const float rel = d / std::max(1e-12f, max_abs_cpu);
+        std::printf("Δ (CPU vs GPU): max|d|/max|Au_cpu|=%.4g  %s\n",
+                    rel, rel <= tol_rel ? "OK" : "FAIL");
+        if (rel > tol_rel) ++failures;
+      }
+      saige::gpu::destroy(h);
+    }
+  }
+
+  // ---- matvec_mat(): batch K·U vs k separate matvecs ----------------------
+  // k=5  → one chunk padded from 5 to NC=8 (zero columns must not leak)
+  // k=12 → two chunks, 8 then 4
+  for (int k : {5, 12}) {
+    auto* h = saige::gpu::create(packed, freq, invstd, N, 4);
+    if (!h) { std::fprintf(stderr, "create(tier 4) failed\n"); ++failures; continue; }
+    if (!saige::gpu::matvec_mat_available(h)) {
+      std::fprintf(stderr, "tier 4 reports no batch kernel\n");
+      ++failures; saige::gpu::destroy(h); continue;
+    }
+    std::printf("\n-- matvec_mat k=%d --\n", k);
+
+    std::vector<float> U(static_cast<std::size_t>(N) * k);
+    for (auto& v : U) v = d(rng);
+
+    std::vector<float> KU(static_cast<std::size_t>(N) * k, 0.0f);
+    if (!saige::gpu::matvec_mat(h, U.data(), k, KU.data())) {
+      std::fprintf(stderr, "matvec_mat failed\n"); ++failures;
+      saige::gpu::destroy(h); continue;
+    }
+    // Reference: the same handle, one column at a time.
+    float max_rel = 0.0f;
+    std::vector<float> col(N, 0.0f);
+    for (int c = 0; c < k; ++c) {
+      saige::gpu::matvec(h, U.data() + static_cast<std::size_t>(c) * N, col.data());
+      float num = 0.0f, den = 0.0f;
+      for (int i = 0; i < N; ++i) {
+        const float dv = KU[static_cast<std::size_t>(c) * N + i] - col[i];
+        num += dv * dv;
+        den += col[i] * col[i];
+      }
+      max_rel = std::max(max_rel, std::sqrt(num) / std::max(1e-20f, std::sqrt(den)));
+    }
+    std::printf("max per-column rel-L2 vs single-column kernel = %.4g  %s\n",
+                max_rel, max_rel <= 1e-5f ? "OK" : "FAIL");
+    if (max_rel > 1e-5f) ++failures;
+
+    // Determinism
+    std::vector<float> KU2(static_cast<std::size_t>(N) * k, 0.0f);
+    saige::gpu::matvec_mat(h, U.data(), k, KU2.data());
+    std::printf("batch inter-run: %s\n",
+                std::memcmp(KU.data(), KU2.data(), KU.size() * sizeof(float)) == 0
+                    ? "bit-identical" : "NONDETERMINISTIC");
+    if (std::memcmp(KU.data(), KU2.data(), KU.size() * sizeof(float)) != 0) ++failures;
+
+    saige::gpu::destroy(h);
+  }
+
   if (failures) {
-    std::fprintf(stderr, "\n%d tier(s) FAILED\n", failures);
+    std::fprintf(stderr, "\n%d check(s) FAILED\n", failures);
     return 1;
   }
-  std::printf("\nAll tiers OK\n");
+  std::printf("\nAll checks OK\n");
   return 0;
 }

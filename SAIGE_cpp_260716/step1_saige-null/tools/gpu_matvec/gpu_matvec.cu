@@ -245,15 +245,25 @@ __global__ void packed_sgemv_N(const uint8_t* __restrict__ packed,
   Au[i] = acc * inv_M;
 }
 
+// Where the packed bytes come from. Exactly one of `flat` / `rows` is set:
+// `flat` is a PackedFlat (one contiguous buffer, stride == nbyte); `rows` is an
+// array of M per-marker pointers (SAIGE's legacy genoVecofPointers).
+struct Src {
+  const saige::PackedFlat*    flat = nullptr;
+  const unsigned char* const* rows = nullptr;
+  std::size_t                 nbyte = 0;
+  std::size_t                 M     = 0;
+};
+
 static bool init_handle(Handle* h,
-                        const saige::PackedFlat& packed,
+                        const Src& src,
                         const std::vector<float>& freq,
                         const std::vector<float>& invstd,
                         int N, int tier_override) {
   h->N       = N;
-  h->M       = static_cast<int>(packed.n_stored());
-  h->nbyte   = static_cast<int>(packed.nbyte());
-  h->packed  = &packed;
+  h->M       = static_cast<int>(src.M);
+  h->nbyte   = static_cast<int>(src.nbyte);
+  h->packed  = src.flat;           // null in the scattered-rows case
   h->freq    = freq;
   h->invstd  = invstd;
 
@@ -295,15 +305,28 @@ static bool init_handle(Handle* h,
   } else if (tier_override == 3 || (tier_override == 0 && tier3_need <= free_b * 90 / 100)) {
     chosen_tier = 3;
   }
+  if (!src.flat && chosen_tier != 3 && chosen_tier != 4) {
+    // Tiers 1/2 re-expand from the host buffer on every matvec and have no
+    // scattered-row variant. Say so instead of dereferencing a null.
+    std::fprintf(stderr,
+                 "[gpu_matvec] scattered-row input needs tier 3 or 4, but "
+                 "neither fits (free %zu MB, tier4 %zu MB, tier3 %zu MB)\n",
+                 free_b >> 20, tier4_need >> 20, tier3_need >> 20);
+    return false;
+  }
 
   if (chosen_tier == 4) {
     // PackedFlat is one contiguous buffer with row stride == nbyte(), so the
     // upload is a single cudaMemcpy2D straight off raw() — no gather into a
     // staging buffer, no host-side fp32 expansion. (The R package had to
     // gather because its store was a vector of per-block pointers; that copy
-    // is what made host RSS 23.2/29 GiB at UKB scale.)
-    h->g2b = saige::gpu::g2b::create(packed.raw(), packed.nbyte(),
-                                     h->N, h->M, freq.data(), invstd.data());
+    // is what made host RSS 23.2/29 GiB at UKB scale.) The scattered-row form
+    // avoids the gather too, at the cost of M small H2D copies, once.
+    h->g2b = src.flat
+        ? saige::gpu::g2b::create(src.flat->raw(), src.nbyte,
+                                  h->N, h->M, freq.data(), invstd.data())
+        : saige::gpu::g2b::create_rows(src.rows, src.nbyte,
+                                       h->N, h->M, freq.data(), invstd.data());
     if (!h->g2b) {
       std::fprintf(stderr, "[gpu_matvec] tier-4 create failed"
                            " (need %zu MB, free %zu MB)\n",
@@ -334,7 +357,14 @@ static bool init_handle(Handle* h,
     CUDA_CHECK(cudaMalloc(&h->d_y,      h->M * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&h->d_Au,     per_col_float));
 
-    CUDA_CHECK(cudaMemcpy(h->d_packed, packed.raw(), packed_bytes, cudaMemcpyHostToDevice));
+    if (src.flat) {
+      CUDA_CHECK(cudaMemcpy(h->d_packed, src.flat->raw(), packed_bytes,
+                            cudaMemcpyHostToDevice));
+    } else {
+      for (int m = 0; m < h->M; ++m)
+        CUDA_CHECK(cudaMemcpy(h->d_packed + (std::size_t)m * h->nbyte, src.rows[m],
+                              src.nbyte, cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMemcpy(h->d_freq,   freq.data(),  h->M * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(h->d_invstd, invstd.data(),h->M * sizeof(float), cudaMemcpyHostToDevice));
 
@@ -416,23 +446,49 @@ bool available() {
   return count > 0;
 }
 
-Handle* create(const saige::PackedFlat& packed,
-               const std::vector<float>& freq,
-               const std::vector<float>& invstd,
-               int N,
-               int tier_override) {
+static Handle* create_from(const Src& src,
+                           const std::vector<float>& freq,
+                           const std::vector<float>& invstd,
+                           int N, int tier_override) {
   if (!available()) return nullptr;
-  if (packed.n_stored() == 0 || N <= 0) return nullptr;
-  if (static_cast<int>(freq.size())   < static_cast<int>(packed.n_stored())) return nullptr;
-  if (static_cast<int>(invstd.size()) < static_cast<int>(packed.n_stored())) return nullptr;
+  if (src.M == 0 || src.nbyte == 0 || N <= 0) return nullptr;
+  if (freq.size()   < src.M) return nullptr;
+  if (invstd.size() < src.M) return nullptr;
 
   auto* h = new Handle();
-  if (!init_handle(h, packed, freq, invstd, N, tier_override)) {
+  if (!init_handle(h, src, freq, invstd, N, tier_override)) {
     free_handle(h);
     delete h;
     return nullptr;
   }
   return h;
+}
+
+Handle* create(const saige::PackedFlat& packed,
+               const std::vector<float>& freq,
+               const std::vector<float>& invstd,
+               int N,
+               int tier_override) {
+  Src src;
+  src.flat  = &packed;
+  src.nbyte = packed.nbyte();
+  src.M     = packed.n_stored();
+  return create_from(src, freq, invstd, N, tier_override);
+}
+
+Handle* create_rows(const unsigned char* const* row_ptrs,
+                    std::size_t nbyte,
+                    std::size_t M,
+                    const std::vector<float>& freq,
+                    const std::vector<float>& invstd,
+                    int N,
+                    int tier_override) {
+  if (!row_ptrs) return nullptr;
+  Src src;
+  src.rows  = row_ptrs;
+  src.nbyte = nbyte;
+  src.M     = M;
+  return create_from(src, freq, invstd, N, tier_override);
 }
 
 void destroy(Handle* h) {
@@ -442,6 +498,16 @@ void destroy(Handle* h) {
 }
 
 int tier(const Handle* h) { return h ? h->tier : 0; }
+
+bool matvec_mat_available(const Handle* h) { return h && h->tier == 4 && h->g2b; }
+
+bool matvec_mat(Handle* h, const float* U, int k, float* out_KU) {
+  if (!h || !U || !out_KU || k < 0) return false;
+  if (h->tier != 4 || !h->g2b) return false;   // no batch kernel below tier 4
+  return saige::gpu::g2b::matvec_mat(h->g2b, k,
+                                     1.0f / static_cast<float>(h->M),
+                                     U, out_KU);
+}
 
 bool matvec(Handle* h, const float* u, float* out_Au) {
   if (!h || !u || !out_Au) return false;

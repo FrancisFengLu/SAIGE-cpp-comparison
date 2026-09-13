@@ -54,10 +54,39 @@ Handle* create(const saige::PackedFlat& packed,
                int                       N,
                int                       tier_override = 0);
 
+// Same contract, for callers whose packed markers are NOT in one buffer:
+// row_ptrs[m] points at marker m's `nbyte` packed bytes (SAIGE's legacy
+// genoVecofPointers, one heap allocation per marker — the storage the
+// isVarRatio BED path still uses). Uploaded row by row, so no host-side
+// staging copy is made.
+// Only tiers 3 and 4 can serve this: both upload once at create() and never
+// look at host memory again. Tiers 1/2 stream from the host on every matvec
+// and need a contiguous buffer, so if neither packed tier fits in VRAM this
+// returns nullptr rather than silently falling back.
+Handle* create_rows(const unsigned char* const* row_ptrs,
+                    std::size_t               nbyte,
+                    std::size_t               M,
+                    const std::vector<float>& freq,
+                    const std::vector<float>& invstd,
+                    int                       N,
+                    int                       tier_override = 0);
+
 // Compute out_Au = K · u. Returns false on error — caller falls back to CPU.
 // Safe to call concurrently with other handles; NOT safe to call two matvecs
 // on the same Handle concurrently from different threads.
 bool matvec(Handle* h, const float* u, float* out_Au);
+
+// True if this handle's tier implements matvec_mat(). Only tier 4 does today;
+// ask BEFORE calling so a "no batch kernel here" answer is not confused with a
+// device failure.
+bool matvec_mat_available(const Handle* h);
+
+// Multi-RHS: out_KU = K · U for a column-major N × k matrix U (an arma::fmat's
+// memptr() drops straight in; out_KU is the same shape). Same 1/M_pass
+// normalization as matvec().
+// Returns false if the tier has no batch kernel OR the device failed — check
+// matvec_mat_available() first to tell those apart.
+bool matvec_mat(Handle* h, const float* U, int k, float* out_KU);
 
 // Release all device buffers held by h.
 void destroy(Handle* h);

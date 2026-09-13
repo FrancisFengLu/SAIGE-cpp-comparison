@@ -1973,22 +1973,39 @@ int  getTraceSeedOr(int builtin_default) {
 	return (g_trace_seed >= 0) ? g_trace_seed : builtin_default;
 }
 
-// INTERNAL: Parallel computation helper for cross products
-arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
+// ---- shared GPU handle for the dense-GRM K·u and K·U paths ---------------
+// ONE Handle serves both parallelCrossProd (single column) and
+// parallelCrossProdMat (multi-RHS). A second handle would upload the whole
+// packed genotype matrix a second time.
+namespace {
 
-	// G3: GPU dispatch. Lazily create a single saige::gpu::Handle on first
-	// call when SAIGE_USE_GPU=1 is set by main.cpp and we have a populated
-	// packed_flat_. Silent CPU fallback on any failure.
-	static saige::gpu::Handle* s_gpu_handle = nullptr;
-	static int   s_gpu_state = 0;  // 0=unknown, 1=use, 2=cpu-fallback
-	// Set while re-entering this function to produce the CPU reference under
-	// SAIGE_GPU_VERIFY=1 — makes the GPU blocks below no-ops for that one call.
-	static bool  s_gpu_in_verify = false;
-	if (s_gpu_state == 0 && !s_gpu_in_verify) {
+saige::gpu::Handle* g_gpu_handle    = nullptr;
+int                 g_gpu_state     = 0;      // 0=unknown, 1=use, 2=permanent CPU
+// Set while re-entering parallelCrossProd to produce the CPU reference under
+// SAIGE_GPU_VERIFY=1 — makes the GPU dispatch a no-op for that one call.
+bool                g_gpu_in_verify = false;
+
+// G3: lazily create the Handle on first use when SAIGE_USE_GPU=1 is set by
+// main.cpp and packed_flat_ is populated. Returns nullptr whenever the caller
+// should run on the CPU. Silent fallback on any failure.
+saige::gpu::Handle* gpu_handle_or_null() {
+	if (g_gpu_in_verify) return nullptr;
+	if (g_gpu_state == 0) {
 		const char* env = std::getenv("SAIGE_USE_GPU");
 		const bool want_gpu = (env != nullptr && std::string(env) == "1");
-		if (want_gpu && geno.use_packed_flat_ && geno.packed_flat_.n_stored() > 0 &&
-		    saige::gpu::available()) {
+		// Two storage shapes reach us:
+		//   · packed_flat_  — the parallel BED path (isVarRatio == false)
+		//   · genoVecofPointers — the serial BED path, one heap allocation per
+		//     marker, which is what main.cpp:1455 selects whenever VR markers
+		//     are requested (i.e. nearly every real run). Before this, the GPU
+		//     gate only accepted the first, so --gpu silently did nothing on a
+		//     default config.
+		const std::size_t n_pass =
+		    (std::size_t)geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM();
+		const bool have_flat = geno.use_packed_flat_ && geno.packed_flat_.n_stored() > 0;
+		const bool have_rows = !have_flat && geno.packed_rows_contiguous() && n_pass > 0 &&
+		                       geno.genoVecofPointers.size() >= n_pass;
+		if (want_gpu && (have_flat || have_rows) && saige::gpu::available()) {
 			// Build freq/invstd host vectors from the per-marker arma::fvec
 			// counterparts the class already maintains.
 			std::vector<float> freq_h(geno.alleleFreqVec.begin(), geno.alleleFreqVec.end());
@@ -2002,32 +2019,68 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 			if (const char* tv = std::getenv("SAIGE_GPU_TIER")) {
 				tier_override = std::atoi(tv);
 			}
-			s_gpu_handle = saige::gpu::create(geno.packed_flat_, freq_h, invstd_h, N, tier_override);
-			if (s_gpu_handle) {
-				s_gpu_state = 1;
+			if (have_flat) {
+				g_gpu_handle = saige::gpu::create(geno.packed_flat_, freq_h, invstd_h,
+				                                  N, tier_override);
+			} else {
+				// Hand over the per-marker pointers directly; the backend
+				// uploads row by row so there is still no host-side gather.
+				// (M pointers = M×8 bytes, i.e. 0.3 MB at M=38 k.)
+				std::vector<const unsigned char*> rows(n_pass);
+				for (std::size_t m = 0; m < n_pass; ++m)
+					rows[m] = geno.packed_row_ptr(m);
+				g_gpu_handle = saige::gpu::create_rows(rows.data(),
+				                                       geno.packed_size(0), n_pass,
+				                                       freq_h, invstd_h, N, tier_override);
+			}
+			if (g_gpu_handle) {
+				g_gpu_state = 1;
 				std::cout << "[parallelCrossProd] GPU tier="
-				          << saige::gpu::tier(s_gpu_handle) << " enabled.\n";
-				// The GPU divides by packed_flat_.n_stored(); the CPU path
-				// divides by Msub_mafge1perc. Both come from the same passQC
-				// count, but a mismatch would be a SILENT scale error in tau,
-				// so print all three once and let the log prove it.
-				std::cout << "[parallelCrossProd] M_pass check: packed_flat_.n_stored()="
-				          << geno.packed_flat_.n_stored()
+				          << saige::gpu::tier(g_gpu_handle)
+				          << " enabled (source="
+				          << (have_flat ? "packed_flat_" : "genoVecofPointers")
+				          << ", batch K·U "
+				          << (saige::gpu::matvec_mat_available(g_gpu_handle) ? "yes" : "no")
+				          << ").\n";
+				// The GPU divides by the marker count it was handed; the CPU
+				// path divides by Msub_mafge1perc. Both come from the same
+				// passQC count, but a mismatch would be a SILENT scale error in
+				// tau, so print them once and let the log prove it.
+				const std::size_t m_src =
+				    have_flat ? geno.packed_flat_.n_stored() : n_pass;
+				std::cout << "[parallelCrossProd] M_pass check: uploaded=" << m_src
 				          << "  numberofMarkerswithMAFge_minMAFtoConstructGRM="
 				          << geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM()
 				          << "  freq/invstd len=" << freq_h.size() << "/" << invstd_h.size()
-				          << (geno.packed_flat_.n_stored() ==
-				                  (std::size_t)geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM()
-				              ? "  OK" : "  **MISMATCH**")
+				          << ((m_src == n_pass && freq_h.size() >= n_pass &&
+				               invstd_h.size() >= n_pass) ? "  OK" : "  **MISMATCH**")
 				          << std::endl;
 			} else {
-				s_gpu_state = 2;
+				g_gpu_state = 2;
 				std::cerr << "[parallelCrossProd] GPU unavailable — falling back to CPU.\n";
 			}
 		} else {
-			s_gpu_state = 2;
+			g_gpu_state = 2;
 		}
 	}
+	return (g_gpu_state == 1) ? g_gpu_handle : nullptr;
+}
+
+// A kernel-level failure (not a "this tier has no batch path" refusal) means
+// the device is in a bad state; give up on it for the rest of the run.
+void gpu_mark_failed(const char* where) {
+	std::cerr << "[" << where << "] GPU matvec failed, permanent CPU fallback.\n";
+	saige::gpu::destroy(g_gpu_handle);
+	g_gpu_handle = nullptr;
+	g_gpu_state  = 2;
+}
+
+}  // namespace
+
+// INTERNAL: Parallel computation helper for cross products
+arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
+
+	saige::gpu::Handle* s_gpu_handle = gpu_handle_or_null();
 	// G4: optionally release the host copy of packed_flat_ once the GPU
 	// has assumed ownership. Default OFF — post-solver debug paths
 	// (output_grm_diagonal, Get_OneSNP_Geno scans) still read packed_byte
@@ -2052,13 +2105,13 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 			const char* v = std::getenv("SAIGE_GPU_VERIFY");
 			return v && std::string(v) == "1";
 		}();
-		if (s_gpu_state == 1 && s_gpu_handle && !s_gpu_in_verify) {
+		if (s_gpu_handle) {
 			arma::fvec out((arma::uword)geno.getNnomissing());
 			if (saige::gpu::matvec(s_gpu_handle, bVec.memptr(), out.memptr())) {
 				if (s_gpu_verify) {
-					s_gpu_in_verify = true;
+					g_gpu_in_verify = true;
 					arma::fvec ref = parallelCrossProd(bVec);   // CPU reference
-					s_gpu_in_verify = false;
+					g_gpu_in_verify = false;
 					const double rn = arma::norm(ref);
 					const double rel = arma::norm(out - ref) / std::max(1e-30, rn);
 					static long s_vcalls = 0;
@@ -2070,17 +2123,14 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 					          << std::endl;
 				}
 				if (s_release_enabled && !s_released && ++s_success_count >= 4 &&
-				    saige::gpu::tier(s_gpu_handle) >= 3) {
+				    saige::gpu::tier(s_gpu_handle) >= 3 && geno.use_packed_flat_) {
 					geno.release_packed_flat_host();
 					s_released = true;
 				}
 				return out;
 			}
 			// one-time failure → fall through to CPU on this and all future calls
-			std::cerr << "[parallelCrossProd] GPU matvec failed, permanent CPU fallback.\n";
-			saige::gpu::destroy(s_gpu_handle);
-			s_gpu_handle = nullptr;
-			s_gpu_state  = 2;
+			gpu_mark_failed("parallelCrossProd");
 		}
 	}
 
@@ -2512,6 +2562,20 @@ arma::fmat parallelCrossProdMat(const arma::fmat& Bmat) {
 				          << 1e3 * total() / cols() << "ms" << std::endl;
 		}
 	} psivmat_timer(s_time_psiv, k);
+
+	// G6: batch GPU dispatch, sharing the single-column handle. Only tier 4
+	// has a multi-RHS kernel; every other tier answers "not available" and we
+	// stay on the CPU rather than looping matvec() k times (that would re-read
+	// the whole packed matrix once per column, which is the very cost the
+	// batch kernel exists to avoid).
+	if (saige::gpu::Handle* h = gpu_handle_or_null()) {
+		if (saige::gpu::matvec_mat_available(h)) {
+			arma::fmat out(N, k);
+			if (saige::gpu::matvec_mat(h, Bmat.memptr(), (int)k, out.memptr()))
+				return out;
+			gpu_mark_failed("parallelCrossProdMat");
+		}
+	}
 
 	CorssProdMat worker(Bmat);
 
