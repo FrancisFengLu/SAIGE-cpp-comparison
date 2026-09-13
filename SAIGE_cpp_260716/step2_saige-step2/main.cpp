@@ -3685,6 +3685,16 @@ int main(int argc, char* argv[])
     mallopt(M_MMAP_THRESHOLD, 65536);
     mallopt(M_TRIM_THRESHOLD, 65536);
 
+    // Spell non-finite doubles the way R does ("Inf"/"-Inf"/"NaN") in every
+    // output stream.  Setting the global locale covers streams constructed from
+    // here on; OutFile / OutFile_singleInGroup* are namespace-scope objects
+    // already constructed before main(), so they are imbued explicitly.
+    // Finite formatting is unchanged.
+    installRNumericLocale();
+    OutFile.imbue(std::locale());
+    OutFile_singleInGroup.imbue(std::locale());
+    OutFile_singleInGroup_temp.imbue(std::locale());
+
     g_timing_start = TimingClock::now();  // TIMING_INSTRUMENT_REMOVE_ME
     g_timing_last = g_timing_start;  // TIMING_INSTRUMENT_REMOVE_ME
     timing_mark("00_main_start");  // TIMING_INSTRUMENT_REMOVE_ME

@@ -205,3 +205,13 @@ double add_logp(double p1, double p2)
         double result = maxp+std::log(1+std::exp(minp-maxp));
         return(result);
 }
+
+// Install the R-compatible non-finite spelling ("Inf"/"-Inf"/"NaN") as the
+// global locale's numeric-output facet.  Streams constructed afterwards -- all
+// of the association output files -- pick it up automatically; finite values
+// are untouched.  See UTIL.hpp for why this is a correctness issue and not a
+// cosmetic one.
+void installRNumericLocale()
+{
+    std::locale::global(std::locale(std::locale::classic(), new RNumPut));
+}
