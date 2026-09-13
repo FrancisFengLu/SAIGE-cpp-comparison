@@ -810,6 +810,24 @@ private:
     // Raw genotype buffer for one variant
     std::vector<unsigned char> m_OneMarkerRaw;
 
+    // Raw 2-bit code -> ALT dosage, with PGEN_MISSING for a missing call.
+    // The two storage modes this reader supports do NOT share a code table:
+    //
+    //   mode 0x02 (PLINK 2 basic variant-major)
+    //       00 = hom REF (0)   01 = het (1)   10 = hom ALT (2)   11 = missing
+    //   mode 0x01 (PLINK 1 .bed layout inside a .pgen container -- 6c 1b 01 is
+    //              literally the .bed magic, and plink2 accepts such a file)
+    //       00 = hom A1        01 = missing   10 = het           11 = hom A2
+    //       and plink2's .pvar for a PLINK-1 dataset carries ALT = A1,
+    //       REF = A2, so 00 -> 2, 01 -> missing, 10 -> 1, 11 -> 0.
+    //
+    // Decoding mode 0x01 with the 0x02 table (what this reader used to do for
+    // every mode) reverses homozygotes AND turns real missing calls into
+    // heterozygotes while reporting MissingRate 0 -- silently wrong output, no
+    // error.  Set once in readPgenHeader().
+    static const uint8_t PGEN_MISSING = 3;
+    uint8_t m_genoCode[4] = {0, 1, 2, PGEN_MISSING};
+
     // Internal parsers
     void readPvarFile();
     void readPsamFile();

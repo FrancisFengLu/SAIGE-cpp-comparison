@@ -2716,6 +2716,12 @@ void PgenClass::readPgenHeader()
         m_M0 = m_M;
         m_dataOffset = 3;
         m_bytesPerVariant = (m_N0 + 3) / 4;
+        // PLINK-1 code table: 00=hom A1(=ALT)->2, 01=missing, 10=het->1,
+        // 11=hom A2(=REF)->0.  See the m_genoCode comment in genotype_reader.hpp.
+        m_genoCode[0] = 2;
+        m_genoCode[1] = PGEN_MISSING;
+        m_genoCode[2] = 1;
+        m_genoCode[3] = 0;
         std::cout << "PGEN mode 0x01 (PLINK 1 variant-major)" << std::endl;
         std::cout << "  Variants: " << m_M0 << " (from .pvar)" << std::endl;
         std::cout << "  Samples:  " << m_N0 << " (from .psam)" << std::endl;
@@ -2746,14 +2752,21 @@ void PgenClass::readPgenHeader()
             m_dataOffset += nonrefBytes;
         }
 
+        // PLINK-2 code table: the 2-bit code IS the ALT dosage, 11 = missing.
+        m_genoCode[0] = 0;
+        m_genoCode[1] = 1;
+        m_genoCode[2] = 2;
+        m_genoCode[3] = PGEN_MISSING;
         std::cout << "PGEN mode 0x02 (basic variant-major)" << std::endl;
         std::cout << "  Variants in header: " << m_M0 << std::endl;
         std::cout << "  Samples in header:  " << m_N0 << std::endl;
         std::cout << "  Header control:     0x" << std::hex << (int)headerCtrl << std::dec << std::endl;
         std::cout << "  Data offset:        " << m_dataOffset << std::endl;
     } else {
+        char modeHex[8];
+        snprintf(modeHex, sizeof(modeHex), "0x%02x", (unsigned)m_mode);
         throw std::runtime_error(
-            "Unsupported PGEN mode 0x" + std::to_string((int)m_mode) +
+            std::string("Unsupported PGEN mode ") + modeHex +
             ". This standalone reader only supports mode 0x01 (PLINK 1) and 0x02 (basic variant-major). "
             "For mode 0x10/0x11 (variable-type records with LD compression or dosage), "
             "the full pgenlib library would be required.");
@@ -3052,36 +3065,35 @@ void PgenClass::getOneMarker(
             "Failed to read variant " + std::to_string(t_gIndex) + " from PGEN file");
     }
 
-    // Decode genotypes for each sample in the analysis
-    // PGEN mode 0x02 encoding: 00=0(ref), 01=1(het), 10=2(alt), 11=missing
+    // Decode genotypes for each sample in the analysis.  m_genoCode maps the raw
+    // 2-bit code to an ALT dosage (or PGEN_MISSING) for the storage mode this
+    // file actually uses -- mode 0x01 and mode 0x02 do NOT share a table.
     uint32_t numMissing = 0;
     t_altCounts = 0;
     uint j = 0;
 
     for (uint32_t i = 0; i < m_N; i++) {
         uint32_t sampleIdx = m_posSampleInPgen[i];
-        uint8_t geno = getGenotype(sampleIdx);
+        uint8_t geno = m_genoCode[getGenotype(sampleIdx)];
 
         double genoVal;
-        if (geno == 0x03) {
-            // Missing
+        if (geno == PGEN_MISSING) {
             genoVal = std::numeric_limits<double>::quiet_NaN();
             numMissing++;
             if (t_isOutputIndexForMissing) {
                 t_indexForMissing.push_back(i);
             }
         } else {
-            // 00->0, 01->1, 10->2
             genoVal = (double)geno;
             t_altCounts += genoVal;
         }
 
-        if (geno > 0 && geno != 0x03) {
+        if (geno > 0 && geno != PGEN_MISSING) {
             t_indexForNonZero.push_back(i);
         }
 
         if (t_isOnlyOutputNonZero) {
-            if (geno > 0 && geno != 0x03) {
+            if (geno > 0 && geno != PGEN_MISSING) {
                 OneMarkerG1[j] = genoVal;
                 j++;
             }
@@ -3177,7 +3189,7 @@ void PgenClass::getOneMarker_ts(uint64_t t_gIndex,
             std::to_string(t_gIndex) + " from PGEN file");
     }
 
-    // Decode genotypes (PGEN mode 0x02 encoding: 00=0, 01=1, 10=2, 11=missing)
+    // Decode genotypes through m_genoCode (mode-dependent; see genotype_reader.hpp).
     // We inline the 2-bit extraction because getGenotype() reads m_OneMarkerRaw.
     uint32_t numMissing = 0;
     t_altCounts = 0;
@@ -3187,10 +3199,11 @@ void PgenClass::getOneMarker_ts(uint64_t t_gIndex,
         uint32_t sampleIdx = m_posSampleInPgen[i];
         uint32_t byteIdx  = sampleIdx / 4;
         uint32_t bitShift = (sampleIdx % 4) * 2;
-        uint8_t  geno     = (tlsOneMarkerRaw[byteIdx] >> bitShift) & 0x03;
+        uint8_t  raw      = (tlsOneMarkerRaw[byteIdx] >> bitShift) & 0x03;
+        uint8_t  geno     = m_genoCode[raw];
 
         double genoVal;
-        if (geno == 0x03) {
+        if (geno == PGEN_MISSING) {
             genoVal = std::numeric_limits<double>::quiet_NaN();
             numMissing++;
             if (t_isOutputIndexForMissing) {
@@ -3201,12 +3214,12 @@ void PgenClass::getOneMarker_ts(uint64_t t_gIndex,
             t_altCounts += genoVal;
         }
 
-        if (geno > 0 && geno != 0x03) {
+        if (geno > 0 && geno != PGEN_MISSING) {
             t_indexForNonZero.push_back(i);
         }
 
         if (t_isOnlyOutputNonZero) {
-            if (geno > 0 && geno != 0x03) {
+            if (geno > 0 && geno != PGEN_MISSING) {
                 OneMarkerG1[j] = genoVal;
                 j++;
             }
