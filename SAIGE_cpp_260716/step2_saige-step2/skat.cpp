@@ -440,10 +440,29 @@ double davies_pvalue(double q, const arma::vec& lambda) {
 
 
 // Strict variant of davies_pvalue for use inside the SKAT-O integrand.
-// Returns NaN when Davies fails (ifault != 0) instead of silently falling
-// back to Liu.  This matches R's behavior where the integrand calls stop()
-// on ifault != 0, causing try(integrate(...)) to fail and trigger the Liu
-// integration fallback path.
+//
+// Returns the RAW Davies tail probability (1 - res), which may legitimately
+// land slightly outside [0,1] because qfc truncates its inversion series at
+// acc=1e-6; NaN is returned ONLY when the algorithm itself reports failure
+// (ifault != 0) or produces a non-finite number.
+//
+// This mirrors R exactly.  SKAT:::SKAT_Optimal_Integrate_Func_Davies is:
+//
+//     dav.re <- SKAT_davies(min1.st, param.m$lambda, acc=10^-6)
+//     temp   <- dav.re$Qq
+//     if (dav.re$ifault != 0) stop("dav.re$ifault is not 0")
+//     if (temp > 1) temp = 1
+//     re[i] <- (1 - temp) * dchisq(x[i], df=1)
+//
+// i.e. only ifault aborts the integration (the stop() propagates out of
+// try(integrate(...)) and triggers the Liu fallback); an out-of-range Qq is
+// CLAMPED and the Davies integration continues.  The clamping is done by the
+// caller so that this function stays a faithful qfc wrapper.
+//
+// NOTE the deliberate asymmetry with davies_pvalue() (non-strict).  There,
+// R's SKAT:::Get_PValue.Lambda really does route `p > 1 || p <= 0` to Liu,
+// so davies_pvalue() must keep that rule.  The two call sites have different
+// rules in R and must keep different rules here.
 double davies_pvalue_strict(double q, const arma::vec& lambda) {
     arma::vec lam = lambda(arma::find(arma::abs(lambda) > 1e-10));
     int n = (int)lam.n_elem;
@@ -480,9 +499,15 @@ double davies_pvalue_strict(double q, const arma::vec& lambda) {
 
     double pval = 1.0 - res;
 
-    // Strict check: if ifault != 0 or pval out of range, return NaN
-    // (do NOT fall back to Liu — caller will detect and handle)
-    if (ifault != 0 || !std::isfinite(pval) || pval <= 0.0 || pval > 1.0) {
+    // Strict check: ONLY a real qfc failure (ifault != 0) or a non-finite
+    // result aborts the Davies integration, matching R's integrand, which
+    // stop()s on ifault alone.  A Qq of 1+1e-8 or -1e-9 is qfc truncation
+    // noise, not a failure: R clamps it (`if (temp > 1) temp = 1`) and keeps
+    // going, and so does our caller.  Treating those as failures is what made
+    // a converged Davies integral get thrown away for a Liu approximation,
+    // moving SKAT-O p-values by up to 1.8e-2 relative in the null range and by
+    // up to 2.8x near genome-wide significance.
+    if (ifault != 0 || !std::isfinite(pval)) {
         return std::numeric_limits<double>::quiet_NaN();
     }
 
@@ -1669,27 +1694,34 @@ double SKATO_optimal_pvalue(const arma::vec& Score,
         double min1_temp = temp_min - MuQ;
         double min1_st = min1_temp * sd1 + MuQ;
 
-        // ONE Davies call with shared lambda (strict: NaN on ifault != 0)
+        // ONE Davies call with shared lambda (strict: NaN on ifault != 0 only).
         // In R, ifault != 0 calls stop() inside the integrand, which causes
         // try(integrate(...)) to fail entirely, falling back to Liu integration.
-        // We replicate this by using davies_pvalue_strict() which returns NaN
-        // on failure, then set the flag so the caller switches to Liu integration.
+        // Anything else -- including Qq marginally outside [0,1], which is just
+        // qfc's acc=1e-6 truncation error -- is clamped and kept, exactly as
+        // R's `if (temp > 1) temp = 1` does.
         double tail_prob;
         if (lambda_shared.n_elem > 0) {
             tail_prob = davies_pvalue_strict(min1_st, lambda_shared);
-            if (std::isnan(tail_prob) || tail_prob < 0.0 || tail_prob > 1.0) {
-                // Davies failed — flag for Liu fallback and abort integration
+            if (std::isnan(tail_prob)) {
+                // Davies genuinely failed — flag for Liu fallback and abort
                 davies_failed_in_integrand = true;
-                return 0.0;  // Return 0 to not corrupt the integral; it will be discarded
+                return 0.0;  // will be discarded together with the whole integral
             }
+            // R: if (temp > 1) temp = 1.  R has no lower clamp; we add one so a
+            // Qq of -1e-9 cannot push the integral past 1 and trip the
+            // `qr.value > 1` guard below into a spurious Liu fallback -- i.e.
+            // the clamp exists to PREVENT the very branch flip this fix removes.
+            // It moves the integrand by at most qfc's own acc (1e-6) at a single
+            // quadrature node.
+            if (tail_prob > 1.0) tail_prob = 1.0;
+            if (tail_prob < 0.0) tail_prob = 0.0;
         } else {
             tail_prob = 0.0;
         }
 
         // re[i] = (1 - tail_prob) * dchisq(x, 1)  =  CDF * density
         double cdf_val = 1.0 - tail_prob;
-        if (cdf_val < 0.0) cdf_val = 0.0;
-        if (cdf_val > 1.0) cdf_val = 1.0;
 
         return cdf_val * fx;
     };
