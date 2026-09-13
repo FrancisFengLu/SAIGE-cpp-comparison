@@ -157,6 +157,19 @@ SAIGEClass::SAIGEClass(
     m_isFastTest = t_isFastTest;
     m_isnoadjCov = t_isnoadjCov;
     m_pval_cutoff_for_fastTest = t_pval_cutoff_for_fastTest;
+    // flagSparseGRM=true with dimNum=0 is not a usable state: m_spSigmaMat and
+    // m_diagSigma stay empty below, yet the fast-test recompute still sets
+    // flagSparseGRM_cur=true for low-MAC markers (main.cpp:1052, :1590), which
+    // reaches getPCG1ofSigmaAndGtilde with a zero-length preconditioner. This
+    // file is built with -DARMA_NO_DEBUG, so that is silent garbage rather than
+    // a throw. The loader already refuses to construct this combination; catch
+    // it here too, so any other caller gets a diagnosable failure instead.
+    if(t_flagSparseGRM && t_dimNum == 0){
+        throw std::runtime_error(
+            "setSAIGEobjInCPP: flagSparseGRM=true but dimNum=0. The sparse GRM is "
+            "missing while the sparse variance path is enabled; this combination "
+            "would run the PCG solve against an empty preconditioner.");
+    }
     if(t_dimNum != 0){
         m_spSigmaMat = arma::sp_mat(t_locationMat, t_valueVec, t_dimNum, t_dimNum);
 	m_diagSigma = arma::vec(m_spSigmaMat.diag());

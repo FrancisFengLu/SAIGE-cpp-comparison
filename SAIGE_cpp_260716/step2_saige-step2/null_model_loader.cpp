@@ -706,11 +706,34 @@ NullModelData loadNullModel(const std::string & model_dir,
             std::cout << "  sparseGRM_valueVec: " << data.valueVec.n_elem << " elements" << std::endl;
             std::cout << "  dimNum = " << data.dimNum << std::endl;
         } else {
-            std::cout << "  WARNING: flagSparseGRM=true but sparse GRM files not found." << std::endl;
-            std::cout << "  Setting dimNum=0 (no sparse GRM)." << std::endl;
-            data.locationMat = arma::umat(2, 1, arma::fill::zeros);
-            data.valueVec = arma::vec(1, arma::fill::zeros);
-            data.dimNum = 0;
+            // Do not fall back silently. The old code left flagSparseGRM=true while
+            // zeroing dimNum, which is an inconsistent state the rest of the program
+            // cannot detect: setSAIGEobjInCPP only builds m_spSigmaMat/m_diagSigma
+            // when dimNum != 0 (saige_test.cpp), so m_diagSigma stays empty, while
+            // the fast-test recompute still turns flagSparseGRM_cur back on for
+            // low-MAC markers (main.cpp:1052, :1590). Those markers then reach
+            // getPCG1ofSigmaAndGtilde with a zero-length preconditioner, and this
+            // translation unit is built with -DARMA_NO_DEBUG (Makefile:15), so
+            // Armadillo does not bounds-check it -- silent garbage instead of a throw.
+            //
+            // Reaching here also means the run would have used a dense variance
+            // where the caller asked for a sparse one, which changes the statistics,
+            // not just the speed. That is worth stopping for.
+            //
+            // This is reachable from a supported workflow: step 1 writes
+            // "flagSparseGRM": true whenever use_sparse_grm_to_fit is set
+            // (null_model_engine.cpp:793) but never emits the two .arma files --
+            // it saves the sparse GRM as MatrixMarket COO instead. Until that
+            // plumbing is connected, the honest answer is to refuse the run.
+            throw std::runtime_error(
+                "nullmodel.json sets flagSparseGRM=true but the sparse GRM was not found at\n"
+                "  " + model_dir + "/sparseGRM_locationMat.arma\n"
+                "  " + model_dir + "/sparseGRM_valueVec.arma\n"
+                "Refusing to continue: falling back to a dense variance would silently\n"
+                "change the test statistics, and the partially-initialised sparse state\n"
+                "is not safe to run.\n"
+                "Either supply those two files, or set flagSparseGRM=false in nullmodel.json\n"
+                "to request the dense path explicitly.");
         }
     } else {
         // No sparse GRM: set dummy values
