@@ -3720,7 +3720,8 @@ int main(int argc, char* argv[])
             std::cerr << "  minMAC:            Minimum MAC (default: 0.5)" << std::endl;
             std::cerr << "  maxMissRate:       Maximum missing rate (default: 0.15)" << std::endl;
             std::cerr << "  minINFO:           Minimum imputation info (default: 0)" << std::endl;
-            std::cerr << "  AlleleOrder:       'alt-first' or 'ref-first' (default: 'alt-first')" << std::endl;
+            std::cerr << "  AlleleOrder:       'alt-first' or 'ref-first' (default: plink 'alt-first', bgen/pgen 'ref-first';" << std::endl;
+            std::cerr << "                     bgen and pgen accept ONLY 'ref-first')" << std::endl;
             std::cerr << "  dosage_zerod_cutoff:     (default: 0.2)" << std::endl;
             std::cerr << "  dosage_zerod_MAC_cutoff: (default: 10)" << std::endl;
             std::cerr << "  pgenFile:          Path to .pgen file [for genoType=pgen]" << std::endl;
@@ -3837,7 +3838,35 @@ int main(int argc, char* argv[])
         double minMAC = config["minMAC"] ? config["minMAC"].as<double>() : 0.5;
         double maxMissRate = config["maxMissRate"] ? config["maxMissRate"].as<double>() : 0.15;
         double minINFO = config["minINFO"] ? config["minINFO"].as<double>() : 0.0;
-        std::string alleleOrder = config["AlleleOrder"] ? config["AlleleOrder"].as<std::string>() : "alt-first";
+        // AlleleOrder default is PER READER, exactly as R's Geno.R decides it:
+        //   plink  -> "alt-first" (Geno.R:172), .bim column 5 is A1 = ALT
+        //   bgen   -> "ref-first" (Geno.R:232) and nothing else is accepted
+        //             (Geno.R:233-235 stop()s), because the BGEN spec defines
+        //             the FIRST listed allele as the reference
+        //   pgen   -> "ref-first" (Geno.R:203) and nothing else is accepted
+        //             (Geno.R:204-206 stop()s); .pvar carries REF/ALT explicitly
+        // The single global default of "alt-first" meant any bgen run that did
+        // not spell AlleleOrder out got REF and ALT swapped: on the same file,
+        // ref-first gives snp0 Allele1=A/Allele2=G/AF=0.694794 (agreeing with
+        // the PLINK and VCF reads of the same data) while alt-first gives
+        // Allele1=G/Allele2=A/AF=0.305206 with BETA reversed -- silently, with
+        // no warning, and R will not even start in that configuration.
+        std::string alleleOrderDefault =
+            (genoType_early == "bgen" || genoType_early == "pgen") ? "ref-first" : "alt-first";
+        std::string alleleOrder = config["AlleleOrder"]
+            ? config["AlleleOrder"].as<std::string>() : alleleOrderDefault;
+        if (alleleOrder != "alt-first" && alleleOrder != "ref-first") {
+            throw std::runtime_error("AlleleOrder must be 'alt-first' or 'ref-first', got '"
+                                     + alleleOrder + "'");
+        }
+        if ((genoType_early == "bgen" || genoType_early == "pgen") && alleleOrder != "ref-first") {
+            throw std::runtime_error(
+                "genotype is in " + genoType_early + ", please set AlleleOrder=ref-first "
+                "(the " + std::string(genoType_early == "bgen" ? "BGEN" : "PGEN") +
+                " format defines the reference allele first; alt-first would swap REF/ALT "
+                "and flip the sign of BETA).  R refuses this configuration too "
+                "(SAIGE-upstream/R/Geno.R:" + std::string(genoType_early == "bgen" ? "233" : "204") + ").");
+        }
         // P3 fix (2026-05-09): align defaults with R's step2_SPAtests.R.
         // R defaults: dosage_zerod_cutoff=0.2, dosage_zerod_MAC_cutoff=10
         // cpp previously defaulted both to 0, which kept ~12k extra low-info
