@@ -154,8 +154,15 @@ arma::umat g_X_PARregion_mat;
 // Output file streams
 std::ofstream OutFile;
 std::ofstream OutFile_singleInGroup;
-std::ofstream OutFile_single;
 std::ofstream OutFile_singleInGroup_temp;
+
+// Single-variant output: one stream and one TraitMeta per trait, in the order
+// the config wrote them (MULTITRAIT_DESIGN.md section 4.4). Both are length 1
+// on the single-trait path, where g_OutFiles_single[0] is exactly the old
+// global OutFile_single and g_traitMeta[0] carries the traitType /
+// isMoreOutput / isCondition that used to be passed around as loose arguments.
+std::vector<std::ofstream>     g_OutFiles_single;
+std::vector<SAIGE::TraitMeta>  g_traitMeta;
 
 // Output file prefix strings
 std::string g_outputFilePrefixGroup;
@@ -553,14 +560,16 @@ void assign_conditionMarkers_factors(
 // openOutfile_single
 // Direct port from SAIGE/src/Main.cpp lines 2587-2643
 // ============================================================
-bool openOutfile_single(std::string t_traitType,
+bool openOutfile_single(std::ofstream& OutFile_single,
+                         const SAIGE::TraitMeta& t_meta,
                          bool t_isImputation,
-                         bool isappend,
-                         bool t_isMoreOutput)
+                         bool isappend)
 {
+    const std::string& t_traitType   = t_meta.traitType;
+    const bool         t_isMoreOutput = t_meta.isMoreOutput;
     bool isopen;
     if (!isappend) {
-        OutFile_single.open(g_outputFilePrefixSingle.c_str());
+        OutFile_single.open(t_meta.outFile.c_str());
         isopen = OutFile_single.is_open();
         if (isopen) {
             OutFile_single << "CHR\tPOS\tMarkerID\tAllele1\tAllele2\tAC_Allele2\tAF_Allele2\t";
@@ -574,7 +583,7 @@ bool openOutfile_single(std::string t_traitType,
                 OutFile_single << "p.value.NA\tIs.SPA\t";
             }
 
-            if (ptr_gSAIGEobj->m_isCondition) {
+            if (t_meta.isCondition) {
                 OutFile_single << "BETA_c\tSE_c\tTstat_c\tvar_c\tp.value_c\t";
                 if (t_traitType == "binary" || t_traitType == "survival") {
                     OutFile_single << "p.value.NA_c\t";
@@ -598,7 +607,7 @@ bool openOutfile_single(std::string t_traitType,
             }
         }
     } else {
-        OutFile_single.open(g_outputFilePrefixSingle.c_str(), std::ofstream::out | std::ofstream::app);
+        OutFile_single.open(t_meta.outFile.c_str(), std::ofstream::out | std::ofstream::app);
         isopen = OutFile_single.is_open();
     }
 
@@ -610,13 +619,12 @@ bool openOutfile_single(std::string t_traitType,
 // writeOutfile_single
 // Direct port from SAIGE/src/Main.cpp lines 2646-2779
 // ============================================================
-void writeOutfile_single(bool t_isMoreOutput,
+void writeOutfile_single(std::ofstream& OutFile_single,
+                          const SAIGE::TraitMeta& t_meta,
                           bool t_isImputation,
-                          bool t_isCondition,
                           bool t_isFirth,
                           int mFirth,
                           int mFirthConverge,
-                          std::string t_traitType,
                           std::vector<std::string> & chrVec,
                           std::vector<std::string> & posVec,
                           std::vector<std::string> & markerVec,
@@ -649,6 +657,10 @@ void writeOutfile_single(bool t_isMoreOutput,
                           std::vector<double> & N_ctrl_homVec,
                           std::vector<uint32_t> & N_Vec)
 {
+    // Unpacked from TraitMeta so the body below is untouched.
+    const bool         t_isMoreOutput = t_meta.isMoreOutput;
+    const bool         t_isCondition  = t_meta.isCondition;
+    const std::string& t_traitType    = t_meta.traitType;
     int numtest = 0;
     for (unsigned int k = 0; k < pvalVec.size(); k++) {
         if (pvalVec.at(k) != "NA") {
@@ -1888,13 +1900,12 @@ void mainMarkerInCPP(
     }  // for(int i = 0; i < q; i++)
 
     // output
-    writeOutfile_single(t_isMoreOutput,
+    writeOutfile_single(g_OutFiles_single[0],
+                         g_traitMeta[0],
                          t_isImputation,
-                         isCondition,
                          t_isFirth,
                          mFirth,
                          mFirthConverge,
-                         t_traitType,
                          chrVec,
                          posVec,
                          markerVec,
@@ -4276,6 +4287,41 @@ int main(int argc, char* argv[])
         std::cout << "  n = " << ptr_gSAIGEobj->m_n << ", p = " << ptr_gSAIGEobj->m_p << std::endl;
         std::cout << std::endl;
 
+        // ---- 5b. Per-trait metadata + output streams ----
+        // One entry here; a multi-trait run fills P of these. Every field is
+        // the exact value the output writers used to receive as a loose
+        // argument, so the written bytes are unchanged.
+        g_traitMeta.resize(1);
+        {
+            SAIGE::TraitMeta& tm = g_traitMeta[0];
+            tm.name      = modelSpecs[0].traitName;
+            tm.modelDir  = modelSpecs[0].modelFile;
+            tm.vrFile    = modelSpecs[0].varianceRatioFile;
+            tm.outFile   = modelSpecs[0].outputFile;
+            tm.traitType = nullModel.traitType;
+            // Lenient on purpose: the single-trait path has never rejected an
+            // unrecognised traitType, and `kind` is not read at P == 1.
+            SAIGE::tryTraitKindFromString(tm.traitType, tm.kind);
+            tm.p                        = static_cast<int>(nullModel.p);
+            tm.tau0                     = nullModel.tau0;
+            tm.SPA_Cutoff               = nullModel.SPA_Cutoff;
+            tm.is_Firth_beta            = nullModel.is_Firth_beta;
+            tm.pCutoffforFirth          = nullModel.pCutoffforFirth;
+            tm.isFastTest               = nullModel.isFastTest;
+            tm.pval_cutoff_for_fastTest = nullModel.pval_cutoff_for_fastTest;
+            tm.isnoadjCov               = nullModel.isnoadjCov;
+            tm.flagSparseGRM            = nullModel.flagSparseGRM;
+            tm.isCondition              = ptr_gSAIGEobj->m_isCondition;
+            tm.isMoreOutput             = isMoreOutput;
+            // loco_applied, not useLOCO: loadNullModel silently falls back to
+            // the genome-wide fit when `chrom` is absent from loco_chroms
+            // (null_model_loader.cpp guard 3). Phase 1 warns when P models
+            // disagree here, so it has to record what really happened.
+            tm.locoApplied              = nullModel.loco_applied;
+            tm.outIdx                   = 0;
+        }
+        g_OutFiles_single.resize(1);
+
         // ---- 6. Set up genotype reader (PLINK, VCF, or BGEN) ----
         std::cout << "===== Setting up genotype reader =====" << std::endl;
         uint32_t numMarkers = 0;
@@ -4737,7 +4783,8 @@ int main(int argc, char* argv[])
 
             // ---- 8a. Open output file ----
             std::cout << "===== Opening output file =====" << std::endl;
-            bool isopen = openOutfile_single(nullModel.traitType, isImputation, false, isMoreOutput);
+            bool isopen = openOutfile_single(g_OutFiles_single[0], g_traitMeta[0],
+                                             isImputation, false);
             if (!isopen) {
                 throw std::runtime_error("Cannot open output file: " + outputFile);
             }
@@ -4786,7 +4833,7 @@ int main(int argc, char* argv[])
             }
 
             // ---- 10a. Close output file ----
-            OutFile_single.close();
+            g_OutFiles_single[0].close();
 
         } else {
             // ============================================================
