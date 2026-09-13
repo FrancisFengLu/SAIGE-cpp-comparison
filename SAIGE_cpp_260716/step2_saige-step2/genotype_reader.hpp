@@ -278,8 +278,25 @@ public:
 
     std::vector<std::string> getChrVec() { return m_chr; }
 
-    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to marker index
-    // Used by group file parser to look up variant genotype indices
+    // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") AND from the
+    // .bim ID column to marker index.  Used by the group file parser to look up
+    // variant genotype indices.
+    //
+    // Both spellings are accepted on purpose, because R and this port disagree
+    // about which one a PLINK group file may use and the disagreement is
+    // SILENT on both sides.  R resolves PLINK group-file variants only through
+    // markerInfo$ID = .bim column 2 (SAIGE-upstream/R/Geno.R:182-196 -- the
+    // PLINK branch never builds the CHROM:POS:REF:ALT key that the PGEN branch
+    // at :215 does), then prints "N markers in RegionFile are not in GenoFile",
+    // writes a ZERO-BYTE output file and exits rc=0.  This port used to accept
+    // only chr:pos:ref:alt, skipping every region with a matching-but-differently
+    // spelled name and also exiting rc=0.  So one group file could not feed both
+    // sides, and neither side failed loudly.
+    //
+    // Accepting the union means every group file R accepts works here, plus the
+    // chr:pos:ref:alt convention that real SAIGE-GENE+ group files normally use.
+    // Positional keys are inserted first and win any collision, so a .bim ID
+    // that happens to look like a coordinate cannot shadow the real coordinate.
     std::unordered_map<std::string, uint32_t> getMarkerIDToIndex() {
         std::unordered_map<std::string, uint32_t> idMap;
         for (uint32_t i = 0; i < m_M0; i++) {
@@ -294,6 +311,12 @@ public:
                 idMap[id2] = i;
             }
         }
+        // Fallback keys: the .bim ID column, which is the ONLY spelling R
+        // understands here.  emplace() after the loop above, so a positional
+        // key is never overwritten.
+        for (uint32_t i = 0; i < m_M0 && i < m_MarkerInPlink.size(); i++) {
+            idMap.emplace(m_MarkerInPlink[i], i);
+        }
         return idMap;
     }
 
@@ -307,6 +330,11 @@ public:
             std::string base = m_chr[i] + ":" + std::to_string(m_pd[i]) + ":";
             chrMap[base + m_ref[i] + ":" + m_alt[i]] = m_chr[i];
             chrMap.emplace(base + m_alt[i] + ":" + m_ref[i], m_chr[i]);
+        }
+        // Same .bim-ID fallback as getMarkerIDToIndex(), so the region-level
+        // LOCO filter resolves the same group files the region reader does.
+        for (uint32_t i = 0; i < m_M0 && i < m_MarkerInPlink.size(); i++) {
+            chrMap.emplace(m_MarkerInPlink[i], m_chr[i]);
         }
         return chrMap;
     }
