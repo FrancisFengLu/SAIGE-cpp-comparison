@@ -272,7 +272,14 @@ void SAIGEClass::scoreTestFast(arma::vec & t_GVec,
     thread_local arma::vec tl_g1, tl_res1, tl_mu21, tl_B, tl_g1t;
     thread_local arma::mat tl_X1, tl_A1;
     if(tl_g1.n_elem < nnz){ tl_g1.set_size(nnz); tl_res1.set_size(nnz); tl_mu21.set_size(nnz); tl_B.set_size(nnz); tl_g1t.set_size(nnz); }
-    if(tl_X1.n_rows < nnz){ tl_X1.set_size(nnz, p); tl_A1.set_size(nnz, p); }
+    // The grow test must be on the ELEMENT count, not n_rows: the aliases below
+    // are nnz*p doubles laid out over this buffer, and under multi-trait one
+    // thread alternates between traits with different p. n_rows alone lets a
+    // (nnz=900, p=20) alias -- 18000 doubles -- sit on a buffer grown for
+    // (nnz=1000, p=5) = 5000 doubles, i.e. a heap overwrite. Single-trait p is
+    // constant, so n_elem < nnz*p fires on exactly the same markers as
+    // n_rows < nnz did: behaviour is unchanged at P=1.
+    if(tl_X1.n_elem < nnz * p){ tl_X1.set_size(nnz, p); tl_A1.set_size(nnz, p); }
     // Exact-size (nnz) aliases over the persistent buffers; no allocation. The
     // physical buffers may be larger (grow-only) but each alias is written and
     // read with the same nnz-stride, so the layout is self-consistent.
