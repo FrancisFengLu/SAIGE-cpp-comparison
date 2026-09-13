@@ -1322,13 +1322,35 @@ bool VcfClass::getOneMarker(
                     // DS field: single dosage value per sample
                     dose_val = ds_arr[i];
                 } else {
-                    // HDS field: sum haplotype dosages (like savvy stride_reduce)
+                    // HDS field: sum the haplotype dosages.
+                    //
+                    // A missing haplotype makes the SAMPLE's dosage unknown, and
+                    // must propagate.  Skipping missing entries and summing the
+                    // rest (what this loop used to do) silently reported
+                    // HDS=".,." as dosage 0 and HDS="0.5,." as dosage 0.5, with
+                    // MissingRate 0 in both cases -- a factual misstatement about
+                    // the data, and a value the mean-imputation step then never
+                    // gets the chance to replace.  R reaches the same conclusion
+                    // by a different route: savvy's stride_reduce adds the
+                    // haplotypes straight up, so a NaN haplotype poisons the sum
+                    // and its VCF.cpp:250 std::isnan test fires.
+                    //
+                    // bcf_float_vector_end is NOT missing: it marks a sample with
+                    // fewer haplotypes than the record's stride (a haploid call in
+                    // a diploid record, e.g. chrX outside the PAR).  Those samples
+                    // have a well-defined dosage from the haplotypes present, so
+                    // the loop stops rather than failing.
                     dose_val = 0.0f;
                     for (int p = 0; p < stride; p++) {
                         float v = ds_arr[i * stride + p];
-                        if (!bcf_float_is_missing(v) && !bcf_float_is_vector_end(v)) {
-                            dose_val += v;
+                        if (bcf_float_is_vector_end(v)) {
+                            break;
                         }
+                        if (bcf_float_is_missing(v) || std::isnan(v)) {
+                            dose_val = std::numeric_limits<float>::quiet_NaN();
+                            break;
+                        }
+                        dose_val += v;
                     }
                 }
 
