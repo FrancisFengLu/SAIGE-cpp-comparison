@@ -41,6 +41,20 @@ isFirth: true
 MACCutoffforER: 4
 nThreads: 16
 
+# --- batch kernel (multi-trait only; none of these change the numbers) -------
+# mtBatch: false sends every (marker, trait) pair down the per-pair scalar
+#   path. Output is identical either way -- it exists so a numerical surprise
+#   can be attributed to the kernel or ruled out of it in one run.
+# mtBlockSize: markers per block. Only moves the block boundaries; a run at 32
+#   and a run at 512 are byte-identical.
+# mtMemBudgetGB: total block scratch across all threads when mtBlockSize is
+#   absent. Cost is about 16 bytes per (sample, block column) per thread.
+mtBatch: true
+# mtBlockSize: 0        # 0 / absent = pick from mtMemBudgetGB
+mtMemBudgetGB: 1.5
+# mtRequireSameSamples: true   # the only accepted value; false is refused
+#                              # rather than silently ignored
+
 # Constraints (see MULTITRAIT_DESIGN.md section 4.3):
 #   - all models must share the same sample IDs, in the same order
 #   - all models must agree on impute_method

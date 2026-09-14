@@ -101,7 +101,7 @@ struct TraitMeta {
     int    p      = 0;      // covariate count including the intercept
     int    colOff = 0;      // first column of this trait inside Xstack / Astack
     int    binOff = -1;     // first column inside WXstack; -1 when not binary
-    int    binIdx = -1;     // trait index inside MU2bin / CCM; -1 when not binary
+    int    binIdx = -1;     // trait index inside MU2bin; -1 when not binary
     double tau0            = 1.0;
     double SPA_Cutoff      = 2.0;
     bool   is_Firth_beta   = false;
@@ -113,7 +113,6 @@ struct TraitMeta {
     bool   isCondition     = false;
     bool   isMoreOutput    = false;
     bool   locoApplied     = false;   // did this trait really read chr<N>/ ?
-    int    nCase = 0, nCtrl = 0;
     bool   batchable = false;         // static gating result, design section 3.1
     int    outIdx = 0;                // position in the config's `models:` order
 };
@@ -135,16 +134,34 @@ struct MTContext {
     arma::mat WXstack;   // N x sumPbin  block t = mu2_t % X_t (binary only)
     arma::mat RES;       // N x P        column t = res_t
     arma::mat MU2bin;    // N x nBin
-    arma::mat CCM;       // N x 2*nBin   [case_0, ctrl_0, case_1, ctrl_1, ...]
+    // No CCM (the case/control indicator stack of design 2.3): the case and
+    // control allele counts are still summed per pair in index order, because
+    // a GEMM re-associates that sum and would move the printed AF columns in
+    // their last digit on mean-imputed dosages. See the commit that added the
+    // kernel.
 
     std::vector<arma::mat> XVX;    // P matrices, p_t x p_t
     std::vector<arma::vec> S_a;    // P vectors, p_t
-    std::vector<TraitMeta> meta;   // internal order
-    std::vector<int> outOrder;     // internal index -> config order
+    std::vector<TraitMeta> meta;   // internal order; TraitMeta::outIdx carries
+                                   // the position in the config's models: list
 
     std::vector<int> batchTraits;       // batchable, binary first
     std::vector<int> batchQuantTraits;  // batchable and quantitative
     std::vector<int> scalarTraits;      // not batchable
+};
+
+// The batch kernel's intermediates: one per thread, reused across blocks
+// (grow-only, never reallocated per block). The block's genotype matrix itself
+// is NOT here -- the caller owns it, because it is filled marker by marker
+// during the read and only then handed to the kernel.
+struct MTScratch {
+    arma::mat Gb2;     // N x B   = Gb % Gb
+    arma::mat Zall;    // sumP x B
+    arma::mat GWbin;   // sumPbin x B
+    arma::mat GWqnt;   // sumPqnt x B
+    arma::mat GR;      // B x P
+    arma::mat G2Mu2;   // B x nBin
+    arma::vec Gsq;     // B
 };
 
 // ------------------------------------------------------------------
@@ -177,20 +194,65 @@ const char* batchableReason(const TraitMeta& t_meta);
 // P = 64 run cannot be localised to a trait.
 void printMTGateTable(const std::vector<TraitMeta>& t_meta, bool t_locoEnabled);
 
-// One per thread, reused across blocks (grow-only, never reallocated per block).
-struct MTScratch {
-    arma::mat Gb;      // N x B
-    arma::mat Gb2;     // N x B   = Gb % Gb
-    arma::mat Zall;    // sumP x B
-    arma::mat GWbin;   // sumPbin x B
-    arma::mat GWqnt;   // sumPqnt x B
-    arma::mat GR;      // B x P
-    arma::mat G2Mu2;   // B x nBin
-    arma::vec Gsq;     // B
-    arma::mat AC;      // B x 2*nBin
-    arma::mat VR;      // B x P    per-pair variance ratio
-    std::vector<std::pair<int,int>> fb;   // fallback queue: (column in block, internal trait)
+// ------------------------------------------------------------------
+// Batch kernel
+// ------------------------------------------------------------------
+
+// Fills t_meta's colOff / binOff / binIdx and builds the stacked matrices.
+// t_meta must already be in internal order; t_order[t] is the config index of
+// internal trait t, so t_nms[t_order[t]] is that trait's loaded model.
+// Every trait gets a column block, batchable or not: the few extra columns cost
+// p_t*N doubles and keep the offsets a single uniform rule.
+void buildMTContext(MTContext& t_ctx,
+                    const std::vector<NullModelData>& t_nms,
+                    const std::vector<int>& t_order,
+                    std::vector<TraitMeta>& t_meta,
+                    bool t_locoEnabled,
+                    const std::string& t_locoChrom);
+
+// One marker block's normal-approximation results, B x P. Only the columns of
+// the trait set passed to scoreTestBatchMT are written.
+struct MTBlockResult {
+    arma::mat Beta, seBeta, Tstat, var1, var2, StdStat;
+    // The p-value as format_score_result returns it: linear, or natural log
+    // when pvalIsLog is set for that pair. This is the number the scalar path
+    // gates Firth on, so the fallback decision uses it and not a re-parse of
+    // the printed string.
+    arma::mat pvalRaw;
+    std::vector<std::vector<std::string>> pvalStr;    // [P][B]
+    std::vector<std::vector<char>>        pvalIsLog;  // [P][B]
+
+    void resize(int t_B, int t_P);
 };
+
+// Normal-approximation score test for one marker block against several traits
+// at once (design section 2). Computes exactly the quantities
+// SAIGEClass::scoreTestFast computes -- S, var2, var1, and the p-value through
+// the same format_score_result -- but with the per-trait cancellations of
+// design section 2.2 applied, so neither B nor gtilde is ever materialised.
+//
+//   t_Gb        N x B, imputed / QC'd / flipped; one column per marker
+//   t_j0, t_j1  the half-open column range to score. The caller packs the
+//               high-MAC markers from column 0 up and the low-MAC ones from
+//               column B down, so both groups are contiguous and each gets one
+//               call with its own trait set (design section 3.2) without ever
+//               copying or masking the block.
+//   t_traitSet  internal trait indices to score; other columns are untouched
+//   t_VR        B x P, the per-pair variance ratio (only t_traitSet read)
+//
+// NOT bit-identical to scoreTestFast: the scalar version sums over the carrier
+// samples only, this one sums over all N (the non-carriers contribute exact
+// zeros but change the association order). Algebraically equal; the caller
+// must treat the difference as last-bit rounding, never as a licence to skip a
+// fallback.
+void scoreTestBatchMT(const MTContext& t_ctx,
+                      const std::vector<int>& t_traitSet,
+                      const arma::mat& t_Gb,
+                      int t_j0, int t_j1,
+                      const arma::mat& t_VR,
+                      MTScratch& t_scr,
+                      MTBlockResult& t_out);
+
 
 }  // namespace SAIGE
 

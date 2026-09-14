@@ -25,6 +25,7 @@
 #include <thread>
 #include <memory>
 #include <chrono>
+#include <atomic>
 #include <omp.h>
 
 // OpenBLAS thread-count knob (no public header in some installs); declared here
@@ -175,6 +176,19 @@ std::vector<SAIGE::TraitMeta>  g_traitMeta;
 // instances is what makes a multi-trait fallback pair run literally the same
 // code as a single-trait run.
 std::vector<SAIGE::SAIGEClass*> g_saigeObjs;
+
+// Stacked per-trait constants for the batch kernel. Built only when P > 1 and
+// at least one trait passes the static gate; empty otherwise.
+SAIGE::MTContext g_mtctx;
+// Marker block width for the batch kernel; 0 means "pick one from the sample
+// count" (see mainMarkerMT). Config key mtBlockSize.
+int  g_mtBlockSize = 0;
+// Config key mtBatch: false forces every pair down the per-pair scalar path,
+// which is the Phase 1 behaviour and the A/B reference for the batch kernel.
+bool g_mtBatch = true;
+// Config key mtMemBudgetGB: total marker-block scratch across all threads,
+// used to pick a block width when mtBlockSize is absent.
+double g_mtMemBudgetGB = 1.5;
 
 // Output file prefix strings
 std::string g_outputFilePrefixGroup;
@@ -2029,6 +2043,49 @@ struct MTTraitChunk {
     }
 };
 
+// Per-thread scratch for one marker block. Grow-only and reused across blocks:
+// allocating an N x B buffer per block is exactly the mmap/munmap fault storm
+// the thread_local buffers elsewhere in this file exist to avoid.
+//
+// The two index vectors the scalar path needs (zero / nonzero sample indices)
+// are deliberately NOT kept per column. They are recomputable from the dense
+// column -- both producers define them as {i : g[i] == 0} and its complement in
+// ascending i (UTIL.cpp imputeGenoAndFlip, PlinkClass::fillOneMarkerFusedDense_ts)
+// -- and only a fallback pair needs them. Caching them would add 8 bytes per
+// (sample, block column), a third of the block scratch, to serve the ~2% of
+// pairs that actually ask for them.
+struct MTBlockWork {
+    arma::mat Gb;                 // N x B; high-MAC markers packed from column 0
+                                  // up, low-MAC ones from column B-1 down, so
+                                  // both groups are contiguous (design 3.2)
+    arma::mat VR;                 // B x P, per-pair variance ratio
+    std::vector<int>    colOf;    // block-local marker -> Gb column, -1 if not scored
+    std::vector<char>   isHi;     // per Gb column
+    std::vector<double> MACc, altFreqc;
+    std::vector<char>   flipc;
+    SAIGE::MTScratch     scr;
+    SAIGE::MTBlockResult res;
+
+    // per-marker read scratch
+    arma::vec tmpG, gtilde, P2Vec;
+    arma::uvec idxZ, idxNZ;
+    std::vector<uint> izv, inzv, imv;
+
+    void ensure(int t_n, int t_B, int t_P) {
+        const arma::uword N = static_cast<arma::uword>(t_n);
+        const arma::uword B = static_cast<arma::uword>(t_B);
+        if (Gb.n_rows != N || Gb.n_cols != B) Gb.set_size(N, B);
+        if (VR.n_rows != B || VR.n_cols != (arma::uword)t_P) VR.set_size(B, t_P);
+        if (tmpG.n_elem != N) { tmpG.set_size(N); gtilde.set_size(N); }
+        colOf.assign(t_B, -1);
+        isHi.assign(t_B, 0);
+        MACc.assign(t_B, 0.0);
+        altFreqc.assign(t_B, 0.0);
+        flipc.assign(t_B, 0);
+        res.resize(t_B, t_P);
+    }
+};
+
 void mainMarkerMT(
     std::string & t_genoType,
     std::vector<std::string> & t_genoIndex_prev,
@@ -2037,6 +2094,7 @@ void mainMarkerMT(
     bool & t_isImputation,
     bool & t_isFirth)
 {
+    const SAIGE::MTContext& ctx = g_mtctx;
     const int P = static_cast<int>(g_saigeObjs.size());
     const int n = g_saigeObjs[0]->m_n;
     const int q = static_cast<int>(t_genoIndex.size());
@@ -2052,7 +2110,35 @@ void mainMarkerMT(
         }
     }
     std::vector<int> mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
+    std::vector<long> nBatched(P, 0), nFallback(P, 0);
     std::vector<MTTraitChunk> out(P);
+
+    const bool batchOn = g_mtBatch && !ctx.batchTraits.empty();
+
+    // Block width. Each thread holds Gb (N*B doubles) plus the kernel's Gb2
+    // (same again), so the resident cost is ~16 bytes per (sample, column) per
+    // thread. mtBlockSize overrides it outright; otherwise the width is the
+    // largest power of two in [32, 256] that fits mtMemBudgetGB across all
+    // threads. Block width never changes any pair's arithmetic (design G4.1),
+    // only where the block boundaries fall.
+    const int nThreadsHere = std::max(1, omp_get_max_threads());
+    int Bblk = g_mtBlockSize;
+    if (Bblk <= 0) {
+        const double budget = g_mtMemBudgetGB * 1024.0 * 1024.0 * 1024.0;
+        const double fit = budget / (16.0 * (double)n * (double)nThreadsHere);
+        Bblk = 32;
+        while (Bblk * 2 <= (int)fit && Bblk < 256) Bblk *= 2;
+    }
+    if (Bblk < 1) Bblk = 1;
+    if (batchOn) {
+        std::cout << "  MT batch kernel: block size " << Bblk << ", "
+                  << ctx.batchTraits.size() << " batch traits ("
+                  << ctx.batchQuantTraits.size() << " quantitative), "
+                  << ctx.scalarTraits.size() << " scalar traits" << std::endl;
+    } else {
+        std::cout << "  MT batch kernel disabled; every pair takes the scalar path"
+                  << std::endl;
+    }
 
     // BGEN streamer spans the whole run (design section 7.3): it is indexed by
     // the global marker index, so rebuilding it per chunk would restart the
@@ -2069,16 +2155,20 @@ void mainMarkerMT(
         std::cout << "BGEN streamer: " << nDec << " decoders, queueCap=64" << std::endl;
     }
 
+    std::vector<MTBlockWork> work(nThreadsHere);
+
     // End-of-stream sentinel, shared across chunks: once a reader has failed at
     // marker i, every marker from i on is left at its "NA" sentinel and is not
-    // written, exactly as in the single-trait loop.
-    int firstEndIdx = q;
+    // written, exactly as in the single-trait loop. Atomic because the workers
+    // read it without holding critical(endflag) -- same values, but a plain int
+    // read racing a write is undefined rather than merely stale.
+    std::atomic<int> firstEndIdx{q};
     const int chunkSize = (g_marker_chunksize > 0 ? g_marker_chunksize : q);
 
     for (int chunkStart = 0; chunkStart < q; chunkStart += chunkSize) {
         const int chunkEnd = std::min(chunkStart + chunkSize, q);
         const int qc = chunkEnd - chunkStart;
-        if (chunkStart >= firstEndIdx) break;
+        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
 
         // Marker-level output columns: one copy, shared by all P traits.
         std::vector<std::string> markerVec(qc), chrVec(qc), posVec(qc),
@@ -2087,387 +2177,499 @@ void mainMarkerMT(
                             imputationInfoVec(qc, 0.0), missingRateVec(qc, 0.0);
         for (int t = 0; t < P; t++) out[t].reset(qc);
 
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (int jj = 0; jj < qc; jj++) {
-            const int i = chunkStart + jj;
+        const int nBlocks = (qc + Bblk - 1) / Bblk;
 
-            // Same thread_local scratch strategy as mainMarkerInCPP (PATH B1):
-            // these are O(N) and would otherwise mmap/munmap every marker.
-            thread_local arma::vec t_GVec, gtildeVec, t_P2Vec;
-            thread_local std::vector<uint> indexZeroVec, indexNonZeroVec, indexForMissing;
-            thread_local arma::uvec indexZeroVec_arma, indexNonZeroVec_arma;
-            if (t_GVec.n_elem != (arma::uword)n) {
-                t_GVec.set_size(n);
-                gtildeVec.set_size(n);
-            }
-            indexZeroVec.clear();
-            indexNonZeroVec.clear();
-            indexForMissing.clear();
-            t_P2Vec.reset();
+        // Design section 6.2: the parallel dimension is the block. One thread
+        // owns a block end to end -- read, QC, GEMM, fallback, finalize -- so
+        // there is no shared state to guard beyond the EOF sentinel, and the
+        // decode / p-value formatting / fallback work parallelises along with
+        // the BLAS. Results are written to per-marker slots, so the output is
+        // independent of how blocks were scheduled.
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int blk = 0; blk < nBlocks; blk++) {
+            MTBlockWork& W = work[omp_get_thread_num()];
+            W.ensure(n, Bblk, P);
+            const int jj0 = blk * Bblk;
+            const int jj1 = std::min(jj0 + Bblk, qc);
+            int nHi = 0, nLo = 0;
 
-            if (i >= firstEndIdx) continue;
+            // ---- read + QC + impute every marker in the block ----
+            for (int jj = jj0; jj < jj1; jj++) {
+                const int i = chunkStart + jj;
+                if (i >= firstEndIdx.load(std::memory_order_relaxed)) continue;
 
-            if ((i + 1) % g_marker_chunksize == 0) {
-                #pragma omp critical(progress)
-                {
-                    std::cout << "Completed " << (i + 1) << "/" << q
-                              << " markers in the chunk." << std::endl;
-                }
-            }
-
-            std::string chr, ref, alt, marker;
-            uint32_t pd = 0;
-            double altFreq = 0.0, altCounts = 0.0, missingRate = 0.0, imputeInfo = 0.0;
-            bool flip = false;
-            bool usedFusedDecode = false;
-            PLINK::PlinkClass::FusedMarkerStats fsFused;
-            const bool isOutputIndexForMissing = true;
-            const bool isOnlyOutputNonZero = false;
-
-            // ---- read one marker (marker level, shared by every trait) ----
-            bool isReadMarker;
-            if (t_genoType == "bgen") {
-                BGEN::BgenDecodedMarker dm;
-                isReadMarker = bgenStreamer->getMarker((uint64_t)i, dm);
-                if (isReadMarker) {
-                    ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
-                    alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";
-                    marker      = dm.rsID;
-                    pd          = dm.physpos;
-                    chr         = dm.chr;
-                    altFreq     = dm.altFreq;
-                    altCounts   = dm.altCounts;
-                    missingRate = dm.missingRate;
-                    imputeInfo  = dm.info;
-                    indexForMissing = std::move(dm.indexForMissing);
-                    t_GVec = std::move(dm.dosages);
-                }
-            } else {
-                std::string t_genoIndex_str = t_genoIndex.at(i);
-                char* end;
-                uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
-                if (t_genoType == "plink" && g_fusedPlinkDecode) {
-                    usedFusedDecode = true;
-                    isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
-                    if (isReadMarker) {
-                        ref = std::move(fsFused.ref);
-                        alt = std::move(fsFused.alt);
-                        marker = std::move(fsFused.marker);
-                        chr = std::move(fsFused.chr);
-                        pd = fsFused.pd;
-                        altFreq = fsFused.altFreq;
-                        altCounts = fsFused.altCounts;
-                        missingRate = fsFused.missingRate;
-                        imputeInfo = fsFused.imputeInfo;
-                    }
-                } else if (t_genoType == "vcf") {
-                    #pragma omp critical(genoread)
+                if ((i + 1) % g_marker_chunksize == 0) {
+                    #pragma omp critical(progress)
                     {
+                        std::cout << "Completed " << (i + 1) << "/" << q
+                                  << " markers in the chunk." << std::endl;
+                    }
+                }
+
+                std::string chr, ref, alt, marker;
+                uint32_t pd = 0;
+                double altFreq = 0.0, altCounts = 0.0, missingRate = 0.0, imputeInfo = 0.0;
+                bool flip = false;
+                bool usedFusedDecode = false;
+                PLINK::PlinkClass::FusedMarkerStats fsFused;
+                const bool isOutputIndexForMissing = true;
+                const bool isOnlyOutputNonZero = false;
+                W.imv.clear();
+                W.izv.clear();
+                W.inzv.clear();
+
+                bool isReadMarker;
+                if (t_genoType == "bgen") {
+                    BGEN::BgenDecodedMarker dm;
+                    isReadMarker = bgenStreamer->getMarker((uint64_t)i, dm);
+                    if (isReadMarker) {
+                        ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
+                        alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";
+                        marker      = dm.rsID;
+                        pd          = dm.physpos;
+                        chr         = dm.chr;
+                        altFreq     = dm.altFreq;
+                        altCounts   = dm.altCounts;
+                        missingRate = dm.missingRate;
+                        imputeInfo  = dm.info;
+                        W.imv       = std::move(dm.indexForMissing);
+                        W.tmpG      = std::move(dm.dosages);
+                    }
+                } else {
+                    std::string t_genoIndex_str = t_genoIndex.at(i);
+                    char* end;
+                    uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
+                    if (t_genoType == "plink" && g_fusedPlinkDecode) {
+                        usedFusedDecode = true;
+                        isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+                        if (isReadMarker) {
+                            ref = std::move(fsFused.ref);
+                            alt = std::move(fsFused.alt);
+                            marker = std::move(fsFused.marker);
+                            chr = std::move(fsFused.chr);
+                            pd = fsFused.pd;
+                            altFreq = fsFused.altFreq;
+                            altCounts = fsFused.altCounts;
+                            missingRate = fsFused.missingRate;
+                            imputeInfo = fsFused.imputeInfo;
+                        }
+                    } else if (t_genoType == "vcf") {
+                        #pragma omp critical(genoread)
+                        {
+                            isReadMarker = Unified_getOneMarker_ts(
+                                t_genoType, gIndex,
+                                ref, alt, marker, pd, chr,
+                                altFreq, altCounts, missingRate, imputeInfo,
+                                isOutputIndexForMissing, W.imv,
+                                isOnlyOutputNonZero,    W.inzv,
+                                W.tmpG, t_isImputation);
+                        }
+                    } else {
                         isReadMarker = Unified_getOneMarker_ts(
                             t_genoType, gIndex,
                             ref, alt, marker, pd, chr,
                             altFreq, altCounts, missingRate, imputeInfo,
-                            isOutputIndexForMissing, indexForMissing,
-                            isOnlyOutputNonZero,    indexNonZeroVec,
-                            t_GVec, t_isImputation);
-                    }
-                } else {
-                    isReadMarker = Unified_getOneMarker_ts(
-                        t_genoType, gIndex,
-                        ref, alt, marker, pd, chr,
-                        altFreq, altCounts, missingRate, imputeInfo,
-                        isOutputIndexForMissing, indexForMissing,
-                        isOnlyOutputNonZero,    indexNonZeroVec,
-                        t_GVec, t_isImputation);
-                }
-            }
-
-            if (!isReadMarker) {
-                #pragma omp critical(endflag)
-                {
-                    if (i < firstEndIdx) firstEndIdx = i;
-                    g_markerTestEnd = true;
-                }
-                continue;
-            }
-
-            const std::string pds = std::to_string(pd);
-            chrVec[jj] = chr;
-            posVec[jj] = pds;
-            refVec[jj] = ref;
-            altVec[jj] = alt;
-            markerVec[jj] = marker;
-            infoVec[jj] = chr + ":" + pds + ":" + ref + ":" + alt;
-            altFreqVec[jj] = altFreq;
-            missingRateVec[jj] = missingRate;
-            imputationInfoVec[jj] = imputeInfo;
-
-            // ---- QC (marker level) ----
-            double MAF = std::min(altFreq, 1 - altFreq);
-            double MAC = MAF * n * (1 - missingRate) * 2;
-            if ((missingRate > g_missingRate_cutoff) ||
-                (MAF < g_marker_minMAF_cutoff) ||
-                (MAC < g_marker_minMAC_cutoff) ||
-                (imputeInfo < g_marker_minINFO_cutoff)) {
-                continue;
-            }
-
-            indexZeroVec.clear();
-            indexNonZeroVec.clear();
-            if (usedFusedDecode) {
-                PLINK::finalizeFusedStats(
-                    fsFused, string_to_case.at(g_impute_method),
-                    g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC);
-                flip = fsFused.flip;
-                altFreq = fsFused.altFreq_post;
-                altCounts = fsFused.altCounts_post;
-                MAC = fsFused.MAC_imp;
-            } else {
-                flip = imputeGenoAndFlip(
-                    t_GVec, altFreq, altCounts,
-                    indexForMissing, g_impute_method,
-                    g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff,
-                    MAC, indexZeroVec, indexNonZeroVec);
-            }
-
-            MAC = std::min(altCounts, 2.0 * n - altCounts);
-            MAF = std::min(altFreq, 1 - altFreq);
-            if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) {
-                continue;
-            }
-
-            altFreqVec[jj] = altFreq;
-            altCountsVec[jj] = altCounts;
-
-            if (usedFusedDecode) {
-                ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
-                    fsFused, t_GVec, indexZeroVec_arma, indexNonZeroVec_arma);
-            } else {
-                copy_index_uvec_reuse(indexZeroVec, indexZeroVec_arma);
-                copy_index_uvec_reuse(indexNonZeroVec, indexNonZeroVec_arma);
-            }
-            indexZeroVec.clear();
-            indexNonZeroVec.clear();
-
-            const double* gp = t_GVec.memptr();
-
-            // ---- per-trait scoring ----
-            for (int t = 0; t < P; t++) {
-                SAIGE::SAIGEClass* obj = g_saigeObjs[t];
-                const SAIGE::TraitMeta& M = g_traitMeta[t];
-                const std::string& traitType = M.traitType;
-                const bool isCondition = M.isCondition;
-                MTTraitChunk& O = out[t];
-
-                double Beta = arma::datum::nan, seBeta = arma::datum::nan;
-                double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
-                double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
-                double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
-                std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
-                bool isSPAConverge = false, is_gtilde = false;
-                bool is_Firth = false, is_FirthConverge = false;
-                arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
-                t_P2Vec.clear();
-
-                // Per-marker ctx, exactly as the single-trait loop builds it.
-                SAIGE::PerMarkerCtx ctx_first;
-                ctx_first.flagSparseGRM_cur = obj->m_isFastTest
-                    ? false : obj->m_flagSparseGRM;
-                ctx_first.isnoadjCov_cur = obj->m_isnoadjCov;
-                // Design section 3.4 note 2: the ER resampling stream id is the
-                // marker's position in the input and nothing else -- not the
-                // trait, not the thread -- so results do not depend on
-                // scheduling or on how many traits are in the run.
-                ctx_first.erSeedStream = (uint64_t)i + 1;
-                {
-                    bool dummyHas;
-                    if (isSingleVR[t]) {
-                        ctx_first.varRatioVal = obj->computeSingleVarianceRatio(
-                            ctx_first.flagSparseGRM_cur, ctx_first.isnoadjCov_cur);
-                    } else {
-                        ctx_first.varRatioVal = obj->computeVarianceRatio(
-                            MAC, ctx_first.flagSparseGRM_cur,
-                            ctx_first.isnoadjCov_cur, dummyHas);
+                            isOutputIndexForMissing, W.imv,
+                            isOnlyOutputNonZero,    W.inzv,
+                            W.tmpG, t_isImputation);
                     }
                 }
 
-                // W1-1: the fast-test recompute's ctx depends only on MAC and
-                // model constants, so it is known before the first pass. When
-                // it matches ctx_first the recompute is a bit-identical repeat
-                // and is skipped -- and Firth then has to run inline.
-                bool fastRecomputeSameCtx = false;
-                if (obj->m_isFastTest &&
-                    ((traitType == "binary" && MAC > g_MACCutoffforER) ||
-                     traitType != "binary")) {
-                    SAIGE::PerMarkerCtx ctx_probe;
-                    ctx_probe.flagSparseGRM_cur =
-                        (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
-                            ? false : obj->m_flagSparseGRM;
-                    ctx_probe.isnoadjCov_cur = false;
+                if (!isReadMarker) {
+                    #pragma omp critical(endflag)
                     {
-                        bool dummyHas2;
-                        if (!isSingleVR[t]) {
-                            ctx_probe.varRatioVal = obj->computeVarianceRatio(
-                                MAC, ctx_probe.flagSparseGRM_cur,
-                                ctx_probe.isnoadjCov_cur, dummyHas2);
-                        } else {
-                            ctx_probe.varRatioVal = obj->computeSingleVarianceRatio(
-                                ctx_probe.flagSparseGRM_cur, ctx_probe.isnoadjCov_cur);
-                        }
+                        if (i < firstEndIdx.load(std::memory_order_relaxed))
+                            firstEndIdx.store(i, std::memory_order_relaxed);
+                        g_markerTestEnd = true;
                     }
-                    fastRecomputeSameCtx =
-                        (ctx_probe.flagSparseGRM_cur == ctx_first.flagSparseGRM_cur) &&
-                        (ctx_probe.isnoadjCov_cur == ctx_first.isnoadjCov_cur) &&
-                        (ctx_probe.varRatioVal == ctx_first.varRatioVal);
+                    continue;
                 }
 
-                // A3: g_firthDefer is thread_local and this thread will run
-                // several (marker, trait) pairs in a row, so it must be set --
-                // not just cleared -- before every call (design section 3.4).
-                g_firthDefer = (obj->m_isFastTest &&
-                                traitType == "binary" &&
-                                MAC > g_MACCutoffforER &&
-                                !fastRecomputeSameCtx);
+                const std::string pds = std::to_string(pd);
+                chrVec[jj] = chr;
+                posVec[jj] = pds;
+                refVec[jj] = ref;
+                altVec[jj] = alt;
+                markerVec[jj] = marker;
+                infoVec[jj] = chr + ":" + pds + ":" + ref + ":" + alt;
+                altFreqVec[jj] = altFreq;
+                missingRateVec[jj] = missingRate;
+                imputationInfoVec[jj] = imputeInfo;
 
-                const bool isER = (MAC <= g_MACCutoffforER && traitType == "binary");
-                obj->getMarkerPval(
-                    t_GVec, indexNonZeroVec_arma, indexZeroVec_arma,
-                    Beta, seBeta, pval, pval_noSPA,
-                    altFreq, Tstat, gy, varT,
-                    isSPAConverge, gtildeVec, is_gtilde,
-                    /*is_region*/ false, t_P2Vec,
-                    isCondition,
-                    Beta_c, seBeta_c, pval_c, pval_noSPA_c,
-                    Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
-                    is_Firth, is_FirthConverge,
-                    isER,
-                    ctx_first.isnoadjCov_cur,
-                    ctx_first.flagSparseGRM_cur,
-                    ctx_first);
-
-                double pval_num;
-                try {
-                    pval_num = std::stod(pval);
-                } catch (const std::invalid_argument&) {
-                    std::cerr << "Argument is invalid\n";
-                    pval_num = 0;
-                } catch (const std::out_of_range&) {
-                    std::cerr << "Argument is out of range for a double\n";
-                    pval_num = 0;
+                double MAF = std::min(altFreq, 1 - altFreq);
+                double MAC = MAF * n * (1 - missingRate) * 2;
+                if ((missingRate > g_missingRate_cutoff) ||
+                    (MAF < g_marker_minMAF_cutoff) ||
+                    (MAC < g_marker_minMAC_cutoff) ||
+                    (imputeInfo < g_marker_minINFO_cutoff)) {
+                    continue;
                 }
 
-                // Fast test re-evaluation (exact match of SAIGE logic).
-                if ((traitType == "binary" && MAC > g_MACCutoffforER) ||
-                    traitType != "binary") {
-                    if (obj->m_isFastTest &&
-                        !fastRecomputeSameCtx &&
-                        pval_num < obj->m_pval_cutoff_for_fastTest) {
-                        SAIGE::PerMarkerCtx ctx_fast;
-                        ctx_fast.flagSparseGRM_cur =
+                W.izv.clear();
+                W.inzv.clear();
+                if (usedFusedDecode) {
+                    PLINK::finalizeFusedStats(
+                        fsFused, string_to_case.at(g_impute_method),
+                        g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC);
+                    flip = fsFused.flip;
+                    altFreq = fsFused.altFreq_post;
+                    altCounts = fsFused.altCounts_post;
+                    MAC = fsFused.MAC_imp;
+                } else {
+                    flip = imputeGenoAndFlip(
+                        W.tmpG, altFreq, altCounts,
+                        W.imv, g_impute_method,
+                        g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff,
+                        MAC, W.izv, W.inzv);
+                }
+
+                MAC = std::min(altCounts, 2.0 * n - altCounts);
+                MAF = std::min(altFreq, 1 - altFreq);
+                if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) {
+                    continue;
+                }
+
+                altFreqVec[jj] = altFreq;
+                altCountsVec[jj] = altCounts;
+
+                if (usedFusedDecode) {
+                    // Stage C also emits the index vectors; they are rebuilt on
+                    // demand below, so only the dense fill is wanted here.
+                    ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                        fsFused, W.tmpG, W.idxZ, W.idxNZ);
+                }
+
+                // Column assignment: high MAC from the front, low MAC from the
+                // back, so [0, nHi) and [B-nLo, B) are both contiguous.
+                const bool hi = (MAC > g_MACCutoffforER);
+                const int c = hi ? (nHi++) : (Bblk - 1 - (nLo++));
+                // The readers are supposed to hand back exactly n dosages; a
+                // short vector here would memcpy past its end, so check rather
+                // than trust.
+                if (W.tmpG.n_elem != (arma::uword)n) {
+                    throw std::runtime_error(
+                        "mainMarkerMT: reader returned " +
+                        std::to_string(W.tmpG.n_elem) + " dosages for marker " +
+                        markerVec[jj] + ", expected " + std::to_string(n));
+                }
+                std::memcpy(W.Gb.colptr(c), W.tmpG.memptr(), sizeof(double) * (size_t)n);
+                W.colOf[jj - jj0] = c;
+                W.isHi[c] = hi ? 1 : 0;
+                W.MACc[c] = MAC;
+                W.altFreqc[c] = altFreq;
+                W.flipc[c] = flip ? 1 : 0;
+
+                // The variance ratio is a pure function of MAC and per-trait
+                // constants, so it is computed once here and read by both the
+                // batch kernel and the fallback -- they cannot disagree.
+                for (int t = 0; t < P; t++) {
+                    SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                    const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                    const bool noadjCur  = obj->m_isnoadjCov;
+                    bool dummyHas;
+                    W.VR(c, t) = isSingleVR[t]
+                        ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
+                        : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                }
+            }
+
+            // ---- batch pass ----
+            if (batchOn) {
+                if (nHi > 0)
+                    SAIGE::scoreTestBatchMT(ctx, ctx.batchTraits, W.Gb, 0, nHi,
+                                            W.VR, W.scr, W.res);
+                // Low-MAC binary pairs go to ER, never to the kernel
+                // (design 3.2); the quantitative traits on those same markers
+                // stay batched, which is the whole point of splitting by column
+                // instead of dropping the marker.
+                if (nLo > 0 && !ctx.batchQuantTraits.empty())
+                    SAIGE::scoreTestBatchMT(ctx, ctx.batchQuantTraits, W.Gb,
+                                            Bblk - nLo, Bblk, W.VR, W.scr, W.res);
+            }
+
+            // ---- finalize every (marker, trait) pair in the block ----
+            for (int jj = jj0; jj < jj1; jj++) {
+                const int c = W.colOf[jj - jj0];
+                if (c < 0) continue;
+                const int i = chunkStart + jj;
+                const double MAC = W.MACc[c];
+                const double altFreq = W.altFreqc[c];
+                const bool flip = (W.flipc[c] != 0);
+                const bool hi = (W.isHi[c] != 0);
+                // Alias, not a copy: getMarkerPval takes arma::vec& but never
+                // writes through it.
+                arma::vec gCol(W.Gb.colptr(c), n, false, false);
+                const double* gp = W.Gb.colptr(c);
+                bool idxReady = false;
+
+                for (int t = 0; t < P; t++) {
+                    SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                    const SAIGE::TraitMeta& M = ctx.meta[t];
+                    const std::string& traitType = M.traitType;
+                    const bool isCondition = M.isCondition;
+                    const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
+                    MTTraitChunk& O = out[t];
+
+                    double Beta = arma::datum::nan, seBeta = arma::datum::nan;
+                    double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
+                    double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
+                    double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
+                    std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+                    bool isSPAConverge = false;
+                    bool is_Firth = false, is_FirthConverge = false;
+
+                    // W1-1: the fast-test recompute's ctx depends only on MAC
+                    // and model constants, so it is known before the first
+                    // pass. When it matches, the recompute is a bit-identical
+                    // repeat and is skipped -- and Firth must run inline.
+                    bool fastRecomputeSameCtx = false;
+                    const bool fastEligible =
+                        obj->m_isFastTest &&
+                        ((traitType == "binary" && MAC > g_MACCutoffforER) ||
+                         traitType != "binary");
+                    const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                    const bool noadjCur  = obj->m_isnoadjCov;
+                    if (fastEligible) {
+                        const bool probeSparse =
                             (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
                                 ? false : obj->m_flagSparseGRM;
-                        ctx_fast.isnoadjCov_cur = false;
-                        {
-                            bool dummyHas;
-                            if (!isSingleVR[t]) {
-                                ctx_fast.varRatioVal = obj->computeVarianceRatio(
-                                    MAC, ctx_fast.flagSparseGRM_cur,
-                                    ctx_fast.isnoadjCov_cur, dummyHas);
-                            } else {
-                                ctx_fast.varRatioVal = obj->computeSingleVarianceRatio(
-                                    ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
-                            }
+                        bool dummyHas2;
+                        const double probeVR = isSingleVR[t]
+                            ? obj->computeSingleVarianceRatio(probeSparse, false)
+                            : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
+                        // The probe always has isnoadjCov_cur == false, so
+                        // the middle clause is "the first pass had it false too".
+                        fastRecomputeSameCtx = (probeSparse == sparseCur) &&
+                                               (noadjCur == false) &&
+                                               (probeVR == W.VR(c, t));
+                    }
+
+                    // ---- can this pair keep the batch result? ----
+                    // Design section 3.3: the union below is exactly the set of
+                    // pairs whose scalar path would have left the normal
+                    // approximation, so taking the batch number anywhere else
+                    // is not an approximation, it is the same test.
+                    bool useBatch = false;
+                    if (batchOn && M.batchable && (hi || !isBin)) {
+                        const double stdStat = W.res.StdStat(c, t);
+                        const double pRaw    = W.res.pvalRaw(c, t);
+                        const bool   isLog   = (W.res.pvalIsLog[t][c] != 0);
+                        const std::string& pStr = W.res.pvalStr[t][c];
+
+                        const bool needSPA = (!std::isnan(stdStat)) &&
+                                             (stdStat > M.SPA_Cutoff) &&
+                                             (M.kind != SAIGE::TraitKind::Quantitative);
+                        bool needFirth = false;
+                        if (isBin && M.is_Firth_beta) {
+                            // Gate on the number, not on a re-parse of the
+                            // printed string: getMarkerPval gates on
+                            // pval_noadj itself.
+                            needFirth = isLog ? (pRaw <= std::log(M.pCutoffforFirth))
+                                              : (pRaw <= M.pCutoffforFirth);
                         }
-                        g_firthDefer = false;  // A3: Firth runs once, here
+                        bool needFast = false;
+                        if (fastEligible && !fastRecomputeSameCtx) {
+                            // The scalar path compares std::stod of the printed
+                            // p-value, so this one does too.
+                            double pnum;
+                            try { pnum = std::stod(pStr); }
+                            catch (const std::invalid_argument&) { pnum = 0; }
+                            catch (const std::out_of_range&)     { pnum = 0; }
+                            needFast = (pnum < obj->m_pval_cutoff_for_fastTest);
+                        }
+                        useBatch = !needSPA && !needFirth && !needFast;
+                    }
+
+                    if (useBatch) {
+                        Beta       = W.res.Beta(c, t);
+                        seBeta     = W.res.seBeta(c, t);
+                        Tstat      = W.res.Tstat(c, t);
+                        varT       = W.res.var1(c, t);
+                        pval       = W.res.pvalStr[t][c];
+                        pval_noSPA = pval;
+                        isSPAConverge = false;   // SPA was never invoked
+                        #pragma omp atomic
+                        nBatched[t]++;
+                    } else {
+                        if (!idxReady) {
+                            // {i : g[i] == 0} and its complement, ascending --
+                            // the definition both producers use.
+                            arma::uword cz = 0;
+                            for (int k = 0; k < n; k++) if (gp[k] == 0.0) cz++;
+                            W.idxZ.set_size(cz);
+                            W.idxNZ.set_size((arma::uword)n - cz);
+                            arma::uword a = 0, b = 0;
+                            for (int k = 0; k < n; k++) {
+                                if (gp[k] == 0.0) W.idxZ[a++] = (arma::uword)k;
+                                else              W.idxNZ[b++] = (arma::uword)k;
+                            }
+                            idxReady = true;
+                        }
+                        arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
+                        W.P2Vec.clear();
+                        bool is_gtilde = false;
+
+                        SAIGE::PerMarkerCtx ctx_first;
+                        ctx_first.flagSparseGRM_cur = sparseCur;
+                        ctx_first.isnoadjCov_cur    = noadjCur;
+                        // Design 3.4 note 2: the ER resampling stream id is the
+                        // marker's position in the input and nothing else --
+                        // not the trait, not the thread -- so the result does
+                        // not depend on scheduling or on P.
+                        ctx_first.erSeedStream      = (uint64_t)i + 1;
+                        ctx_first.varRatioVal       = W.VR(c, t);
+
+                        // A3: g_firthDefer is thread_local and this thread runs
+                        // many pairs in a row, so it must be set -- not just
+                        // cleared -- before every call (design 3.4 note 1).
+                        g_firthDefer = (obj->m_isFastTest &&
+                                        traitType == "binary" &&
+                                        MAC > g_MACCutoffforER &&
+                                        !fastRecomputeSameCtx);
+
+                        const bool isER = (MAC <= g_MACCutoffforER && traitType == "binary");
                         obj->getMarkerPval(
-                            t_GVec, indexNonZeroVec_arma, indexZeroVec_arma,
+                            gCol, W.idxNZ, W.idxZ,
                             Beta, seBeta, pval, pval_noSPA,
                             altFreq, Tstat, gy, varT,
-                            isSPAConverge, gtildeVec, is_gtilde,
-                            /*is_region*/ false, t_P2Vec,
+                            isSPAConverge, W.gtilde, is_gtilde,
+                            /*is_region*/ false, W.P2Vec,
                             isCondition,
                             Beta_c, seBeta_c, pval_c, pval_noSPA_c,
                             Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
                             is_Firth, is_FirthConverge,
-                            false,
-                            ctx_fast.isnoadjCov_cur,
-                            ctx_fast.flagSparseGRM_cur,
-                            ctx_fast);
-                    }
-                }
+                            isER,
+                            ctx_first.isnoadjCov_cur,
+                            ctx_first.flagSparseGRM_cur,
+                            ctx_first);
 
-                if (traitType == "binary" && is_Firth) {
-                    #pragma omp atomic
-                    mFirth[t] += 1;
-                    if (is_FirthConverge) {
+                        double pval_num;
+                        try {
+                            pval_num = std::stod(pval);
+                        } catch (const std::invalid_argument&) {
+                            std::cerr << "Argument is invalid\n";
+                            pval_num = 0;
+                        } catch (const std::out_of_range&) {
+                            std::cerr << "Argument is out of range for a double\n";
+                            pval_num = 0;
+                        }
+
+                        // Fast test re-evaluation (exact match of SAIGE logic).
+                        if (fastEligible && !fastRecomputeSameCtx &&
+                            pval_num < obj->m_pval_cutoff_for_fastTest) {
+                            SAIGE::PerMarkerCtx ctx_fast;
+                            ctx_fast.flagSparseGRM_cur =
+                                (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                    ? false : obj->m_flagSparseGRM;
+                            ctx_fast.isnoadjCov_cur = false;
+                            {
+                                bool dummyHas;
+                                if (!isSingleVR[t]) {
+                                    ctx_fast.varRatioVal = obj->computeVarianceRatio(
+                                        MAC, ctx_fast.flagSparseGRM_cur,
+                                        ctx_fast.isnoadjCov_cur, dummyHas);
+                                } else {
+                                    ctx_fast.varRatioVal = obj->computeSingleVarianceRatio(
+                                        ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
+                                }
+                            }
+                            g_firthDefer = false;  // A3: Firth runs once, here
+                            obj->getMarkerPval(
+                                gCol, W.idxNZ, W.idxZ,
+                                Beta, seBeta, pval, pval_noSPA,
+                                altFreq, Tstat, gy, varT,
+                                isSPAConverge, W.gtilde, is_gtilde,
+                                /*is_region*/ false, W.P2Vec,
+                                isCondition,
+                                Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                                Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                                is_Firth, is_FirthConverge,
+                                false,
+                                ctx_fast.isnoadjCov_cur,
+                                ctx_fast.flagSparseGRM_cur,
+                                ctx_fast);
+                        }
+
+                        if (traitType == "binary" && is_Firth) {
+                            #pragma omp atomic
+                            mFirth[t] += 1;
+                            if (is_FirthConverge) {
+                                #pragma omp atomic
+                                mFirthConverge[t] += 1;
+                            }
+                        }
                         #pragma omp atomic
-                        mFirthConverge[t] += 1;
+                        nFallback[t]++;
+
+                        // Conditional output lives here and not after the
+                        // branch because isCondition implies !batchable
+                        // (design 3.1), so a conditional pair never takes the
+                        // batch result and this is its only writer.
+                        if (isCondition) {
+                            O.Beta_c[jj]   = Beta_c * (1 - 2 * flip);
+                            O.seBeta_c[jj] = seBeta_c;
+                            O.pval_c[jj]   = pval_c;
+                            O.pvalNA_c[jj] = pval_noSPA_c;
+                            O.Tstat_c[jj]  = Tstat_c * (1 - 2 * flip);
+                            O.varT_c[jj]   = varT_c;
+                        }
                     }
-                }
 
-                O.Beta[jj]   = Beta * (1 - 2 * flip);
-                O.seBeta[jj] = seBeta;
-                O.pval[jj]   = pval;
-                O.pvalNA[jj] = pval_noSPA;
-                O.Tstat[jj]  = Tstat * (1 - 2 * flip);
-                O.varT[jj]   = varT;
+                    O.Beta[jj]   = Beta * (1 - 2 * flip);
+                    O.seBeta[jj] = seBeta;
+                    O.pval[jj]   = pval;
+                    O.pvalNA[jj] = pval_noSPA;
+                    O.Tstat[jj]  = Tstat * (1 - 2 * flip);
+                    O.varT[jj]   = varT;
 
-                if (isCondition) {
-                    O.Beta_c[jj]   = Beta_c * (1 - 2 * flip);
-                    O.seBeta_c[jj] = seBeta_c;
-                    O.pval_c[jj]   = pval_c;
-                    O.pvalNA_c[jj] = pval_noSPA_c;
-                    O.Tstat_c[jj]  = Tstat_c * (1 - 2 * flip);
-                    O.varT_c[jj]   = varT_c;
-                }
-
-                if (traitType == "binary" || traitType == "survival") {
-                    const arma::uvec& case_idx = obj->m_case_indices;
-                    const arma::uvec& ctrl_idx = obj->m_ctrl_indices;
-                    const uint32_t N_case = case_idx.n_elem;
-                    const uint32_t N_ctrl = ctrl_idx.n_elem;
-                    double sum_case = 0.0, sum_ctrl = 0.0;
-                    uint32_t case_hom_cnt = 0, case_het_cnt = 0;
-                    uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
-                    for (arma::uword k = 0; k < N_case; ++k) {
-                        double d = gp[case_idx[k]];
-                        sum_case += d;
+                    if (traitType == "binary" || traitType == "survival") {
+                        const arma::uvec& case_idx = obj->m_case_indices;
+                        const arma::uvec& ctrl_idx = obj->m_ctrl_indices;
+                        const uint32_t N_case = case_idx.n_elem;
+                        const uint32_t N_ctrl = ctrl_idx.n_elem;
+                        double sum_case = 0.0, sum_ctrl = 0.0;
+                        uint32_t case_hom_cnt = 0, case_het_cnt = 0;
+                        uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
+                        for (arma::uword k = 0; k < N_case; ++k) {
+                            double d = gp[case_idx[k]];
+                            sum_case += d;
+                            if (t_isMoreOutput) {
+                                if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
+                                else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                            }
+                        }
+                        for (arma::uword k = 0; k < N_ctrl; ++k) {
+                            double d = gp[ctrl_idx[k]];
+                            sum_ctrl += d;
+                            if (t_isMoreOutput) {
+                                if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
+                                else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                            }
+                        }
+                        double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
+                        double AF_ctrl = (N_ctrl > 0) ? sum_ctrl / N_ctrl / 2.0 : 0.0;
+                        if (flip) { AF_case = 1 - AF_case; AF_ctrl = 1 - AF_ctrl; }
+                        O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
+                        O.AF_case[jj] = AF_case;
+                        O.AF_ctrl[jj] = AF_ctrl;
+                        O.N_case[jj] = N_case;
+                        O.N_ctrl[jj] = N_ctrl;
                         if (t_isMoreOutput) {
-                            if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
-                            else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                            O.N_case_hom[jj] = case_hom_cnt;
+                            O.N_case_het[jj] = case_het_cnt;
+                            O.N_ctrl_hom[jj] = ctrl_hom_cnt;
+                            O.N_ctrl_het[jj] = ctrl_het_cnt;
+                            if (flip) {
+                                O.N_case_hom[jj] = N_case - O.N_case_het[jj] - O.N_case_hom[jj];
+                                O.N_ctrl_hom[jj] = N_ctrl - O.N_ctrl_het[jj] - O.N_ctrl_hom[jj];
+                            }
                         }
+                    } else if (traitType == "quantitative") {
+                        O.N[jj] = n;
                     }
-                    for (arma::uword k = 0; k < N_ctrl; ++k) {
-                        double d = gp[ctrl_idx[k]];
-                        sum_ctrl += d;
-                        if (t_isMoreOutput) {
-                            if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
-                            else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
-                        }
-                    }
-                    double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
-                    double AF_ctrl = (N_ctrl > 0) ? sum_ctrl / N_ctrl / 2.0 : 0.0;
-                    if (flip) { AF_case = 1 - AF_case; AF_ctrl = 1 - AF_ctrl; }
-                    O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
-                    O.AF_case[jj] = AF_case;
-                    O.AF_ctrl[jj] = AF_ctrl;
-                    O.N_case[jj] = N_case;
-                    O.N_ctrl[jj] = N_ctrl;
-                    if (t_isMoreOutput) {
-                        O.N_case_hom[jj] = case_hom_cnt;
-                        O.N_case_het[jj] = case_het_cnt;
-                        O.N_ctrl_hom[jj] = ctrl_hom_cnt;
-                        O.N_ctrl_het[jj] = ctrl_het_cnt;
-                        if (flip) {
-                            O.N_case_hom[jj] = N_case - O.N_case_het[jj] - O.N_case_hom[jj];
-                            O.N_ctrl_hom[jj] = N_ctrl - O.N_ctrl_het[jj] - O.N_ctrl_hom[jj];
-                        }
-                    }
-                } else if (traitType == "quantitative") {
-                    O.N[jj] = n;
-                }
-            }  // for t
-        }  // for jj (omp)
+                }  // for t
+            }  // for jj (finalize)
+        }  // for blk (omp)
 
         // ---- write this chunk's rows, one file per trait (serial) ----
         for (int t = 0; t < P; t++) {
@@ -2499,14 +2701,28 @@ void mainMarkerMT(
     }  // for chunkStart
 
     // One summary per trait, after every chunk (design section 7.2).
+    long totBatch = 0, totFall = 0;
     for (int t = 0; t < P; t++) {
         std::cout << "[" << g_traitMeta[t].name << "] " << numtestTotal[t]
-                  << " markers were tested." << std::endl;
+                  << " markers were tested";
+        if (batchOn) {
+            std::cout << " (" << nBatched[t] << " batched, " << nFallback[t]
+                      << " via the scalar path)";
+        }
+        std::cout << "." << std::endl;
+        totBatch += nBatched[t];
+        totFall  += nFallback[t];
         if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
             std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
                       << mFirth[t] << " markers. " << mFirthConverge[t]
                       << " successfully converged." << std::endl;
         }
+    }
+    if (batchOn && (totBatch + totFall) > 0) {
+        std::cout << "  MT batch coverage: " << totBatch << " / "
+                  << (totBatch + totFall) << " pairs ("
+                  << (100.0 * (double)totBatch / (double)(totBatch + totFall))
+                  << "%)" << std::endl;
     }
     if (t_isFirth) {
         std::cout << "[A3] Firth fit calls: " << g_firthFitCalls.load()
@@ -4550,6 +4766,17 @@ int main(int argc, char* argv[])
         // MULTITRAIT_DESIGN.md sections 4.1 and 5.
         std::vector<SAIGE::MTModelSpec> modelSpecs = SAIGE::parseModelSpecs(config);
         const int numTraits = static_cast<int>(modelSpecs.size());
+        // Design sections 4.3 / 10: traits fitted on different sample sets are
+        // not supported. Accepting the key silently would let a user believe
+        // they had turned the requirement off. Checked before anything is
+        // loaded so the message is the first thing they see.
+        if (config["mtRequireSameSamples"] &&
+            !config["mtRequireSameSamples"].as<bool>()) {
+            throw std::runtime_error(
+                "mtRequireSameSamples: false is not supported: every model must "
+                "be fitted on the same samples in the same order. Remove the key "
+                "(or set it to true) and use one config per sample set.");
+        }
 
         // Determine genotype type early (needed for input file validation)
         std::string genoType_early = config["genoType"] ? config["genoType"].as<std::string>() : "plink";
@@ -5111,6 +5338,26 @@ int main(int argc, char* argv[])
         }
         if (numTraits > 1) {
             SAIGE::printMTGateTable(g_traitMeta, useLOCO);
+            // Stacked per-trait constants for the batch kernel. Building them
+            // needs the loaded models, which are still alive here; nothing
+            // reads nms after this point.
+            g_mtBatch     = config["mtBatch"] ? config["mtBatch"].as<bool>() : true;
+            g_mtBlockSize = config["mtBlockSize"] ? config["mtBlockSize"].as<int>() : 0;
+            if (config["mtMemBudgetGB"]) {
+                g_mtMemBudgetGB = config["mtMemBudgetGB"].as<double>();
+                if (g_mtMemBudgetGB <= 0.0)
+                    throw std::runtime_error("mtMemBudgetGB must be > 0");
+            }
+            {
+                std::vector<int> order = SAIGE::mtInternalOrder(nms);
+                SAIGE::buildMTContext(g_mtctx, nms, order, g_traitMeta,
+                                      useLOCO, locoChrom);
+            }
+            std::cout << "  Sigma p = " << g_mtctx.sumP
+                      << " (binary " << g_mtctx.sumPbin
+                      << " / quantitative " << g_mtctx.sumPqnt << ")"
+                      << ", batch kernel " << (g_mtBatch ? "on" : "OFF (mtBatch: false)")
+                      << std::endl;
             std::cout << std::endl;
         }
 

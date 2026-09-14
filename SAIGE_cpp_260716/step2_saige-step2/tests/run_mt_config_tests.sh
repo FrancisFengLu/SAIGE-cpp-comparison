@@ -171,19 +171,89 @@ models:
 $(common)
 EOF
 
-# Phase 0 only: P>1 must refuse loudly rather than quietly test the first trait.
-expect_error p_gt_1_not_implemented "not implemented yet" <<EOF
+# P > 1 runs now. What must still fail loudly is a model set that cannot
+# legitimately share one genotype stream (design section 4.3) -- silently
+# analysing a permuted sample vector is the failure mode this prevents -- and
+# region testing with P > 1 (design section 10).
+PERM="$WORK/perm_model"
+IMPM="$WORK/imp_model"
+python3 - "$MODEL" "$PERM" "$IMPM" <<'PY2'
+import json, os, shutil, sys
+src, perm, imp = sys.argv[1:4]
+for dst in (perm, imp):
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+j = json.load(open(os.path.join(perm, "nullmodel.json")))
+ids = list(j["sampleIDs"])
+ids[0], ids[1] = ids[1], ids[0]          # same set, different order
+j["sampleIDs"] = ids
+json.dump(j, open(os.path.join(perm, "nullmodel.json"), "w"))
+j = json.load(open(os.path.join(imp, "nullmodel.json")))
+j["impute_method"] = "bestguess"
+json.dump(j, open(os.path.join(imp, "nullmodel.json"), "w"))
+PY2
+
+expect_error sample_order_differs "identical sample IDs in identical order" <<EOF
 models:
   - traitName: a
     modelFile: $MODEL
     varianceRatioFile: $VR
-    outputFile: $WORK/a.txt
+    outputFile: $WORK/so_a.txt
+  - traitName: b
+    modelFile: $PERM
+    varianceRatioFile: $VR
+    outputFile: $WORK/so_b.txt
+$(common)
+EOF
+
+expect_error impute_method_differs "the models must agree on it" <<EOF
+models:
+  - traitName: a
+    modelFile: $MODEL
+    varianceRatioFile: $VR
+    outputFile: $WORK/im_a.txt
+  - traitName: b
+    modelFile: $IMPM
+    varianceRatioFile: $VR
+    outputFile: $WORK/im_b.txt
+$(common)
+EOF
+
+expect_error subset_samples_requested "mtRequireSameSamples: false is not supported" <<EOF
+mtRequireSameSamples: false
+models:
+  - traitName: a
+    modelFile: $MODEL
+    varianceRatioFile: $VR
+    outputFile: $WORK/ss_a.txt
   - traitName: b
     modelFile: $MODEL
     varianceRatioFile: $VR
-    outputFile: $WORK/b.txt
+    outputFile: $WORK/ss_b.txt
 $(common)
 EOF
+
+MT_GROUP="${MT_GROUP:-/opt/saige/logs/step2/mid_group_400.txt}"
+if [ -e "$MT_GROUP" ]; then
+expect_error region_with_multitrait "multi-trait region testing is not supported" <<EOF
+groupFile: $MT_GROUP
+annotationList:
+  - "lof"
+maxMAFList:
+  - 0.01
+models:
+  - traitName: a
+    modelFile: $MODEL
+    varianceRatioFile: $VR
+    outputFile: $WORK/rg_a.txt
+  - traitName: b
+    modelFile: $MODEL
+    varianceRatioFile: $VR
+    outputFile: $WORK/rg_b.txt
+$(common)
+EOF
+fi
 
 # Legacy form keeps its original per-key messages.
 expect_error legacy_missing_output "Config missing required key: outputFile" <<EOF
