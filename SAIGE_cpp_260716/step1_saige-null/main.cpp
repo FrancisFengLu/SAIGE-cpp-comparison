@@ -1937,8 +1937,12 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     if (models.size() > 1) {
       auto t = std::chrono::steady_clock::now();
-      printf("[TIMER-MAIN] phenotype %-28s %8.2fs\n", m.y_col.c_str(),
-             std::chrono::duration<double>(t - T_ph).count());
+      // Under lockstep the fit already happened in the one fit_null_multi call
+      // above, so this window covers only the post-fit work; say so rather than
+      // letting it read as a per-trait fit time.
+      printf("[TIMER-MAIN] phenotype %-28s %8.2fs%s\n", m.y_col.c_str(),
+             std::chrono::duration<double>(t - T_ph).count(),
+             use_lockstep ? "  (post-fit only; fit is in fit_null_multi)" : "");
     }
 
     // Free this trait's design as soon as it is fitted: at P=32 on a big cohort

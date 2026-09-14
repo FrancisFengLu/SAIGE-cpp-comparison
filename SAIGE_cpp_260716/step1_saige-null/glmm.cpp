@@ -1697,7 +1697,11 @@ multi_glmm_solver(const std::vector<Paths>& paths,
     stash_eta_mu_into(out, s.eta, mu_final);
     out.converged  = converged;
     out.iterations = iterations;
-    export_score_null_json(paths[p], out);
+    // Only on the converged path, matching both scalar drivers: they call this
+    // from their converged returns and fall through without it on maxiter /
+    // large-variance. Writing it unconditionally here would make a lockstep run
+    // emit an obj_noK.json that the same fit done per-trait does not.
+    if (converged) export_score_null_json(paths[p], out);
 
     s.active = false;
     s.finalized = true;
