@@ -37,6 +37,9 @@
 #   D12 D3 with mtBlockSize 7 and nThreads 4 == D3
 #   D13 D6 under SAIGE_STEP2_SCALAR_DECODE=1 (goldens under the same env)
 #   D14 D3 with a per-model isnoadjCov on one own-sample trait (not batchable)
+#   D15 LOCO chrom 1, P=4: two models with a perturbed chr1/ fit (one full set,
+#       one subset), one subset model whose loco_chroms lacks chr1 (silent
+#       genome-wide fallback), one quantitative subset model with a chr1/ fit
 #   E1-E3 refusals: mtRequireSameSamples: true, genoType bgen, conditional analysis
 
 set -u
@@ -47,7 +50,7 @@ NULLD="${MS_NULL:-/opt/saige/logs/missing_mt/step2/null}"
 MID="${MS_MID:-/opt/saige/data/mid2k}"
 RARE="${MS_RARE:-/opt/saige/data/rare}"
 JOBS="${MS_JOBS:-3}"
-CASES="${MS_CASES:-D1 D2 D3 D4 D5 D6 D7 D8 D9 D10 D11 D12 D13 D14 E1 E2 E3}"
+CASES="${MS_CASES:-D1 D2 D3 D4 D5 D6 D7 D8 D9 D10 D11 D12 D13 D14 D15 E1 E2 E3}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
@@ -78,6 +81,7 @@ vr_file () {
     case "$1" in
         Bp1)  vr_file B1 ;;  Ip4) vr_file I4 ;;  Qp2) vr_file Q2 ;;
         Bs10) vr_file B10 ;; Is6) vr_file I6 ;;
+        Bl1)  vr_file B1 ;;  Bl9) vr_file B9 ;;  Il2) vr_file I2 ;;  Ql3) vr_file Q3 ;;
         B[0-9]*) echo "$NULLD/block16/mvr_y${1#B}.varianceRatio.txt" ;;
         I[0-9]*) echo "$NULLD/indep16/mvr_y${1#I}.varianceRatio.txt" ;;
         Q[0-9]*) echo "$NULLD/qmiss/mvr_qm${1#Q}.varianceRatio.txt" ;;
@@ -92,6 +96,34 @@ python3 "$MK" "$(model_dir Q2)"  "$WORK/models/Qp2"  --permute 13 &&
 python3 "$MK" "$(model_dir B10)" "$WORK/models/Bs10" --json SPA_Cutoff=0.5 &&
 python3 "$MK" "$(model_dir I6)"  "$WORK/models/Is6"  --json SPA_Cutoff=0.5 ||
     { echo "FAIL: could not build derived models"; exit 1; }
+# LOCO variants: same construction as run_mt_correctness.sh (copy the model,
+# write a perturbed chr<N>/ set, declare loco_chroms). The perturbation is what
+# makes a silently ignored chr1/ visible.
+mk_loco () {  # mk_loco <src model> <dst dir> <chrom> <factor> <loco_chroms json>
+    python3 - "$1" "$2" "$3" "$4" "$5" "$HERE/make_loco_model.py" <<'PY2'
+import importlib.util, json, os, shutil, sys
+src, dst, chrom, factor, chroms, helper = sys.argv[1:7]
+spec = importlib.util.spec_from_file_location("mlm", helper)
+mlm = importlib.util.module_from_spec(spec); spec.loader.exec_module(mlm)
+if os.path.exists(dst): shutil.rmtree(dst)
+shutil.copytree(src, dst)
+cdir = os.path.join(dst, "chr" + chrom); os.makedirs(cdir, exist_ok=True)
+for name in mlm.PER_CHROM:
+    header, rows, cols, vals = mlm.read_arma(os.path.join(src, name + ".arma"))
+    mlm.write_arma(os.path.join(cdir, name + ".arma"), header, rows, cols,
+                   mlm.perturb(name, vals, float(factor)))
+j = json.load(open(os.path.join(dst, "nullmodel.json")))
+j["loco"] = True; j["loco_chroms"] = json.loads(chroms)
+json.dump(j, open(os.path.join(dst, "nullmodel.json"), "w"))
+PY2
+}
+if has_case D15; then
+    mk_loco "$(model_dir B1)" "$WORK/models/Bl1" 1 0.90 '[1]' &&
+    mk_loco "$(model_dir B9)" "$WORK/models/Bl9" 1 1.10 '[1]' &&
+    mk_loco "$(model_dir I2)" "$WORK/models/Il2" 2 0.85 '[2]' &&
+    mk_loco "$(model_dir Q3)" "$WORK/models/Ql3" 1 1.20 '[1]' ||
+        { echo "FAIL: could not build LOCO models"; exit 1; }
+fi
 
 # ---- config pieces ---------------------------------------------------------
 # tag -> genotype file + the keys that change the columns or the numbers
@@ -104,6 +136,7 @@ tag_yaml () {  # tag_yaml <tag> <nThreads>
         rare_plain|rare_scalar) plink="$RARE" ;;
         rare_mac5) plink="$RARE"; minmac=5 ;;
         rare_er20) plink="$RARE"; er=20 ;;
+        mid_loco)  extra=$'LOCO: true\nchrom: "1"' ;;
         *) echo "unknown tag $1" >&2; return 1 ;;
     esac
     cat <<EOF
@@ -145,6 +178,9 @@ has_case D7  && need rare_mac5 $D6T
 has_case D8  && need rare_er20 $D6T
 has_case D9  && need mid_more $D3T
 has_case D13 && need rare_scalar $D6T
+D15T="Bl1 Bl9 Il2 Ql3"
+has_case D15 && need mid_loco $D15T
+has_case D15 && need mid_plain B9
 sort -u "$GLIST" -o "$GLIST"
 
 golden_one () {  # golden_one <model key> <tag>
@@ -246,6 +282,19 @@ if has_case D14; then
         ok "D14: I3 gated out of the batch path (isnoadjCov=true)"
     else
         bad "D14: the override did not reach the gate table"
+    fi
+fi
+if has_case D15; then
+    mt_case D15_loco mid_loco 1 $D15T
+    if grep -q "fell back to the genome-wide fit" "$WORK/out/D15_loco.log"; then
+        ok "D15: mixed LOCO state announced"
+    else
+        bad "D15: mixed LOCO state NOT announced"
+    fi
+    if cmp -s "$WORK/golden/mid_loco_Bl9.txt" "$WORK/golden/mid_plain_B9.txt"; then
+        bad "D15: Bl9 chr1 fit == B9 genome-wide fit; chr1/ was not read"
+    else
+        ok "D15: Bl9 chr1 fit differs from the genome-wide fit"
     fi
 fi
 
