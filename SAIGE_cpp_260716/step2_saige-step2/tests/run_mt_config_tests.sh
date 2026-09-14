@@ -194,7 +194,10 @@ j["impute_method"] = "bestguess"
 json.dump(j, open(os.path.join(imp, "nullmodel.json"), "w"))
 PY2
 
+# Different sample lists are legal since design 4.7; mtRequireSameSamples: true
+# turns them back into a hard error.
 expect_error sample_order_differs "identical sample IDs in identical order" <<EOF
+mtRequireSameSamples: true
 models:
   - traitName: a
     modelFile: $MODEL
@@ -220,19 +223,36 @@ models:
 $(common)
 EOF
 
-expect_error subset_samples_requested "mtRequireSameSamples: false is not supported" <<EOF
-mtRequireSameSamples: false
+# ...and without the key the same pair of models runs, each trait on its own
+# sample list, and each output is byte-identical to that model run alone.
+cat > "$WORK/so_run.yaml" <<EOF
 models:
   - traitName: a
     modelFile: $MODEL
     varianceRatioFile: $VR
-    outputFile: $WORK/ss_a.txt
+    outputFile: $WORK/so_run_a.txt
   - traitName: b
-    modelFile: $MODEL
+    modelFile: $PERM
     varianceRatioFile: $VR
-    outputFile: $WORK/ss_b.txt
+    outputFile: $WORK/so_run_b.txt
 $(common)
 EOF
+cat > "$WORK/so_single_b.yaml" <<EOF
+modelFile:         $PERM
+varianceRatioFile: $VR
+outputFile:        $WORK/so_single_b.txt
+$(common)
+EOF
+"$BIN" "$WORK/so_run.yaml" > "$WORK/so_run.log" 2>&1
+so_rc=$?
+"$BIN" "$WORK/so_single_b.yaml" > "$WORK/so_single_b.log" 2>&1
+if [ $so_rc -ne 0 ]; then
+    bad "different sample order without mtRequireSameSamples: exited $so_rc ($(tail -1 "$WORK/so_run.log"))"
+elif cmp -s "$WORK/so_run_a.txt" "$WORK/p1_scalar.txt" && cmp -s "$WORK/so_run_b.txt" "$WORK/so_single_b.txt"; then
+    ok "different sample order runs; both traits == their single-trait runs"
+else
+    bad "different sample order: a multi-trait output differs from its single-trait run"
+fi
 
 MT_GROUP="${MT_GROUP:-/opt/saige/logs/step2/mid_group_400.txt}"
 if [ -e "$MT_GROUP" ]; then

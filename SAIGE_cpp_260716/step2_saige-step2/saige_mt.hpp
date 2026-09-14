@@ -115,6 +115,22 @@ struct TraitMeta {
     bool   locoApplied     = false;   // did this trait really read chr<N>/ ?
     bool   batchable = false;         // static gating result, design section 3.1
     int    outIdx = 0;                // position in the config's `models:` order
+    // Different sample sets (design section 4.7). Column of this trait inside
+    // MTContext::MASKq; -1 unless the trait is quantitative AND its sample
+    // list differs from the union's.
+    int    maskIdx = -1;
+};
+
+// Where one trait's samples sit inside the union sample list (design 4.7).
+// Built once; read-only in the marker loop.
+struct MTTraitSamples {
+    // The trait's sampleIDs are the union's, element for element. Such a
+    // trait's genotype vector IS the block's union column, so it takes exactly
+    // the arithmetic of a same-sample-set run and none of the corrections.
+    bool sameAsUnion = true;
+    int  n = 0;                            // this trait's sample count
+    std::vector<arma::uword> pos;          // [n]  union index of the trait's k-th sample
+    std::vector<arma::uword> comp;         // union indices NOT in the trait, ascending
 };
 
 // Built once after all P null models are loaded; read-only from then on.
@@ -145,6 +161,24 @@ struct MTContext {
     std::vector<TraitMeta> meta;   // internal order; TraitMeta::outIdx carries
                                    // the position in the config's models: list
 
+    // ---- different sample sets (design section 4.7) ----
+    // N above is the size of the union. Every stacked matrix is union-length:
+    // a trait's rows sit at its union positions and the rows of samples the
+    // trait does not have are exact zeros, so any inner product of a stack
+    // column with a union-length genotype column only ever sees that trait's
+    // own samples.
+    bool sampleSetsDiffer = false;          // at least one trait is !sameAsUnion
+    std::vector<std::string> unionIDs;      // [N], R's union_vector order
+    std::vector<MTTraitSamples> samp;       // [P], internal order
+    // Per-trait sums over the trait's samples (union-length columns summed in
+    // union order), the constant half of the flip correction in scoreTestBatchMT.
+    std::vector<arma::vec> sumA;            // p_t   column sums of A_t
+    std::vector<arma::vec> sumW;            // p_t   of mu2_t % X_t (binary) / X_t (quantitative)
+    std::vector<double>    sumR;            // sum res_t
+    std::vector<double>    sumM;            // sum mu2_t (binary) / n_t (quantitative)
+    arma::mat MASKq;    // N x nMask  0/1 sample indicator of each quantitative
+                        // trait whose sample list differs from the union
+
     std::vector<int> batchTraits;       // batchable, binary first
     std::vector<int> batchQuantTraits;  // batchable and quantitative
     std::vector<int> scalarTraits;      // not batchable
@@ -162,6 +196,32 @@ struct MTScratch {
     arma::mat GR;      // B x P
     arma::mat G2Mu2;   // B x nBin
     arma::vec Gsq;     // B
+    // Different sample sets only (design 4.7).
+    arma::mat GMu2;    // B x nBin   Gb' MU2bin      (flip correction, binary)
+    arma::mat GMask1;  // B x nMask  Gb' MASKq       (flip correction, quantitative)
+    arma::mat GMask2;  // B x nMask  Gb2' MASKq      (sum of g^2 over the trait's samples)
+    arma::mat MissA, MissWbin, MissWqnt;   // (cols) x B  stack rows summed over a column's missing cells
+    arma::mat MissR, MissMu2, MissMask;    // B x (P | nBin | nMask), same
+    arma::mat Zc, Wc;                      // p x B   one trait's corrected Z / GW
+    arma::vec Rc, Qc;                      // B
+};
+
+// Per-(block column, trait) description of how the trait's own genotype vector
+// relates to the block's union column (design section 4.7). With g the union
+// column and g_t the vector a single-trait run of trait t would build, on the
+// trait's samples
+//     g_t = a * g + b + d * [cell is a missing genotype]
+// exactly: a = +1, b = 0 when the trait and the union agree on the flip,
+// a = -1, b = 2 when they do not, and d is the difference of the two imputed
+// values. The kernel only reads the traits whose sample list differs from the
+// union's; everyone else takes the unadjusted arithmetic.
+struct MTBlockAdj {
+    arma::mat a, b, d;    // B x P
+    arma::mat q;          // B x P  g_t^2 - (a*g + b)^2 on a missing cell
+    arma::umat nMiss;     // B x P  missing genotypes among the trait's samples
+    std::vector<std::vector<arma::uword>> miss;   // [B] union indices of the column's missing cells
+
+    void resize(int t_B, int t_P);
 };
 
 // ------------------------------------------------------------------
@@ -175,12 +235,21 @@ struct MTScratch {
 std::vector<int> mtInternalOrder(const std::vector<NullModelData>& t_nms);
 
 // Hard-fails when the P models cannot legitimately share one genotype stream
-// (design section 4.3): different sample IDs (content OR order), different n,
-// or different impute_method. Warns -- does not fail -- when the models
-// disagree on whether LOCO really applied. `t_names` supplies the trait label
-// used in the messages and must be the same length as t_nms.
-void validateMTModels(const std::vector<NullModelData>& t_nms,
-                      const std::vector<std::string>& t_names);
+// (design sections 4.3 / 4.7): different impute_method; a model whose
+// sampleIDs list is empty, does not have n entries, or repeats an ID while the
+// lists differ between models; or -- only when t_requireSameSamples -- sample
+// lists that differ in content or order. Warns -- does not fail -- when the
+// models disagree on whether LOCO really applied. `t_names` supplies the trait
+// label used in the messages and must be the same length as t_nms.
+// Returns true when the sample lists are not all identical (content and order).
+bool validateMTModels(const std::vector<NullModelData>& t_nms,
+                      const std::vector<std::string>& t_names,
+                      bool t_requireSameSamples);
+
+// R's union_vector (readInGLMM.R ReadModel_multiTrait): every model's
+// sampleIDs, first occurrence wins, models taken in config order. When all
+// lists are identical this is model 0's list, element for element.
+std::vector<std::string> mtUnionSampleIDs(const std::vector<NullModelData>& t_nms);
 
 // Static per-trait gate, evaluated once before the marker loop (design
 // section 3.1). False means the trait runs the per-pair scalar path for every
@@ -203,12 +272,15 @@ void printMTGateTable(const std::vector<TraitMeta>& t_meta, bool t_locoEnabled);
 // internal trait t, so t_nms[t_order[t]] is that trait's loaded model.
 // Every trait gets a column block, batchable or not: the few extra columns cost
 // p_t*N doubles and keep the offsets a single uniform rule.
+// t_unionIDs is mtUnionSampleIDs(t_nms); the stacks are built at its length
+// with each trait's rows placed at its union positions (design 4.7).
 void buildMTContext(MTContext& t_ctx,
                     const std::vector<NullModelData>& t_nms,
                     const std::vector<int>& t_order,
                     std::vector<TraitMeta>& t_meta,
                     bool t_locoEnabled,
-                    const std::string& t_locoChrom);
+                    const std::string& t_locoChrom,
+                    const std::vector<std::string>& t_unionIDs);
 
 // One marker block's normal-approximation results, B x P. Only the columns of
 // the trait set passed to scoreTestBatchMT are written.
@@ -245,11 +317,17 @@ struct MTBlockResult {
 // zeros but change the association order). Algebraically equal; the caller
 // must treat the difference as last-bit rounding, never as a licence to skip a
 // fallback.
+//
+//   t_adj       per-(column, trait) map from the union column to the trait's
+//               own genotype vector; read only for traits whose sample list
+//               differs from the union's (ctx.samp[t].sameAsUnion == false),
+//               may be nullptr when there are none.
 void scoreTestBatchMT(const MTContext& t_ctx,
                       const std::vector<int>& t_traitSet,
                       const arma::mat& t_Gb,
                       int t_j0, int t_j1,
                       const arma::mat& t_VR,
+                      const MTBlockAdj* t_adj,
                       MTScratch& t_scr,
                       MTBlockResult& t_out);
 

@@ -1988,11 +1988,22 @@ void mainMarkerInCPP(
 // that model would run.
 //
 // What is shared across traits, and why it is legitimate to share it
-// (design section 4.3): all P models are validated to have identical sample
-// IDs in identical order and identical impute_method, so the file read, the
+// (design section 4.3): when all P models list identical sample IDs in
+// identical order (and they always share impute_method), the file read, the
 // imputation, the flip, MAC / MAF / altFreq / altCounts / missingRate and the
 // zero/nonzero index vectors are marker-level quantities. One Gvec feeds every
 // trait.
+//
+// Different sample sets (design section 4.7, ctx.sampleSetsDiffer): the reader
+// runs on the union of the models' sample lists, PLINK only. What is still
+// shared is the read and the 2-bit codes of the union samples. Everything that
+// depends on the sample set is recomputed per trait from those codes with the
+// single-trait expressions: the code counts over the trait's samples, the
+// pre-impute altFreq / missingRate, QC, flip, the imputed value, the
+// dosage-zeroing gate, the post-impute altFreq / altCounts, MAC, the variance
+// ratio, ER. The block's genotype column is the union's; the batch kernel maps
+// it exactly onto each trait's own vector (MTBlockAdj), and a fallback pair
+// materialises the trait's own vector from the codes.
 //
 // What is per trait: the SAIGEClass instance, traitType, isCondition, the
 // single-variance-ratio flag, the Firth counters, the case/control indices and
@@ -2012,9 +2023,9 @@ void mainMarkerInCPP(
 // ============================================================
 
 // One chunk's worth of per-trait results. Marker-level columns (chr / pos /
-// ref / alt / altFreq / ...) are NOT here: they are shared by every trait and
-// stored once, which is what keeps the chunk buffer at 10*chunk + 16*chunk*P
-// instead of 21*chunk*P (design section 7.2).
+// ref / alt / marker) are NOT here: they are shared by every trait and stored
+// once (design section 7.2). altFreq / altCounts / missingRate / imputeInfo
+// are here: with different sample sets they are per trait (design 4.7).
 struct MTTraitChunk {
     std::vector<double>      Beta, seBeta, Tstat, varT;
     std::vector<std::string> pval, pvalNA;
@@ -2025,6 +2036,7 @@ struct MTTraitChunk {
     std::vector<uint32_t>    N_case, N_ctrl;
     std::vector<double>      N_case_hom, N_ctrl_het, N_case_het, N_ctrl_hom;
     std::vector<uint32_t>    N;
+    std::vector<double>      altFreq, altCounts, missingRate, imputeInfo;
 
     void reset(int qc) {
         const double nan = arma::datum::nan;
@@ -2040,6 +2052,8 @@ struct MTTraitChunk {
         N_case_hom.assign(qc, 0.0); N_ctrl_het.assign(qc, 0.0);
         N_case_het.assign(qc, 0.0); N_ctrl_hom.assign(qc, 0.0);
         N.assign(qc, 0);
+        altFreq.assign(qc, 0.0); altCounts.assign(qc, 0.0);
+        missingRate.assign(qc, 0.0); imputeInfo.assign(qc, 0.0);
     }
 };
 
@@ -2071,7 +2085,21 @@ struct MTBlockWork {
     arma::uvec idxZ, idxNZ;
     std::vector<uint> izv, inzv, imv;
 
-    void ensure(int t_n, int t_B, int t_P) {
+    // ---- different sample sets only (design 4.7) ----
+    std::vector<uint8_t> codes;       // N x B, 2-bit code of each union sample per Gb column
+    std::vector<uint8_t> tmpCodes;    // N, the marker being read
+    SAIGE::MTBlockAdj    adj;         // B x P map from the union column to each trait's vector
+    std::vector<char>    qcP, flipP, affP;   // [B*P] QC passed / flipped / affine map exact
+    arma::mat MACp, AFp, ACp, MRp, IIp;      // B x P
+    std::vector<double>  fdP;         // [B*P*4] the trait's code -> final dosage table
+    // per-trait scratch for the marker being read
+    std::vector<char>    tq, tflip;
+    std::vector<double>  tMAC, tAF, tAC, tMR, tII, tfd;
+    std::vector<arma::uword> tnMiss;
+    arma::vec gT;                     // a trait's own genotype vector (fallback)
+    arma::uvec idxZt, idxNZt;
+
+    void ensure(int t_n, int t_B, int t_P, bool t_differ) {
         const arma::uword N = static_cast<arma::uword>(t_n);
         const arma::uword B = static_cast<arma::uword>(t_B);
         if (Gb.n_rows != N || Gb.n_cols != B) Gb.set_size(N, B);
@@ -2083,6 +2111,21 @@ struct MTBlockWork {
         altFreqc.assign(t_B, 0.0);
         flipc.assign(t_B, 0);
         res.resize(t_B, t_P);
+        if (t_differ) {
+            const std::size_t BP = (std::size_t)t_B * (std::size_t)t_P;
+            if (codes.size() != (std::size_t)N * B) codes.resize((std::size_t)N * B);
+            if (tmpCodes.size() != N) tmpCodes.resize(N);
+            adj.resize(t_B, t_P);
+            qcP.assign(BP, 0); flipP.assign(BP, 0); affP.assign(BP, 0);
+            MACp.set_size(B, t_P); AFp.set_size(B, t_P); ACp.set_size(B, t_P);
+            MRp.set_size(B, t_P); IIp.set_size(B, t_P);
+            fdP.resize(BP * 4);
+            tq.resize(t_P); tflip.resize(t_P);
+            tMAC.resize(t_P); tAF.resize(t_P); tAC.resize(t_P);
+            tMR.resize(t_P); tII.resize(t_P); tfd.resize((std::size_t)t_P * 4);
+            tnMiss.resize(t_P);
+            if (gT.n_elem < N) gT.set_size(N);
+        }
     }
 };
 
@@ -2096,8 +2139,29 @@ void mainMarkerMT(
 {
     const SAIGE::MTContext& ctx = g_mtctx;
     const int P = static_cast<int>(g_saigeObjs.size());
-    const int n = g_saigeObjs[0]->m_n;
+    const bool differ = ctx.sampleSetsDiffer;
+    // Union sample count when the sample sets differ; otherwise every model's n.
+    const int n = differ ? ctx.N : g_saigeObjs[0]->m_n;
     const int q = static_cast<int>(t_genoIndex.size());
+
+    if (differ) {
+        // main() refuses the other readers and conditional analysis (design 4.7).
+        if (t_genoType != "plink" || ptr_gPLINKobj == nullptr)
+            throw std::runtime_error("mainMarkerMT: different sample sets need genoType plink");
+        for (int t = 0; t < P; t++) {
+            if (g_saigeObjs[t]->m_isCondition)
+                throw std::runtime_error("mainMarkerMT: conditional analysis with different sample sets");
+            // The single-trait reader counts over sampleIDs (m_N) while QC and
+            // MAC use m_n = y.size(); per-trait stats reproduce both, but the
+            // union column can only stand in for a sameAsUnion trait if they
+            // agree, so require it everywhere.
+            if (g_saigeObjs[t]->m_n != ctx.samp[t].n)
+                throw std::runtime_error("model '" + ctx.meta[t].name + "' has " +
+                                         std::to_string(g_saigeObjs[t]->m_n) +
+                                         " rows in y but lists " +
+                                         std::to_string(ctx.samp[t].n) + " sample IDs");
+        }
+    }
 
     // Per-trait one-time setup. assignSingleVarianceRatio mutates the object,
     // so like mainMarkerInCPP it runs here, before any thread exists.
@@ -2109,8 +2173,34 @@ void mainMarkerMT(
             isSingleVR[t] = 1;
         }
     }
+    // Case / control sample positions in the union, for traits with their own
+    // sample list: caseU[t][k] is the union index of the trait's k-th case, in
+    // the order of m_case_indices, so the case / control allele sums below run
+    // over the same values in the same order as the single-trait loop.
+    std::vector<arma::uvec> caseU(P), ctrlU(P);
+    if (differ) {
+        for (int t = 0; t < P; t++) {
+            const SAIGE::MTTraitSamples& S = ctx.samp[t];
+            if (S.sameAsUnion) continue;
+            const arma::uvec& ci = g_saigeObjs[t]->m_case_indices;
+            const arma::uvec& oi = g_saigeObjs[t]->m_ctrl_indices;
+            caseU[t].set_size(ci.n_elem);
+            ctrlU[t].set_size(oi.n_elem);
+            for (arma::uword k = 0; k < ci.n_elem; k++) caseU[t][k] = S.pos.at(ci[k]);
+            for (arma::uword k = 0; k < oi.n_elem; k++) ctrlU[t][k] = S.pos.at(oi[k]);
+        }
+    }
+    const int imputeCase = string_to_case.at(g_impute_method);
+    static const uint8_t kMiss = 0x1;   // PLINK 2-bit code 01 = missing genotype
+
     std::vector<int> mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
     std::vector<long> nBatched(P, 0), nFallback(P, 0);
+    // Different sample sets, coverage diagnostics only: pairs whose flip is the
+    // opposite of the union column's (and how many of those stayed batched),
+    // pairs the affine map could not describe, and markers that passed QC for
+    // some traits but not all.
+    std::vector<long> nFlipOpp(P, 0), nFlipOppBatched(P, 0), nAffFail(P, 0);
+    long nPartialQC = 0;
     std::vector<MTTraitChunk> out(P);
 
     const bool batchOn = g_mtBatch && !ctx.batchTraits.empty();
@@ -2188,7 +2278,7 @@ void mainMarkerMT(
         #pragma omp parallel for schedule(dynamic, 1)
         for (int blk = 0; blk < nBlocks; blk++) {
             MTBlockWork& W = work[omp_get_thread_num()];
-            W.ensure(n, Bblk, P);
+            W.ensure(n, Bblk, P, differ);
             const int jj0 = blk * Bblk;
             const int jj1 = std::min(jj0 + Bblk, qc);
             int nHi = 0, nLo = 0;
@@ -2204,6 +2294,206 @@ void mainMarkerMT(
                         std::cout << "Completed " << (i + 1) << "/" << q
                                   << " markers in the chunk." << std::endl;
                     }
+                }
+
+                if (differ) {
+                    // ---- different sample sets: union read, per-trait stats ----
+                    uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
+                    PLINK::PlinkClass::FusedMarkerStats fsU;
+                    const bool isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsU);
+                    if (!isReadMarker) {
+                        #pragma omp critical(endflag)
+                        {
+                            if (i < firstEndIdx.load(std::memory_order_relaxed))
+                                firstEndIdx.store(i, std::memory_order_relaxed);
+                            g_markerTestEnd = true;
+                        }
+                        continue;
+                    }
+                    const std::string pds = std::to_string(fsU.pd);
+                    chrVec[jj] = fsU.chr;
+                    posVec[jj] = pds;
+                    refVec[jj] = fsU.ref;
+                    altVec[jj] = fsU.alt;
+                    markerVec[jj] = fsU.marker;
+                    infoVec[jj] = fsU.chr + ":" + pds + ":" + fsU.ref + ":" + fsU.alt;
+
+                    const uint8_t* codes = W.tmpCodes.data();
+                    ptr_gPLINKobj->copyFusedCodes_ts(fsU, W.tmpCodes.data());
+
+                    // The union column's own imputation table: what a
+                    // single-trait run on exactly the union samples would use.
+                    // A trait whose list IS the union gets this table from the
+                    // per-trait loop below too (same counts, same n).
+                    PLINK::PlinkClass::FusedMarkerStats fu;
+                    for (int c4 = 0; c4 < 4; c4++) { fu.counts[c4] = fsU.counts[c4]; fu.dmap[c4] = fsU.dmap[c4]; }
+                    fu.N = (uint32_t)n;
+                    fu.gIndex = gIndex;
+                    ptr_gPLINKobj->fusedPreStatsFromCounts(fu, (uint32_t)n);
+                    {
+                        const double MAFu = std::min(fu.altFreq, 1 - fu.altFreq);
+                        const double MACu = MAFu * n * (1 - fu.missingRate) * 2;
+                        PLINK::finalizeFusedStats(fu, imputeCase, g_dosage_zerod_cutoff,
+                                                  g_dosage_zerod_MAC_cutoff, MACu);
+                    }
+
+                    bool anyQC = false;
+                    for (int t = 0; t < P; t++) {
+                        const SAIGE::MTTraitSamples& S = ctx.samp[t];
+                        const int nObj = g_saigeObjs[t]->m_n;
+                        W.tq[t] = 0;
+                        PLINK::PlinkClass::FusedMarkerStats ft;
+                        for (int c4 = 0; c4 < 4; c4++) ft.dmap[c4] = fsU.dmap[c4];
+                        if (S.sameAsUnion) {
+                            for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = fsU.counts[c4];
+                        } else if (S.comp.size() <= S.pos.size()) {
+                            // Counts over the trait = union counts minus the
+                            // samples it does not have: cost ~ |comp|.
+                            uint64_t cnt[4] = {fsU.counts[0], fsU.counts[1], fsU.counts[2], fsU.counts[3]};
+                            for (arma::uword u : S.comp) cnt[codes[u]]--;
+                            for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
+                        } else {
+                            uint64_t cnt[4] = {0, 0, 0, 0};
+                            for (arma::uword u : S.pos) cnt[codes[u]]++;
+                            for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
+                        }
+                        ft.N = (uint32_t)S.n;
+                        ft.gIndex = gIndex;
+                        // Stage A's pre-impute expressions on the trait's counts.
+                        ptr_gPLINKobj->fusedPreStatsFromCounts(ft, (uint32_t)S.n);
+                        double altFreq = ft.altFreq;
+                        const double missingRate = ft.missingRate;
+                        const double imputeInfo = ft.imputeInfo;
+                        W.tMR[t] = missingRate;
+                        W.tII[t] = imputeInfo;
+
+                        // From here on: mainMarkerInCPP's QC / impute / flip
+                        // chain with that trait's n.
+                        double MAF = std::min(altFreq, 1 - altFreq);
+                        double MAC = MAF * nObj * (1 - missingRate) * 2;
+                        if ((missingRate > g_missingRate_cutoff) ||
+                            (MAF < g_marker_minMAF_cutoff) ||
+                            (MAC < g_marker_minMAC_cutoff) ||
+                            (imputeInfo < g_marker_minINFO_cutoff)) {
+                            continue;
+                        }
+                        PLINK::finalizeFusedStats(ft, imputeCase, g_dosage_zerod_cutoff,
+                                                  g_dosage_zerod_MAC_cutoff, MAC);
+                        const bool flip = ft.flip;
+                        altFreq = ft.altFreq_post;
+                        double altCounts = ft.altCounts_post;
+                        if (!g_fusedPlinkDecode) {
+                            // SAIGE_STEP2_SCALAR_DECODE=1: the single-trait run
+                            // takes imputeGenoAndFlip, whose post-impute altCount
+                            // is arma::sum over the trait's dosage vector
+                            // (UTIL.cpp). Same values, same order, same sum.
+                            const double* fdt = ft.fd;
+                            double* g = W.gT.memptr();
+                            if (S.sameAsUnion) {
+                                for (int k = 0; k < S.n; k++) g[k] = fdt[codes[k]];
+                            } else {
+                                for (int k = 0; k < S.n; k++) g[k] = fdt[codes[S.pos[k]]];
+                            }
+                            arma::vec gv(g, (arma::uword)S.n, false, false);
+                            const uint dosagesSize = (uint)S.n;
+                            altCounts = arma::sum(gv);
+                            altFreq = altCounts / (2 * dosagesSize);
+                            if (flip) {
+                                altFreq = 1 - altFreq;
+                                altCounts = 2 * dosagesSize - altCounts;
+                            }
+                        }
+                        MAC = std::min(altCounts, 2.0 * nObj - altCounts);
+                        MAF = std::min(altFreq, 1 - altFreq);
+                        if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) {
+                            continue;
+                        }
+                        W.tq[t] = 1;
+                        anyQC = true;
+                        W.tflip[t] = flip ? 1 : 0;
+                        W.tMAC[t] = MAC;
+                        W.tAF[t] = altFreq;
+                        W.tAC[t] = altCounts;
+                        for (int c4 = 0; c4 < 4; c4++) W.tfd[(std::size_t)t * 4 + c4] = ft.fd[c4];
+                        W.tnMiss[t] = (arma::uword)ft.counts[kMiss];
+                    }
+                    if (!anyQC) continue;
+                    {
+                        bool allQC = true;
+                        for (int t = 0; t < P; t++) if (!W.tq[t]) { allQC = false; break; }
+                        if (!allQC) {
+                            #pragma omp atomic
+                            nPartialQC++;
+                        }
+                    }
+
+                    // High-MAC column iff some batchable binary trait scores
+                    // it with the normal approximation rather than ER. Quantitative
+                    // traits are scored on both kinds of column.
+                    bool hi = false;
+                    for (int t = 0; t < P; t++) {
+                        if (W.tq[t] && ctx.meta[t].batchable &&
+                            ctx.meta[t].kind == SAIGE::TraitKind::Binary &&
+                            W.tMAC[t] > g_MACCutoffforER) { hi = true; break; }
+                    }
+                    const int c = hi ? (nHi++) : (Bblk - 1 - (nLo++));
+                    {
+                        double* g = W.Gb.colptr(c);
+                        for (int u = 0; u < n; u++) g[u] = fu.fd[codes[u]];
+                    }
+                    std::memcpy(W.codes.data() + (std::size_t)c * (std::size_t)n, codes, (size_t)n);
+                    std::vector<arma::uword>& mv = W.adj.miss[c];
+                    mv.clear();
+                    if (fu.counts[kMiss] > 0) {
+                        for (int u = 0; u < n; u++) if (codes[u] == kMiss) mv.push_back((arma::uword)u);
+                    }
+                    W.colOf[jj - jj0] = c;
+                    W.isHi[c] = hi ? 1 : 0;
+
+                    for (int t = 0; t < P; t++) {
+                        const std::size_t k = (std::size_t)c * (std::size_t)P + (std::size_t)t;
+                        W.qcP[k] = W.tq[t];
+                        W.adj.a(c, t) = 1.0; W.adj.b(c, t) = 0.0;
+                        W.adj.d(c, t) = 0.0; W.adj.q(c, t) = 0.0;
+                        W.adj.nMiss(c, t) = 0;
+                        W.affP[k] = 0;
+                        if (!W.tq[t]) continue;
+                        const double MAC = W.tMAC[t];
+                        W.flipP[k] = W.tflip[t];
+                        W.MACp(c, t) = MAC;
+                        W.AFp(c, t)  = W.tAF[t];
+                        W.ACp(c, t)  = W.tAC[t];
+                        W.MRp(c, t)  = W.tMR[t];
+                        W.IIp(c, t)  = W.tII[t];
+                        const double* fdt = &W.tfd[(std::size_t)t * 4];
+                        for (int c4 = 0; c4 < 4; c4++) W.fdP[k * 4 + c4] = fdt[c4];
+
+                        // g_t = a*g + b on the non-missing codes, exactly.
+                        const bool sameFlip = ((W.tflip[t] != 0) == fu.flip);
+                        const double a = sameFlip ? 1.0 : -1.0;
+                        const double b = sameFlip ? 0.0 : 2.0;
+                        bool aff = true;
+                        for (int c4 = 0; c4 < 4; c4++) {
+                            if ((uint8_t)c4 == kMiss) continue;
+                            if (fdt[c4] != a * fu.fd[c4] + b) aff = false;
+                        }
+                        const double gm = a * fu.fd[kMiss] + b;
+                        W.adj.a(c, t) = a;
+                        W.adj.b(c, t) = b;
+                        W.adj.d(c, t) = fdt[kMiss] - gm;
+                        W.adj.q(c, t) = fdt[kMiss] * fdt[kMiss] - gm * gm;
+                        W.adj.nMiss(c, t) = W.tnMiss[t];
+                        W.affP[k] = aff ? 1 : 0;
+
+                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                        const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                        const bool noadjCur  = obj->m_isnoadjCov;
+                        bool dummyHas;
+                        W.VR(c, t) = isSingleVR[t]
+                            ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
+                            : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                    }
+                    continue;
                 }
 
                 std::string chr, ref, alt, marker;
@@ -2374,17 +2664,18 @@ void mainMarkerMT(
             }
 
             // ---- batch pass ----
+            const SAIGE::MTBlockAdj* adjPtr = differ ? &W.adj : nullptr;
             if (batchOn) {
                 if (nHi > 0)
                     SAIGE::scoreTestBatchMT(ctx, ctx.batchTraits, W.Gb, 0, nHi,
-                                            W.VR, W.scr, W.res);
+                                            W.VR, adjPtr, W.scr, W.res);
                 // Low-MAC binary pairs go to ER, never to the kernel
                 // (design 3.2); the quantitative traits on those same markers
                 // stay batched, which is the whole point of splitting by column
                 // instead of dropping the marker.
                 if (nLo > 0 && !ctx.batchQuantTraits.empty())
                     SAIGE::scoreTestBatchMT(ctx, ctx.batchQuantTraits, W.Gb,
-                                            Bblk - nLo, Bblk, W.VR, W.scr, W.res);
+                                            Bblk - nLo, Bblk, W.VR, adjPtr, W.scr, W.res);
             }
 
             // ---- finalize every (marker, trait) pair in the block ----
@@ -2392,14 +2683,11 @@ void mainMarkerMT(
                 const int c = W.colOf[jj - jj0];
                 if (c < 0) continue;
                 const int i = chunkStart + jj;
-                const double MAC = W.MACc[c];
-                const double altFreq = W.altFreqc[c];
-                const bool flip = (W.flipc[c] != 0);
-                const bool hi = (W.isHi[c] != 0);
                 // Alias, not a copy: getMarkerPval takes arma::vec& but never
                 // writes through it.
                 arma::vec gCol(W.Gb.colptr(c), n, false, false);
                 const double* gp = W.Gb.colptr(c);
+                const uint8_t* codesC = differ ? (W.codes.data() + (std::size_t)c * (std::size_t)n) : nullptr;
                 bool idxReady = false;
 
                 for (int t = 0; t < P; t++) {
@@ -2409,6 +2697,37 @@ void mainMarkerMT(
                     const bool isCondition = M.isCondition;
                     const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
                     MTTraitChunk& O = out[t];
+
+                    // Per-trait marker statistics. Same sample set: the
+                    // marker-level values. Own sample set: this trait's.
+                    const std::size_t kP = (std::size_t)c * (std::size_t)P + (std::size_t)t;
+                    const bool ownSamples = differ && !ctx.samp[t].sameAsUnion;
+                    double MAC, altFreq;
+                    bool flip;
+                    const double* fdt = nullptr;
+                    if (differ) {
+                        if (!W.qcP[kP]) continue;   // failed QC for this trait: row stays NA
+                        MAC = W.MACp(c, t);
+                        altFreq = W.AFp(c, t);
+                        flip = (W.flipP[kP] != 0);
+                        fdt = &W.fdP[kP * 4];
+                        O.altFreq[jj]     = altFreq;
+                        O.altCounts[jj]   = W.ACp(c, t);
+                        O.missingRate[jj] = W.MRp(c, t);
+                        O.imputeInfo[jj]  = W.IIp(c, t);
+                    } else {
+                        MAC = W.MACc[c];
+                        altFreq = W.altFreqc[c];
+                        flip = (W.flipc[c] != 0);
+                        O.altFreq[jj]     = altFreqVec[jj];
+                        O.altCounts[jj]   = altCountsVec[jj];
+                        O.missingRate[jj] = missingRateVec[jj];
+                        O.imputeInfo[jj]  = imputationInfoVec[jj];
+                    }
+                    const bool hi = (MAC > g_MACCutoffforER);
+                    // The trait's genotype values: the block column, or the
+                    // trait's own table looked up through the union codes.
+                    const SAIGE::MTTraitSamples& S = ctx.samp[t];
 
                     double Beta = arma::datum::nan, seBeta = arma::datum::nan;
                     double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
@@ -2450,7 +2769,8 @@ void mainMarkerMT(
                     // approximation, so taking the batch number anywhere else
                     // is not an approximation, it is the same test.
                     bool useBatch = false;
-                    if (batchOn && M.batchable && (hi || !isBin)) {
+                    const bool affOK = !differ || (W.affP[kP] != 0);
+                    if (batchOn && M.batchable && (hi || !isBin) && affOK) {
                         const double stdStat = W.res.StdStat(c, t);
                         const double pRaw    = W.res.pvalRaw(c, t);
                         const bool   isLog   = (W.res.pvalIsLog[t][c] != 0);
@@ -2480,6 +2800,21 @@ void mainMarkerMT(
                         useBatch = !needSPA && !needFirth && !needFast;
                     }
 
+                    if (ownSamples) {
+                        if (W.adj.a(c, t) < 0.0) {
+                            #pragma omp atomic
+                            nFlipOpp[t]++;
+                            if (useBatch) {
+                                #pragma omp atomic
+                                nFlipOppBatched[t]++;
+                            }
+                        }
+                        if (!affOK) {
+                            #pragma omp atomic
+                            nAffFail[t]++;
+                        }
+                    }
+
                     if (useBatch) {
                         Beta       = W.res.Beta(c, t);
                         seBeta     = W.res.seBeta(c, t);
@@ -2491,7 +2826,33 @@ void mainMarkerMT(
                         #pragma omp atomic
                         nBatched[t]++;
                     } else {
-                        if (!idxReady) {
+                        // The genotype vector getMarkerPval sees: the block
+                        // column itself, or -- for a trait with its own sample
+                        // list -- that trait's vector, rebuilt from the codes
+                        // with the trait's table. Either way it holds exactly
+                        // the values a single-trait run would.
+                        arma::vec gOwn;
+                        arma::vec* gUse = &gCol;
+                        arma::uvec* izUse = &W.idxZ;
+                        arma::uvec* inzUse = &W.idxNZ;
+                        if (ownSamples) {
+                            const arma::uword nT = (arma::uword)S.n;
+                            double* g = W.gT.memptr();
+                            for (arma::uword k = 0; k < nT; k++) g[k] = fdt[codesC[S.pos[k]]];
+                            gOwn = arma::vec(g, nT, false, false);
+                            arma::uword cz = 0;
+                            for (arma::uword k = 0; k < nT; k++) if (g[k] == 0.0) cz++;
+                            W.idxZt.set_size(cz);
+                            W.idxNZt.set_size(nT - cz);
+                            arma::uword a = 0, b = 0;
+                            for (arma::uword k = 0; k < nT; k++) {
+                                if (g[k] == 0.0) W.idxZt[a++] = k;
+                                else             W.idxNZt[b++] = k;
+                            }
+                            gUse = &gOwn;
+                            izUse = &W.idxZt;
+                            inzUse = &W.idxNZt;
+                        } else if (!idxReady) {
                             // {i : g[i] == 0} and its complement, ascending --
                             // the definition both producers use.
                             arma::uword cz = 0;
@@ -2529,7 +2890,7 @@ void mainMarkerMT(
 
                         const bool isER = (MAC <= g_MACCutoffforER && traitType == "binary");
                         obj->getMarkerPval(
-                            gCol, W.idxNZ, W.idxZ,
+                            *gUse, *inzUse, *izUse,
                             Beta, seBeta, pval, pval_noSPA,
                             altFreq, Tstat, gy, varT,
                             isSPAConverge, W.gtilde, is_gtilde,
@@ -2575,7 +2936,7 @@ void mainMarkerMT(
                             }
                             g_firthDefer = false;  // A3: Firth runs once, here
                             obj->getMarkerPval(
-                                gCol, W.idxNZ, W.idxZ,
+                                *gUse, *inzUse, *izUse,
                                 Beta, seBeta, pval, pval_noSPA,
                                 altFreq, Tstat, gy, varT,
                                 isSPAConverge, W.gtilde, is_gtilde,
@@ -2630,20 +2991,44 @@ void mainMarkerMT(
                         double sum_case = 0.0, sum_ctrl = 0.0;
                         uint32_t case_hom_cnt = 0, case_het_cnt = 0;
                         uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
-                        for (arma::uword k = 0; k < N_case; ++k) {
-                            double d = gp[case_idx[k]];
-                            sum_case += d;
-                            if (t_isMoreOutput) {
-                                if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
-                                else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                        if (!ownSamples) {
+                            for (arma::uword k = 0; k < N_case; ++k) {
+                                double d = gp[case_idx[k]];
+                                sum_case += d;
+                                if (t_isMoreOutput) {
+                                    if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
+                                    else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                                }
                             }
-                        }
-                        for (arma::uword k = 0; k < N_ctrl; ++k) {
-                            double d = gp[ctrl_idx[k]];
-                            sum_ctrl += d;
-                            if (t_isMoreOutput) {
-                                if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
-                                else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                            for (arma::uword k = 0; k < N_ctrl; ++k) {
+                                double d = gp[ctrl_idx[k]];
+                                sum_ctrl += d;
+                                if (t_isMoreOutput) {
+                                    if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
+                                    else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                                }
+                            }
+                        } else {
+                            // The trait's k-th case is union sample caseU[t][k];
+                            // its value is the trait's table at that sample's
+                            // code -- the same number, visited in the same order.
+                            const arma::uvec& cu = caseU[t];
+                            const arma::uvec& ou = ctrlU[t];
+                            for (arma::uword k = 0; k < N_case; ++k) {
+                                double d = fdt[codesC[cu[k]]];
+                                sum_case += d;
+                                if (t_isMoreOutput) {
+                                    if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
+                                    else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                                }
+                            }
+                            for (arma::uword k = 0; k < N_ctrl; ++k) {
+                                double d = fdt[codesC[ou[k]]];
+                                sum_ctrl += d;
+                                if (t_isMoreOutput) {
+                                    if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
+                                    else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                                }
                             }
                         }
                         double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
@@ -2665,7 +3050,7 @@ void mainMarkerMT(
                             }
                         }
                     } else if (traitType == "quantitative") {
-                        O.N[jj] = n;
+                        O.N[jj] = differ ? obj->m_n : n;
                     }
                 }  // for t
             }  // for jj (finalize)
@@ -2683,8 +3068,8 @@ void mainMarkerMT(
                                 mFirth[t],
                                 mFirthConverge[t],
                                 chrVec, posVec, markerVec, refVec, altVec,
-                                altCountsVec, altFreqVec,
-                                imputationInfoVec, missingRateVec,
+                                O.altCounts, O.altFreq,
+                                O.imputeInfo, O.missingRate,
                                 O.Beta, O.seBeta, O.Tstat, O.varT,
                                 O.pval, O.pvalNA, spa,
                                 O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
@@ -2716,6 +3101,17 @@ void mainMarkerMT(
             std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
                       << mFirth[t] << " markers. " << mFirthConverge[t]
                       << " successfully converged." << std::endl;
+        }
+    }
+    if (differ) {
+        std::cout << "  Own-sample-set traits: markers passing QC for only some traits: "
+                  << nPartialQC << std::endl;
+        for (int t = 0; t < P; t++) {
+            if (ctx.samp[t].sameAsUnion) continue;
+            std::cout << "  [" << g_traitMeta[t].name << "] n=" << ctx.samp[t].n
+                      << ", flip opposite to the union column: " << nFlipOpp[t]
+                      << " pairs (" << nFlipOppBatched[t] << " batched)"
+                      << ", affine map not exact: " << nAffFail[t] << std::endl;
         }
     }
     if (batchOn && (totBatch + totFall) > 0) {
@@ -4766,17 +5162,13 @@ int main(int argc, char* argv[])
         // MULTITRAIT_DESIGN.md sections 4.1 and 5.
         std::vector<SAIGE::MTModelSpec> modelSpecs = SAIGE::parseModelSpecs(config);
         const int numTraits = static_cast<int>(modelSpecs.size());
-        // Design sections 4.3 / 10: traits fitted on different sample sets are
-        // not supported. Accepting the key silently would let a user believe
-        // they had turned the requirement off. Checked before anything is
-        // loaded so the message is the first thing they see.
-        if (config["mtRequireSameSamples"] &&
-            !config["mtRequireSameSamples"].as<bool>()) {
-            throw std::runtime_error(
-                "mtRequireSameSamples: false is not supported: every model must "
-                "be fitted on the same samples in the same order. Remove the key "
-                "(or set it to true) and use one config per sample set.");
-        }
+        // Design section 4.7: models fitted on different sample sets are
+        // supported (the genotype reader runs on the union of their sample
+        // lists and every trait is scored on its own samples). Setting
+        // mtRequireSameSamples: true turns a sample-list mismatch back into a
+        // hard error, for pipelines where one would signal an upstream mistake.
+        const bool mtRequireSameSamples = config["mtRequireSameSamples"]
+            ? config["mtRequireSameSamples"].as<bool>() : false;
 
         // Determine genotype type early (needed for input file validation)
         std::string genoType_early = config["genoType"] ? config["genoType"].as<std::string>() : "plink";
@@ -5182,11 +5574,50 @@ int main(int argc, char* argv[])
         // Cross-model agreement on exactly those things is what the check below
         // enforces, so this is safe for P > 1 too.
         NullModelData& nullModel = nms[0];
+        // Sample IDs the genotype reader is built on. Single trait: the
+        // model's. Multi-trait: the union of the models' lists (design 4.7),
+        // which is model 0's list, element for element, when they all agree.
+        std::vector<std::string> readerSampleIDs = nullModel.sampleIDs;
+        bool mtSampleSetsDiffer = false;
         {
             std::vector<std::string> traitNames;
             traitNames.reserve(modelSpecs.size());
             for (const auto& s : modelSpecs) traitNames.push_back(s.traitName);
-            SAIGE::validateMTModels(nms, traitNames);
+            mtSampleSetsDiffer = SAIGE::validateMTModels(nms, traitNames,
+                                                         mtRequireSameSamples);
+        }
+        if (mtSampleSetsDiffer) {
+            // Per-trait allele counts, flip and imputation are reproduced from
+            // the PLINK 2-bit code counts, which are exact integers. The BGEN /
+            // VCF / PGEN readers accumulate dosages in floating point over the
+            // reader's sample list, and matching that per trait is not
+            // implemented -- refuse rather than print numbers that differ from
+            // a single-trait run.
+            if (genoType_early != "plink") {
+                throw std::runtime_error(
+                    "The models were fitted on different sample sets; multi-trait "
+                    "testing on different sample sets currently supports "
+                    "genoType: plink only (this config uses " + genoType_early +
+                    "). Run one config per sample set.");
+            }
+            // assign_conditionMarkers_factors reads the conditioning markers
+            // through the shared reader at the reader's sample count.
+            if (!conditionMarkerIDs.empty()) {
+                throw std::runtime_error(
+                    "Conditional analysis is not supported in a multi-trait run "
+                    "whose models were fitted on different sample sets. Run one "
+                    "config per sample set.");
+            }
+            readerSampleIDs = SAIGE::mtUnionSampleIDs(nms);
+            std::cout << "  Sample sets differ between models: the genotype reader "
+                         "uses the union of " << readerSampleIDs.size()
+                      << " samples; each trait is scored on its own samples." << std::endl;
+            for (int ti = 0; ti < numTraits; ti++) {
+                std::cout << "    [" << ti << "] " << modelSpecs[ti].traitName
+                          << ": n=" << nms[ti].n
+                          << (nms[ti].sampleIDs == readerSampleIDs ? " (= union)" : "")
+                          << std::endl;
+            }
         }
 
         // ---- 4. Set global variables ----
@@ -5351,7 +5782,9 @@ int main(int argc, char* argv[])
             {
                 std::vector<int> order = SAIGE::mtInternalOrder(nms);
                 SAIGE::buildMTContext(g_mtctx, nms, order, g_traitMeta,
-                                      useLOCO, locoChrom);
+                                      useLOCO, locoChrom, readerSampleIDs);
+                if (g_mtctx.sampleSetsDiffer != mtSampleSetsDiffer)
+                    throw std::runtime_error("internal: sample-set bookkeeping disagrees");
             }
             std::cout << "  Sigma p = " << g_mtctx.sumP
                       << " (binary " << g_mtctx.sumPbin
@@ -5370,7 +5803,7 @@ int main(int argc, char* argv[])
             std::string famFile = plinkPrefix + ".fam";
             std::string bedFile = plinkPrefix + ".bed";
 
-            setPLINKobjInCPP(bimFile, famFile, bedFile, nullModel.sampleIDs, alleleOrder);
+            setPLINKobjInCPP(bimFile, famFile, bedFile, readerSampleIDs, alleleOrder);
             numMarkers = ptr_gPLINKobj->getM();
         } else if (genoType == "vcf") {
             setVCFobjInCPP(vcfFile, vcfField, nullModel.sampleIDs);
@@ -5436,7 +5869,14 @@ int main(int argc, char* argv[])
         timing_mark("40_geno_reader_ready");  // TIMING_INSTRUMENT_REMOVE_ME
 
         // Verify sample size consistency
-        if ((int)numSamplesAnalysis != nullModel.n) {
+        if (mtSampleSetsDiffer) {
+            if (numSamplesAnalysis != readerSampleIDs.size()) {
+                throw std::runtime_error(
+                    "genotype reader analyses " + std::to_string(numSamplesAnalysis) +
+                    " samples but the union of the models' sample lists has " +
+                    std::to_string(readerSampleIDs.size()));
+            }
+        } else if ((int)numSamplesAnalysis != nullModel.n) {
             std::cerr << "WARNING: Sample size mismatch. Null model n=" << nullModel.n
                       << " but genotype file analysis n=" << numSamplesAnalysis << std::endl;
         }

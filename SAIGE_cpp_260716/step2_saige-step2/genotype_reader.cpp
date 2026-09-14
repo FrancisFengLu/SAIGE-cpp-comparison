@@ -624,10 +624,22 @@ bool PlinkClass::getOneMarkerFusedStats_ts(uint64_t t_gIndex,
     for (int c = 0; c < 4; c++) fs.counts[c] = cnt[c];
 
     // ---- pre-impute stats: EXACT expressions of getOneMarker_ts ----
+    fusedPreStatsFromCounts(fs, m_N);
+
+    tlsFusedIdx = t_gIndex;
+    tlsFusedValid = true;
+    return true;
+}
+
+// Moved verbatim out of getOneMarkerFusedStats_ts (m_N -> t_N) so the
+// multi-trait path evaluates the same expressions on one trait's counts.
+void PlinkClass::fusedPreStatsFromCounts(FusedMarkerStats& fs, uint32_t t_N) const
+{
+    const uint64_t* cnt = fs.counts;
     const int numMissing = (int)cnt[MISSING];
-    const int count = (int)m_N - numMissing;
+    const int count = (int)t_N - numMissing;
     fs.nMissing    = (uint32_t)numMissing;
-    fs.missingRate = (double)numMissing / (double)m_N;
+    fs.missingRate = (double)numMissing / (double)t_N;
     fs.imputeInfo  = 1;
     double altCounts = (double)(cnt[HET] + 2 * cnt[HOM_ALT]);
     double altFreq;
@@ -642,10 +654,22 @@ bool PlinkClass::getOneMarkerFusedStats_ts(uint64_t t_gIndex,
     }
     fs.altFreq = altFreq;
     fs.altCounts = altCounts;
+}
 
-    tlsFusedIdx = t_gIndex;
-    tlsFusedValid = true;
-    return true;
+void PlinkClass::copyFusedCodes_ts(const FusedMarkerStats& fs, uint8_t* t_codes) const
+{
+    if (!tlsFusedValid || tlsFusedIdx != fs.gIndex) {
+        throw std::runtime_error(
+            "copyFusedCodes_ts: thread-local packed cache does not hold marker " +
+            std::to_string(fs.gIndex) + " (Stage A must precede it on the same thread).");
+    }
+    if (m_posIsIdentity) {
+        const unsigned char* buf = tlsFusedBuf.data();
+        for (uint32_t i = 0; i < m_N; ++i)
+            t_codes[i] = (uint8_t)((buf[i >> 2] >> ((i & 3u) * 2)) & 3u);
+    } else {
+        std::memcpy(t_codes, tlsFusedCodes.data(), (size_t)m_N);
+    }
 }
 
 // Stage B (pure). Mirrors UTIL.cpp::imputeGenoAndFlip on the 4-entry table.

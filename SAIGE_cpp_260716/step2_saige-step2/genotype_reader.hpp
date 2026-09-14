@@ -218,6 +218,22 @@ public:
 
     bool getOneMarkerFusedStats_ts(uint64_t t_gIndex, FusedMarkerStats& fs);
 
+    // The pre-impute half of Stage A, as a function of the 2-bit code counts
+    // alone: fills nMissing / missingRate / imputeInfo / altFreq / altCounts
+    // of `fs` from fs.counts over a sample set of size t_N. Stage A calls this
+    // with t_N = m_N; the multi-trait path calls it with one trait's counts and
+    // that trait's sample count, which is exactly what a single-trait reader
+    // built on that trait's samples would have computed (the counts are
+    // integers, so neither the sample order nor the union around the subset
+    // can move a bit).
+    void fusedPreStatsFromCounts(FusedMarkerStats& fs, uint32_t t_N) const;
+
+    // Multi-trait, different sample sets: after Stage A on the SAME thread
+    // with the same gIndex, write the 2-bit code of every sample in analysis
+    // (m_N of them, in m_posSampleInPlink order) to t_codes[0..m_N). Reads the
+    // cached packed bytes; no file access.
+    void copyFusedCodes_ts(const FusedMarkerStats& fs, uint8_t* t_codes) const;
+
     // Stage C. Requires the immediately preceding Stage A call on the SAME
     // thread with the same gIndex (packed bytes are cached thread_local).
     void fillOneMarkerFusedDense_ts(const FusedMarkerStats& fs,
