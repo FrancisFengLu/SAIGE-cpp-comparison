@@ -40,14 +40,42 @@ CoefficientsOut getCoefficients_cpp(const arma::fvec& Y,
   std::cout << "wVec[0:5]: " << w(0) << " " << w(1) << " " << w(2) << " " << w(3) << " " << w(4) << std::endl;
   std::cout << "============================================" << std::endl;
   std::cout << std::flush;
-  // Sigma^{-1}Y and Sigma^{-1}X via PCG
-  std::cout << "[DEBUG] About to call getPCG1ofSigmaAndVector for Y..." << std::endl << std::flush;
-  arma::fvec Sigma_iY = getPCG1ofSigmaAndVector(w, tau, Y, maxiterPCG, tolPCG);
-  std::cout << "[DEBUG] getPCG1ofSigmaAndVector for Y done" << std::endl << std::flush;                // :contentReference[oaicite:0]{index=0}
+  // Sigma^{-1}Y and Sigma^{-1}X via PCG.
+  //
+  // The 1+q columns are independent solves against the SAME Sigma, so they can
+  // be driven as one lockstep batch (getPCGofSigmaAndMatrix): every column keeps
+  // its own alpha/beta/residual and freezes on its own convergence test, and the
+  // only thing they share is the psi*B product — which is where the cost is. The
+  // 2-bit GPU kernel re-reads the whole matrix per 8-column block
+  // (tools/gpu_matvec/gemv2bit.cu GMC_NCMAX), so 1+q<=8 columns cost ONE pass
+  // instead of 1+q passes. This is the single largest PCG block in step 1: the
+  // inner IRLS loop calls it on every iteration of every outer AI-REML iteration.
+  //
+  // It is opt-in (SAIGE_COEF_BLOCKPCG=1) because it is not bit-identical: the
+  // per-column arithmetic is the same, but psi*B reduces in a different order
+  // than psi*b, exactly like the trace/VR block paths already accepted in trunk.
+  static const bool coef_block = [](){
+    const char* e = std::getenv("SAIGE_COEF_BLOCKPCG");
+    return e && std::string(e) == "1"; }();
+
+  arma::fvec Sigma_iY;
   arma::fmat Sigma_iX(Y.n_rows, X.n_cols);
-  for (int j = 0; j < static_cast<int>(X.n_cols); ++j) {
-    std::cout << "[DEBUG] getPCG for X col " << j << "..." << std::endl << std::flush;
-    Sigma_iX.col(j) = getPCG1ofSigmaAndVector(w, tau, X.col(j), maxiterPCG, tolPCG);
+
+  if (coef_block) {
+    arma::fmat B(Y.n_rows, 1 + X.n_cols);
+    B.col(0) = Y;
+    if (X.n_cols > 0) B.cols(1, X.n_cols) = X;
+    arma::fmat S = ::getPCGofSigmaAndMatrix(w, tau, B, maxiterPCG, tolPCG);
+    Sigma_iY = S.col(0);
+    if (X.n_cols > 0) Sigma_iX = S.cols(1, X.n_cols);
+  } else {
+    std::cout << "[DEBUG] About to call getPCG1ofSigmaAndVector for Y..." << std::endl << std::flush;
+    Sigma_iY = getPCG1ofSigmaAndVector(w, tau, Y, maxiterPCG, tolPCG);
+    std::cout << "[DEBUG] getPCG1ofSigmaAndVector for Y done" << std::endl << std::flush;                // :contentReference[oaicite:0]{index=0}
+    for (int j = 0; j < static_cast<int>(X.n_cols); ++j) {
+      std::cout << "[DEBUG] getPCG for X col " << j << "..." << std::endl << std::flush;
+      Sigma_iX.col(j) = getPCG1ofSigmaAndVector(w, tau, X.col(j), maxiterPCG, tolPCG);
+    }
   }
   std::cout << "[DEBUG] All Sigma_iX done" << std::endl << std::flush;
 
