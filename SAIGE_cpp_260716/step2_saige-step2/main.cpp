@@ -169,6 +169,13 @@ bool g_isOutputMarkerList = false;
 std::vector<std::ofstream>     g_OutFiles_single;
 std::vector<SAIGE::TraitMeta>  g_traitMeta;
 
+// The P SAIGEClass instances, in the same (internal) order as g_traitMeta.
+// Length 1 on the single-trait path, where g_saigeObjs[0] == ptr_gSAIGEobj and
+// nothing below ever indexes past 0. Design section 1.1(b): keeping P untouched
+// instances is what makes a multi-trait fallback pair run literally the same
+// code as a single-trait run.
+std::vector<SAIGE::SAIGEClass*> g_saigeObjs;
+
 // Output file prefix strings
 std::string g_outputFilePrefixGroup;
 std::string g_outputFilePrefixSingleInGroup;
@@ -660,7 +667,14 @@ void writeOutfile_single(std::ofstream& OutFile_single,
                           std::vector<double> & N_ctrl_hetVec,
                           std::vector<double> & N_case_hetVec,
                           std::vector<double> & N_ctrl_homVec,
-                          std::vector<uint32_t> & N_Vec)
+                          std::vector<uint32_t> & N_Vec,
+                          // Multi-trait chunking (design section 7.2): one trait's
+                          // rows arrive in several calls, so the per-call summary
+                          // line has to be suppressed and the tested-marker count
+                          // accumulated by the caller instead. Defaulted, so the
+                          // single-trait call site and its output are unchanged.
+                          bool t_printSummary = true,
+                          int* t_numtestOut = nullptr)
 {
     // Unpacked from TraitMeta so the body below is untouched.
     const bool         t_isMoreOutput = t_meta.isMoreOutput;
@@ -751,6 +765,8 @@ void writeOutfile_single(std::ofstream& OutFile_single,
             }
         }
     }
+    if (t_numtestOut) *t_numtestOut = numtest;
+    if (!t_printSummary) return;
     std::cout << numtest << " markers were tested." << std::endl;
     if (t_traitType == "binary") {
         if (t_isFirth) {
@@ -1944,6 +1960,562 @@ void mainMarkerInCPP(
                          N_Vec);
     timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
 }
+
+
+// ============================================================
+// mainMarkerMT
+// Multi-trait (P > 1) single-variant marker loop.
+//
+// Phase 1 shape (MULTITRAIT_DESIGN.md section 8): marker-dimension parallel,
+// and for each marker an inner loop over the P traits that calls that trait's
+// own SAIGEClass::getMarkerPval. No batching yet -- this function IS the
+// correctness baseline the batch kernel is later validated against, and every
+// (marker, trait) pair here runs literally the same code a single-trait run of
+// that model would run.
+//
+// What is shared across traits, and why it is legitimate to share it
+// (design section 4.3): all P models are validated to have identical sample
+// IDs in identical order and identical impute_method, so the file read, the
+// imputation, the flip, MAC / MAF / altFreq / altCounts / missingRate and the
+// zero/nonzero index vectors are marker-level quantities. One Gvec feeds every
+// trait.
+//
+// What is per trait: the SAIGEClass instance, traitType, isCondition, the
+// single-variance-ratio flag, the Firth counters, the case/control indices and
+// the output file.
+//
+// Differences from mainMarkerInCPP, all deliberate:
+//   * markers are processed in chunks of g_marker_chunksize and each chunk's
+//     rows are appended to the P open streams, so the output buffers are
+//     O(chunk * P) rather than O(q * P) (design section 7.2);
+//   * the blockSize > 1 prefetch path is not used (the batch kernel replaces
+//     it in Phase 2);
+//   * isSPAConverge is accumulated in a std::vector<char>, not a
+//     std::vector<bool>: concurrent writes to distinct elements of the latter
+//     race on the shared word;
+//   * the checkpoint dumps (g_writeCheckpoints) are single-trait debug output
+//     and are not emitted here.
+// ============================================================
+
+// One chunk's worth of per-trait results. Marker-level columns (chr / pos /
+// ref / alt / altFreq / ...) are NOT here: they are shared by every trait and
+// stored once, which is what keeps the chunk buffer at 10*chunk + 16*chunk*P
+// instead of 21*chunk*P (design section 7.2).
+struct MTTraitChunk {
+    std::vector<double>      Beta, seBeta, Tstat, varT;
+    std::vector<std::string> pval, pvalNA;
+    std::vector<double>      Beta_c, seBeta_c, Tstat_c, varT_c;
+    std::vector<std::string> pval_c, pvalNA_c;
+    std::vector<char>        isSPAConverge;   // char, not bool: see above
+    std::vector<double>      AF_case, AF_ctrl;
+    std::vector<uint32_t>    N_case, N_ctrl;
+    std::vector<double>      N_case_hom, N_ctrl_het, N_case_het, N_ctrl_hom;
+    std::vector<uint32_t>    N;
+
+    void reset(int qc) {
+        const double nan = arma::datum::nan;
+        Beta.assign(qc, nan); seBeta.assign(qc, nan);
+        Tstat.assign(qc, nan); varT.assign(qc, nan);
+        pval.assign(qc, "NA"); pvalNA.assign(qc, "NA");
+        Beta_c.assign(qc, nan); seBeta_c.assign(qc, nan);
+        Tstat_c.assign(qc, nan); varT_c.assign(qc, nan);
+        pval_c.assign(qc, "NA"); pvalNA_c.assign(qc, "NA");
+        isSPAConverge.assign(qc, 0);
+        AF_case.assign(qc, 0.0); AF_ctrl.assign(qc, 0.0);
+        N_case.assign(qc, 0); N_ctrl.assign(qc, 0);
+        N_case_hom.assign(qc, 0.0); N_ctrl_het.assign(qc, 0.0);
+        N_case_het.assign(qc, 0.0); N_ctrl_hom.assign(qc, 0.0);
+        N.assign(qc, 0);
+    }
+};
+
+void mainMarkerMT(
+    std::string & t_genoType,
+    std::vector<std::string> & t_genoIndex_prev,
+    std::vector<std::string> & t_genoIndex,
+    bool & t_isMoreOutput,
+    bool & t_isImputation,
+    bool & t_isFirth)
+{
+    const int P = static_cast<int>(g_saigeObjs.size());
+    const int n = g_saigeObjs[0]->m_n;
+    const int q = static_cast<int>(t_genoIndex.size());
+
+    // Per-trait one-time setup. assignSingleVarianceRatio mutates the object,
+    // so like mainMarkerInCPP it runs here, before any thread exists.
+    std::vector<char> isSingleVR(P, 0);
+    for (int t = 0; t < P; t++) {
+        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+        if ((obj->m_varRatio_null).n_elem == 1) {
+            obj->assignSingleVarianceRatio(obj->m_flagSparseGRM, obj->m_isnoadjCov);
+            isSingleVR[t] = 1;
+        }
+    }
+    std::vector<int> mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
+    std::vector<MTTraitChunk> out(P);
+
+    // BGEN streamer spans the whole run (design section 7.3): it is indexed by
+    // the global marker index, so rebuilding it per chunk would restart the
+    // reader thread from the beginning of the file.
+    std::unique_ptr<BGEN::BgenStreamer> bgenStreamer;
+    if (t_genoType == "bgen") {
+        if (ptr_gBGENobj == nullptr) {
+            throw std::runtime_error(
+                "mainMarkerMT: BGEN object not initialized but t_genoType=='bgen'.");
+        }
+        int nDec = (g_bgenDecoders > 0 ? g_bgenDecoders : 4);
+        bgenStreamer.reset(new BGEN::BgenStreamer(
+            ptr_gBGENobj, t_genoIndex, t_isImputation, nDec, /*queueCap*/ 64));
+        std::cout << "BGEN streamer: " << nDec << " decoders, queueCap=64" << std::endl;
+    }
+
+    // End-of-stream sentinel, shared across chunks: once a reader has failed at
+    // marker i, every marker from i on is left at its "NA" sentinel and is not
+    // written, exactly as in the single-trait loop.
+    int firstEndIdx = q;
+    const int chunkSize = (g_marker_chunksize > 0 ? g_marker_chunksize : q);
+
+    for (int chunkStart = 0; chunkStart < q; chunkStart += chunkSize) {
+        const int chunkEnd = std::min(chunkStart + chunkSize, q);
+        const int qc = chunkEnd - chunkStart;
+        if (chunkStart >= firstEndIdx) break;
+
+        // Marker-level output columns: one copy, shared by all P traits.
+        std::vector<std::string> markerVec(qc), chrVec(qc), posVec(qc),
+                                 refVec(qc), altVec(qc), infoVec(qc);
+        std::vector<double> altFreqVec(qc, 0.0), altCountsVec(qc, 0.0),
+                            imputationInfoVec(qc, 0.0), missingRateVec(qc, 0.0);
+        for (int t = 0; t < P; t++) out[t].reset(qc);
+
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int jj = 0; jj < qc; jj++) {
+            const int i = chunkStart + jj;
+
+            // Same thread_local scratch strategy as mainMarkerInCPP (PATH B1):
+            // these are O(N) and would otherwise mmap/munmap every marker.
+            thread_local arma::vec t_GVec, gtildeVec, t_P2Vec;
+            thread_local std::vector<uint> indexZeroVec, indexNonZeroVec, indexForMissing;
+            thread_local arma::uvec indexZeroVec_arma, indexNonZeroVec_arma;
+            if (t_GVec.n_elem != (arma::uword)n) {
+                t_GVec.set_size(n);
+                gtildeVec.set_size(n);
+            }
+            indexZeroVec.clear();
+            indexNonZeroVec.clear();
+            indexForMissing.clear();
+            t_P2Vec.reset();
+
+            if (i >= firstEndIdx) continue;
+
+            if ((i + 1) % g_marker_chunksize == 0) {
+                #pragma omp critical(progress)
+                {
+                    std::cout << "Completed " << (i + 1) << "/" << q
+                              << " markers in the chunk." << std::endl;
+                }
+            }
+
+            std::string chr, ref, alt, marker;
+            uint32_t pd = 0;
+            double altFreq = 0.0, altCounts = 0.0, missingRate = 0.0, imputeInfo = 0.0;
+            bool flip = false;
+            bool usedFusedDecode = false;
+            PLINK::PlinkClass::FusedMarkerStats fsFused;
+            const bool isOutputIndexForMissing = true;
+            const bool isOnlyOutputNonZero = false;
+
+            // ---- read one marker (marker level, shared by every trait) ----
+            bool isReadMarker;
+            if (t_genoType == "bgen") {
+                BGEN::BgenDecodedMarker dm;
+                isReadMarker = bgenStreamer->getMarker((uint64_t)i, dm);
+                if (isReadMarker) {
+                    ref         = dm.alleles.size() > 0 ? dm.alleles[0] : "";
+                    alt         = dm.alleles.size() > 1 ? dm.alleles[1] : "";
+                    marker      = dm.rsID;
+                    pd          = dm.physpos;
+                    chr         = dm.chr;
+                    altFreq     = dm.altFreq;
+                    altCounts   = dm.altCounts;
+                    missingRate = dm.missingRate;
+                    imputeInfo  = dm.info;
+                    indexForMissing = std::move(dm.indexForMissing);
+                    t_GVec = std::move(dm.dosages);
+                }
+            } else {
+                std::string t_genoIndex_str = t_genoIndex.at(i);
+                char* end;
+                uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
+                if (t_genoType == "plink" && g_fusedPlinkDecode) {
+                    usedFusedDecode = true;
+                    isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+                    if (isReadMarker) {
+                        ref = std::move(fsFused.ref);
+                        alt = std::move(fsFused.alt);
+                        marker = std::move(fsFused.marker);
+                        chr = std::move(fsFused.chr);
+                        pd = fsFused.pd;
+                        altFreq = fsFused.altFreq;
+                        altCounts = fsFused.altCounts;
+                        missingRate = fsFused.missingRate;
+                        imputeInfo = fsFused.imputeInfo;
+                    }
+                } else if (t_genoType == "vcf") {
+                    #pragma omp critical(genoread)
+                    {
+                        isReadMarker = Unified_getOneMarker_ts(
+                            t_genoType, gIndex,
+                            ref, alt, marker, pd, chr,
+                            altFreq, altCounts, missingRate, imputeInfo,
+                            isOutputIndexForMissing, indexForMissing,
+                            isOnlyOutputNonZero,    indexNonZeroVec,
+                            t_GVec, t_isImputation);
+                    }
+                } else {
+                    isReadMarker = Unified_getOneMarker_ts(
+                        t_genoType, gIndex,
+                        ref, alt, marker, pd, chr,
+                        altFreq, altCounts, missingRate, imputeInfo,
+                        isOutputIndexForMissing, indexForMissing,
+                        isOnlyOutputNonZero,    indexNonZeroVec,
+                        t_GVec, t_isImputation);
+                }
+            }
+
+            if (!isReadMarker) {
+                #pragma omp critical(endflag)
+                {
+                    if (i < firstEndIdx) firstEndIdx = i;
+                    g_markerTestEnd = true;
+                }
+                continue;
+            }
+
+            const std::string pds = std::to_string(pd);
+            chrVec[jj] = chr;
+            posVec[jj] = pds;
+            refVec[jj] = ref;
+            altVec[jj] = alt;
+            markerVec[jj] = marker;
+            infoVec[jj] = chr + ":" + pds + ":" + ref + ":" + alt;
+            altFreqVec[jj] = altFreq;
+            missingRateVec[jj] = missingRate;
+            imputationInfoVec[jj] = imputeInfo;
+
+            // ---- QC (marker level) ----
+            double MAF = std::min(altFreq, 1 - altFreq);
+            double MAC = MAF * n * (1 - missingRate) * 2;
+            if ((missingRate > g_missingRate_cutoff) ||
+                (MAF < g_marker_minMAF_cutoff) ||
+                (MAC < g_marker_minMAC_cutoff) ||
+                (imputeInfo < g_marker_minINFO_cutoff)) {
+                continue;
+            }
+
+            indexZeroVec.clear();
+            indexNonZeroVec.clear();
+            if (usedFusedDecode) {
+                PLINK::finalizeFusedStats(
+                    fsFused, string_to_case.at(g_impute_method),
+                    g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff, MAC);
+                flip = fsFused.flip;
+                altFreq = fsFused.altFreq_post;
+                altCounts = fsFused.altCounts_post;
+                MAC = fsFused.MAC_imp;
+            } else {
+                flip = imputeGenoAndFlip(
+                    t_GVec, altFreq, altCounts,
+                    indexForMissing, g_impute_method,
+                    g_dosage_zerod_cutoff, g_dosage_zerod_MAC_cutoff,
+                    MAC, indexZeroVec, indexNonZeroVec);
+            }
+
+            MAC = std::min(altCounts, 2.0 * n - altCounts);
+            MAF = std::min(altFreq, 1 - altFreq);
+            if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) {
+                continue;
+            }
+
+            altFreqVec[jj] = altFreq;
+            altCountsVec[jj] = altCounts;
+
+            if (usedFusedDecode) {
+                ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                    fsFused, t_GVec, indexZeroVec_arma, indexNonZeroVec_arma);
+            } else {
+                copy_index_uvec_reuse(indexZeroVec, indexZeroVec_arma);
+                copy_index_uvec_reuse(indexNonZeroVec, indexNonZeroVec_arma);
+            }
+            indexZeroVec.clear();
+            indexNonZeroVec.clear();
+
+            const double* gp = t_GVec.memptr();
+
+            // ---- per-trait scoring ----
+            for (int t = 0; t < P; t++) {
+                SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                const SAIGE::TraitMeta& M = g_traitMeta[t];
+                const std::string& traitType = M.traitType;
+                const bool isCondition = M.isCondition;
+                MTTraitChunk& O = out[t];
+
+                double Beta = arma::datum::nan, seBeta = arma::datum::nan;
+                double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
+                double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
+                double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
+                std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+                bool isSPAConverge = false, is_gtilde = false;
+                bool is_Firth = false, is_FirthConverge = false;
+                arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
+                t_P2Vec.clear();
+
+                // Per-marker ctx, exactly as the single-trait loop builds it.
+                SAIGE::PerMarkerCtx ctx_first;
+                ctx_first.flagSparseGRM_cur = obj->m_isFastTest
+                    ? false : obj->m_flagSparseGRM;
+                ctx_first.isnoadjCov_cur = obj->m_isnoadjCov;
+                // Design section 3.4 note 2: the ER resampling stream id is the
+                // marker's position in the input and nothing else -- not the
+                // trait, not the thread -- so results do not depend on
+                // scheduling or on how many traits are in the run.
+                ctx_first.erSeedStream = (uint64_t)i + 1;
+                {
+                    bool dummyHas;
+                    if (isSingleVR[t]) {
+                        ctx_first.varRatioVal = obj->computeSingleVarianceRatio(
+                            ctx_first.flagSparseGRM_cur, ctx_first.isnoadjCov_cur);
+                    } else {
+                        ctx_first.varRatioVal = obj->computeVarianceRatio(
+                            MAC, ctx_first.flagSparseGRM_cur,
+                            ctx_first.isnoadjCov_cur, dummyHas);
+                    }
+                }
+
+                // W1-1: the fast-test recompute's ctx depends only on MAC and
+                // model constants, so it is known before the first pass. When
+                // it matches ctx_first the recompute is a bit-identical repeat
+                // and is skipped -- and Firth then has to run inline.
+                bool fastRecomputeSameCtx = false;
+                if (obj->m_isFastTest &&
+                    ((traitType == "binary" && MAC > g_MACCutoffforER) ||
+                     traitType != "binary")) {
+                    SAIGE::PerMarkerCtx ctx_probe;
+                    ctx_probe.flagSparseGRM_cur =
+                        (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                            ? false : obj->m_flagSparseGRM;
+                    ctx_probe.isnoadjCov_cur = false;
+                    {
+                        bool dummyHas2;
+                        if (!isSingleVR[t]) {
+                            ctx_probe.varRatioVal = obj->computeVarianceRatio(
+                                MAC, ctx_probe.flagSparseGRM_cur,
+                                ctx_probe.isnoadjCov_cur, dummyHas2);
+                        } else {
+                            ctx_probe.varRatioVal = obj->computeSingleVarianceRatio(
+                                ctx_probe.flagSparseGRM_cur, ctx_probe.isnoadjCov_cur);
+                        }
+                    }
+                    fastRecomputeSameCtx =
+                        (ctx_probe.flagSparseGRM_cur == ctx_first.flagSparseGRM_cur) &&
+                        (ctx_probe.isnoadjCov_cur == ctx_first.isnoadjCov_cur) &&
+                        (ctx_probe.varRatioVal == ctx_first.varRatioVal);
+                }
+
+                // A3: g_firthDefer is thread_local and this thread will run
+                // several (marker, trait) pairs in a row, so it must be set --
+                // not just cleared -- before every call (design section 3.4).
+                g_firthDefer = (obj->m_isFastTest &&
+                                traitType == "binary" &&
+                                MAC > g_MACCutoffforER &&
+                                !fastRecomputeSameCtx);
+
+                const bool isER = (MAC <= g_MACCutoffforER && traitType == "binary");
+                obj->getMarkerPval(
+                    t_GVec, indexNonZeroVec_arma, indexZeroVec_arma,
+                    Beta, seBeta, pval, pval_noSPA,
+                    altFreq, Tstat, gy, varT,
+                    isSPAConverge, gtildeVec, is_gtilde,
+                    /*is_region*/ false, t_P2Vec,
+                    isCondition,
+                    Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                    Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                    is_Firth, is_FirthConverge,
+                    isER,
+                    ctx_first.isnoadjCov_cur,
+                    ctx_first.flagSparseGRM_cur,
+                    ctx_first);
+
+                double pval_num;
+                try {
+                    pval_num = std::stod(pval);
+                } catch (const std::invalid_argument&) {
+                    std::cerr << "Argument is invalid\n";
+                    pval_num = 0;
+                } catch (const std::out_of_range&) {
+                    std::cerr << "Argument is out of range for a double\n";
+                    pval_num = 0;
+                }
+
+                // Fast test re-evaluation (exact match of SAIGE logic).
+                if ((traitType == "binary" && MAC > g_MACCutoffforER) ||
+                    traitType != "binary") {
+                    if (obj->m_isFastTest &&
+                        !fastRecomputeSameCtx &&
+                        pval_num < obj->m_pval_cutoff_for_fastTest) {
+                        SAIGE::PerMarkerCtx ctx_fast;
+                        ctx_fast.flagSparseGRM_cur =
+                            (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                ? false : obj->m_flagSparseGRM;
+                        ctx_fast.isnoadjCov_cur = false;
+                        {
+                            bool dummyHas;
+                            if (!isSingleVR[t]) {
+                                ctx_fast.varRatioVal = obj->computeVarianceRatio(
+                                    MAC, ctx_fast.flagSparseGRM_cur,
+                                    ctx_fast.isnoadjCov_cur, dummyHas);
+                            } else {
+                                ctx_fast.varRatioVal = obj->computeSingleVarianceRatio(
+                                    ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur);
+                            }
+                        }
+                        g_firthDefer = false;  // A3: Firth runs once, here
+                        obj->getMarkerPval(
+                            t_GVec, indexNonZeroVec_arma, indexZeroVec_arma,
+                            Beta, seBeta, pval, pval_noSPA,
+                            altFreq, Tstat, gy, varT,
+                            isSPAConverge, gtildeVec, is_gtilde,
+                            /*is_region*/ false, t_P2Vec,
+                            isCondition,
+                            Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                            Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                            is_Firth, is_FirthConverge,
+                            false,
+                            ctx_fast.isnoadjCov_cur,
+                            ctx_fast.flagSparseGRM_cur,
+                            ctx_fast);
+                    }
+                }
+
+                if (traitType == "binary" && is_Firth) {
+                    #pragma omp atomic
+                    mFirth[t] += 1;
+                    if (is_FirthConverge) {
+                        #pragma omp atomic
+                        mFirthConverge[t] += 1;
+                    }
+                }
+
+                O.Beta[jj]   = Beta * (1 - 2 * flip);
+                O.seBeta[jj] = seBeta;
+                O.pval[jj]   = pval;
+                O.pvalNA[jj] = pval_noSPA;
+                O.Tstat[jj]  = Tstat * (1 - 2 * flip);
+                O.varT[jj]   = varT;
+
+                if (isCondition) {
+                    O.Beta_c[jj]   = Beta_c * (1 - 2 * flip);
+                    O.seBeta_c[jj] = seBeta_c;
+                    O.pval_c[jj]   = pval_c;
+                    O.pvalNA_c[jj] = pval_noSPA_c;
+                    O.Tstat_c[jj]  = Tstat_c * (1 - 2 * flip);
+                    O.varT_c[jj]   = varT_c;
+                }
+
+                if (traitType == "binary" || traitType == "survival") {
+                    const arma::uvec& case_idx = obj->m_case_indices;
+                    const arma::uvec& ctrl_idx = obj->m_ctrl_indices;
+                    const uint32_t N_case = case_idx.n_elem;
+                    const uint32_t N_ctrl = ctrl_idx.n_elem;
+                    double sum_case = 0.0, sum_ctrl = 0.0;
+                    uint32_t case_hom_cnt = 0, case_het_cnt = 0;
+                    uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
+                    for (arma::uword k = 0; k < N_case; ++k) {
+                        double d = gp[case_idx[k]];
+                        sum_case += d;
+                        if (t_isMoreOutput) {
+                            if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
+                            else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                        }
+                    }
+                    for (arma::uword k = 0; k < N_ctrl; ++k) {
+                        double d = gp[ctrl_idx[k]];
+                        sum_ctrl += d;
+                        if (t_isMoreOutput) {
+                            if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
+                            else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                        }
+                    }
+                    double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
+                    double AF_ctrl = (N_ctrl > 0) ? sum_ctrl / N_ctrl / 2.0 : 0.0;
+                    if (flip) { AF_case = 1 - AF_case; AF_ctrl = 1 - AF_ctrl; }
+                    O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
+                    O.AF_case[jj] = AF_case;
+                    O.AF_ctrl[jj] = AF_ctrl;
+                    O.N_case[jj] = N_case;
+                    O.N_ctrl[jj] = N_ctrl;
+                    if (t_isMoreOutput) {
+                        O.N_case_hom[jj] = case_hom_cnt;
+                        O.N_case_het[jj] = case_het_cnt;
+                        O.N_ctrl_hom[jj] = ctrl_hom_cnt;
+                        O.N_ctrl_het[jj] = ctrl_het_cnt;
+                        if (flip) {
+                            O.N_case_hom[jj] = N_case - O.N_case_het[jj] - O.N_case_hom[jj];
+                            O.N_ctrl_hom[jj] = N_ctrl - O.N_ctrl_het[jj] - O.N_ctrl_hom[jj];
+                        }
+                    }
+                } else if (traitType == "quantitative") {
+                    O.N[jj] = n;
+                }
+            }  // for t
+        }  // for jj (omp)
+
+        // ---- write this chunk's rows, one file per trait (serial) ----
+        for (int t = 0; t < P; t++) {
+            MTTraitChunk& O = out[t];
+            std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
+            int numtestChunk = 0;
+            writeOutfile_single(g_OutFiles_single[t],
+                                g_traitMeta[t],
+                                t_isImputation,
+                                t_isFirth,
+                                mFirth[t],
+                                mFirthConverge[t],
+                                chrVec, posVec, markerVec, refVec, altVec,
+                                altCountsVec, altFreqVec,
+                                imputationInfoVec, missingRateVec,
+                                O.Beta, O.seBeta, O.Tstat, O.varT,
+                                O.pval, O.pvalNA, spa,
+                                O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
+                                O.pval_c, O.pvalNA_c,
+                                O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
+                                O.N_case_hom, O.N_ctrl_het,
+                                O.N_case_het, O.N_ctrl_hom,
+                                O.N,
+                                /*printSummary*/ false,
+                                &numtestChunk);
+            numtestTotal[t] += numtestChunk;
+        }
+        for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+    }  // for chunkStart
+
+    // One summary per trait, after every chunk (design section 7.2).
+    for (int t = 0; t < P; t++) {
+        std::cout << "[" << g_traitMeta[t].name << "] " << numtestTotal[t]
+                  << " markers were tested." << std::endl;
+        if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
+            std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
+                      << mFirth[t] << " markers. " << mFirthConverge[t]
+                      << " successfully converged." << std::endl;
+        }
+    }
+    if (t_isFirth) {
+        std::cout << "[A3] Firth fit calls: " << g_firthFitCalls.load()
+                  << " (equals candidate count when no duplicate execution)" << std::endl;
+    }
+    timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
+}
+
+
 
 
 // ============================================================
@@ -3750,6 +4322,127 @@ void mainRegionInCPP(
 
 
 // ============================================================
+// applyNullModelOverrides
+// Applies the YAML override keys to ONE loaded null model, in the order the
+// design fixes (section 4.1): the top-level keys first (they apply to every
+// trait), then that model's own `models[i]` keys, which beat them. On the
+// single-trait path this is exactly the sequence main() used to run inline, so
+// the resulting NullModelData -- and therefore the output -- is unchanged.
+//
+// g_is_Firth_beta / g_pCutoffforFirth are write-only globals (nothing reads
+// them); they are kept updated so their value still reflects the last model
+// processed, as before.
+// ============================================================
+static void applyNullModelOverrides(NullModelData& t_nm,
+                                    const YAML::Node& t_config,
+                                    const SAIGE::ModelOverrides& t_ov,
+                                    const std::string& t_traitName,
+                                    bool t_labelTrait)
+{
+    const std::string tag = t_labelTrait ? ("  [" + t_traitName + "]") : std::string("  ");
+
+    // Override Firth settings from null model, then let YAML config override
+    // (mirrors R Step-2's --is_Firth_beta / --pCutoffforFirth CLI behavior).
+    g_is_Firth_beta = t_nm.is_Firth_beta;
+    g_pCutoffforFirth = t_nm.pCutoffforFirth;
+    if (t_config["is_Firth_beta"]) {
+        t_nm.is_Firth_beta = t_config["is_Firth_beta"].as<bool>();
+        g_is_Firth_beta = t_nm.is_Firth_beta;
+        std::cout << tag << " is_Firth_beta overridden from config: "
+                  << std::boolalpha << g_is_Firth_beta << std::endl;
+    }
+    if (t_config["pCutoffforFirth"]) {
+        t_nm.pCutoffforFirth = t_config["pCutoffforFirth"].as<double>();
+        g_pCutoffforFirth = t_nm.pCutoffforFirth;
+        std::cout << tag << " pCutoffforFirth overridden from config: "
+                  << g_pCutoffforFirth << std::endl;
+    }
+
+    // ---- Override cateVarRatioMinMACVecExclude / cateVarRatioMaxMACVecInclude ----
+    // R SAIGE defaults: cateVarRatioMinMACVecExclude = c(10.5, 20.5)
+    //                   cateVarRatioMaxMACVecInclude = c(20.5, N)
+    // These control which MAC threshold triggers the PCG (sparse GRM) path
+    // during re-evaluation for markers with p < pval_cutoff_for_fastTest.
+    // If not specified in config, the values from the VR file are used.
+    if (t_config["cateVarRatioMinMACVecExclude"] &&
+        t_config["cateVarRatioMinMACVecExclude"].IsSequence()) {
+        size_t n = t_config["cateVarRatioMinMACVecExclude"].size();
+        t_nm.cateVarRatioMinMACVecExclude.set_size(n);
+        for (size_t i = 0; i < n; i++) {
+            t_nm.cateVarRatioMinMACVecExclude(i) =
+                t_config["cateVarRatioMinMACVecExclude"][i].as<double>();
+        }
+        std::cout << tag << " cateVarRatioMinMACVecExclude overridden from config: [";
+        for (size_t i = 0; i < n; i++) {
+            if (i > 0) std::cout << ", ";
+            std::cout << t_nm.cateVarRatioMinMACVecExclude(i);
+        }
+        std::cout << "]" << std::endl;
+    }
+    if (t_config["cateVarRatioMaxMACVecInclude"] &&
+        t_config["cateVarRatioMaxMACVecInclude"].IsSequence()) {
+        size_t n = t_config["cateVarRatioMaxMACVecInclude"].size();
+        t_nm.cateVarRatioMaxMACVecInclude.set_size(n);
+        for (size_t i = 0; i < n; i++) {
+            t_nm.cateVarRatioMaxMACVecInclude(i) =
+                t_config["cateVarRatioMaxMACVecInclude"][i].as<double>();
+        }
+        std::cout << tag << " cateVarRatioMaxMACVecInclude overridden from config: [";
+        for (size_t i = 0; i < n; i++) {
+            if (i > 0) std::cout << ", ";
+            std::cout << t_nm.cateVarRatioMaxMACVecInclude(i);
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    // ---- Override isnoadjCov from YAML config ----
+    // The JSON null model may have isnoadjCov=false, but the YAML config
+    // can override it (e.g., for testing the scoreTestFast_noadjCov path).
+    if (t_config["isnoadjCov"]) {
+        t_nm.isnoadjCov = t_config["isnoadjCov"].as<bool>();
+        std::cout << tag << " isnoadjCov overridden from config: "
+                  << std::boolalpha << t_nm.isnoadjCov << std::endl;
+    }
+
+    // ---- Per-model overrides (`models:` form only) ----
+    // Design section 4.1: a key written inside a models[] entry applies to
+    // that trait only and beats the top-level value, which is why this runs
+    // after the block above. The legacy scalar form never populates
+    // ModelOverrides, so nothing here executes on that path and P == 1 stays
+    // byte-identical.
+    if (t_ov.has_is_Firth_beta) {
+        t_nm.is_Firth_beta = t_ov.is_Firth_beta;
+        g_is_Firth_beta = t_nm.is_Firth_beta;
+        std::cout << "  [" << t_traitName << "] is_Firth_beta overridden per model: "
+                  << std::boolalpha << g_is_Firth_beta << std::endl;
+    }
+    if (t_ov.has_pCutoffforFirth) {
+        t_nm.pCutoffforFirth = t_ov.pCutoffforFirth;
+        g_pCutoffforFirth = t_nm.pCutoffforFirth;
+        std::cout << "  [" << t_traitName << "] pCutoffforFirth overridden per model: "
+                  << g_pCutoffforFirth << std::endl;
+    }
+    if (t_ov.has_isnoadjCov) {
+        t_nm.isnoadjCov = t_ov.isnoadjCov;
+        std::cout << "  [" << t_traitName << "] isnoadjCov overridden per model: "
+                  << std::boolalpha << t_nm.isnoadjCov << std::endl;
+    }
+    if (t_ov.has_cateVarRatioMinMACVecExclude) {
+        t_nm.cateVarRatioMinMACVecExclude =
+            arma::vec(t_ov.cateVarRatioMinMACVecExclude);
+        std::cout << "  [" << t_traitName
+                  << "] cateVarRatioMinMACVecExclude overridden per model." << std::endl;
+    }
+    if (t_ov.has_cateVarRatioMaxMACVecInclude) {
+        t_nm.cateVarRatioMaxMACVecInclude =
+            arma::vec(t_ov.cateVarRatioMaxMACVecInclude);
+        std::cout << "  [" << t_traitName
+                  << "] cateVarRatioMaxMACVecInclude overridden per model." << std::endl;
+    }
+}
+
+
+// ============================================================
 // main() -- CLI entry point
 // Parses YAML config file, loads null model, sets up genotype
 // reader, runs single-variant or region testing.
@@ -3857,13 +4550,6 @@ int main(int argc, char* argv[])
         // MULTITRAIT_DESIGN.md sections 4.1 and 5.
         std::vector<SAIGE::MTModelSpec> modelSpecs = SAIGE::parseModelSpecs(config);
         const int numTraits = static_cast<int>(modelSpecs.size());
-        if (numTraits > 1) {
-            throw std::runtime_error(
-                "Config lists " + std::to_string(numTraits) + " models, but "
-                "multi-trait testing (P > 1) is not implemented yet: this build "
-                "carries the Phase 0 skeleton only. Run one model per config for "
-                "now -- refusing rather than silently testing only the first.");
-        }
 
         // Determine genotype type early (needed for input file validation)
         std::string genoType_early = config["genoType"] ? config["genoType"].as<std::string>() : "plink";
@@ -4023,6 +4709,15 @@ int main(int argc, char* argv[])
         // ---- Region/gene-based testing config keys ----
         std::string groupFile = config["groupFile"] ? config["groupFile"].as<std::string>() : "";
         bool isRegionTest = !groupFile.empty();
+        // Design section 10: region / gene-based testing is a separate design,
+        // not an extension of this one. Refuse rather than silently testing
+        // only the first trait.
+        if (isRegionTest && numTraits > 1) {
+            throw std::runtime_error(
+                "multi-trait region testing is not supported: the config lists " +
+                std::to_string(numTraits) + " models together with groupFile '" +
+                groupFile + "'. Run the region test one model per config.");
+        }
 
         // Annotation list (e.g., ["lof", "lof;missense", "lof;missense;synonymous"])
         std::vector<std::string> annotationList;
@@ -4224,23 +4919,48 @@ int main(int argc, char* argv[])
         std::cout << std::endl;
 
         timing_mark("10_yaml_parsed");  // TIMING_INSTRUMENT_REMOVE_ME
-        // ---- 3. Load null model from Step 1 ----
-        std::cout << "===== Loading null model =====" << std::endl;
-        NullModelData nullModel = loadNullModel(modelFile, varianceRatioFile,
-                                                useLOCO, locoChrom);
+        // ---- 3. Load null model(s) from Step 1 ----
+        // One model on the single-trait path, P on the multi-trait one. They
+        // are loaded in config order here and only permuted into the internal
+        // (binary-first) order once every SAIGEClass exists -- design sections
+        // 1.2 and 4.2.
+        std::cout << "===== Loading null model" << (numTraits > 1 ? "s" : "")
+                  << " =====" << std::endl;
+        std::vector<NullModelData> nms(numTraits);
+        for (int ti = 0; ti < numTraits; ti++) {
+            nms[ti] = loadNullModel(modelSpecs[ti].modelFile,
+                                    modelSpecs[ti].varianceRatioFile,
+                                    useLOCO, locoChrom);
+            const NullModelData& nmi = nms[ti];
+            if (numTraits > 1) {
+                std::cout << "  --- [" << ti << "] " << modelSpecs[ti].traitName
+                          << " ---" << std::endl;
+            }
+            std::cout << "  Trait type:   " << nmi.traitType << std::endl;
+            std::cout << "  Sample size:  " << nmi.n << std::endl;
+            std::cout << "  Covariates:   " << nmi.p << std::endl;
+            std::cout << "  tau[0]:       " << nmi.tau0 << std::endl;
+            std::cout << "  tau[1]:       " << nmi.tau1 << std::endl;
+            std::cout << "  SPA_Cutoff:   " << nmi.SPA_Cutoff << std::endl;
+            std::cout << "  flagSparseGRM:" << std::boolalpha << nmi.flagSparseGRM << std::endl;
+            std::cout << "  isFastTest:   " << std::boolalpha << nmi.isFastTest << std::endl;
+            std::cout << "  isCondition:  " << std::boolalpha << nmi.isCondition << std::endl;
+            std::cout << "  is_Firth_beta:" << std::boolalpha << nmi.is_Firth_beta << std::endl;
+            std::cout << std::endl;
+        }
         timing_mark("20_null_model_loaded");  // TIMING_INSTRUMENT_REMOVE_ME
 
-        std::cout << "  Trait type:   " << nullModel.traitType << std::endl;
-        std::cout << "  Sample size:  " << nullModel.n << std::endl;
-        std::cout << "  Covariates:   " << nullModel.p << std::endl;
-        std::cout << "  tau[0]:       " << nullModel.tau0 << std::endl;
-        std::cout << "  tau[1]:       " << nullModel.tau1 << std::endl;
-        std::cout << "  SPA_Cutoff:   " << nullModel.SPA_Cutoff << std::endl;
-        std::cout << "  flagSparseGRM:" << std::boolalpha << nullModel.flagSparseGRM << std::endl;
-        std::cout << "  isFastTest:   " << std::boolalpha << nullModel.isFastTest << std::endl;
-        std::cout << "  isCondition:  " << std::boolalpha << nullModel.isCondition << std::endl;
-        std::cout << "  is_Firth_beta:" << std::boolalpha << nullModel.is_Firth_beta << std::endl;
-        std::cout << std::endl;
+        // Everything downstream that needs "the" model (sample IDs for the
+        // genotype reader, the trait type for the region path) reads model 0.
+        // Cross-model agreement on exactly those things is what the check below
+        // enforces, so this is safe for P > 1 too.
+        NullModelData& nullModel = nms[0];
+        {
+            std::vector<std::string> traitNames;
+            traitNames.reserve(modelSpecs.size());
+            for (const auto& s : modelSpecs) traitNames.push_back(s.traitName);
+            SAIGE::validateMTModels(nms, traitNames);
+        }
 
         // ---- 4. Set global variables ----
         std::cout << "===== Setting global variables =====" << std::endl;
@@ -4258,197 +4978,141 @@ int main(int argc, char* argv[])
 
         setMarker_GlobalVarsInCPP(isMoreOutput, marker_chunksize);
 
-        // Override Firth settings from null model, then let YAML config override
-        // (mirrors R Step-2's --is_Firth_beta / --pCutoffforFirth CLI behavior).
-        g_is_Firth_beta = nullModel.is_Firth_beta;
-        g_pCutoffforFirth = nullModel.pCutoffforFirth;
-        if (config["is_Firth_beta"]) {
-            nullModel.is_Firth_beta = config["is_Firth_beta"].as<bool>();
-            g_is_Firth_beta = nullModel.is_Firth_beta;
-            std::cout << "  is_Firth_beta overridden from config: "
-                      << std::boolalpha << g_is_Firth_beta << std::endl;
+        // ---- YAML overrides, per trait ----
+        // Top-level keys apply to every trait; a key inside a models[] entry
+        // beats them for that trait only (design section 4.1). Both are applied
+        // by applyNullModelOverrides in exactly the order main() used to run
+        // them inline, so the single-trait result is unchanged.
+        for (int ti = 0; ti < numTraits; ti++) {
+            applyNullModelOverrides(nms[ti], config, modelSpecs[ti].ov,
+                                    modelSpecs[ti].traitName, numTraits > 1);
         }
-        if (config["pCutoffforFirth"]) {
-            nullModel.pCutoffforFirth = config["pCutoffforFirth"].as<double>();
-            g_pCutoffforFirth = nullModel.pCutoffforFirth;
-            std::cout << "  pCutoffforFirth overridden from config: "
-                      << g_pCutoffforFirth << std::endl;
-        }
-
-        // ---- Override cateVarRatioMinMACVecExclude / cateVarRatioMaxMACVecInclude ----
-        // R SAIGE defaults: cateVarRatioMinMACVecExclude = c(10.5, 20.5)
-        //                   cateVarRatioMaxMACVecInclude = c(20.5, N)
-        // These control which MAC threshold triggers the PCG (sparse GRM) path
-        // during re-evaluation for markers with p < pval_cutoff_for_fastTest.
-        // If not specified in config, the values from the VR file are used.
-        if (config["cateVarRatioMinMACVecExclude"] && config["cateVarRatioMinMACVecExclude"].IsSequence()) {
-            size_t n = config["cateVarRatioMinMACVecExclude"].size();
-            nullModel.cateVarRatioMinMACVecExclude.set_size(n);
-            for (size_t i = 0; i < n; i++) {
-                nullModel.cateVarRatioMinMACVecExclude(i) = config["cateVarRatioMinMACVecExclude"][i].as<double>();
-            }
-            std::cout << "  cateVarRatioMinMACVecExclude overridden from config: [";
-            for (size_t i = 0; i < n; i++) {
-                if (i > 0) std::cout << ", ";
-                std::cout << nullModel.cateVarRatioMinMACVecExclude(i);
-            }
-            std::cout << "]" << std::endl;
-        }
-        if (config["cateVarRatioMaxMACVecInclude"] && config["cateVarRatioMaxMACVecInclude"].IsSequence()) {
-            size_t n = config["cateVarRatioMaxMACVecInclude"].size();
-            nullModel.cateVarRatioMaxMACVecInclude.set_size(n);
-            for (size_t i = 0; i < n; i++) {
-                nullModel.cateVarRatioMaxMACVecInclude(i) = config["cateVarRatioMaxMACVecInclude"][i].as<double>();
-            }
-            std::cout << "  cateVarRatioMaxMACVecInclude overridden from config: [";
-            for (size_t i = 0; i < n; i++) {
-                if (i > 0) std::cout << ", ";
-                std::cout << nullModel.cateVarRatioMaxMACVecInclude(i);
-            }
-            std::cout << "]" << std::endl;
-        }
-
-        // ---- Override isnoadjCov from YAML config ----
-        // The JSON null model may have isnoadjCov=false, but the YAML config
-        // can override it (e.g., for testing the scoreTestFast_noadjCov path).
-        if (config["isnoadjCov"]) {
-            nullModel.isnoadjCov = config["isnoadjCov"].as<bool>();
-            std::cout << "  isnoadjCov overridden from config: " << std::boolalpha << nullModel.isnoadjCov << std::endl;
-        }
-
-        // ---- Per-model overrides (`models:` form only) ----
-        // Design section 4.1: a key written inside a models[] entry applies to
-        // that trait only and beats the top-level value, which is why this runs
-        // after the top-level block above. The legacy scalar form never
-        // populates ModelOverrides, so nothing here executes on that path and
-        // P == 1 stays byte-identical.
-        {
-            const SAIGE::ModelOverrides& ov = modelSpecs[0].ov;
-            if (ov.has_is_Firth_beta) {
-                nullModel.is_Firth_beta = ov.is_Firth_beta;
-                g_is_Firth_beta = nullModel.is_Firth_beta;
-                std::cout << "  [" << modelSpecs[0].traitName
-                          << "] is_Firth_beta overridden per model: "
-                          << std::boolalpha << g_is_Firth_beta << std::endl;
-            }
-            if (ov.has_pCutoffforFirth) {
-                nullModel.pCutoffforFirth = ov.pCutoffforFirth;
-                g_pCutoffforFirth = nullModel.pCutoffforFirth;
-                std::cout << "  [" << modelSpecs[0].traitName
-                          << "] pCutoffforFirth overridden per model: "
-                          << g_pCutoffforFirth << std::endl;
-            }
-            if (ov.has_isnoadjCov) {
-                nullModel.isnoadjCov = ov.isnoadjCov;
-                std::cout << "  [" << modelSpecs[0].traitName
-                          << "] isnoadjCov overridden per model: "
-                          << std::boolalpha << nullModel.isnoadjCov << std::endl;
-            }
-            if (ov.has_cateVarRatioMinMACVecExclude) {
-                nullModel.cateVarRatioMinMACVecExclude =
-                    arma::vec(ov.cateVarRatioMinMACVecExclude);
-                std::cout << "  [" << modelSpecs[0].traitName
-                          << "] cateVarRatioMinMACVecExclude overridden per model."
-                          << std::endl;
-            }
-            if (ov.has_cateVarRatioMaxMACVecInclude) {
-                nullModel.cateVarRatioMaxMACVecInclude =
-                    arma::vec(ov.cateVarRatioMaxMACVecInclude);
-                std::cout << "  [" << modelSpecs[0].traitName
-                          << "] cateVarRatioMaxMACVecInclude overridden per model."
-                          << std::endl;
-            }
-        }
-
         // ---- Set isCondition from YAML condition markers ----
         // Note: isCondition is set to true if condition markers are specified.
         // The actual condition_genoIndex will be populated after PLINK setup
         // (since we need the genotype file to look up marker indices).
         if (!conditionMarkerIDs.empty()) {
-            nullModel.isCondition = true;
-            // Use a dummy condition_genoIndex for now; will be populated after PLINK setup.
-            // SAIGEClass just needs to know m_numMarker_cond.
-            nullModel.condition_genoIndex.resize(conditionMarkerIDs.size(), 0);
+            for (int ti = 0; ti < numTraits; ti++) {
+                nms[ti].isCondition = true;
+                // Use a dummy condition_genoIndex for now; will be populated after PLINK setup.
+                // SAIGEClass just needs to know m_numMarker_cond.
+                nms[ti].condition_genoIndex.resize(conditionMarkerIDs.size(), 0);
+            }
             std::cout << "  Conditional analysis enabled with " << conditionMarkerIDs.size()
                       << " conditioning markers." << std::endl;
         }
 
-        // ---- 5. Construct SAIGEClass from NullModelData ----
-        std::cout << "===== Constructing SAIGEClass =====" << std::endl;
-        setSAIGEobjInCPP(
-            nullModel.XVX,
-            nullModel.XXVX_inv,
-            nullModel.XV,
-            nullModel.XVX_inv_XV,
-            nullModel.Sigma_iXXSigma_iX,
-            nullModel.X,
-            nullModel.S_a,
-            nullModel.res,
-            nullModel.mu2,
-            nullModel.mu,
-            nullModel.varRatio_sparse,
-            nullModel.varRatio_null,
-            nullModel.varRatio_null_noXadj,
-            nullModel.cateVarRatioMinMACVecExclude,
-            nullModel.cateVarRatioMaxMACVecInclude,
-            nullModel.SPA_Cutoff,
-            nullModel.tauvec,
-            nullModel.traitType,
-            nullModel.y,
-            nullModel.impute_method,
-            nullModel.flagSparseGRM,
-            nullModel.isFastTest,
-            nullModel.isnoadjCov,
-            nullModel.pval_cutoff_for_fastTest,
-            nullModel.locationMat,
-            nullModel.valueVec,
-            nullModel.dimNum,
-            nullModel.isCondition,
-            nullModel.condition_genoIndex,
-            nullModel.is_Firth_beta,
-            nullModel.pCutoffforFirth,
-            nullModel.offset,
-            nullModel.resout);
-        timing_mark("30_saige_obj_built");  // TIMING_INSTRUMENT_REMOVE_ME
+        // ---- 5. Construct one SAIGEClass per trait ----
+        // Built in config order, then permuted into the internal (binary-first)
+        // order below. Design section 1.1(b): the class itself is untouched and
+        // P instances exist, so a fallback pair runs literally today's code.
+        std::cout << "===== Constructing SAIGEClass"
+                  << (numTraits > 1 ? "es" : "") << " =====" << std::endl;
+        std::vector<SAIGE::SAIGEClass*> objsCfgOrder(numTraits, nullptr);
+        std::vector<SAIGE::TraitMeta>   metaCfgOrder(numTraits);
+        for (int ti = 0; ti < numTraits; ti++) {
+            NullModelData& nm = nms[ti];
+            // setSAIGEobjInCPP writes the new instance into ptr_gSAIGEobj; grab
+            // it right after the call. ptr_gSAIGEobj is re-pointed at the first
+            // internal-order trait once the loop is done.
+            setSAIGEobjInCPP(
+                nm.XVX,
+                nm.XXVX_inv,
+                nm.XV,
+                nm.XVX_inv_XV,
+                nm.Sigma_iXXSigma_iX,
+                nm.X,
+                nm.S_a,
+                nm.res,
+                nm.mu2,
+                nm.mu,
+                nm.varRatio_sparse,
+                nm.varRatio_null,
+                nm.varRatio_null_noXadj,
+                nm.cateVarRatioMinMACVecExclude,
+                nm.cateVarRatioMaxMACVecInclude,
+                nm.SPA_Cutoff,
+                nm.tauvec,
+                nm.traitType,
+                nm.y,
+                nm.impute_method,
+                nm.flagSparseGRM,
+                nm.isFastTest,
+                nm.isnoadjCov,
+                nm.pval_cutoff_for_fastTest,
+                nm.locationMat,
+                nm.valueVec,
+                nm.dimNum,
+                nm.isCondition,
+                nm.condition_genoIndex,
+                nm.is_Firth_beta,
+                nm.pCutoffforFirth,
+                nm.offset,
+                nm.resout);
+            objsCfgOrder[ti] = ptr_gSAIGEobj;
 
-        std::cout << "  SAIGEClass constructed successfully." << std::endl;
-        std::cout << "  n = " << ptr_gSAIGEobj->m_n << ", p = " << ptr_gSAIGEobj->m_p << std::endl;
-        std::cout << std::endl;
-
-        // ---- 5b. Per-trait metadata + output streams ----
-        // One entry here; a multi-trait run fills P of these. Every field is
-        // the exact value the output writers used to receive as a loose
-        // argument, so the written bytes are unchanged.
-        g_traitMeta.resize(1);
-        {
-            SAIGE::TraitMeta& tm = g_traitMeta[0];
-            tm.name      = modelSpecs[0].traitName;
-            tm.modelDir  = modelSpecs[0].modelFile;
-            tm.vrFile    = modelSpecs[0].varianceRatioFile;
-            tm.outFile   = modelSpecs[0].outputFile;
-            tm.traitType = nullModel.traitType;
-            // Lenient on purpose: the single-trait path has never rejected an
-            // unrecognised traitType, and `kind` is not read at P == 1.
-            SAIGE::tryTraitKindFromString(tm.traitType, tm.kind);
-            tm.p                        = static_cast<int>(nullModel.p);
-            tm.tau0                     = nullModel.tau0;
-            tm.SPA_Cutoff               = nullModel.SPA_Cutoff;
-            tm.is_Firth_beta            = nullModel.is_Firth_beta;
-            tm.pCutoffforFirth          = nullModel.pCutoffforFirth;
-            tm.isFastTest               = nullModel.isFastTest;
-            tm.pval_cutoff_for_fastTest = nullModel.pval_cutoff_for_fastTest;
-            tm.isnoadjCov               = nullModel.isnoadjCov;
-            tm.flagSparseGRM            = nullModel.flagSparseGRM;
-            tm.isCondition              = ptr_gSAIGEobj->m_isCondition;
+            // ---- Per-trait metadata ----
+            // Every field is the exact value the output writers used to receive
+            // as a loose argument, so the written bytes are unchanged.
+            SAIGE::TraitMeta& tm = metaCfgOrder[ti];
+            tm.name      = modelSpecs[ti].traitName;
+            tm.modelDir  = modelSpecs[ti].modelFile;
+            tm.vrFile    = modelSpecs[ti].varianceRatioFile;
+            tm.outFile   = modelSpecs[ti].outputFile;
+            tm.traitType = nm.traitType;
+            if (numTraits > 1) {
+                // Multi-trait routes on `kind`, so an unrecognised traitType
+                // would silently pick the wrong kernel: reject it.
+                tm.kind = SAIGE::traitKindFromString(tm.traitType);
+            } else {
+                // Lenient on purpose: the single-trait path has never rejected
+                // an unrecognised traitType, and `kind` is not read at P == 1.
+                SAIGE::tryTraitKindFromString(tm.traitType, tm.kind);
+            }
+            tm.p                        = static_cast<int>(nm.p);
+            tm.tau0                     = nm.tau0;
+            tm.SPA_Cutoff               = nm.SPA_Cutoff;
+            tm.is_Firth_beta            = nm.is_Firth_beta;
+            tm.pCutoffforFirth          = nm.pCutoffforFirth;
+            tm.isFastTest               = nm.isFastTest;
+            tm.pval_cutoff_for_fastTest = nm.pval_cutoff_for_fastTest;
+            tm.isnoadjCov               = nm.isnoadjCov;
+            tm.flagSparseGRM            = nm.flagSparseGRM;
+            tm.isCondition              = objsCfgOrder[ti]->m_isCondition;
             tm.isMoreOutput             = isMoreOutput;
             // loco_applied, not useLOCO: loadNullModel silently falls back to
             // the genome-wide fit when `chrom` is absent from loco_chroms
-            // (null_model_loader.cpp guard 3). Phase 1 warns when P models
-            // disagree here, so it has to record what really happened.
-            tm.locoApplied              = nullModel.loco_applied;
-            tm.outIdx                   = 0;
+            // (null_model_loader.cpp guard 3). validateMTModels warns when P
+            // models disagree here, so it has to record what really happened.
+            tm.locoApplied              = nm.loco_applied;
+            tm.outIdx                   = ti;
+            tm.batchable                = SAIGE::isBatchable(tm);
         }
-        g_OutFiles_single.resize(1);
+        std::cout << "  SAIGEClass constructed successfully." << std::endl;
+        std::cout << "  n = " << objsCfgOrder[0]->m_n
+                  << ", p = " << objsCfgOrder[0]->m_p << std::endl;
+        std::cout << std::endl;
+        timing_mark("30_saige_obj_built");  // TIMING_INSTRUMENT_REMOVE_ME
+
+        // ---- 5b. Internal order (binary first) + per-trait output streams ----
+        // The permutation is a no-op for P == 1. Each trait writes its own file
+        // whose path came from its own models[] entry, so the internal order
+        // never reaches the output.
+        {
+            std::vector<int> order = SAIGE::mtInternalOrder(nms);
+            g_saigeObjs.resize(numTraits);
+            g_traitMeta.resize(numTraits);
+            for (int t = 0; t < numTraits; t++) {
+                g_saigeObjs[t] = objsCfgOrder[order[t]];
+                g_traitMeta[t] = metaCfgOrder[order[t]];
+            }
+            ptr_gSAIGEobj = g_saigeObjs[0];
+            g_OutFiles_single.resize(numTraits);
+        }
+        if (numTraits > 1) {
+            SAIGE::printMTGateTable(g_traitMeta, useLOCO);
+            std::cout << std::endl;
+        }
 
         // ---- 6. Set up genotype reader (PLINK, VCF, or BGEN) ----
         std::cout << "===== Setting up genotype reader =====" << std::endl;
@@ -4600,10 +5264,25 @@ int main(int argc, char* argv[])
                 cond_weights.zeros(condGenoIndices.size());
             }
 
-            // Read conditioning marker genotypes and compute factors
+            // Read conditioning marker genotypes and compute factors.
+            // Design section 10: the eleven m_*_cond members are per trait, so
+            // this has to run once per SAIGEClass -- otherwise every trait but
+            // the first would condition on the wrong model's factors.
+            // assign_conditionMarkers_factors reads and writes ptr_gSAIGEobj,
+            // so it is re-pointed around each call and restored afterwards.
             std::cout << "  Reading conditioning marker genotypes..." << std::endl;
-            assign_conditionMarkers_factors(genoType, condGenoIndices,
-                                            numSamplesAnalysis, cond_weights);
+            {
+                SAIGE::SAIGEClass* const savedObj = ptr_gSAIGEobj;
+                for (int ti = 0; ti < numTraits; ti++) {
+                    if (numTraits > 1) {
+                        std::cout << "  [" << g_traitMeta[ti].name << "]" << std::endl;
+                    }
+                    ptr_gSAIGEobj = g_saigeObjs[ti];
+                    assign_conditionMarkers_factors(genoType, condGenoIndices,
+                                                    numSamplesAnalysis, cond_weights);
+                }
+                ptr_gSAIGEobj = savedObj;
+            }
             std::cout << std::endl;
             timing_mark("45_cond_setup_done");  // TIMING_INSTRUMENT_REMOVE_ME
         }
@@ -4909,14 +5588,32 @@ int main(int argc, char* argv[])
             std::cout << "  Will test " << genoIndex.size() << " markers." << std::endl;
             std::cout << std::endl;
 
-            // ---- 8a. Open output file ----
-            std::cout << "===== Opening output file =====" << std::endl;
-            bool isopen = openOutfile_single(g_OutFiles_single[0], g_traitMeta[0],
-                                             isImputation, false);
-            if (!isopen) {
-                throw std::runtime_error("Cannot open output file: " + outputFile);
+            // ---- 8a. Open output file(s) ----
+            // One file per trait, with the columns and header a single-trait run
+            // of that model would produce (design section 4.4). The multi-trait
+            // loop opens its own streams per chunk (append), so here only the
+            // single-trait stream is opened up front.
+            std::cout << "===== Opening output file"
+                      << (numTraits > 1 ? "s" : "") << " =====" << std::endl;
+            if (numTraits == 1) {
+                bool isopen = openOutfile_single(g_OutFiles_single[0], g_traitMeta[0],
+                                                 isImputation, false);
+                if (!isopen) {
+                    throw std::runtime_error("Cannot open output file: " + outputFile);
+                }
+                std::cout << "  Output file opened: " << g_outputFilePrefixSingle << std::endl;
+            } else {
+                for (int t = 0; t < numTraits; t++) {
+                    bool isopen = openOutfile_single(g_OutFiles_single[t], g_traitMeta[t],
+                                                     isImputation, false);
+                    if (!isopen) {
+                        throw std::runtime_error("Cannot open output file: " +
+                                                 g_traitMeta[t].outFile);
+                    }
+                    std::cout << "  [" << g_traitMeta[t].name << "] "
+                              << g_traitMeta[t].outFile << std::endl;
+                }
             }
-            std::cout << "  Output file opened: " << g_outputFilePrefixSingle << std::endl;
             std::cout << std::endl;
 
             // ---- 9a. Run single-variant testing ----
@@ -4924,14 +5621,26 @@ int main(int argc, char* argv[])
             arma::vec timeStart = getTime();
 
             timing_mark("50_before_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
-            mainMarkerInCPP(
-                genoType,
-                nullModel.traitType,
-                genoIndex_prev,
-                genoIndex,
-                isMoreOutput,
-                isImputation,
-                isFirth);
+            // Design section 5: the fork is here, not inside the marker loop.
+            // P == 1 calls the untouched function and cannot regress.
+            if (numTraits == 1) {
+                mainMarkerInCPP(
+                    genoType,
+                    nullModel.traitType,
+                    genoIndex_prev,
+                    genoIndex,
+                    isMoreOutput,
+                    isImputation,
+                    isFirth);
+            } else {
+                mainMarkerMT(
+                    genoType,
+                    genoIndex_prev,
+                    genoIndex,
+                    isMoreOutput,
+                    isImputation,
+                    isFirth);
+            }
             timing_mark("60_after_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
 
             arma::vec timeEnd = getTime();
@@ -4960,8 +5669,8 @@ int main(int argc, char* argv[])
                              "scoreTestFast_fused (Pillar 1)." << std::endl;
             }
 
-            // ---- 10a. Close output file ----
-            g_OutFiles_single[0].close();
+            // ---- 10a. Close output file(s) ----
+            for (int t = 0; t < numTraits; t++) g_OutFiles_single[t].close();
 
         } else {
             // ============================================================

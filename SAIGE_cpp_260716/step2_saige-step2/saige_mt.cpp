@@ -4,6 +4,9 @@
 #include "saige_mt.hpp"
 
 #include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 
@@ -162,6 +165,146 @@ std::vector<MTModelSpec> parseModelSpecs(const YAML::Node& t_config)
         }
     }
     return specs;
+}
+
+// ------------------------------------------------------------------
+// Model set: ordering, validation, static gating
+// ------------------------------------------------------------------
+
+std::vector<int> mtInternalOrder(const std::vector<NullModelData>& t_nms)
+{
+    const int P = static_cast<int>(t_nms.size());
+    std::vector<int> order;
+    order.reserve(P);
+    // Pass 1 binary, pass 2 quantitative, pass 3 the rest (survival, or a
+    // traitType string the loader accepted but we do not classify). Stable by
+    // construction: each pass walks the config order.
+    for (int i = 0; i < P; ++i) if (t_nms[i].traitType == "binary")       order.push_back(i);
+    for (int i = 0; i < P; ++i) if (t_nms[i].traitType == "quantitative") order.push_back(i);
+    for (int i = 0; i < P; ++i) {
+        if (t_nms[i].traitType != "binary" && t_nms[i].traitType != "quantitative")
+            order.push_back(i);
+    }
+    return order;
+}
+
+void validateMTModels(const std::vector<NullModelData>& t_nms,
+                      const std::vector<std::string>& t_names)
+{
+    const std::size_t P = t_nms.size();
+    if (P == 0) throw std::runtime_error("validateMTModels: no models");
+    if (t_names.size() != P)
+        throw std::runtime_error("validateMTModels: name count does not match model count");
+    if (P == 1) return;   // nothing to cross-check; never reached on the P == 1 path anyway
+
+    const NullModelData& ref = t_nms[0];
+    for (std::size_t i = 1; i < P; ++i) {
+        const NullModelData& m = t_nms[i];
+        const std::string where = "model '" + t_names[i] + "' (models[" +
+                                  std::to_string(i) + "])";
+
+        if (m.n != ref.n) {
+            throw std::runtime_error(
+                where + " has n=" + std::to_string(m.n) + " but '" + t_names[0] +
+                "' has n=" + std::to_string(ref.n) +
+                ". Multi-trait testing requires every model to be fitted on the "
+                "same samples.");
+        }
+        if (m.sampleIDs.size() != ref.sampleIDs.size()) {
+            throw std::runtime_error(
+                where + " lists " + std::to_string(m.sampleIDs.size()) +
+                " sample IDs but '" + t_names[0] + "' lists " +
+                std::to_string(ref.sampleIDs.size()) + ".");
+        }
+        // Order matters, not just membership: the genotype reader builds ONE
+        // sample-position map from model 0, so a permuted ID list would make
+        // every other trait read a permuted genotype vector.
+        for (std::size_t k = 0; k < m.sampleIDs.size(); ++k) {
+            if (m.sampleIDs[k] != ref.sampleIDs[k]) {
+                throw std::runtime_error(
+                    where + " has a different sample list from '" + t_names[0] +
+                    "': position " + std::to_string(k) + " is '" + m.sampleIDs[k] +
+                    "' vs '" + ref.sampleIDs[k] +
+                    "'. Multi-trait testing requires identical sample IDs in "
+                    "identical order (subset traits are not supported).");
+            }
+        }
+        if (m.impute_method != ref.impute_method) {
+            throw std::runtime_error(
+                where + " uses impute_method='" + m.impute_method + "' but '" +
+                t_names[0] + "' uses '" + ref.impute_method +
+                "'. Imputation happens once per marker and is shared by every "
+                "trait, so the models must agree on it.");
+        }
+    }
+
+    // LOCO mix: legal (the loader silently falls back to the genome-wide fit
+    // when `chrom` is not in that model's loco_chroms, matching R), but silent
+    // is exactly what makes it dangerous across P models.
+    std::vector<std::size_t> applied, notApplied;
+    for (std::size_t i = 0; i < P; ++i)
+        (t_nms[i].loco_applied ? applied : notApplied).push_back(i);
+    if (!applied.empty() && !notApplied.empty()) {
+        std::cout << "WARNING: " << notApplied.size() << " of " << P
+                  << " models fell back to the genome-wide fit for this chromosome "
+                     "while " << applied.size() << " used their chr<N>/ files."
+                  << std::endl;
+        std::cout << "WARNING:   genome-wide fallback:";
+        for (std::size_t i : notApplied) std::cout << " " << t_names[i];
+        std::cout << std::endl;
+    }
+
+    // A sparse GRM per trait means P copies of m_spSigmaMat resident at once.
+    std::size_t nSparse = 0;
+    for (std::size_t i = 0; i < P; ++i) if (t_nms[i].dimNum > 0) ++nSparse;
+    if (nSparse > 0) {
+        std::cout << "WARNING: " << nSparse << " of " << P
+                  << " models carry a sparse GRM; each is held in full for the "
+                     "duration of the run." << std::endl;
+    }
+}
+
+bool isBatchable(const TraitMeta& t_meta)
+{
+    return batchableReason(t_meta)[0] == '-';
+}
+
+const char* batchableReason(const TraitMeta& t_meta)
+{
+    if (t_meta.kind == TraitKind::Survival)  return "survival";
+    if (t_meta.isCondition)                  return "isCondition=true";
+    if (t_meta.isnoadjCov)                   return "isnoadjCov=true";
+    // First-pass flagSparseGRM_cur, mirroring main()'s per-marker ctx: with
+    // isFastTest the first pass is forced onto the dense path, which is the one
+    // the batch kernel implements.
+    if (!t_meta.isFastTest && t_meta.flagSparseGRM) return "sparseGRM first pass";
+    return "-";
+}
+
+void printMTGateTable(const std::vector<TraitMeta>& t_meta, bool t_locoEnabled)
+{
+    const std::size_t P = t_meta.size();
+    std::cout << "===== Multi-trait: " << P << " models =====" << std::endl;
+    std::cout << "  idx  name                 type            p  batch";
+    if (t_locoEnabled) std::cout << "  loco";
+    std::cout << "  reason" << std::endl;
+    int nBin = 0, nQnt = 0, nBatch = 0;
+    for (std::size_t t = 0; t < P; ++t) {
+        const TraitMeta& M = t_meta[t];
+        std::cout << "  " << std::setw(3) << t << "  " << std::left << std::setw(20)
+                  << M.name.substr(0, 20) << std::right << " " << std::setw(13)
+                  << M.traitType.substr(0, 13) << " " << std::setw(3) << M.p
+                  << "  " << std::setw(5) << (M.batchable ? "yes" : "no");
+        if (t_locoEnabled) std::cout << "  " << std::setw(4) << (M.locoApplied ? "chr" : "gw");
+        std::cout << "  " << batchableReason(M) << std::endl;
+        if (M.batchable) {
+            ++nBatch;
+            if (M.kind == TraitKind::Binary) ++nBin; else ++nQnt;
+        }
+    }
+    std::cout << "  batch traits: " << nBatch << " (binary " << nBin
+              << " / quantitative " << nQnt << "), scalar traits: "
+              << (P - nBatch) << std::endl;
 }
 
 }  // namespace SAIGE

@@ -23,6 +23,8 @@
 #include <armadillo>
 #include <yaml-cpp/yaml.h>
 
+#include "null_model_loader.hpp"
+
 namespace SAIGE {
 
 enum class TraitKind { Binary, Quantitative, Survival };
@@ -144,6 +146,36 @@ struct MTContext {
     std::vector<int> batchQuantTraits;  // batchable and quantitative
     std::vector<int> scalarTraits;      // not batchable
 };
+
+// ------------------------------------------------------------------
+// Multi-trait model set: ordering, validation, static gating
+// ------------------------------------------------------------------
+
+// Internal trait order (design section 1.2): binary first, then quantitative,
+// then everything else; stable within each group so the config order decides
+// ties. Returns a permutation of [0, P) holding config indices. For P == 1
+// this is always {0}, so the single-trait path sees no reordering at all.
+std::vector<int> mtInternalOrder(const std::vector<NullModelData>& t_nms);
+
+// Hard-fails when the P models cannot legitimately share one genotype stream
+// (design section 4.3): different sample IDs (content OR order), different n,
+// or different impute_method. Warns -- does not fail -- when the models
+// disagree on whether LOCO really applied. `t_names` supplies the trait label
+// used in the messages and must be the same length as t_nms.
+void validateMTModels(const std::vector<NullModelData>& t_nms,
+                      const std::vector<std::string>& t_names);
+
+// Static per-trait gate, evaluated once before the marker loop (design
+// section 3.1). False means the trait runs the per-pair scalar path for every
+// marker; it never changes per marker.
+bool isBatchable(const TraitMeta& t_meta);
+
+// Why isBatchable() said no; "-" when it said yes. For the startup table.
+const char* batchableReason(const TraitMeta& t_meta);
+
+// Design section 4.5: the table has to be printed, or a numerical problem in a
+// P = 64 run cannot be localised to a trait.
+void printMTGateTable(const std::vector<TraitMeta>& t_meta, bool t_locoEnabled);
 
 // One per thread, reused across blocks (grow-only, never reallocated per block).
 struct MTScratch {
