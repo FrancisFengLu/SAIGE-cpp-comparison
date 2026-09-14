@@ -1518,6 +1518,17 @@ void init_global_geno(const std::string& bed, const std::string& bim, const std:
 // Forward declaration
 arma::fvec get_GRMdiagVec();
 
+// Samples 1-5 genotype counts printed by output_grm_diagonal, cached across the
+// phenotypes of ONE sample set. File scope (not function-local) so that
+// reset_step1_state_for_new_sample_set() can invalidate it: the counts depend
+// on which samples are rows 1-5, and two groups can have the same marker count
+// with different samples.
+namespace {
+bool s_grmdiag_scan_valid   = false;
+int  s_grmdiag_scan_markers = -1;
+int  s_grmdiag_scan_count[5][3];
+}  // namespace
+
 void output_grm_diagonal(const std::string& out_path) {
   arma::fvec grmDiag = get_GRMdiagVec();  // 使用已有的函数，返回归一化后的GRM对角线
 
@@ -1546,7 +1557,8 @@ void output_grm_diagonal(const std::string& out_path) {
   // 这一段只读样本 1-5，但 Get_OneSNP_Geno 每次调用都解码整个 marker（全部 N 个样本），
   // 所以原来的「样本外层、marker 内层」写法把整个基因型矩阵解码了 5 遍。改成 marker 外层
   // 后每个 marker 只解码一次。计数只依赖 geno、与表型无关（实测 P=8 的 8 个 grm_diag.txt
-  // 逐字节相同），所以跨表型缓存；用 totalMarkers 做键，marker 子集变了就重算。
+  // 逐字节相同），所以在同一样本集的表型之间缓存；换样本集分组时由
+  // reset_step1_state_for_new_sample_set() 作废（marker 数相同、样本不同也要重算）。
   // mid（N=50000, M=40000）上这一段从 12.86 s/表型 降到 ~2.6 s 一次。
   // Even cached, the first call still costs one full decode of the genotype
   // matrix (~2.6 s of mid's 23.5 s end-to-end) for 15 integers of diagnostics.
@@ -1563,25 +1575,26 @@ void output_grm_diagonal(const std::string& out_path) {
   std::cout << "\n=== DEBUG: Samples 1-5 genotype distributions ===" << std::endl;
   int totalMarkers = MminMAF;
 
-  static int cachedTotalMarkers = -1;
-  static int cachedCount[5][3];
-  if (cachedTotalMarkers != totalMarkers) {
-    for (int s = 0; s < 5; s++) cachedCount[s][0] = cachedCount[s][1] = cachedCount[s][2] = 0;
+  if (!s_grmdiag_scan_valid || s_grmdiag_scan_markers != totalMarkers) {
+    for (int s = 0; s < 5; s++)
+      s_grmdiag_scan_count[s][0] = s_grmdiag_scan_count[s][1] = s_grmdiag_scan_count[s][2] = 0;
     for (int m = 0; m < totalMarkers; m++) {
       const arma::ivec* rawGeno = geno.Get_OneSNP_Geno(m);
       for (int s = 0; s < 5; s++) {
         int g = (*rawGeno)[s];
-        if (g == 0) cachedCount[s][0]++;
-        else if (g == 1) cachedCount[s][1]++;
-        else if (g == 2) cachedCount[s][2]++;
+        if (g == 0) s_grmdiag_scan_count[s][0]++;
+        else if (g == 1) s_grmdiag_scan_count[s][1]++;
+        else if (g == 2) s_grmdiag_scan_count[s][2]++;
       }
     }
-    cachedTotalMarkers = totalMarkers;
+    s_grmdiag_scan_markers = totalMarkers;
+    s_grmdiag_scan_valid   = true;
   }
 
   for (int s = 0; s < 5; s++) {
-    std::cout << "Sample " << (s+1) << ": 0=" << cachedCount[s][0] << ", 1=" << cachedCount[s][1]
-              << ", 2=" << cachedCount[s][2] << std::endl;
+    std::cout << "Sample " << (s+1) << ": 0=" << s_grmdiag_scan_count[s][0]
+              << ", 1=" << s_grmdiag_scan_count[s][1]
+              << ", 2=" << s_grmdiag_scan_count[s][2] << std::endl;
   }
   }
   std::cout << "=========================\n" << std::endl;
@@ -3231,6 +3244,68 @@ arma::fmat getCrossprodMatAndKinMat_traceCached(const arma::fmat& Umat, int colS
 		g_traceAUcache.reset();
 	}
 	return AU;
+}
+
+
+// ---------------------------------------------------------------------------
+// Multi-phenotype sample-set grouping (main.cpp): tear down everything that
+// depends on the sample set, so the next group's init_global_geno() starts from
+// the state a fresh process has. Called BETWEEN groups, before the next group's
+// setminMAC_VarianceRatio() / init_global_geno() / sparse-GRM setup.
+//
+// Every item below is keyed (or not keyed at all) on something that two groups
+// can share — n, the marker count, the probe matrix U — so without this reset
+// the next group silently reuses the previous group's numbers:
+//   1. GPU handle: the uploaded packed matrix + freq/invstd of the old samples.
+//      Destroyed FIRST — tiers 1/2 read geno.packed_flat_ on every matvec.
+//      g_gpu_state goes back to 0 (not 2), so the next group creates its own
+//      handle lazily exactly as a solo run would.
+//   2. psi*U trace cache: hit test is "same U"; every group draws the same U
+//      (same trace_seed, and n is often equal).
+//   3. geno: m_DiagStd (guard is size == Nnomissing), allele freq / invstd /
+//      MAC, the QC'd-marker list and counters (setGenoObj APPENDS to the *0
+//      vectors and ++s the counters, it never clears them), the VR marker pool,
+//      LOCO diagonals / chromosome ranges, sparse-GRM helper matrices. The
+//      legacy per-marker heap vectors are deleted (the class has no destructor),
+//      then the whole object is replaced by a value-initialized one — the same
+//      state the global had at program start.
+//   4. sparse GRM globals (locationMat / valueVec / dimNum) and the sparse-Sigma
+//      switches: main.cpp re-subsets and re-sets them for the new group.
+//   5. output_grm_diagonal's samples-1..5 count cache.
+// ---------------------------------------------------------------------------
+void reset_step1_state_for_new_sample_set()
+{
+	// 1. GPU
+	if (g_gpu_handle) saige::gpu::destroy(g_gpu_handle);
+	g_gpu_handle    = nullptr;
+	g_gpu_state     = 0;
+	g_gpu_in_verify = false;
+
+	// 2. trace cache
+	g_traceUcache.reset();
+	g_traceAUcache.reset();
+
+	// 3. genotype object
+	for (auto*& ptr : geno.genoVecofPointers)            { delete ptr; ptr = nullptr; }
+	for (auto*& ptr : geno.genoVecofPointers_forVarRatio) { delete ptr; ptr = nullptr; }
+	geno = genoClass();
+	minMAFtoConstructGRM = 0;   // re-set by init_global_geno()
+
+	// 4. sparse GRM
+	locationMat.reset();
+	valueVec.reset();
+	dimNum = 0;
+	isUsePrecondM                   = false;
+	isUseSparseSigmaforInitTau      = false;
+	isUseSparseSigmaforModelFitting = false;
+	isUsePCGwithSparseSigma         = false;
+
+	// 5. DEBUG scan cache in output_grm_diagonal
+	s_grmdiag_scan_valid   = false;
+	s_grmdiag_scan_markers = -1;
+
+	std::cout << "[multi-pheno] reset genotype object, GPU handle, GRM caches and "
+	             "sparse GRM for the next sample-set group" << std::endl;
 }
 
 

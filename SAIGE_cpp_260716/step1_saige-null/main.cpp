@@ -1167,7 +1167,7 @@ int main(int argc, char** argv) {
       }
     }
     if (models.size() > 1) {
-      std::cout << "[multi-pheno] P=" << models.size() << " phenotypes, shared genotype load:\n";
+      std::cout << "[multi-pheno] P=" << models.size() << " phenotypes (genotype load shared per sample-set group):\n";
       for (const auto& m : models)
         std::cout << "    " << m.y_col << "  ->  " << m.out_prefix
                   << "   vr: " << m.out_prefix_vr << "\n";
@@ -1402,7 +1402,7 @@ int main(int argc, char** argv) {
 
   };  // end finish_design_stageB
 
-  // Build one Design per phenotype (shared genotype load happens once, below).
+  // Build one Design per phenotype.
   std::vector<Design> designs;
   designs.reserve(models.size());
   for (const auto& m : models) {
@@ -1411,40 +1411,26 @@ int main(int argc, char** argv) {
     designs.push_back(load_design_stageA(m.y_col));
   }
 
-  // All traits must end up on the SAME sample set: there is one genotype
-  // object, one subSampleInGeno and one GRM for the whole run. Rows are still
-  // in CSV order here, so "same sample set" is just iid-sequence equality.
+  // Traits whose sample sets differ (different missingness per phenotype).
+  // Rows are still in CSV order here, so "same sample set" is just
+  // iid-sequence equality.
   //
-  // When the sets differ (different missingness per phenotype) there are only
-  // two honest options, and which one is right is the user's call:
-  //   - default: refuse, naming both traits. Each trait then keeps the property
-  //     that a P>1 run reproduces its solo run exactly.
-  //   - design.intersect_samples: true: keep the common samples only. This is
-  //     what the R tier-1 prototype does. It makes every trait's fit differ
-  //     from its solo run, because the solo run would have used more samples —
-  //     so it is opt-in and says so loudly.
+  //   - default: GROUP the traits by sample set (below, after stage B). Each
+  //     group gets its own genotype load, GRM and GPU upload, so every trait
+  //     keeps the property that a P>1 run reproduces its solo run exactly.
+  //   - design.intersect_samples: true: keep the common samples only, one
+  //     group. This is what the R tier-1 prototype does. It makes every
+  //     trait's fit differ from its solo run, because the solo run would have
+  //     used more samples — so it is opt-in and says so loudly.
   if (designs.size() > 1) {
     bool same = true;
     for (size_t k = 1; k < designs.size() && same; ++k)
       same = (designs[k].n == designs[0].n && designs[k].iid == designs[0].iid);
 
-    if (!same) {
-      const bool do_intersect =
-          (y["design"] && y["design"]["intersect_samples"])
-            ? y["design"]["intersect_samples"].as<bool>() : false;
-      if (!do_intersect) {
-        size_t k = 1;
-        while (k < designs.size() &&
-               designs[k].n == designs[0].n && designs[k].iid == designs[0].iid) ++k;
-        throw std::runtime_error(
-            "multi-phenotype: phenotype '" + models[k].y_col + "' keeps " +
-            std::to_string(designs[k].n) + " samples but '" + models[0].y_col +
-            "' keeps " + std::to_string(designs[0].n) +
-            " (or the IDs differ). A shared genotype load needs one common "
-            "sample set. Set design.intersect_samples: true to fit all traits "
-            "on the intersection (results then differ from single-trait runs), "
-            "or run the traits separately.");
-      }
+    const bool do_intersect =
+        (y["design"] && y["design"]["intersect_samples"])
+          ? y["design"]["intersect_samples"].as<bool>() : false;
+    if (!same && do_intersect) {
       // Intersection: an IID kept by every trait. Each design's rows are a
       // subsequence of the CSV, so filtering each to the intersection leaves
       // all of them in the same order — no sorting needed.
@@ -1472,8 +1458,6 @@ int main(int argc, char** argv) {
                    "results are NOT comparable to single-trait runs, which "
                    "would each use more samples.\n";
     }
-    std::cout << "[multi-pheno] all " << designs.size()
-              << " phenotypes share the same " << designs[0].n << " samples\n";
   }
 
   // Now the y-dependent work, per trait, in the original order.
@@ -1487,19 +1471,55 @@ int main(int argc, char** argv) {
     ensure_parent_dir(mp.out_prefix_vr + ".touch");
     finish_design_stageB(designs[mi], mp);
   }
-  Design& design = designs[0];
 
+  // ===== Sample-set groups =====
+  // Traits are grouped by their FINAL row set (after stage B, whose sex /
+  // whitelist filters are the last thing that can drop rows), still in CSV
+  // order, so equal iid sequences <=> equal sample sets. Groups are ordered by
+  // first appearance and list their traits in config order. With P=1, with
+  // identical sample sets, or after intersect_samples this is one group and
+  // everything below is the single-load path it always was.
+  std::vector<std::vector<size_t>> groups;
+  for (size_t k = 0; k < designs.size(); ++k) {
+    size_t g = 0;
+    for (; g < groups.size(); ++g) {
+      const Design& d0 = designs[groups[g][0]];
+      if (designs[k].n == d0.n && designs[k].iid == d0.iid) break;
+    }
+    if (g == groups.size()) groups.emplace_back();
+    groups[g].push_back(k);
+  }
+  const size_t G = groups.size();
+  auto group_traits = [&](size_t g) {
+    std::string s;
+    for (size_t k : groups[g]) { if (!s.empty()) s += " "; s += models[k].y_col; }
+    return s;
+  };
+  if (designs.size() > 1) {
+    if (G == 1) {
+      std::cout << "[multi-pheno] all " << designs.size()
+                << " phenotypes share the same " << designs[0].n << " samples\n";
+    } else {
+      std::cout << "\n[multi-pheno] " << designs.size() << " phenotypes fall into "
+                << G << " sample-set groups; each group gets its own genotype "
+                   "load, GRM and GPU upload:\n";
+      for (size_t g = 0; g < G; ++g)
+        std::cout << "    group " << (g + 1) << "/" << G << ": n="
+                  << designs[groups[g][0]].n << "  traits(" << groups[g].size()
+                  << "): " << group_traits(g) << "\n";
+    }
+  }
 
   // LOCO ranges are computed inside PreprocessEngine::compute_chr_ranges_from_bim_()
   // (post-QC/compacted marker index space, which is what the genotype object
   // indexes in) and flow to NullModelEngine via PreOut::chr. There used to be a
   // duplicate raw-BIM scan here whose result was discarded; it has been removed.
 
-  // FAM alignment (IID->1-based index)
+  // FAM alignment (IID->1-based index), once per group.
   // FIXED: indicatorWithPheno should have N elements (FAM size), not design.n elements
   // This matches R's: indicatorGenoSamplesWithPheno = (sampleListwithGeno$IndexGeno %in% dataMerge_sort$IndexGeno)
-  std::vector<int> subSampleInGeno;
-  std::vector<bool> indicatorWithPheno;
+  std::vector<std::vector<int>>  group_subSampleInGeno(G);
+  std::vector<std::vector<bool>> group_indicatorWithPheno(G);
   {
     auto fam_iids = read_fam_iids(paths.fam);
     int N_fam = static_cast<int>(fam_iids.size());
@@ -1507,6 +1527,11 @@ int main(int argc, char** argv) {
     // Create mapping from IID to FAM index (1-based)
     std::unordered_map<std::string,int> fam_pos; fam_pos.reserve(N_fam*2);
     for (int i=0;i<N_fam;++i) fam_pos.emplace(fam_iids[i], i+1); // 1-based
+
+    for (size_t g = 0; g < G; ++g) {
+    Design& design = designs[groups[g][0]];
+    std::vector<int>&  subSampleInGeno    = group_subSampleInGeno[g];
+    std::vector<bool>& indicatorWithPheno = group_indicatorWithPheno[g];
 
     // Initialize indicator with N elements, all false
     indicatorWithPheno.resize(N_fam, false);
@@ -1532,9 +1557,11 @@ int main(int argc, char** argv) {
                 [&](int a, int b) { return subSampleInGeno[a] < subSampleInGeno[b]; });
 
       // The permutation is derived from subSampleInGeno, which is built from
-      // design.iid — identical across phenotypes (enforced above) — so one perm
-      // serves every trait. Field-for-field identical to the single-trait code.
-      for (Design& d : designs) {
+      // design.iid — identical across the phenotypes of one group — so one
+      // perm serves every trait in the group. Field-for-field identical to the
+      // single-trait code.
+      for (size_t k : groups[g]) {
+        Design& d = designs[k];
         std::vector<std::string> new_iid(d.n);
         std::vector<double> new_y(d.n);
         std::vector<double> new_X(static_cast<size_t>(d.n) * d.p);
@@ -1564,6 +1591,7 @@ int main(int argc, char** argv) {
         subSampleInGeno = std::move(new_sub);
       }
 
+      if (G > 1) std::cout << "[FAM] group " << (g + 1) << "/" << G << ":\n";
       std::cout << "[FAM] reordered design/subSampleInGeno to ascending FAM row (matches R)\n";
       std::cout << "[FAM] subSampleInGeno[0:5] after reorder: ";
       for (int i = 0; i < std::min(5, design.n); ++i) std::cout << subSampleInGeno[i] << " ";
@@ -1572,7 +1600,10 @@ int main(int argc, char** argv) {
 
     std::cout << "[FAM] N_fam=" << N_fam << ", design.n=" << design.n
               << ", indicatorWithPheno.size()=" << indicatorWithPheno.size() << std::endl;
+    }
   }
+  Design& design = designs[0];
+  const std::vector<int>& subSampleInGeno = group_subSampleInGeno[0];
 
   // ===== Step 18: Dry-run exit (validate inputs only, no genotype loading) =====
   if (cfg.dry_run) {
@@ -1621,6 +1652,12 @@ int main(int argc, char** argv) {
     }
     std::cout << "FAM alignment:\n";
     std::cout << "  samples matched: " << subSampleInGeno.size() << " / " << design.n << "\n";
+    if (G > 1) {
+      std::cout << "Sample-set groups: " << G << "\n";
+      for (size_t g = 0; g < G; ++g)
+        std::cout << "  group " << (g + 1) << ": n=" << designs[groups[g][0]].n
+                  << "  traits: " << group_traits(g) << "\n";
+    }
     std::cout << "============================================\n";
     std::cout << "DRY RUN PASSED: all input validations succeeded.\n";
     std::cout << "============================================\n";
@@ -1645,19 +1682,97 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Sparse GRM: whether it is read from files or built from the genotypes is
+  // decided ONCE, before any group runs — a solo run decides it before it
+  // writes anything, so an earlier group must not flip a later group's choice
+  // by writing the files.
+  const bool need_sparse = (cfg.use_sparse_grm_to_fit || cfg.use_sparse_grm_for_vr);
+  const bool sparse_have_files =
+    !paths.sparse_grm.empty()     && fs::exists(paths.sparse_grm) &&
+    !paths.sparse_grm_ids.empty() && fs::exists(paths.sparse_grm_ids);
+  if (G > 1 && cfg.make_sparse_grm_only)
+    throw std::runtime_error(
+        "make_sparse_grm_only=true with " + std::to_string(G) + " sample-set groups: "
+        "the sparse GRM is a property of ONE sample set. Build it once on the full "
+        "cohort (single phenotype, or no missingness) and pass it via "
+        "paths.sparse_grm / paths.sparse_grm_ids.");
+  if (G > 1 && need_sparse && !sparse_have_files)
+    throw std::runtime_error(
+        "sparse GRM requested with " + std::to_string(G) + " sample-set groups but "
+        "paths.sparse_grm / paths.sparse_grm_ids do not name existing files, so each "
+        "group would build (and write) its own GRM on its own samples. Build the "
+        "sparse GRM once on the full cohort (fit.make_sparse_grm_only) and pass the "
+        "files; every group is then subset from them.");
+
+  // Variance-ratio overwrite guard (checked for EVERY trait before any fitting,
+  // so a P-trait run cannot die half way through after writing some outputs —
+  // with several sample-set groups that means before the first group loads).
+  // A make_sparse_grm_only run writes no variance ratio, and used to exit before
+  // this guard, so it stays exempt.
+  if (cfg.num_markers_for_vr > 0 && !cfg.make_sparse_grm_only) {
+    bool allow_overwrite = (y["paths"] && y["paths"]["overwrite_varratio"]) ? y["paths"]["overwrite_varratio"].as<bool>() : false;
+    for (const auto& m : models) {
+      std::string vr_txt = m.out_prefix_vr + ".varianceRatio.txt";
+      if (!allow_overwrite && fs::exists(vr_txt)) {
+        std::ostringstream oss;
+        oss << "Refusing to overwrite existing variance-ratio file: " << vr_txt
+            << " (set paths.overwrite_varratio=true to allow).";
+        throw std::runtime_error(oss.str());
+      }
+    }
+  }
+
+  // Propagate the AI-REML trace-estimator seed override (fit.trace_seed) to the
+  // GetTrace / GetTrace_q RNG. -1 keeps the builtin per-trait defaults (10/200).
+  setTraceSeed(cfg.trace_seed);
+  if (cfg.trace_seed >= 0)
+    std::cout << "[config] trace_seed override = " << cfg.trace_seed << "\n";
+
+  {
+    auto t = std::chrono::steady_clock::now();
+    printf("[TIMER-MAIN] %-40s %8.2fs\n", "Design + preprocessing",
+           std::chrono::duration<double>(t - T0).count());
+  }
+
+  // The sparse GRM file is the same for every group; parse it once (lazily, on
+  // the first group) and subset it per group below.
+  bool sparse_parsed = false;
+  arma::umat sparse_loc; arma::vec sparse_val; int sparse_n_mtx = 0;
+  std::vector<std::string> sparse_grm_ids;
+
+  // ================= one pass per sample-set group =================
+  // Everything from here to the end of the loop body depends on the group's
+  // sample set: the genotype object (subSampleInGeno, allele frequencies,
+  // invstd, QC'd marker list, VR marker pool, GRM diagonal, LOCO diagonals),
+  // the subset sparse GRM, the GPU-resident matrix and the psi*U trace cache.
+  // reset_step1_state_for_new_sample_set() tears all of that down between
+  // groups (see its comment in SAIGE_step1_fast.cpp for the list).
+  for (size_t gi = 0; gi < G; ++gi) {
+  const std::vector<size_t>& members = groups[gi];
+  Design& design = designs[members[0]];
+  const std::vector<int>& subSampleInGeno = group_subSampleInGeno[gi];
+
+  if (gi > 0) reset_step1_state_for_new_sample_set();
+  if (G > 1) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "=== sample-set group " << (gi + 1) << "/" << G << ": n=" << design.n
+              << "  traits(" << members.size() << "): " << group_traits(gi) << "\n";
+    std::cout << std::string(70, '=') << "\n";
+  }
+
   // Match R: set isVarRatio=true so genotype loading excludes VR markers from GRM
   if (cfg.num_markers_for_vr > 0) {
     setminMAC_VarianceRatio(20.0f, -1.0f, true);
   }
 
   // Initialize genotype data BEFORE sparse GRM section (needed for build_sparse_grm_in_place)
-  {
-    auto t = std::chrono::steady_clock::now();
-    printf("[TIMER-MAIN] %-40s %8.2fs\n", "Design + preprocessing",
-           std::chrono::duration<double>(t - T0).count());
-  }
   auto T1 = std::chrono::steady_clock::now();
-  init_global_geno(paths.bed, paths.bim, paths.fam, subSampleInGeno, indicatorWithPheno, cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm);
+  {
+    // init_global_geno takes non-const refs; it copies them into the genotype object.
+    std::vector<int>  sub_copy = subSampleInGeno;
+    std::vector<bool> ind_copy = group_indicatorWithPheno[gi];
+    init_global_geno(paths.bed, paths.bim, paths.fam, sub_copy, ind_copy, cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm);
+  }
   {
     auto t = std::chrono::steady_clock::now();
     printf("[TIMER-MAIN] %-40s %8.2fs\n", "Genotype loading (init_global_geno)",
@@ -1672,43 +1787,44 @@ int main(int argc, char** argv) {
   // The setisUseSparseSigma* flags downstream are still only flipped when
   // use_sparse_grm_to_fit=TRUE; otherwise the dense path runs the GLMM fit and
   // only VR computation uses the loaded sparse Σ.
-  if (cfg.use_sparse_grm_to_fit || cfg.use_sparse_grm_for_vr) {
-    const bool have_files =
-      !paths.sparse_grm.empty()     && fs::exists(paths.sparse_grm) &&
-      !paths.sparse_grm_ids.empty() && fs::exists(paths.sparse_grm_ids);
-
-    if (have_files) {
+  if (need_sparse) {
+    if (sparse_have_files) {
+      if (!sparse_parsed) {
       auto T2 = std::chrono::steady_clock::now();
-      arma::umat loc; arma::vec val; int n_mtx=0;
-      load_matrix_market_coo(paths.sparse_grm, loc, val, n_mtx);
+      load_matrix_market_coo(paths.sparse_grm, sparse_loc, sparse_val, sparse_n_mtx);
       {
         auto t = std::chrono::steady_clock::now();
         printf("[TIMER-MAIN] %-40s %8.2fs\n", "Sparse GRM file parse (MTX)",
                std::chrono::duration<double>(t - T2).count());
       }
-
-      // ===== Subset sparse GRM to phenotyped samples =====
-      // The loaded GRM may cover all samples in the cohort (e.g. 488K),
-      // but we only need the subset that overlaps with our phenotyped samples.
-      // Read sparse GRM sample IDs and build GRM-index -> design-index map.
-      {
         // Read one ID per line from the sparse GRM sample IDs file
         std::ifstream id_in(paths.sparse_grm_ids);
         if (!id_in) throw std::runtime_error("Failed to open sparse GRM IDs: " + paths.sparse_grm_ids);
-        std::vector<std::string> grm_ids;
-        grm_ids.reserve(n_mtx);
+        sparse_grm_ids.reserve(sparse_n_mtx);
         std::string line;
         while (std::getline(id_in, line)) {
           // trim whitespace
           size_t s = line.find_first_not_of(" \t\r\n");
           size_t e = line.find_last_not_of(" \t\r\n");
-          if (s != std::string::npos) grm_ids.push_back(line.substr(s, e - s + 1));
+          if (s != std::string::npos) sparse_grm_ids.push_back(line.substr(s, e - s + 1));
         }
-        if ((int)grm_ids.size() != n_mtx) {
-          std::cerr << "[warning] Sparse GRM IDs count (" << grm_ids.size()
-                    << ") differs from GRM dimension (" << n_mtx << ").\n";
+        if ((int)sparse_grm_ids.size() != sparse_n_mtx) {
+          std::cerr << "[warning] Sparse GRM IDs count (" << sparse_grm_ids.size()
+                    << ") differs from GRM dimension (" << sparse_n_mtx << ").\n";
         }
+        sparse_parsed = true;
+      }
+      const arma::umat& loc = sparse_loc;
+      const arma::vec&  val = sparse_val;
+      const int n_mtx = sparse_n_mtx;
+      const std::vector<std::string>& grm_ids = sparse_grm_ids;
 
+      // ===== Subset sparse GRM to phenotyped samples =====
+      // The loaded GRM may cover all samples in the cohort (e.g. 488K),
+      // but we only need the subset that overlaps with our phenotyped samples
+      // (this group's samples, in this group's row order).
+      // Build GRM-index -> design-index map.
+      {
         // Build map: design IID -> design index (0-based)
         std::unordered_map<std::string, int> design_pos;
         design_pos.reserve(design.n * 2);
@@ -1794,6 +1910,7 @@ int main(int argc, char** argv) {
                   << "  n=" << design.n << "\n";
       }
     } else {
+      // Only reachable with G == 1 (refused above otherwise).
       double rc = (cfg.relatedness_cutoff > 0.0 ? cfg.relatedness_cutoff : 0.05);
       build_sparse_grm_in_place(rc, cfg.min_maf_grm, cfg.max_miss_grm);
       auto loc = export_sparse_grm_locations();
@@ -1830,85 +1947,59 @@ int main(int argc, char** argv) {
               << (cfg.use_pcg_with_sparse_grm ? " (PCG solver)" : " (direct sparse solve, R default)") << "\n";
   }
 
-  // Early exit: construct-only
+  // Early exit: construct-only (G == 1 here; refused above otherwise)
   if (cfg.make_sparse_grm_only) {
     std::cout << "[ok] make_sparse_grm_only=true: exiting before null model fit.\n";
     return 0;
   }
 
-  // Variance-ratio overwrite guard (checked for EVERY trait before any fitting,
-  // so a P-trait run cannot die half way through after writing some outputs).
-  if (cfg.num_markers_for_vr > 0) {
-    bool allow_overwrite = (y["paths"] && y["paths"]["overwrite_varratio"]) ? y["paths"]["overwrite_varratio"].as<bool>() : false;
-    for (const auto& m : models) {
-      std::string vr_txt = m.out_prefix_vr + ".varianceRatio.txt";
-      if (!allow_overwrite && fs::exists(vr_txt)) {
-        std::ostringstream oss;
-        oss << "Refusing to overwrite existing variance-ratio file: " << vr_txt
-            << " (set paths.overwrite_varratio=true to allow).";
-        throw std::runtime_error(oss.str());
-      }
-    }
-  }
-
-  // ------------------ genoClass integration (optional) ------------------
-  // genoClass geno;
-  // geno.isVarRatio = (cfg.num_markers_for_vr > 0 || cfg.use_sparse_grm_for_vr);
-  // geno.g_minMACVarRatio = static_cast<float>(cfg.vr_min_mac > 0 ? cfg.vr_min_mac : 1);
-  // geno.g_maxMACVarRatio = static_cast<float>(cfg.vr_max_mac != 0 ? cfg.vr_max_mac : -1);
-  // geno.setGenoObj(paths.bed, paths.bim, paths.fam,
-  //                 subSampleInGeno, indicatorWithPheno,
-  //                 static_cast<float>(cfg.memory_chunk_gb > 0 ? cfg.memory_chunk_gb : 1.0f),
-  //                 /* isDiagofKinSetAsOne */ false);
-
-  // NOTE: init_global_geno moved earlier (before sparse GRM section) for make_sparse_grm_only support
-
-  // ------------------ Run null fit ------------------
-  // Propagate the AI-REML trace-estimator seed override (fit.trace_seed) to the
-  // GetTrace / GetTrace_q RNG. -1 keeps the builtin per-trait defaults (10/200).
-  setTraceSeed(cfg.trace_seed);
-  if (cfg.trace_seed >= 0)
-    std::cout << "[config] trace_seed override = " << cfg.trace_seed << "\n";
-
-  // If you have the overload with genoClass&, call:
-  // FitNullResult out = saige::fit_null(cfg, paths, design, geno);
-
   // ------------------ Tier-1: fit each phenotype on the shared genotype ------
   // The genotype object, the 2-bit GRM (and its GPU-resident copy) were built
-  // once above; every trait below reuses them. Nothing inside fit_null carries
-  // state across traits: the VR marker order is a fresh std::mt19937(200) and
-  // the Hutchinson probe stream is re-seeded on every GetTrace/GetTrace_q entry,
-  // so trait k's numbers do not depend on traits 0..k-1 having run first.
-  // ------------------ Tier-2: lockstep the P AI-REML loops -----------------
-  // fit.multi_lockstep advances all P traits' AI-REML iterations together so
+  // once above for this group; every trait of the group reuses them. Nothing
+  // inside fit_null carries state across traits: the VR marker order is a
+  // fresh std::mt19937(200) and the Hutchinson probe stream is re-seeded on
+  // every GetTrace/GetTrace_q entry, so trait k's numbers do not depend on
+  // traits 0..k-1 having run first.
+  // ------------------ Tier-2: lockstep the group's AI-REML loops ------------
+  // fit.multi_lockstep advances all the group's AI-REML iterations together so
   // the fixed-effect PCG solves of every still-active trait are issued as ONE
   // batched multi-Sigma solve. Off by default: it is not bit-identical to the
   // per-trait path (psi*B reduces in a different order), and tier-1's
   // "a P>1 run reproduces each solo run exactly" property is worth keeping as
-  // the default.
-  const bool use_lockstep = (cfg.multi_lockstep && models.size() > 1);
+  // the default. A group with one trait always takes the per-trait path.
+  const bool use_lockstep = (cfg.multi_lockstep && members.size() > 1);
   std::vector<FitNullResult> lockstep_fits;
   if (use_lockstep) {
     std::cout << "\n" << std::string(70, '#') << "\n";
-    std::cout << "### lockstep multi-phenotype fit: P=" << models.size() << "\n";
-    std::cout << std::string(70, '#') << "\n";
-    std::vector<Paths> mpaths_all(models.size(), paths);
-    for (size_t mi = 0; mi < models.size(); ++mi) {
-      mpaths_all[mi].out_prefix    = models[mi].out_prefix;
-      mpaths_all[mi].out_prefix_vr = models[mi].out_prefix_vr;
+    std::cout << "### lockstep multi-phenotype fit: P=" << members.size();
+    if (G > 1) std::cout << " (group " << (gi + 1) << "/" << G << ")";
+    std::cout << "\n" << std::string(70, '#') << "\n";
+    std::vector<Paths> mpaths_all(members.size(), paths);
+    // The lockstep driver takes the group's designs as one vector. Moved, not
+    // copied: under lockstep designs[mi] is not read again after the fit.
+    std::vector<Design> group_designs;
+    group_designs.reserve(members.size());
+    for (size_t k = 0; k < members.size(); ++k) {
+      mpaths_all[k].out_prefix    = models[members[k]].out_prefix;
+      mpaths_all[k].out_prefix_vr = models[members[k]].out_prefix_vr;
+      group_designs.push_back(std::move(designs[members[k]]));
     }
     auto T_all = std::chrono::steady_clock::now();
-    lockstep_fits = saige::fit_null_multi(cfg, mpaths_all, designs);
+    lockstep_fits = saige::fit_null_multi(cfg, mpaths_all, group_designs);
     auto t = std::chrono::steady_clock::now();
     const double s = std::chrono::duration<double>(t - T_all).count();
     printf("[TIMER-MAIN] lockstep fit_null_multi P=%zu %8.2fs (%.2fs/trait)\n",
-           models.size(), s, s / (double)models.size());
-  } else if (cfg.multi_lockstep) {
+           members.size(), s, s / (double)members.size());
+  } else if (cfg.multi_lockstep && models.size() == 1) {
     std::cout << "[multi-pheno] fit.multi_lockstep requested with P=1 — "
                  "nothing to lockstep, using the per-trait path.\n";
+  } else if (cfg.multi_lockstep) {
+    std::cout << "[multi-pheno] fit.multi_lockstep: group " << (gi + 1) << "/" << G
+              << " has one trait — nothing to lockstep, using the per-trait path.\n";
   }
 
-  for (size_t mi = 0; mi < models.size(); ++mi) {
+  for (size_t k = 0; k < members.size(); ++k) {
+    const size_t mi = members[k];
     const auto& m = models[mi];
     Paths mpaths = paths;
     mpaths.out_prefix    = m.out_prefix;
@@ -1917,12 +2008,13 @@ int main(int argc, char** argv) {
     if (models.size() > 1) {
       std::cout << "\n" << std::string(70, '#') << "\n";
       std::cout << "### phenotype " << (mi + 1) << "/" << models.size()
-                << ": " << m.y_col << "\n";
-      std::cout << std::string(70, '#') << "\n";
+                << ": " << m.y_col;
+      if (G > 1) std::cout << "  (group " << (gi + 1) << "/" << G << ")";
+      std::cout << "\n" << std::string(70, '#') << "\n";
     }
     auto T_ph = std::chrono::steady_clock::now();
 
-    FitNullResult out = use_lockstep ? std::move(lockstep_fits[mi])
+    FitNullResult out = use_lockstep ? std::move(lockstep_fits[k])
                                      : saige::fit_null(cfg, mpaths, designs[mi]);
 
     // ------------------ Output GRM diagonal (after fit_null, same as R version) ------------------
@@ -1959,9 +2051,11 @@ int main(int argc, char** argv) {
     // the N*(p_full+3) doubles per trait are not negligible next to the GRM.
     designs[mi] = Design{};
   }
+  }  // end of the per-group loop
 
   // Diagnostic only: exercise the tier-2 lockstep multi-Sigma primitives against
-  // the real psi now that the genotype object (and the GPU handle) are live.
+  // the real psi now that the genotype object (and the GPU handle) are live
+  // (the last group's, when there are several).
   // SAIGE_MULTISIGMA_SELFTEST=<P>, optionally SAIGE_MULTISIGMA_SELFTEST_NRHS=<k>.
   if (const char* e = std::getenv("SAIGE_MULTISIGMA_SELFTEST")) {
     const int P_test = std::max(1, std::atoi(e));

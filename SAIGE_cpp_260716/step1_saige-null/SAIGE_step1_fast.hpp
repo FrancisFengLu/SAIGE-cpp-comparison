@@ -34,6 +34,13 @@ void output_grm_diagonal(const std::string& out_path);
 
 void closeGenoFile_plink();
 
+// Multi-phenotype sample-set grouping: tear down every piece of process state
+// that depends on the sample set (genotype object, GPU handle, psi*U trace
+// cache, sparse GRM globals, GRM-diagonal debug cache) so the next group's
+// init_global_geno() starts from a fresh-process state. See the definition in
+// SAIGE_step1_fast.cpp for the list and why each item needs it.
+void reset_step1_state_for_new_sample_set();
+
 // Genotype data access functions
 arma::ivec Get_OneSNP_Geno(int SNPIdx);
 arma::ivec Get_OneSNP_Geno_forVarRatio(int SNPIdx);
