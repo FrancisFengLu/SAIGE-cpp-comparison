@@ -902,8 +902,8 @@ static void design_take_rows(Design& d, const std::vector<size_t>& keep) {
   // COLUMN-major, so the row-major buffer every other reader assumes was left
   // transposed whenever p > 1 — silently corrupting the covariates on the two
   // paths that call this (duplicate-IID removal and the design.whitelist_ids
-  // filter). Copy rows directly instead; apply_row_subset
-  // (preprocess_engine.cpp:379) already did.
+  // filter), and on the multi-phenotype intersection added later. Copy rows
+  // directly instead; apply_row_subset (preprocess_engine.cpp:379) already did.
   if (d.p>0 && !d.X.empty()){
     std::vector<double> X2((size_t)n2 * (size_t)d.p);
     for (int r=0;r<n2;++r) {
@@ -1194,8 +1194,11 @@ int main(int argc, char** argv) {
   // per-phenotype and is run in the SAME order as the single-trait path, on the
   // CSV row order (before the FAM reorder below). Keeping that order is what
   // makes each trait of a P>1 run byte-identical to running it alone.
-  auto build_design_for_pheno = [&](const std::string& y_col_name,
-                                    const Paths& paths) -> Design {
+  // Stage A: parse + de-duplicate. This is what FIXES the row set (rows with a
+  // missing value in THIS phenotype or in a covariate are dropped by
+  // load_design_csv), so it has to run for every trait before the sample sets
+  // can be reconciled.
+  auto load_design_stageA = [&](const std::string& y_col_name) -> Design {
   Design design = load_design_csv(design_csv, min_cov_ct, drop_ref, covar_col_names,
                                   iid_col_name, y_col_name);
   add_intercept_if_missing(design);
@@ -1220,6 +1223,16 @@ int main(int argc, char** argv) {
       design_take_rows(design, keep);
     }
   }
+  return design;
+  };  // end load_design_stageA
+
+  // Stage B: everything downstream that reads y (validity checks, optional
+  // inverse-normalisation, the covariate-offset GLM) plus the y-independent row
+  // filters (sex, whitelist) which drop the same rows for every trait. Runs
+  // AFTER the sample sets are reconciled, in the original order, on the CSV row
+  // order — the covariate GLM accumulates over rows, so reordering first would
+  // perturb beta in the last fp digits.
+  auto finish_design_stageB = [&](Design& design, const Paths& paths) {
 
   // ===== Step 1: Binary phenotype must be 0 or 1 (R lines 1754-1757) =====
   // R: uniqPheno = sort(unique(y)); if (uniqPheno[1] != 0 | uniqPheno[2] != 1) stop(...)
@@ -1376,8 +1389,7 @@ int main(int argc, char** argv) {
               << " preserved for Step-2 export\n";
   }
 
-  return design;
-  };  // end build_design_for_pheno
+  };  // end finish_design_stageB
 
   // Build one Design per phenotype (shared genotype load happens once, below).
   std::vector<Design> designs;
@@ -1385,31 +1397,84 @@ int main(int argc, char** argv) {
   for (const auto& m : models) {
     if (models.size() > 1)
       std::cout << "\n[multi-pheno] ===== design for phenotype '" << m.y_col << "' =====\n";
-    Paths mp = paths;
-    mp.out_prefix    = m.out_prefix;
-    mp.out_prefix_vr = m.out_prefix_vr;
-    ensure_parent_dir(mp.out_prefix + ".touch");
-    ensure_parent_dir(mp.out_prefix_vr + ".touch");
-    designs.push_back(build_design_for_pheno(m.y_col, mp));
+    designs.push_back(load_design_stageA(m.y_col));
   }
 
-  // All traits must end up on the SAME sample set: one genotype object, one
-  // subSampleInGeno, one GRM. Rows are still in CSV order here, so identical
-  // sample sets means identical iid sequences.
+  // All traits must end up on the SAME sample set: there is one genotype
+  // object, one subSampleInGeno and one GRM for the whole run. Rows are still
+  // in CSV order here, so "same sample set" is just iid-sequence equality.
+  //
+  // When the sets differ (different missingness per phenotype) there are only
+  // two honest options, and which one is right is the user's call:
+  //   - default: refuse, naming both traits. Each trait then keeps the property
+  //     that a P>1 run reproduces its solo run exactly.
+  //   - design.intersect_samples: true: keep the common samples only. This is
+  //     what the R tier-1 prototype does. It makes every trait's fit differ
+  //     from its solo run, because the solo run would have used more samples —
+  //     so it is opt-in and says so loudly.
   if (designs.size() > 1) {
-    for (size_t k = 1; k < designs.size(); ++k) {
-      if (designs[k].n != designs[0].n || designs[k].iid != designs[0].iid) {
+    bool same = true;
+    for (size_t k = 1; k < designs.size() && same; ++k)
+      same = (designs[k].n == designs[0].n && designs[k].iid == designs[0].iid);
+
+    if (!same) {
+      const bool do_intersect =
+          (y["design"] && y["design"]["intersect_samples"])
+            ? y["design"]["intersect_samples"].as<bool>() : false;
+      if (!do_intersect) {
+        size_t k = 1;
+        while (k < designs.size() &&
+               designs[k].n == designs[0].n && designs[k].iid == designs[0].iid) ++k;
         throw std::runtime_error(
             "multi-phenotype: phenotype '" + models[k].y_col + "' keeps " +
             std::to_string(designs[k].n) + " samples but '" + models[0].y_col +
             "' keeps " + std::to_string(designs[0].n) +
-            " (or the IDs differ). A shared genotype load requires one common "
-            "sample set; drop the rows with missing values from the design CSV "
-            "first, or run the traits separately.");
+            " (or the IDs differ). A shared genotype load needs one common "
+            "sample set. Set design.intersect_samples: true to fit all traits "
+            "on the intersection (results then differ from single-trait runs), "
+            "or run the traits separately.");
       }
+      // Intersection: an IID kept by every trait. Each design's rows are a
+      // subsequence of the CSV, so filtering each to the intersection leaves
+      // all of them in the same order — no sorting needed.
+      std::unordered_map<std::string,int> cnt;
+      for (const auto& d : designs)
+        for (const auto& id : d.iid) ++cnt[id];
+      const int P_ = (int)designs.size();
+      for (size_t k = 0; k < designs.size(); ++k) {
+        std::vector<size_t> keep;
+        keep.reserve(designs[k].n);
+        for (size_t i = 0; i < (size_t)designs[k].n; ++i)
+          if (cnt[designs[k].iid[i]] == P_) keep.push_back(i);
+        const int before = designs[k].n;
+        if ((int)keep.size() != before) design_take_rows(designs[k], keep);
+        std::cout << "[multi-pheno] " << models[k].y_col << ": " << before
+                  << " -> " << designs[k].n << " samples after intersection\n";
+      }
+      for (size_t k = 1; k < designs.size(); ++k)
+        if (designs[k].iid != designs[0].iid)
+          throw std::runtime_error("multi-phenotype: intersection did not align "
+                                   "sample lists (internal error)");
+      std::cerr << "[warning] design.intersect_samples=true: all "
+                << designs.size() << " traits were fitted on the "
+                << designs[0].n << " samples common to every phenotype. These "
+                   "results are NOT comparable to single-trait runs, which "
+                   "would each use more samples.\n";
     }
     std::cout << "[multi-pheno] all " << designs.size()
               << " phenotypes share the same " << designs[0].n << " samples\n";
+  }
+
+  // Now the y-dependent work, per trait, in the original order.
+  for (size_t mi = 0; mi < models.size(); ++mi) {
+    if (models.size() > 1)
+      std::cout << "\n[multi-pheno] ===== covariate fit for '" << models[mi].y_col << "' =====\n";
+    Paths mp = paths;
+    mp.out_prefix    = models[mi].out_prefix;
+    mp.out_prefix_vr = models[mi].out_prefix_vr;
+    ensure_parent_dir(mp.out_prefix + ".touch");
+    ensure_parent_dir(mp.out_prefix_vr + ".touch");
+    finish_design_stageB(designs[mi], mp);
   }
   Design& design = designs[0];
 
