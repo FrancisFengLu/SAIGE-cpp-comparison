@@ -1542,20 +1542,47 @@ void output_grm_diagonal(const std::string& out_path) {
   }
 
   // DEBUG: 统计样本1-5的基因型分布
+  //
+  // 这一段只读样本 1-5，但 Get_OneSNP_Geno 每次调用都解码整个 marker（全部 N 个样本），
+  // 所以原来的「样本外层、marker 内层」写法把整个基因型矩阵解码了 5 遍。改成 marker 外层
+  // 后每个 marker 只解码一次。计数只依赖 geno、与表型无关（实测 P=8 的 8 个 grm_diag.txt
+  // 逐字节相同），所以跨表型缓存；用 totalMarkers 做键，marker 子集变了就重算。
+  // mid（N=50000, M=40000）上这一段从 12.86 s/表型 降到 ~2.6 s 一次。
+  // Even cached, the first call still costs one full decode of the genotype
+  // matrix (~2.6 s of mid's 23.5 s end-to-end) for 15 integers of diagnostics.
+  // SAIGE_SKIP_GRMDIAG_SCAN=1 skips it. Default is off so stdout stays
+  // byte-identical unless a caller opts out.
+  static const bool skipScan = [] {
+    const char* e = std::getenv("SAIGE_SKIP_GRMDIAG_SCAN");
+    return e && *e && std::string(e) != "0";
+  }();
+  if (skipScan) {
+    std::cout << "\n=== DEBUG: Samples 1-5 genotype distributions (skipped: "
+                 "SAIGE_SKIP_GRMDIAG_SCAN) ===" << std::endl;
+  } else {
   std::cout << "\n=== DEBUG: Samples 1-5 genotype distributions ===" << std::endl;
-  arma::ivec* rawGeno;
   int totalMarkers = MminMAF;
 
-  for (int s = 0; s < 5; s++) {
-    int count0 = 0, count1 = 0, count2 = 0;
+  static int cachedTotalMarkers = -1;
+  static int cachedCount[5][3];
+  if (cachedTotalMarkers != totalMarkers) {
+    for (int s = 0; s < 5; s++) cachedCount[s][0] = cachedCount[s][1] = cachedCount[s][2] = 0;
     for (int m = 0; m < totalMarkers; m++) {
-      rawGeno = geno.Get_OneSNP_Geno(m);
-      int g = (*rawGeno)[s];
-      if (g == 0) count0++;
-      else if (g == 1) count1++;
-      else if (g == 2) count2++;
+      const arma::ivec* rawGeno = geno.Get_OneSNP_Geno(m);
+      for (int s = 0; s < 5; s++) {
+        int g = (*rawGeno)[s];
+        if (g == 0) cachedCount[s][0]++;
+        else if (g == 1) cachedCount[s][1]++;
+        else if (g == 2) cachedCount[s][2]++;
+      }
     }
-    std::cout << "Sample " << (s+1) << ": 0=" << count0 << ", 1=" << count1 << ", 2=" << count2 << std::endl;
+    cachedTotalMarkers = totalMarkers;
+  }
+
+  for (int s = 0; s < 5; s++) {
+    std::cout << "Sample " << (s+1) << ": 0=" << cachedCount[s][0] << ", 1=" << cachedCount[s][1]
+              << ", 2=" << cachedCount[s][2] << std::endl;
+  }
   }
   std::cout << "=========================\n" << std::endl;
 
