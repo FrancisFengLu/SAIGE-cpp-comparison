@@ -230,6 +230,16 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("min_maf_grm")) c.min_maf_grm = get("min_maf_grm").as<double>();
   if (get("max_miss_grm")) c.max_miss_grm = get("max_miss_grm").as<double>();
   if (get("num_markers_for_vr")) c.num_markers_for_vr = get("num_markers_for_vr").as<int>();
+
+  // step-2 knobs carried through nullmodel.json. Defaults keep the previously
+  // hardcoded values; note fast_test and impute_method do NOT match the R CLI
+  // defaults (R: is_fastTest=FALSE, impute_method=best_guess), so set them
+  // explicitly when comparing against R.
+  if (get("fast_test"))          c.fast_test          = get("fast_test").as<bool>();
+  if (get("impute_method"))      c.impute_method      = get("impute_method").as<std::string>();
+  if (get("spa_cutoff"))         c.spa_cutoff         = get("spa_cutoff").as<double>();
+  if (get("p_cutoff_for_firth")) c.p_cutoff_for_firth = get("p_cutoff_for_firth").as<double>();
+  if (get("firth_beta"))         c.firth_beta         = get("firth_beta").as<bool>() ? 1 : 0;
   // Categorical variance ratio (R: --isCateVarianceRatio + MAC bin vectors)
   if (get("isCateVarianceRatio")) c.isCateVarianceRatio = get("isCateVarianceRatio").as<bool>();
   if (get("cateVarRatioMinMACVecExclude") && get("cateVarRatioMinMACVecExclude").IsSequence()) {

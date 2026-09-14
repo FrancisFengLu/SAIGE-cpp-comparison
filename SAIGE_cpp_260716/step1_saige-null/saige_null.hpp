@@ -87,6 +87,25 @@ struct FitNullConfig {
   // VR controls
   int num_markers_for_vr{30};
 
+  // step-2 knobs that step 1 writes into nullmodel.json. They used to be
+  // hardcoded there, and nullmodel.json is step 2's ONLY source for them
+  // (null_model_loader.cpp reads them off that file; there is no YAML override),
+  // so a C++ user had no way to ask for the exact test or a different
+  // imputation. Defaults are the previously hardcoded values, so an existing
+  // config produces a byte-identical nullmodel.json.
+  //
+  // NOTE these two do NOT match the R CLI defaults: R defaults
+  // --is_fastTest=FALSE and --impute_method=best_guess. Comparing C++ against
+  // R without aligning them compares two different algorithms -- on mid (~1%
+  // missing) the mean/best_guess difference alone moved log10 p by up to 1.1.
+  bool        fast_test{true};              // R CLI: FALSE
+  std::string impute_method{"mean"};        // R CLI: "best_guess"
+  double      spa_cutoff{2.0};
+  double      p_cutoff_for_firth{0.01};
+  // Firth beta defaults to on for binary, off otherwise (the previous derived
+  // behaviour). Set explicitly to override.
+  int         firth_beta{-1};               // -1 = derive from trait, 0 = off, 1 = on
+
   // Categorical VR (R: --isCateVarianceRatio + --cateVarRatioMinMACVecExclude / --cateVarRatioMaxMACVecInclude)
   // When isCateVarianceRatio=true, markers are partitioned into MAC bins
   // (numCate = cateVarRatioMinMACVecExclude.size()). For bin i in [0..numCate-2]:

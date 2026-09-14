@@ -844,14 +844,16 @@ FitNullResult NullModelEngine::export_result(NullPrep& prep_in, FitNullResult ou
     js << "],\n";
     // step2 keys (defaults match step2's hard-coded fallbacks; we just emit them so
     // its parser doesn't print "0 entries"-style noise).
-    js << "  \"SPA_Cutoff\": 2,\n";
-    js << "  \"impute_method\": \"mean\",\n";
+    js << "  \"SPA_Cutoff\": " << cfg_.spa_cutoff << ",\n";
+    js << "  \"impute_method\": \"" << cfg_.impute_method << "\",\n";
     js << "  \"flagSparseGRM\": " << (cfg_.use_sparse_grm_to_fit ? "true" : "false") << ",\n";
-    js << "  \"isFastTest\": true,\n";
+    js << "  \"isFastTest\": " << (cfg_.fast_test ? "true" : "false") << ",\n";
     js << "  \"isnoadjCov\": false,\n";
     js << "  \"isCondition\": false,\n";
-    js << "  \"is_Firth_beta\": " << (cfg_.trait == "binary" ? "true" : "false") << ",\n";
-    js << "  \"pCutoffforFirth\": 0.01,\n";
+    js << "  \"is_Firth_beta\": "
+       << ((cfg_.firth_beta < 0) ? (cfg_.trait == "binary" ? "true" : "false")
+                                 : (cfg_.firth_beta ? "true" : "false")) << ",\n";
+    js << "  \"pCutoffforFirth\": " << cfg_.p_cutoff_for_firth << ",\n";
     // sampleIDs — required by step2 to subset BED rows to the null-model samples.
     js << "  \"sampleIDs\": [";
     for (size_t i = 0; i < design_in.iid.size(); ++i) {
