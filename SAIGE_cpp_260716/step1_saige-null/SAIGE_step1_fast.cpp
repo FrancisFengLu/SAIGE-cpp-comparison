@@ -3108,14 +3108,24 @@ arma::fmat getCrossprodMatAndKinMat(const arma::fmat& Bmat){
 // Σ = tau0·diag(1/w) + tau1·ψ.
 arma::fmat getCrossprodMat(const arma::fmat& Pmat, arma::fvec& wVec,
                            arma::fvec& tauVec){
-	if (tauVec(1) == 0) {
-		arma::fmat out = Pmat;
-		out.each_col() %= (tauVec(0) / wVec);
-		return out;
-	}
-	arma::fmat crossProd1 = getCrossprodMatAndKinMat(Pmat);
+	// Association order deliberately follows the SCALAR getCrossprod,
+	//     tau0 * (b % (1/w)),
+	// not the b % (tau0/w) this used to compute. The two are not the same in
+	// fp — (tau0/w_i) rounds once and then multiplies, while (1/w_i) rounds,
+	// multiplies by b_i, and then scales by tau0 — so the block paths (trace,
+	// variance ratio, the blocked coefficient solve) drifted from the scalar
+	// path for no reason other than how the expression was written. Matching
+	// the scalar keeps a batched column comparable to the same column solved
+	// alone, which is what the tier-2 lockstep driver relies on. Note this is
+	// a no-op whenever tau0 == 1 exactly (every binary/survival fit, where
+	// tau[0] is fixed at 1): tau0/w and 1/w are then bit-identical.
+	arma::fvec winv = 1.0f / wVec;
 	arma::fmat out = Pmat;
-	out.each_col() %= (tauVec(0) / wVec);
+	out.each_col() %= winv;
+	out *= tauVec(0);
+	if (tauVec(1) == 0) return out;
+
+	arma::fmat crossProd1 = getCrossprodMatAndKinMat(Pmat);
 	out += tauVec(1) * crossProd1;
 	return out;
 }
