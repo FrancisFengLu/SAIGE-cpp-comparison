@@ -1091,6 +1091,72 @@ int main(int argc, char** argv) {
   if (y["design"] && y["design"]["y_col"])
     y_col_name = y["design"]["y_col"].as<std::string>();
 
+  // ===== Tier-1 multi-phenotype: model specs =====
+  // Three mutually exclusive ways to name the phenotype(s):
+  //   design.y_col: y                     (single, legacy — unchanged behaviour)
+  //   design.y_cols: [q1, q2, ...]        (shorthand; per-trait paths derived)
+  //   models: [{y_col:, out_prefix:, out_prefix_vr:}, ...]   (explicit paths)
+  // The derived-path rule for y_cols mirrors how the two prefixes are consumed
+  // downstream: out_prefix is used as a DIRECTORY (nullmodel.json + *.arma live
+  // inside it) so the trait becomes a subdirectory, while out_prefix_vr is a
+  // FILE prefix (+ ".varianceRatio.txt") so the trait is suffixed.
+  struct ModelSpec { std::string y_col, out_prefix, out_prefix_vr; };
+  std::vector<ModelSpec> models;
+  {
+    const bool has_models = (bool)y["models"];
+    const bool has_ycols  = (bool)(y["design"] && y["design"]["y_cols"]);
+    const bool has_ycol   = (bool)(y["design"] && y["design"]["y_col"]);
+    if (has_models && (has_ycols || has_ycol))
+      throw std::runtime_error("config: `models:` is mutually exclusive with design.y_col / design.y_cols");
+    if (has_models && has_ycols)
+      throw std::runtime_error("config: `models:` is mutually exclusive with design.y_cols");
+    if (has_ycols && has_ycol)
+      throw std::runtime_error("config: design.y_cols is mutually exclusive with design.y_col");
+
+    if (has_models) {
+      const auto& mn = y["models"];
+      if (!mn.IsSequence() || mn.size() == 0)
+        throw std::runtime_error("config: `models:` must be a non-empty sequence");
+      for (const auto& m : mn) {
+        ModelSpec ms;
+        if (!m["y_col"]) throw std::runtime_error("config: every models[] entry needs y_col");
+        ms.y_col         = m["y_col"].as<std::string>();
+        ms.out_prefix    = m["out_prefix"]    ? m["out_prefix"].as<std::string>()    : (paths.out_prefix + "/" + ms.y_col);
+        ms.out_prefix_vr = m["out_prefix_vr"] ? m["out_prefix_vr"].as<std::string>() : (paths.out_prefix_vr + "_" + ms.y_col);
+        models.push_back(std::move(ms));
+      }
+    } else if (has_ycols) {
+      const auto& cn = y["design"]["y_cols"];
+      if (!cn.IsSequence() || cn.size() == 0)
+        throw std::runtime_error("config: design.y_cols must be a non-empty sequence");
+      for (const auto& c : cn) {
+        ModelSpec ms;
+        ms.y_col         = c.as<std::string>();
+        ms.out_prefix    = paths.out_prefix + "/" + ms.y_col;
+        ms.out_prefix_vr = paths.out_prefix_vr + "_" + ms.y_col;
+        models.push_back(std::move(ms));
+      }
+    } else {
+      // Single-phenotype: byte-for-byte the legacy path (prefixes untouched).
+      models.push_back(ModelSpec{y_col_name, paths.out_prefix, paths.out_prefix_vr});
+    }
+    {
+      std::set<std::string> seen_y, seen_p;
+      for (const auto& m : models) {
+        if (!seen_y.insert(m.y_col).second)
+          throw std::runtime_error("config: duplicate phenotype column '" + m.y_col + "'");
+        if (!seen_p.insert(m.out_prefix).second)
+          throw std::runtime_error("config: duplicate out_prefix '" + m.out_prefix + "' across models");
+      }
+    }
+    if (models.size() > 1) {
+      std::cout << "[multi-pheno] P=" << models.size() << " phenotypes, shared genotype load:\n";
+      for (const auto& m : models)
+        std::cout << "    " << m.y_col << "  ->  " << m.out_prefix
+                  << "   vr: " << m.out_prefix_vr << "\n";
+    }
+  }
+
   // ===== Step 14: Validate q_covar_cols subset of covar_cols (R lines 1446-1454) =====
   // R: if(!all(qCovarCol %in% covarColList)) stop("ERROR! all covariates in qCovarCol must be in covarColList")
   if (!cfg.q_covar_cols.empty()) {
@@ -1118,6 +1184,12 @@ int main(int argc, char** argv) {
 
   // Parse design (with categoricals) - using configurable column names
   auto T0 = std::chrono::steady_clock::now();
+  // Everything from the CSV parse through the covariate-offset GLM is
+  // per-phenotype and is run in the SAME order as the single-trait path, on the
+  // CSV row order (before the FAM reorder below). Keeping that order is what
+  // makes each trait of a P>1 run byte-identical to running it alone.
+  auto build_design_for_pheno = [&](const std::string& y_col_name,
+                                    const Paths& paths) -> Design {
   Design design = load_design_csv(design_csv, min_cov_ct, drop_ref, covar_col_names,
                                   iid_col_name, y_col_name);
   add_intercept_if_missing(design);
@@ -1298,9 +1370,43 @@ int main(int argc, char** argv) {
               << " preserved for Step-2 export\n";
   }
 
-  // Ensure output dirs exist
-  ensure_parent_dir(paths.out_prefix + ".touch");
-  ensure_parent_dir(paths.out_prefix_vr + ".touch");
+  return design;
+  };  // end build_design_for_pheno
+
+  // Build one Design per phenotype (shared genotype load happens once, below).
+  std::vector<Design> designs;
+  designs.reserve(models.size());
+  for (const auto& m : models) {
+    if (models.size() > 1)
+      std::cout << "\n[multi-pheno] ===== design for phenotype '" << m.y_col << "' =====\n";
+    Paths mp = paths;
+    mp.out_prefix    = m.out_prefix;
+    mp.out_prefix_vr = m.out_prefix_vr;
+    ensure_parent_dir(mp.out_prefix + ".touch");
+    ensure_parent_dir(mp.out_prefix_vr + ".touch");
+    designs.push_back(build_design_for_pheno(m.y_col, mp));
+  }
+
+  // All traits must end up on the SAME sample set: one genotype object, one
+  // subSampleInGeno, one GRM. Rows are still in CSV order here, so identical
+  // sample sets means identical iid sequences.
+  if (designs.size() > 1) {
+    for (size_t k = 1; k < designs.size(); ++k) {
+      if (designs[k].n != designs[0].n || designs[k].iid != designs[0].iid) {
+        throw std::runtime_error(
+            "multi-phenotype: phenotype '" + models[k].y_col + "' keeps " +
+            std::to_string(designs[k].n) + " samples but '" + models[0].y_col +
+            "' keeps " + std::to_string(designs[0].n) +
+            " (or the IDs differ). A shared genotype load requires one common "
+            "sample set; drop the rows with missing values from the design CSV "
+            "first, or run the traits separately.");
+      }
+    }
+    std::cout << "[multi-pheno] all " << designs.size()
+              << " phenotypes share the same " << designs[0].n << " samples\n";
+  }
+  Design& design = designs[0];
+
 
   // LOCO ranges are computed inside PreprocessEngine::compute_chr_ranges_from_bim_()
   // (post-QC/compacted marker index space, which is what the genotype object
@@ -1343,31 +1449,38 @@ int main(int argc, char** argv) {
       std::sort(perm.begin(), perm.end(),
                 [&](int a, int b) { return subSampleInGeno[a] < subSampleInGeno[b]; });
 
-      std::vector<int> new_sub(design.n);
-      std::vector<std::string> new_iid(design.n);
-      std::vector<double> new_y(design.n);
-      std::vector<double> new_X(static_cast<size_t>(design.n) * design.p);
-      std::vector<double> new_offset;
-      std::vector<double> new_event;
-      if (!design.offset.empty())     new_offset.resize(design.n);
-      if (!design.event_time.empty()) new_event.resize(design.n);
+      // The permutation is derived from subSampleInGeno, which is built from
+      // design.iid — identical across phenotypes (enforced above) — so one perm
+      // serves every trait. Field-for-field identical to the single-trait code.
+      for (Design& d : designs) {
+        std::vector<std::string> new_iid(d.n);
+        std::vector<double> new_y(d.n);
+        std::vector<double> new_X(static_cast<size_t>(d.n) * d.p);
+        std::vector<double> new_offset;
+        std::vector<double> new_event;
+        if (!d.offset.empty())     new_offset.resize(d.n);
+        if (!d.event_time.empty()) new_event.resize(d.n);
 
-      for (int i = 0; i < design.n; ++i) {
-        int s = perm[i];
-        new_sub[i] = subSampleInGeno[s];
-        new_iid[i] = design.iid[s];
-        new_y[i]   = design.y[s];
-        for (int j = 0; j < design.p; ++j)
-          new_X[static_cast<size_t>(i) * design.p + j] = design.X[static_cast<size_t>(s) * design.p + j];
-        if (!design.offset.empty())     new_offset[i] = design.offset[s];
-        if (!design.event_time.empty()) new_event[i]  = design.event_time[s];
+        for (int i = 0; i < d.n; ++i) {
+          int s = perm[i];
+          new_iid[i] = d.iid[s];
+          new_y[i]   = d.y[s];
+          for (int j = 0; j < d.p; ++j)
+            new_X[static_cast<size_t>(i) * d.p + j] = d.X[static_cast<size_t>(s) * d.p + j];
+          if (!d.offset.empty())     new_offset[i] = d.offset[s];
+          if (!d.event_time.empty()) new_event[i]  = d.event_time[s];
+        }
+        d.iid = std::move(new_iid);
+        d.y   = std::move(new_y);
+        d.X   = std::move(new_X);
+        if (!new_offset.empty()) d.offset     = std::move(new_offset);
+        if (!new_event.empty())  d.event_time = std::move(new_event);
       }
-      subSampleInGeno = std::move(new_sub);
-      design.iid      = std::move(new_iid);
-      design.y        = std::move(new_y);
-      design.X        = std::move(new_X);
-      if (!new_offset.empty()) design.offset     = std::move(new_offset);
-      if (!new_event.empty())  design.event_time = std::move(new_event);
+      {
+        std::vector<int> new_sub(design.n);
+        for (int i = 0; i < design.n; ++i) new_sub[i] = subSampleInGeno[perm[i]];
+        subSampleInGeno = std::move(new_sub);
+      }
 
       std::cout << "[FAM] reordered design/subSampleInGeno to ascending FAM row (matches R)\n";
       std::cout << "[FAM] subSampleInGeno[0:5] after reorder: ";
@@ -1641,15 +1754,18 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  // Variance-ratio overwrite guard
+  // Variance-ratio overwrite guard (checked for EVERY trait before any fitting,
+  // so a P-trait run cannot die half way through after writing some outputs).
   if (cfg.num_markers_for_vr > 0) {
-    std::string vr_txt = paths.out_prefix_vr + ".varianceRatio.txt";
     bool allow_overwrite = (y["paths"] && y["paths"]["overwrite_varratio"]) ? y["paths"]["overwrite_varratio"].as<bool>() : false;
-    if (!allow_overwrite && fs::exists(vr_txt)) {
-      std::ostringstream oss;
-      oss << "Refusing to overwrite existing variance-ratio file: " << vr_txt
-          << " (set paths.overwrite_varratio=true to allow).";
-      throw std::runtime_error(oss.str());
+    for (const auto& m : models) {
+      std::string vr_txt = m.out_prefix_vr + ".varianceRatio.txt";
+      if (!allow_overwrite && fs::exists(vr_txt)) {
+        std::ostringstream oss;
+        oss << "Refusing to overwrite existing variance-ratio file: " << vr_txt
+            << " (set paths.overwrite_varratio=true to allow).";
+        throw std::runtime_error(oss.str());
+      }
     }
   }
 
@@ -1675,26 +1791,57 @@ int main(int argc, char** argv) {
   // If you have the overload with genoClass&, call:
   // FitNullResult out = saige::fit_null(cfg, paths, design, geno);
 
-  FitNullResult out = saige::fit_null(cfg, paths, design);
+  // ------------------ Tier-1: fit each phenotype on the shared genotype ------
+  // The genotype object, the 2-bit GRM (and its GPU-resident copy) were built
+  // once above; every trait below reuses them. Nothing inside fit_null carries
+  // state across traits: the VR marker order is a fresh std::mt19937(200) and
+  // the Hutchinson probe stream is re-seeded on every GetTrace/GetTrace_q entry,
+  // so trait k's numbers do not depend on traits 0..k-1 having run first.
+  for (size_t mi = 0; mi < models.size(); ++mi) {
+    const auto& m = models[mi];
+    Paths mpaths = paths;
+    mpaths.out_prefix    = m.out_prefix;
+    mpaths.out_prefix_vr = m.out_prefix_vr;
 
-  // ------------------ Output GRM diagonal (after fit_null, same as R version) ------------------
-  output_grm_diagonal(paths.out_prefix + ".grm_diag.txt");
+    if (models.size() > 1) {
+      std::cout << "\n" << std::string(70, '#') << "\n";
+      std::cout << "### phenotype " << (mi + 1) << "/" << models.size()
+                << ": " << m.y_col << "\n";
+      std::cout << std::string(70, '#') << "\n";
+    }
+    auto T_ph = std::chrono::steady_clock::now();
 
-  // ------------------ Report artifacts ------------------
-  std::cout << "== SAIGE Null Fit Completed ==\n";
-  std::cout << "Converged: " << (out.converged ? "yes" : "NO") << "\n";
-  std::cout << "Iterations: " << out.iterations << "\n";
-  std::cout << "Model artifact: " << out.model_rda_path << "\n";
-  if (!out.vr_path.empty())           std::cout << "Variance ratio: " << out.vr_path << "\n";
-  if (!out.markers_out_path.empty())  std::cout << "Marker results: " << out.markers_out_path << "\n";
-  // out.loco is set by the engine only when the LOCO batch actually ran, so this
-  // no longer claims "on" for a run that quietly skipped LOCO.
-  std::cout << "LOCO: " << (out.loco ? "on" : "off")
-            << "  LowMem: " << (out.lowmem_loco ? "yes" : "no");
-  if (out.loco) {
-    std::cout << "  chroms:";
-    for (int c : out.loco_chroms) std::cout << " " << c;
+    FitNullResult out = saige::fit_null(cfg, mpaths, designs[mi]);
+
+    // ------------------ Output GRM diagonal (after fit_null, same as R version) ------------------
+    output_grm_diagonal(mpaths.out_prefix + ".grm_diag.txt");
+
+    // ------------------ Report artifacts ------------------
+    std::cout << "== SAIGE Null Fit Completed ==\n";
+    if (models.size() > 1) std::cout << "Phenotype: " << m.y_col << "\n";
+    std::cout << "Converged: " << (out.converged ? "yes" : "NO") << "\n";
+    std::cout << "Iterations: " << out.iterations << "\n";
+    std::cout << "Model artifact: " << out.model_rda_path << "\n";
+    if (!out.vr_path.empty())           std::cout << "Variance ratio: " << out.vr_path << "\n";
+    if (!out.markers_out_path.empty())  std::cout << "Marker results: " << out.markers_out_path << "\n";
+    // out.loco is set by the engine only when the LOCO batch actually ran, so this
+    // no longer claims "on" for a run that quietly skipped LOCO.
+    std::cout << "LOCO: " << (out.loco ? "on" : "off")
+              << "  LowMem: " << (out.lowmem_loco ? "yes" : "no");
+    if (out.loco) {
+      std::cout << "  chroms:";
+      for (int c : out.loco_chroms) std::cout << " " << c;
+    }
+    std::cout << "\n";
+    if (models.size() > 1) {
+      auto t = std::chrono::steady_clock::now();
+      printf("[TIMER-MAIN] phenotype %-28s %8.2fs\n", m.y_col.c_str(),
+             std::chrono::duration<double>(t - T_ph).count());
+    }
+
+    // Free this trait's design as soon as it is fitted: at P=32 on a big cohort
+    // the N*(p_full+3) doubles per trait are not negligible next to the GRM.
+    designs[mi] = Design{};
   }
-  std::cout << "\n";
   return 0;
 }
