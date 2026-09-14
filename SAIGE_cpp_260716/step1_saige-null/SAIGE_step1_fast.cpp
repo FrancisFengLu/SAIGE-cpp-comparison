@@ -3131,6 +3131,72 @@ bool isBlockPCGdisabled() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Cache for ψ·U in the AI-REML trace estimator (Hutchinson probes).
+//
+// Both GetTrace and GetTrace_q re-seed the RNG on EVERY entry (set_seed(10) /
+// set_seed(200), or fit.trace_seed), so the probe matrix U is the same on every
+// outer AI-REML iteration — and, under tier-1 multi-phenotype, the same for
+// every trait. ψ is constant for the whole process (full-genome GRM; the LOCO
+// offsets use a different entry point). Therefore ψ·U is a constant of the run,
+// recomputed today once per outer iteration per trait purely as waste: at mid
+// that is nrun=30 right-hand sides through the whole 2-bit matrix, ~4 extra
+// passes of GMC_NCMAX=8-column blocks, every single AI-REML iteration.
+//
+// The cache is SELF-VALIDATING and numerics-neutral: the caller still draws U
+// from the RNG exactly as before (so the stream is consumed bit-for-bit
+// identically and the nrun+10 wave extension stays reproducible), and the
+// stored ψ·U is reused only when the freshly drawn block compares exactly equal
+// to the stored probes. On any mismatch we fall through to the real product.
+// SAIGE_NO_TRACE_AU_CACHE=1 disables it.
+static arma::fmat g_traceUcache;
+static arma::fmat g_traceAUcache;
+
+static bool isTraceAUcacheDisabled() {
+	static const bool v = [](){
+		const char* e = std::getenv("SAIGE_NO_TRACE_AU_CACHE");
+		return e && std::string(e) == "1"; }();
+	return v;
+}
+
+arma::fmat getCrossprodMatAndKinMat_traceCached(const arma::fmat& Umat, int colStart)
+{
+	if (isTraceAUcacheDisabled() || colStart < 0)
+		return getCrossprodMatAndKinMat(Umat);
+
+	const arma::uword n    = Umat.n_rows;
+	const arma::uword k    = Umat.n_cols;
+	const arma::uword c0   = (arma::uword)colStart;
+	const arma::uword need = c0 + k;
+
+	if (g_traceUcache.n_rows == n && g_traceUcache.n_cols >= need &&
+	    g_traceAUcache.n_rows == n && g_traceAUcache.n_cols >= need) {
+		const arma::fmat cachedU = g_traceUcache.cols(c0, need - 1);
+		if (arma::all(arma::vectorise(cachedU == Umat))) {
+			std::cout << "[trace] psi*U cache hit for probes ["
+			          << c0 << "," << need << ")\n";
+			return g_traceAUcache.cols(c0, need - 1);
+		}
+	}
+
+	arma::fmat AU = getCrossprodMatAndKinMat(Umat);
+
+	if (c0 == 0) {
+		g_traceUcache  = Umat;
+		g_traceAUcache = AU;
+	} else if (g_traceUcache.n_rows == n && g_traceUcache.n_cols == c0) {
+		g_traceUcache  = arma::join_rows(g_traceUcache,  Umat);
+		g_traceAUcache = arma::join_rows(g_traceAUcache, AU);
+	} else {
+		// Non-contiguous request (should not happen): give up on caching
+		// rather than store something whose column indices lie.
+		g_traceUcache.reset();
+		g_traceAUcache.reset();
+	}
+	return AU;
+}
+
+
 // INTERNAL: LOCO version of cross product with kinship matrix
 arma::fvec getCrossprodMatAndKin_LOCO(arma::fcolvec& bVec){
 
@@ -6720,7 +6786,7 @@ float GetTrace(const arma::fmat& Sigma_iX,
       arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
                                                    maxiterPCG, tolPCG);
       arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));
-      arma::fmat AU = getCrossprodMatAndKinMat(Umat);
+      arma::fmat AU = getCrossprodMatAndKinMat_traceCached(Umat, nrunStart);
       if (!AU.is_finite()) throw std::runtime_error("GetTrace: Au non-finite");
       if (!PU.is_finite()) throw std::runtime_error("GetTrace: Pu non-finite");
       for (int i = 0; i < nb_cols; ++i)
@@ -7591,7 +7657,7 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
       arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
                                                    maxiterPCG, tolPCG);
       arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));
-      arma::fmat AU = getCrossprodMatAndKinMat(Umat);
+      arma::fmat AU = getCrossprodMatAndKinMat_traceCached(Umat, nrunStart);
       for (int i = 0; i < nb_cols; ++i) {
         tempVec(nrunStart + i)  = arma::dot(AU.col(i), PU.col(i));
         tempVec0(nrunStart + i) = arma::dot(Umat.col(i), PU.col(i));
