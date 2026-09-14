@@ -31,6 +31,13 @@
 
 namespace fs = std::filesystem;
 
+// Sparse GRM accessors from SAIGE_step1_fast.cpp (global scope, not in
+// namespace saige). Forward-declared rather than including
+// SAIGE_step1_fast.hpp, which drags in the genotype class and does not coexist
+// cleanly with the Eigen headers this translation unit needs.
+arma::umat export_sparse_grm_locations();
+arma::vec  export_sparse_grm_values();
+
 namespace saige {
 
 // ======= Utility: map raw vectors to Eigen without copying =======
@@ -960,6 +967,25 @@ FitNullResult NullModelEngine::export_result(NullPrep& prep_in, FitNullResult ou
     } else if (!out.offset.empty()) {
       log("WARNING: out.offset has size " + std::to_string(out.offset.size())
           + " (expected " + std::to_string(n_s) + "); skipped offset.arma");
+    }
+
+    // The sparse GRM, in the exact form step 2 reads it. Step 1 already holds it
+    // subsetted and reindexed to this model's samples (main.cpp calls
+    // setupSparseGRM with design.n rows), but it only ever wrote it back out as
+    // MatrixMarket COO -- so a run with flagSparseGRM=true produced a model
+    // directory step 2 could not load, and null_model_loader.cpp refuses it.
+    // Emitting the two .arma files here is the missing half of that contract.
+    // Written whenever a sparse GRM is loaded, not just under
+    // use_sparse_grm_to_fit, so the directory is self-consistent either way.
+    {
+      arma::umat sp_loc = ::export_sparse_grm_locations();
+      arma::vec  sp_val = ::export_sparse_grm_values();
+      if (sp_val.n_elem > 0 && sp_loc.n_cols == sp_val.n_elem) {
+        sp_loc.save(model_dir + "/sparseGRM_locationMat.arma", arma::arma_binary);
+        sp_val.save(model_dir + "/sparseGRM_valueVec.arma", arma::arma_binary);
+        log("Saved sparseGRM_locationMat.arma / sparseGRM_valueVec.arma (nnz="
+            + std::to_string(sp_val.n_elem) + ", n=" + std::to_string(n_s) + ")");
+      }
     }
 
     log("Saved .arma binary files for Step 2: mu, res, y, V, S_a, X, XV, XVX, XVX_inv, XXVX_inv, XVX_inv_XV, offset");
