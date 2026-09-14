@@ -184,6 +184,33 @@ arma::fmat getPCGofSigmaAndMatrix(const arma::fvec& w,
 // the serial per-probe / per-marker PCG loops).
 bool isBlockPCGdisabled();
 
+// Tier-2 (lockstep multi-phenotype) primitives. P phenotypes share psi but each
+// has its own Sigma_p = tau0_p*diag(1/w_p) + tau1_p*psi, so every column of B
+// carries a phenotype index (phenoInd) into Wmat (N x P) / tauMat (2 x P).
+// Only psi*B is shared across phenotypes; the diagonal term, the Jacobi
+// preconditioner and all dots/axpys stay per column. Association order follows
+// the scalar getCrossprod: tau0*(b % (1/w)).
+arma::fmat getCrossprodMat_multiSigma(const arma::fmat& Bmat,
+                                      const arma::fmat& Wmat,
+                                      const arma::fmat& tauMat,
+                                      const arma::uvec& phenoInd,
+                                      const arma::uvec& activeMask);
+
+// Lockstep batched PCG against P different Sigmas. Converged columns freeze but
+// stay in the batch. itersOut (optional) receives the per-column iteration count.
+arma::fmat getPCGofSigmaAndMatrix_multiSigma(const arma::fmat& Wmat,
+                                             const arma::fmat& tauMat,
+                                             const arma::fmat& Bmat,
+                                             const arma::uvec& phenoInd,
+                                             int maxiterPCG, float tolPCG,
+                                             arma::ivec* itersOut = nullptr);
+
+// Diagnostic self-check for the two above (SAIGE_MULTISIGMA_SELFTEST=P). Solves
+// P*nrhs synthetic right-hand sides against P deliberately different Sigma_p
+// both in one lockstep batch and one column at a time with the scalar solver,
+// and prints the worst relative difference. Writes nothing.
+void runMultiSigmaSelfTest(int P, int nrhs, int maxiterPCG, float tolPCG);
+
 arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& w,
                                         const arma::fvec& tau,
                                         const arma::fvec& v,

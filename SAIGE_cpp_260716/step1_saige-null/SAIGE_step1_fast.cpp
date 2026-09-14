@@ -5332,6 +5332,236 @@ arma::fmat getPCGofSigmaAndMatrix(const arma::fvec& wVec,
 }
 
 
+// ===========================================================================
+// Tier-2 (lockstep multi-phenotype) primitives.
+//
+// P phenotypes fitted together share psi but NOT Sigma: trait p has its own
+// IRLS weights w_p and its own variance components tau_p, so
+//     Sigma_p = tau0_p * diag(1/w_p) + tau1_p * psi.
+// The single-Sigma pair above (getCrossprodMat / getPCGofSigmaAndMatrix) cannot
+// express that — one (w,tau) applies to every column, and minvVec is a single
+// vector. These two functions are the multi-Sigma analogues: same per-column
+// arithmetic, but every column carries a phenotype index into Wmat/tauMat.
+//
+// The whole point is that only psi*B is shared. It is issued ONCE for all
+// active columns of all phenotypes, so P traits cost one pass of the packed
+// 2-bit matrix per GMC_NCMAX-column block instead of P passes. Everything else
+// (the diagonal term, Jacobi preconditioning, the dots and axpys) stays
+// per-column, exactly as in the scalar path.
+//
+// Association order deliberately follows the SCALAR getCrossprod,
+//     tau0 * (b % (1/w)),
+// not the single-Sigma getCrossprodMat's  b % (tau0/w). Those two are not the
+// same in fp, and matching the scalar reference keeps a lockstep column
+// comparable to the same column solved alone.
+// ===========================================================================
+
+// Sigma_{p(j)} * B.col(j) for every active column j.
+//   Bmat       N x k
+//   Wmat       N x P   per-phenotype IRLS weights
+//   tauMat     2 x P   per-phenotype variance components
+//   phenoInd   k       phenoInd(j) = which phenotype column j belongs to
+//   activeMask k       0 => column frozen; skipped entirely, output column left
+//                      untouched (the caller does not read it)
+arma::fmat getCrossprodMat_multiSigma(const arma::fmat& Bmat,
+                                      const arma::fmat& Wmat,
+                                      const arma::fmat& tauMat,
+                                      const arma::uvec& phenoInd,
+                                      const arma::uvec& activeMask)
+{
+	const arma::uword N = Bmat.n_rows;
+	const arma::uword k = Bmat.n_cols;
+	const arma::uword P = Wmat.n_cols;
+	if (phenoInd.n_elem   != k) throw std::runtime_error("multiSigma: phenoInd length != ncol(B)");
+	if (activeMask.n_elem != k) throw std::runtime_error("multiSigma: activeMask length != ncol(B)");
+	if (Wmat.n_rows != N)       throw std::runtime_error("multiSigma: nrow(W) != nrow(B)");
+	if (tauMat.n_rows < 2 || tauMat.n_cols != P)
+		throw std::runtime_error("multiSigma: tauMat must be 2 x P");
+
+	// Which active columns actually need psi? (tau1_p == 0 short-circuits, as
+	// the scalar getCrossprod does.)
+	std::vector<arma::uword> need;
+	need.reserve(k);
+	for (arma::uword j = 0; j < k; ++j) {
+		if (!activeMask(j)) continue;
+		if (phenoInd(j) >= P) throw std::runtime_error("multiSigma: phenoInd out of range");
+		if (tauMat(1, phenoInd(j)) != 0.0f) need.push_back(j);
+	}
+
+	arma::fmat psiB;
+	if (!need.empty()) {
+		arma::uvec idx(need.size());
+		for (size_t t = 0; t < need.size(); ++t) idx(t) = need[t];
+		arma::fmat G = Bmat.cols(idx);
+		psiB = getCrossprodMatAndKinMat(G);   // the ONE shared product
+	}
+
+	arma::fmat out(N, k, arma::fill::zeros);
+	std::vector<arma::fvec> winv(P);          // 1/w_p, built on first use
+	std::vector<bool>       have(P, false);
+	arma::uword t = 0;                        // walks `need` in the same order
+	for (arma::uword j = 0; j < k; ++j) {
+		if (!activeMask(j)) continue;
+		const arma::uword pj = phenoInd(j);
+		if (!have[pj]) { winv[pj] = 1.0f / Wmat.col(pj); have[pj] = true; }
+		out.col(j) = tauMat(0, pj) * (Bmat.col(j) % winv[pj]);
+		if (tauMat(1, pj) != 0.0f) {
+			out.col(j) += tauMat(1, pj) * psiB.col(t);
+			++t;
+		}
+	}
+	return out;
+}
+
+// Lockstep batched PCG against P different Sigmas.
+// Solves Sigma_{p(j)} x_j = B.col(j) for every column j at once. Each column
+// keeps its own alpha/beta/residual and FREEZES on its own convergence test
+// (sumr2 <= tolPCG, the same absolute criterion the scalar solver uses) — it is
+// not iterated further, because (a) the scalar baseline stopped there, and (b)
+// after convergence rz -> 0 and beta = rz_new/rz is numerically 0/0.
+// Frozen columns stay in the batch but are dropped from the psi product.
+//
+// Paths with no batched implementation (sparse direct solve, sparse
+// preconditioner) fall back per column, each against its own Sigma_p — same
+// rule as the single-Sigma getPCGofSigmaAndMatrix.
+arma::fmat getPCGofSigmaAndMatrix_multiSigma(const arma::fmat& Wmat,
+                                             const arma::fmat& tauMat,
+                                             const arma::fmat& Bmat,
+                                             const arma::uvec& phenoInd,
+                                             int maxiterPCG, float tolPCG,
+                                             arma::ivec* itersOut)
+{
+	const arma::uword N = Bmat.n_rows;
+	const arma::uword k = Bmat.n_cols;
+	const arma::uword P = Wmat.n_cols;
+	if (phenoInd.n_elem != k) throw std::runtime_error("multiSigma PCG: phenoInd length != ncol(B)");
+	if (tauMat.n_rows < 2 || tauMat.n_cols != P)
+		throw std::runtime_error("multiSigma PCG: tauMat must be 2 x P");
+	if (itersOut) { itersOut->set_size(k); itersOut->zeros(); }
+
+	if (isUseSparseSigmaforModelFitting || isUsePrecondM) {
+		arma::fmat X(N, k);
+		for (arma::uword j = 0; j < k; ++j) {
+			arma::fvec w = Wmat.col(phenoInd(j));
+			arma::fvec t = tauMat.col(phenoInd(j));
+			arma::fvec b = Bmat.col(j);
+			X.col(j) = getPCG1ofSigmaAndVector(w, t, b, maxiterPCG, tolPCG);
+		}
+		return X;
+	}
+
+	// One Jacobi preconditioner per PHENOTYPE (not per column).
+	arma::fmat minvMat(N, P);
+	for (arma::uword pp = 0; pp < P; ++pp) {
+		arma::fvec w = Wmat.col(pp);
+		arma::fvec t = tauMat.col(pp);
+		minvMat.col(pp) = 1.0f / getDiagOfSigma(w, t);
+	}
+
+	arma::fmat X(N, k, arma::fill::zeros);
+	arma::fmat R = Bmat;
+	arma::fmat Z(N, k);
+	for (arma::uword j = 0; j < k; ++j) Z.col(j) = minvMat.col(phenoInd(j)) % R.col(j);
+	arma::fmat P_ = Z;
+
+	arma::fvec rz(k), sumr2(k);
+	arma::uvec active(k);
+	for (arma::uword j = 0; j < k; ++j) {
+		rz(j)    = arma::dot(R.col(j), Z.col(j));
+		sumr2(j) = arma::dot(R.col(j), R.col(j));
+		active(j) = (sumr2(j) > tolPCG);
+	}
+
+	int iter = 0;
+	while (arma::any(active) && iter < maxiterPCG) {
+		iter++;
+		arma::fmat AP = getCrossprodMat_multiSigma(P_, Wmat, tauMat, phenoInd, active);
+		for (arma::uword j = 0; j < k; ++j) {
+			if (!active(j)) continue;
+			const float pAp = arma::dot(P_.col(j), AP.col(j));
+			const float a   = rz(j) / pAp;
+			X.col(j) += a * P_.col(j);
+			R.col(j) -= a * AP.col(j);
+			Z.col(j)  = minvMat.col(phenoInd(j)) % R.col(j);
+			const float rz_new = arma::dot(R.col(j), Z.col(j));
+			const float bta    = rz_new / rz(j);
+			P_.col(j) = Z.col(j) + bta * P_.col(j);
+			rz(j)     = rz_new;
+			sumr2(j)  = arma::dot(R.col(j), R.col(j));
+			if (itersOut) (*itersOut)(j) = iter;
+			if (sumr2(j) <= tolPCG) active(j) = 0;
+		}
+	}
+	if (arma::any(active)) {
+		std::cout << "multiSigma PCG: " << arma::sum(active) << "/" << k
+		          << " columns did not converge in " << maxiterPCG
+		          << " iterations\n";
+	}
+	std::cout << "iter from getPCGofSigmaAndMatrix_multiSigma " << iter
+	          << " for " << k << " RHS over " << P << " phenotypes\n";
+	return X;
+}
+
+// Self-check for the two functions above, run with SAIGE_MULTISIGMA_SELFTEST=P
+// after a normal fit (so `geno` and the GPU handle are live and psi is the real
+// GRM). It builds P deterministic, deliberately DIFFERENT (w_p, tau_p) pairs
+// and nrhs deterministic right-hand sides per phenotype, solves them (a) in one
+// lockstep multi-Sigma batch and (b) one column at a time with the scalar
+// getPCG1ofSigmaAndVector against that column's own Sigma_p, and reports the
+// worst relative difference and the per-column iteration counts.
+// Purely diagnostic: it writes nothing and changes no fitted result.
+void runMultiSigmaSelfTest(int P, int nrhs, int maxiterPCG, float tolPCG)
+{
+	const arma::uword N = (arma::uword)geno.getNnomissing();
+	if (P < 1) P = 2;
+	if (nrhs < 1) nrhs = 2;
+	std::cout << "\n[multiSigma selftest] N=" << N << " P=" << P
+	          << " nrhs/pheno=" << nrhs << " tolPCG=" << tolPCG << "\n";
+
+	arma::fmat Wmat(N, P);
+	arma::fmat tauMat(2, P);
+	for (int pp = 0; pp < P; ++pp) {
+		for (arma::uword i = 0; i < N; ++i)
+			Wmat(i, pp) = 0.05f + 0.20f * (float)(((i * 7 + pp * 13) % 97) + 1) / 97.0f;
+		tauMat(0, pp) = 1.0f;
+		tauMat(1, pp) = 0.01f * (float)(pp + 1);
+	}
+
+	const arma::uword k = (arma::uword)P * (arma::uword)nrhs;
+	arma::fmat Bmat(N, k);
+	arma::uvec phenoInd(k);
+	for (int pp = 0; pp < P; ++pp) {
+		for (int r = 0; r < nrhs; ++r) {
+			const arma::uword j = (arma::uword)pp * nrhs + r;
+			phenoInd(j) = (arma::uword)pp;
+			for (arma::uword i = 0; i < N; ++i)
+				Bmat(i, j) = (float)std::sin(0.001 * (double)(i + 1) * (double)(j + 3));
+		}
+	}
+
+	arma::ivec itersBatch;
+	arma::fmat Xbatch = getPCGofSigmaAndMatrix_multiSigma(Wmat, tauMat, Bmat,
+	                                                      phenoInd, maxiterPCG,
+	                                                      tolPCG, &itersBatch);
+
+	double worst = 0.0; arma::uword worst_j = 0;
+	for (arma::uword j = 0; j < k; ++j) {
+		arma::fvec w = Wmat.col(phenoInd(j));
+		arma::fvec t = tauMat.col(phenoInd(j));
+		arma::fvec b = Bmat.col(j);
+		arma::fvec xs = getPCG1ofSigmaAndVector(w, t, b, maxiterPCG, tolPCG);
+		const double den = std::max((double)arma::norm(xs), 1e-30);
+		const double rel = (double)arma::norm(Xbatch.col(j) - xs) / den;
+		if (rel > worst) { worst = rel; worst_j = j; }
+		std::cout << "[multiSigma selftest] col " << j << " (pheno "
+		          << phenoInd(j) << ")  rel|x_batch - x_scalar| = " << rel
+		          << "  iters_batch=" << itersBatch(j) << "\n";
+	}
+	std::cout << "[multiSigma selftest] WORST rel err = " << worst
+	          << " at column " << worst_j << "\n\n";
+}
+
+
 // R CONNECTION: PCG solver for Sigma^(-1)*b in survival analysis to R functions
 // Preconditioned conjugate gradient algorithm for survival mixed model linear systems
 arma::fvec getPCG1ofSigmaAndVector_Surv(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec& bVec, arma::fmat & WinvNRt, arma::fmat & ACinv, arma::fvec & diagofWminusUinv, arma::fvec & x0Vec, int maxiterPCG, float tolPCG){

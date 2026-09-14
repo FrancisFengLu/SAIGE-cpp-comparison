@@ -1843,5 +1843,16 @@ int main(int argc, char** argv) {
     // the N*(p_full+3) doubles per trait are not negligible next to the GRM.
     designs[mi] = Design{};
   }
+
+  // Diagnostic only: exercise the tier-2 lockstep multi-Sigma primitives against
+  // the real psi now that the genotype object (and the GPU handle) are live.
+  // SAIGE_MULTISIGMA_SELFTEST=<P>, optionally SAIGE_MULTISIGMA_SELFTEST_NRHS=<k>.
+  if (const char* e = std::getenv("SAIGE_MULTISIGMA_SELFTEST")) {
+    const int P_test = std::max(1, std::atoi(e));
+    const char* e2 = std::getenv("SAIGE_MULTISIGMA_SELFTEST_NRHS");
+    const int nrhs  = e2 ? std::max(1, std::atoi(e2)) : 2;
+    runMultiSigmaSelfTest(P_test, nrhs, cfg.maxiterPCG,
+                          static_cast<float>(cfg.tolPCG));
+  }
   return 0;
 }
