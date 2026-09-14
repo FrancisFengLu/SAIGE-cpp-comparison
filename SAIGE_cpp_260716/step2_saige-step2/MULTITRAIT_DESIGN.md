@@ -17,7 +17,7 @@
 
 | 记号 | 含义 |
 |---|---|
-| `N` | 样本数（所有 trait 共享，见 §4.3） |
+| `N` | 样本数（样本集相同时所有 trait 共享；不同时是并集大小，见 §4.7） |
 | `P` | trait 数 |
 | `p_t` | trait t 的协变量数（含截距），**允许各 trait 不同** |
 | `Σp` | `Σ_t p_t` |
@@ -47,9 +47,10 @@ P=64 → 6.4 GB 内存流量；拼成一个 GEMM 后 `Gb` 只读一遍，加上 
    已经 R-free。R 包侧为了脱 `Rcpp::List` 花掉的那个 commit 这里**不需要**。
 2. 不需要「全或无」门控。R 侧的 gate 是运行时整体开关；这里改成**静态 per-trait 划分**（§3.1），
    一个 trait 是否走批量在 marker 循环开始前就定死。
-3. 不需要复刻 altFreq/altCounts 的翻转侧 quirk。要求全 trait 同样本集（§4.3），
-   于是 flip / altFreq / altCounts / MAC / MAF / missingRate 全是 marker 级共享量，
+3. 不需要复刻 altFreq/altCounts 的翻转侧 quirk。样本集相同时（§4.3）
+   flip / altFreq / altCounts / MAC / MAF / missingRate 全是 marker 级共享量，
    直接沿用主干 `imputeGenoAndFlip` 翻回后的 ALT 侧值，一份输出一套 flip 约定。
+   样本集不同时（§4.7）这些量逐表型、用单表型的同一组表达式重算，仍是一套 flip 约定。
 
 ---
 
@@ -504,7 +505,7 @@ models:
 # 可选，MT 专用
 mtBlockSize: 0          # 0 = 自适应（§6.3）
 mtMemBudgetGB: 8        # 块缓冲的总预算（所有线程合计）
-mtRequireSameSamples: true   # false 目前会直接报错，占位给 Phase 6
+mtRequireSameSamples: false  # 默认 false：允许不同样本集（§4.7）；true = 不同就报错
 ```
 
 **校验：** `models` 与三个标量 key 互斥（同时出现 → 报错，别猜）。
@@ -537,13 +538,13 @@ for i in 0..P-1:
 
 | 检查 | 不通过怎么办 |
 |---|---|
-| `sampleIDs` 完全相同（**内容和顺序都要**） | **硬报错**。Phase ≤5 不支持子集 trait。 |
-| `n` 相同 | 硬报错（由上一条蕴含，但显式查一遍便于定位） |
+| `sampleIDs` 完全相同（**内容和顺序都要**） | 不同 ⇒ 走 §4.7（默认）；`mtRequireSameSamples: true` 时硬报错 |
+| `n` 相同 | sampleIDs 相同而 n 不同 ⇒ 硬报错；sampleIDs 不同时逐模型查 `n == sampleIDs 长度`（§4.7.1） |
 | `traitType` | 允许混合 binary / quantitative；`survival` → 该 trait `batchable=false`（§10） |
 | `p` | **允许不同**，`Σp` 拼接天然支持 |
 | `flagSparseGRM` / `isFastTest` / `isnoadjCov` / `isCondition` | 允许不同，进 `isBatchable()` |
 | `SPA_Cutoff` / `is_Firth_beta` / `pCutoffforFirth` / `pval_cutoff_for_fastTest` | 允许不同，都是 per-trait |
-| `impute_method` | **必须相同**。它是 marker 级 impute 的输入（`g_impute_method`，`main.cpp:85`），不同就没法共享 `Gb` → 硬报错 |
+| `impute_method` | **必须相同**。它是全局 `g_impute_method` 的来源；样本集不同时技术上可逐表型，但未放开 → 硬报错 |
 | `dimNum > 0`（稀疏 GRM） | 允许；该 trait 若 `isBatchable()` 为假就走标量。多个 trait 各带一份 `m_spSigmaMat` 会很占内存，加一条日志警告 |
 | `loco_chroms` 不一致 | **警告，不报错**；见 §4.6 |
 
@@ -564,7 +565,7 @@ Beta/Tstat 乘 `(1-2*flip)`，AF_case/AF_ctrl 在 flip 时取补。一份输出�
 |---|---|---|
 | `main.cpp:4081` | 单次 `loadNullModel` | 循环 P 次 |
 | `main.cpp:4186` | 单次 `setSAIGEobjInCPP`（32 参） | 循环 P 次，结果进 `std::vector<std::unique_ptr<SAIGEClass>>`；`ptr_gSAIGEobj = objs[0].get()` 保留给 region 路径和 `openOutfile_single` 用 |
-| `main.cpp:4235` | `setPLINKobjInCPP(..., nullModel.sampleIDs, ...)` | 传 `nm[0].sampleIDs`（已校验全相同） |
+| `main.cpp:4235` | `setPLINKobjInCPP(..., nullModel.sampleIDs, ...)` | 传 reader 样本表：样本集相同时即 `nm[0].sampleIDs`，不同时是并集（§4.7.2） |
 | `main.cpp:4113-4160` | 标量 YAML 覆盖 | 顶层 + per-model 两级（§4.1） |
 | `main.cpp:4687` | 单次 `openOutfile_single` | P 次，每个 trait 一个 `std::ofstream`；见下 |
 | `main.cpp:4699` | `mainMarkerInCPP(...)` | `P==1` 时不变；否则 `mainMarkerMT(...)` |
@@ -579,8 +580,8 @@ Beta/Tstat 乘 `(1-2*flip)`，AF_case/AF_ctrl 在 flip 时取补。一份输出�
 这样回归门就是最朴素的 `cmp`（§8）。可选的合并长表（多一列 `TraitID`）留到 Phase 5，
 不要在 Phase 1-4 里引入。
 
-因为 QC 是 marker 级的、全 trait 共享，P 个文件的**行集合逐行相同**，
-比对时不用对齐。
+样本集相同时 QC 是 marker 级的、全 trait 共享，P 个文件的**行集合逐行相同**，
+比对时不用对齐。样本集不同时 QC 逐表型（§4.7.3），行集合可以不同。
 
 ### 4.5 启动时打印的门控表
 
@@ -627,6 +628,141 @@ Beta/Tstat 乘 `(1-2*flip)`，AF_case/AF_ctrl 在 flip 时取补。一份输出�
 Phase 1 的先决条件之一是补它的 LOCO 支持（写出 `chr<N>/` 子目录的那 10 个 stem）；
 在补上之前，LOCO 只做「加载路径」的单元检查（P 个模型各自读对了目录、混合状态告警正确），
 不做数值对比。
+
+### 4.7 不同样本集（每个模型拟合在自己的样本上）
+
+**状态：已实现（PLINK），2026-09-14。** 真实 biobank 里每个表型缺失的人不同，
+§4.3 原来的「sampleIDs 必须逐位相同」让多表型在真实数据上基本用不上；取交集不可接受
+（`mid.indep16`：16 个表型各缺 5%，交集只剩 44.1%）。
+
+**不变量：每个表型的输出 == 该模型单独跑（P=1）的输出。** 验收口径是逐字节 `cmp`，
+与 §8 的其余门一致。
+
+#### 4.7.1 配置与校验
+
+- 不同样本集**默认允许**。`mtRequireSameSamples: true` 把「任一模型的 sampleIDs 与
+  models[0] 不逐位相同」变回硬报错（给期望样本集一致、不一致就说明上游出错的流水线用）。
+- `validateMTModels` 返回 `differ`。`differ` 时额外要求：每个模型 `sampleIDs` 非空、
+  长度 == `n`、无重复 ID；`mainMarkerMT` 再要求 `m_n`（= `y.arma` 行数）== `sampleIDs` 长度。
+  `impute_method` 仍须一致（与样本集无关，保持原检查）。
+- `differ` 时**明确报错**的组合：
+  - `genoType` 不是 `plink`（BGEN/VCF/PGEN 读取器在 reader 样本序上做浮点累加，
+    逐表型复刻没做，见 4.7.6）；
+  - 条件分析（`assign_conditionMarkers_factors` 按 reader 样本数读条件位点）；
+  - region / group / LD 矩阵：P>1 本来就报错（§10），不变。
+- 样本集全部相同时 `differ = false`，走的是原来那条路，一个分支都不多（4.7.5）。
+
+#### 4.7.2 并集与下标
+
+- 并集 = R `ReadModel_multiTrait` 的 `union_vector`：按 config 顺序把各模型的 `sampleIDs`
+  拼起来、首次出现者保留（`mtUnionSampleIDs`）。PLINK reader 只按并集建一次。
+- 每个 trait 一个 `MTTraitSamples`：`sameAsUnion`（sampleIDs 与并集**逐位**相同）、
+  `pos[k]`（该 trait 第 k 个样本在并集里的下标，trait 自己的顺序）、
+  `comp`（并集里不属于该 trait 的下标）。
+- 所有 stack（`Xstack/Astack/WXstack/RES/MU2bin`）按并集长度建，trait 的第 k 行放在
+  `pos[k]`，**其余行是精确的 0**。于是任何「stack 列 × 并集长度的基因型列」内积
+  只会收集到该 trait 自己的样本。`sameAsUnion` 的 trait 直接整列赋值，与原来逐字节相同。
+
+#### 4.7.3 逐表型的 marker 统计（全部复用单表型的表达式）
+
+共享的只有「读盘 + 并集样本的 2-bit code」（`copyFusedCodes_ts`，每样本 1 字节）。
+对每个 trait：
+
+| 量 | 算法 | 为什么与单独跑逐位相同 |
+|---|---|---|
+| code 计数 `counts[4]` | 并集计数减去 `comp` 上的 code；trait 小于并集一半时直接在 `pos` 上数 | 整数 |
+| 缺失前 altFreq / altCounts / missingRate / info | `PlinkClass::fusedPreStatsFromCounts(fs, n_t)`——从 Stage A 里**原样搬出**的函数，Stage A 自己也改为调它 | 同一函数、同一输入 |
+| 前置 QC（maxMissRate/minMAF/minMAC/minINFO） | `mainMarkerInCPP` 的表达式，`n = m_n` | 同一表达式 |
+| flip、填充值、dosage-zeroing 闸、code→dosage 表 `fd[4]`、缺失后 altFreq/altCounts | `finalizeFusedStats(fs_t, ...)` | 同一纯函数 |
+| `SAIGE_STEP2_SCALAR_DECODE=1` 时的 altCounts | 物化 trait 自己的向量后 `arma::sum`（与 `imputeGenoAndFlip` 相同） | 同值同序 |
+| 后置 QC、MAC、VR、ER 判定、`fastRecomputeSameCtx`、`g_firthDefer` | 用该 trait 的 MAC | 同一表达式 |
+| trait 看到的基因型 `g_t[k]` | `fd_t[code[pos[k]]]` | 单表型的 Stage C 写的就是 `fd[code]` |
+| `indexZero/indexNonZero` | 由物化的 `g_t` 按 `==0` 升序重建 | 两个生产者的定义 |
+| AF_case / AF_ctrl / hom/het 计数 | 沿 `m_case_indices` 顺序累加 `fd_t[code[pos[case_idx[k]]]]` | 同值同序 |
+| 输出的 AC/AF/MissingRate | 逐表型写（`MTTraitChunk` 里改为 per-trait 列） | — |
+
+QC 逐表型 ⇒ **不同表型文件的行集合可以不同**（§4.4 里「P 个文件行集合逐行相同」只在
+样本集相同时成立）。
+
+#### 4.7.4 共享解码下的批量核：并集列 + 精确仿射修正
+
+块里的基因型列 `g` 是**并集自己的**列：`fd_u[code]`，`fd_u` 是「单表型跑在恰好并集这些样本上」
+会用的表（同一 `finalizeFusedStats`）。对 trait t，在它的样本上逐元素精确成立
+
+```
+g_t = a·g + b + d·[该格是缺失基因型]
+  a = +1, b = 0   （t 与并集的 flip 相同）
+  a = -1, b = 2   （flip 相反，2−G）
+  d = fd_t[MISS] − (a·fd_u[MISS] + b)      （两边的填充值之差）
+```
+
+前提是三个非缺失 code 上 `fd_t[c] == a·fd_u[c] + b` 精确成立（0/1/2 是整数，默认
+`dosage_zerod_cutoff=0.2` 下只有填充值会被清零，所以恒成立）。不成立的 (marker, trait)
+（例如 `dosage_zerod_cutoff ≥ 1` 把 1 清零）**不进批量**，走逐对标量路径。
+
+批量核的全部输入都是 g 的线性或二次式，于是逐项精确映射（`scoreTestBatchMT` 的 adj 分支）：
+
+```
+L(g_t)   = a·L(g) + b·L(1_t) + d·L(e_miss)            L ∈ {Aᵀ, (mu2∘X)ᵀ 或 Xᵀ, resᵀ}
+Q_v(g_t) = Q_v(g) + 2ab·L_v(g) + b²·Σ_t v + q·Σ_miss v   v = mu2_t（binary）/ 1_t（quantitative）
+q        = fd_t[MISS]² − (a·fd_u[MISS] + b)²
+```
+
+- `L(1_t)`、`Σ_t v`：per-trait 常量，建 context 时算一次（`sumA/sumW/sumR/sumM`）。
+- `L(e_miss)`、`Σ_miss v`：对每个块列，把 stack 在该列缺失格那几行上求和（`MissA/MissW/MissR/MissMu2/MissMask`）。
+  stack 在 trait 之外为 0，所以对并集的全部缺失格求和即得该 trait 自己的缺失格之和。
+- `L_v(g)`：只有块里出现 flip 相反的对时才做的额外 GEMM（binary `Gbᵀ·MU2bin`，
+  quantitative `Gbᵀ·MASKq`）。
+- quantitative 的 `Σ_t g²` 不能再用 `colsum(Gb2)`：样本集不同的 quantitative trait 用
+  `Gb2ᵀ·MASKq`（`MASKq` 是这些 trait 的 0/1 样本指示列）。
+- 每一项只在不恒为 0 时才加（`flip / shift / miss` 三个开关），所以同块里有哪些别的对
+  不会改变任何一对的结果（G4.1 仍成立，由 `mtBlockSize: 7` 用例验证）。
+- `sameAsUnion` 的 trait 不读任何修正，算术与样本集相同时逐字节一致。
+
+回落对（SPA / Firth / fastTest / ER / 不可批量的 trait / 仿射不成立）：用该 trait 的表从
+code 物化 `g_t`（长度 `n_t`、trait 自己的样本序），重建下标，调**该 trait 的**
+`SAIGEClass::getMarkerPval`——与单表型是同一段代码、同样的输入。
+
+**块列的 hi/lo 分区**：列为 hi ⇔ 存在一个 QC 通过、可批量的 binary trait 其 MAC_t > MACCutoffforER。
+一对 binary 取批量结果仍要求自己的 MAC_t > MACCutoffforER，故 hi 列覆盖所有这类对；
+quantitative 在两类列上都打分。
+
+#### 4.7.5 样本集相同的运行不受影响
+
+`differ == false` 时：读路径、QC、`Gb` 的写入、批量核（`t_adj` 读都不读）、回落与原实现
+逐行相同；唯一的变化是 AC/AF/MissingRate 从共享列拷进 per-trait 列再写出（值相同）。
+`run_mt_correctness.sh` 与 `run_mt_config_tests.sh` 全过即是这一条的验收。
+
+#### 4.7.6 每表型额外开销（相对样本集相同的运行）
+
+记 `N_u` 并集大小，`n_t` trait 样本数，`m_j` 列 j 的缺失格数，`Σp` 各 trait 协变量数之和。
+
+| 项 | 量级 | 何时发生 |
+|---|---|---|
+| code 拷贝 + 并集列填充 + 缺失格扫描 | O(N_u) / marker，与 P 无关 | 每个 marker |
+| per-trait code 计数 | O(min(N_u − n_t, n_t)) / (marker, trait) | 每对 |
+| per-trait 统计、QC、仿射参数、VR | O(1) / 对 | 每对 |
+| 缺失格 stack 行求和 | O(m_j · (2Σp + P + n_bin + n_maskq)) / 列，所有 trait 共享 | 有缺失格的列 |
+| 修正本身 | O(p_t) / 对 | 样本集不同的 trait |
+| quantitative 的 `Gb2ᵀ·MASKq` | N_u·B·n_maskq flop / 块 | 有样本集不同的 quantitative trait |
+| flip 修正的 GEMM | N_u·B·(n_bin 或 n_maskq) flop / 块 | 块内出现 flip 相反的对 |
+| 回落对物化 `g_t` 与下标 | O(n_t) / 回落对（标量路径本身就是 O(n_t)） | 回落对 |
+| AF_case/AF_ctrl | O(n_t) / binary 对，多一层下标间接（原来也是 O(n)） | binary 对 |
+| `SAIGE_STEP2_SCALAR_DECODE=1` | O(n_t) / 对（为了 `arma::sum`） | 仅该回滚开关 |
+| 内存 | 每线程 N_u·B 字节的 code；stack 按 N_u；`MASKq` N_u·n_maskq | — |
+
+即：稳态下每个样本集不同的 trait 的额外开销与「并集中它**没有**的样本数」和
+「该 marker 的缺失基因型数 × p」成正比，不与 n_t 成正比（binary 的 AF_case/AF_ctrl 除外，
+那一项样本集相同时也是 O(n)）。本轮未做墙钟测量。
+
+#### 4.7.7 没做的 / 已知限制
+
+- **BGEN / VCF / PGEN**：报错。三个读取器的 altFreq/altCounts/info 是 reader 样本序上的浮点累加
+  （BGEN 还是按文件样本序），`imputeGenoAndFlip` 的 altCount 是 `arma::sum`；
+  逐表型逐位复刻需要保留原始剂量（BGEN 存的是 `2−dosage`，反算不精确）并按各自顺序累加，未做。
+- 条件分析：报错（见 4.7.1）。
+- `impute_method` 仍须各模型一致。
+- 上游 R 多表型分支 `missingRate` 的问题（§9.6）在这里不存在：MissingRate 与 QC 都是逐表型的。
 
 ---
 
@@ -786,9 +922,9 @@ for (chunkStart = 0; chunkStart < q; chunkStart += g_marker_chunksize) {
 }
 ```
 
-**关键点：marker 元数据只存一份。** QC、impute、flip、altFreq/altCounts/missingRate
-全是 marker 级共享量（§4.3 的同样本集前提），不要 ×P。
-这一条让 chunk 缓冲从 21×q×P 降到 10×chunk + 16×chunk×P。
+**关键点：marker 元数据只存一份。** chr/pos/ref/alt/marker 不 ×P。
+altFreq/altCounts/missingRate/imputeInfo 在实现里是 per-trait 的 4 列（样本集不同时它们逐表型，
+§4.7.3；样本集相同时从共享值拷入），chunk 缓冲 = 10×chunk + 20×chunk×P。
 
 `writeOutfile_single` 末尾的 `numtest` 和 Firth 计数现在是**每次调用打印一行**
 （`main.cpp:737-748`）。分块后要改成累加到 per-trait 的计数器，
@@ -1002,8 +1138,8 @@ R 包侧的 `mtb_fb_reentrant` 给 `fast_logistf_fit_simple` 传的是**空 offs
 
 R 侧子集 trait 的 `missingRate` 是错的（`Main.cpp:1310` 那行被注释掉，
 打印和 QC 用的都是 marker 级值）。
-本设计要求同样本集 ⇒ marker 级值就是正确值 ⇒ **这个 bug 在我们的范围内不存在**。
-Phase 6 支持子集 trait 时必须重新面对它。
+样本集相同时 marker 级值就是正确值；样本集不同时（§4.7）MissingRate 与 QC 都逐表型、
+用该 trait 自己的 code 计数算 ⇒ **这个 bug 在我们的实现里不存在**。
 
 ### 9.7 GPU SPA
 
@@ -1024,7 +1160,7 @@ R 包侧有一个 `SAIGE_MT_GPUSPA=1` 的可选层挂在回落段上，
 | **稀疏 GRM 的批量** | var 要 per-marker 解一次 PCG（`getPCG1ofSigmaAndGtilde`），不是固定矩阵的收缩。 | 同上：`isBatchable()` 返回 false，走标量。`isFastTest=true` 的稀疏 GRM trait 仍然能批量（第一趟是稠密路径），只是显著位点走回落重算。 |
 | **conditional analysis 的批量** | 要 per-marker 的 `G1tilde_P_G2tilde` 与 `m_VarInvMat_cond` 修正，表达不成「固定 per-trait 矩阵 × 基因型块」。而且 11 个 `m_*_cond` 成员是 per-trait 的，`assignConditionFactors`（`saige_test.cpp:1650`）要对每个 trait 各跑一次。 | `isBatchable()` 返回 false 走标量；`assign_conditionMarkers_factors`（`main.cpp:400`）改成对每个 `isCondition` 的 trait 各调一次。**这一条 Phase 1 就要做对**，否则条件分析的 MT 运行会用错模型。 |
 | **`isnoadjCov` 的批量** | 另一套公式（不做 X 投影），批量段没写。收益也小（它本来就是快路径）。 | `isBatchable()` 返回 false 走标量。 |
-| **不同样本集的 trait（子集 trait）** | 需要读并集样本 + per-trait gather，会把 §4.3 的红利全部吐回去，还要重新面对 altFreq 翻转侧和 missingRate 两个上游 quirk。 | 配置项 `mtRequireSameSamples`（默认 true）已经占位；设为 false 时目前直接报错。Phase 6 的入口。 |
+| ~~不同样本集的 trait（子集 trait）~~ | **已做，见 §4.7**（PLINK）。BGEN/VCF/PGEN + 不同样本集、条件分析 + 不同样本集仍明确报错。 | `mtRequireSameSamples: true` 恢复「不同即报错」。 |
 | **GxE** | 每个 marker 现搭交互项设计矩阵，X 随 marker 变 ⇒ 「X 与 marker 无关」这个前提直接失效，per-trait 缓存和 stack 都不成立。主干目前也没有 GxE。 | 无。将来若加 GxE，它与 MT 批量互斥。 |
 | **降精度** | 全程 double，数值口径对 R。 | 无。这一条不许放宽。 |
 
