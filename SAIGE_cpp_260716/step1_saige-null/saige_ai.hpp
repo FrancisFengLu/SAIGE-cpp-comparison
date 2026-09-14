@@ -63,6 +63,17 @@ CoefficientsOut getCoefficients_cpp(const arma::fvec& Y,
                                     const arma::fvec& tau,
                                     int maxiterPCG, float tolPCG);
 
+// The purely local tail of getCoefficients_cpp: everything after the PCG
+// solves (cov, alpha, eta). Split out so the lockstep multi-phenotype driver,
+// which gets all P traits' Sigma_iY / Sigma_iX back from ONE batched solve,
+// finishes each trait through exactly the same arithmetic as the scalar path.
+CoefficientsOut finishCoefficients_cpp(const arma::fvec& Y,
+                                       const arma::fmat& X,
+                                       const arma::fvec& w,
+                                       const arma::fvec& tau,
+                                       const arma::fvec& Sigma_iY,
+                                       const arma::fmat& Sigma_iX);
+
 AIScoreOut      getAIScore_cpp(const arma::fvec& Y,
                                const arma::fmat& X,
                                const arma::fvec& w,

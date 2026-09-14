@@ -79,17 +79,24 @@ CoefficientsOut getCoefficients_cpp(const arma::fvec& Y,
   }
   std::cout << "[DEBUG] All Sigma_iX done" << std::endl << std::flush;
 
+  return finishCoefficients_cpp(Y, X, w, tau, Sigma_iY, Sigma_iX);
+}
+
+CoefficientsOut finishCoefficients_cpp(const arma::fvec& Y,
+                                       const arma::fmat& X,
+                                       const arma::fvec& w,
+                                       const arma::fvec& tau,
+                                       const arma::fvec& Sigma_iY,
+                                       const arma::fmat& Sigma_iX)
+{
   // cov = (X' Σ^{-1} X)^{-1} with PSD fallback
   arma::fmat cov = inv_psd_or_pinv(X.t() * Sigma_iX);
-  std::cout << "[DEBUG] cov done" << std::endl << std::flush;
 
   // alpha = cov * X' Σ^{-1} Y
   arma::fvec alpha = cov * (Sigma_iX.t() * Y);
-  std::cout << "[DEBUG] alpha done" << std::endl << std::flush;
 
   // eta = Y - τ0 * (Σ^{-1}Y - Σ^{-1}X α) ./ w
   arma::fvec eta = Y - tau(0) * (Sigma_iY - Sigma_iX * alpha) / w;
-  std::cout << "[DEBUG] eta done, returning from getCoefficients_cpp" << std::endl << std::flush;
 
   return {Sigma_iY, Sigma_iX, cov, alpha, eta};
 }

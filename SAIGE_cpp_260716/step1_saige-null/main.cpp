@@ -253,6 +253,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("vr_max_mac")) c.vr_max_mac = get("vr_max_mac").as<int>();
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
+  if (get("multi_lockstep")) c.multi_lockstep = get("multi_lockstep").as<bool>();
   if (get("use_blocked_gemv")) c.use_blocked_gemv = get("use_blocked_gemv").as<bool>();
   if (get("gemv_block_size")) c.gemv_block_size = get("gemv_block_size").as<int>();
   if (get("gemv_verify")) c.gemv_verify = get("gemv_verify").as<bool>();
@@ -1868,6 +1869,35 @@ int main(int argc, char** argv) {
   // state across traits: the VR marker order is a fresh std::mt19937(200) and
   // the Hutchinson probe stream is re-seeded on every GetTrace/GetTrace_q entry,
   // so trait k's numbers do not depend on traits 0..k-1 having run first.
+  // ------------------ Tier-2: lockstep the P AI-REML loops -----------------
+  // fit.multi_lockstep advances all P traits' AI-REML iterations together so
+  // the fixed-effect PCG solves of every still-active trait are issued as ONE
+  // batched multi-Sigma solve. Off by default: it is not bit-identical to the
+  // per-trait path (psi*B reduces in a different order), and tier-1's
+  // "a P>1 run reproduces each solo run exactly" property is worth keeping as
+  // the default.
+  const bool use_lockstep = (cfg.multi_lockstep && models.size() > 1);
+  std::vector<FitNullResult> lockstep_fits;
+  if (use_lockstep) {
+    std::cout << "\n" << std::string(70, '#') << "\n";
+    std::cout << "### lockstep multi-phenotype fit: P=" << models.size() << "\n";
+    std::cout << std::string(70, '#') << "\n";
+    std::vector<Paths> mpaths_all(models.size(), paths);
+    for (size_t mi = 0; mi < models.size(); ++mi) {
+      mpaths_all[mi].out_prefix    = models[mi].out_prefix;
+      mpaths_all[mi].out_prefix_vr = models[mi].out_prefix_vr;
+    }
+    auto T_all = std::chrono::steady_clock::now();
+    lockstep_fits = saige::fit_null_multi(cfg, mpaths_all, designs);
+    auto t = std::chrono::steady_clock::now();
+    const double s = std::chrono::duration<double>(t - T_all).count();
+    printf("[TIMER-MAIN] lockstep fit_null_multi P=%zu %8.2fs (%.2fs/trait)\n",
+           models.size(), s, s / (double)models.size());
+  } else if (cfg.multi_lockstep) {
+    std::cout << "[multi-pheno] fit.multi_lockstep requested with P=1 — "
+                 "nothing to lockstep, using the per-trait path.\n";
+  }
+
   for (size_t mi = 0; mi < models.size(); ++mi) {
     const auto& m = models[mi];
     Paths mpaths = paths;
@@ -1882,7 +1912,8 @@ int main(int argc, char** argv) {
     }
     auto T_ph = std::chrono::steady_clock::now();
 
-    FitNullResult out = saige::fit_null(cfg, mpaths, designs[mi]);
+    FitNullResult out = use_lockstep ? std::move(lockstep_fits[mi])
+                                     : saige::fit_null(cfg, mpaths, designs[mi]);
 
     // ------------------ Output GRM diagonal (after fit_null, same as R version) ------------------
     output_grm_diagonal(mpaths.out_prefix + ".grm_diag.txt");

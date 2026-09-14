@@ -1526,6 +1526,373 @@ FitNullResult quant_glmm_solver(const Paths& paths,
   return out;
 }
 
+
+// ===========================================================================
+// Tier-2: lockstep multi-phenotype AI-REML driver.
+//
+// P traits, one genotype object, one GRM. Each trait keeps its OWN Sigma_p =
+// tau0_p*diag(1/w_p) + tau1_p*psi, so nothing about the linear algebra can be
+// shared except the psi*B product itself. That product is also where all the
+// cost is: the packed 2-bit kernel re-reads the whole matrix per 8-column
+// block (tools/gpu_matvec/gemv2bit.cu GMC_NCMAX), so P traits x (1+q) columns
+// cost ceil(P*(1+q)/8) passes instead of P*(1+q) passes.
+//
+// Which pieces are batched, and which are deliberately not:
+//   BATCHED   the fixed-effect solve. Every active trait contributes its
+//             [Y_p | X_p] block to one getPCGofSigmaAndMatrix_multiSigma call.
+//             This is the hot one: the inner IRLS loop runs it on every
+//             iteration of every outer AI-REML iteration.
+//   NOT       the AI score / Hutchinson trace. A single trait's probe block is
+//             already nrun=30 columns = 4 kernel passes, so cross-trait
+//             batching buys almost nothing there, and psi*U is already cached
+//             across iterations and traits by
+//             getCrossprodMatAndKinMat_traceCached.
+//   NOT       the final Get_Coef re-solve. Traits reach it at different outer
+//             iterations; each one runs it alone on the scalar path.
+//
+// Per-trait arithmetic is the scalar driver's, statement for statement. The
+// only numerical difference from fitting a trait alone is the association
+// order inside psi*B (batched kernel vs single-column kernel) — the same
+// difference the trace and variance-ratio block paths already carry.
+// ===========================================================================
+
+namespace {
+
+struct TraitState {
+  // fixed inputs
+  arma::fmat X;
+  arma::fvec y, offset, beta_init;
+  int n{0}, p{0};
+
+  // running state (the scalar driver's locals)
+  arma::fvec eta, mu, mu_eta, W, Y;
+  arma::fvec tau{arma::fvec(2)}, tau_prev{arma::fvec(2)};
+  arma::fvec alpha0_outer, alpha_outer_prev;
+  CoefficientsOut coef;
+
+  bool active{true};        // still in the outer AI-REML batch
+  bool inner_active{true};  // still in this outer iteration's IRLS batch
+
+  FitNullResult out;
+  bool finalized{false};
+};
+
+// One lockstep fixed-effect solve for every trait in `idx`.
+// Returns the N x sum(1+p_t) solution block; colStart[t] is where trait
+// idx[t]'s block begins.
+static arma::fmat multi_coef_solve(std::vector<TraitState>& T,
+                                   const std::vector<int>& idx,
+                                   std::vector<arma::uword>& colStart,
+                                   int maxiterPCG, float tolPCG,
+                                   arma::ivec& itersOut)
+{
+  const arma::uword N  = T[idx[0]].y.n_elem;
+  const arma::uword Pa = (arma::uword)idx.size();
+
+  // Only the participating traits go into Wmat/tauMat, so the per-phenotype
+  // Jacobi preconditioner is built for those and no others.
+  arma::fmat Wmat(N, Pa);
+  arma::fmat tauMat(2, Pa);
+  colStart.assign(idx.size(), 0);
+  arma::uword k = 0;
+  for (size_t t = 0; t < idx.size(); ++t) {
+    TraitState& s = T[idx[t]];
+    Wmat.col(t)   = s.W;
+    tauMat(0, t)  = s.tau(0);
+    tauMat(1, t)  = s.tau(1);
+    colStart[t]   = k;
+    k += 1 + (arma::uword)s.X.n_cols;
+  }
+
+  arma::fmat  B(N, k);
+  arma::uvec  phenoInd(k);
+  for (size_t t = 0; t < idx.size(); ++t) {
+    TraitState& s  = T[idx[t]];
+    const arma::uword c0 = colStart[t];
+    B.col(c0) = s.Y;                                  // the working response
+    if (s.X.n_cols > 0)
+      B.cols(c0 + 1, c0 + s.X.n_cols) = s.X;          // then the covariates
+    for (arma::uword j = 0; j <= (arma::uword)s.X.n_cols; ++j)
+      phenoInd(c0 + j) = (arma::uword)t;
+  }
+
+  return ::getPCGofSigmaAndMatrix_multiSigma(Wmat, tauMat, B, phenoInd,
+                                           maxiterPCG, tolPCG, &itersOut);
+}
+
+} // anonymous namespace
+
+std::vector<FitNullResult>
+multi_glmm_solver(const std::vector<Paths>& paths,
+                  const FitNullConfig& cfg,
+                  const std::vector<const Design*>& designs,
+                  const std::vector<const std::vector<double>*>& offsets,
+                  const std::vector<const std::vector<double>*>& beta_inits,
+                  bool is_binary)
+{
+  const int P = static_cast<int>(designs.size());
+  if (P <= 0) throw std::runtime_error("multi_glmm_solver: no phenotypes");
+  if ((int)paths.size() != P || (int)offsets.size() != P || (int)beta_inits.size() != P)
+    throw std::runtime_error("multi_glmm_solver: input vectors have different lengths");
+
+  const int   maxiter    = std::max(5, cfg.maxiter);
+  const float tol_coef   = static_cast<float>(std::max(1e-6, cfg.tol));
+  const int   maxiterPCG = cfg.maxiterPCG > 0 ? cfg.maxiterPCG : 500;
+  const float tolPCG     = cfg.tolPCG > 0.0 ? static_cast<float>(cfg.tolPCG) : 1e-5f;
+  const int   nrun       = cfg.nrun > 0 ? cfg.nrun : 30;
+  const float trace_cut  = cfg.traceCVcutoff > 0.0 ? static_cast<float>(cfg.traceCVcutoff) : 0.1f;
+  // The quantitative driver's final Get_Coef does NOT pass tol.coef, so R's
+  // default 0.1 applies; the binary driver passes tol.coef = tol.
+  const float tol_coef_final = is_binary ? tol_coef : 0.1f;
+
+  std::vector<TraitState> T(P);
+  for (int p = 0; p < P; ++p) {
+    const Design& d = *designs[p];
+    TraitState& s = T[p];
+    s.n = d.n; s.p = d.p;
+    if (p > 0 && s.n != T[0].n)
+      throw std::runtime_error("multi_glmm_solver: all traits must share n "
+                               "(one genotype object, one GRM)");
+    s.X         = (d.p > 0) ? map_X_row_major_to_fmat(d) : arma::fmat(d.n, 0);
+    s.y         = map_y(d);
+    s.offset    = map_offset(d, *offsets[p]);
+    s.beta_init = map_beta_init(d, *beta_inits[p]);
+    s.eta       = (d.p > 0) ? (s.X * s.beta_init + s.offset) : s.offset;
+    s.tau.set_size(2); s.tau(0) = 1.0f; s.tau(1) = 0.0f;   // R's initial value
+    s.tau_prev = s.tau;
+    s.alpha_outer_prev = arma::conv_to<arma::fvec>::from(s.beta_init);
+  }
+
+  std::cout << "\n[lockstep] multi-phenotype AI-REML: P=" << P
+            << " traits, n=" << T[0].n
+            << ", trait=" << (is_binary ? "binary" : "quantitative")
+            << ", maxiter=" << maxiter << ", tol=" << tol_coef << "\n";
+
+  // Finalize one trait exactly the way the scalar driver's exit paths do:
+  // the unconditional final Get_Coef at the final tau (R:967 binary /
+  // R:963 quantitative), then build the score-null from ITS refreshed mu.
+  auto finalize = [&](int p, bool converged, int iterations) {
+    TraitState& s = T[p];
+    GetCoefOut fc = run_get_coef(s.y, s.X, s.tau, s.offset, s.alpha_outer_prev,
+                                 s.eta, is_binary, maxiter, maxiterPCG,
+                                 tolPCG, tol_coef_final);
+    s.coef       = fc.coef;
+    s.coef.alpha = fc.alpha;
+    s.eta = fc.eta; s.mu = fc.mu; s.W = fc.W; s.Y = fc.Y;
+
+    arma::fvec mu_final = fc.mu;
+    ScoreNull sn;
+    if (is_binary) {
+      sn = saige::build_score_null_binary(s.X, s.y, mu_final);
+    } else {
+      float tau0_inv = (s.tau(0) > 0.0f) ? 1.0f / s.tau(0) : 0.0f;
+      sn = saige::build_score_null_quant(s.X, s.y, mu_final, tau0_inv);
+    }
+
+    FitNullResult& out = s.out;
+    out.alpha  = std::vector<double>(s.coef.alpha.begin(), s.coef.alpha.end());
+    out.theta  = {static_cast<double>(s.tau(0)), static_cast<double>(s.tau(1))};
+    out.offset = *offsets[p];
+    stash_score_null_into(out, sn, s.n, s.p);
+    stash_eta_mu_into(out, s.eta, mu_final);
+    out.converged  = converged;
+    out.iterations = iterations;
+    export_score_null_json(paths[p], out);
+
+    s.active = false;
+    s.finalized = true;
+    std::cout << "[lockstep] trait " << p << " DONE: tau=[" << s.tau(0) << ", "
+              << s.tau(1) << "]  converged=" << (converged ? "true" : "false")
+              << "  iterations=" << iterations
+              << "  final Get_Coef iters=" << fc.iters << "\n";
+  };
+
+  int it = 0;
+  for (; it < maxiter; ++it) {
+    std::vector<int> outer_idx;
+    for (int p = 0; p < P; ++p) if (T[p].active) outer_idx.push_back(p);
+    if (outer_idx.empty()) break;
+
+    std::cout << "\n[lockstep] ===== outer iteration " << it << ": "
+              << outer_idx.size() << "/" << P << " traits active =====\n";
+
+    // ---------------- inner IRLS, lockstep over the active traits ----------
+    for (int p : outer_idx) {
+      T[p].alpha0_outer = T[p].alpha_outer_prev;   // R compares against the
+      T[p].inner_active = true;                    // PREVIOUS outer alpha
+    }
+
+    for (int inner_it = 0; inner_it < maxiter; ++inner_it) {
+      std::vector<int> idx;
+      for (int p : outer_idx) if (T[p].inner_active) idx.push_back(p);
+      if (idx.empty()) break;
+
+      for (int p : idx) {
+        TraitState& s = T[p];
+        if (is_binary) irls_binary_build  (s.eta, s.y, s.offset, s.mu, s.mu_eta, s.W, s.Y);
+        else           irls_gaussian_build(s.eta, s.y, s.offset, s.mu, s.mu_eta, s.W, s.Y);
+      }
+
+      std::vector<arma::uword> colStart;
+      arma::ivec pcgIters;
+      arma::fmat S = multi_coef_solve(T, idx, colStart, maxiterPCG, tolPCG, pcgIters);
+
+      std::cout << "[lockstep] it=" << it << " inner=" << inner_it
+                << " coef block: " << idx.size() << " traits, " << S.n_cols
+                << " RHS; PCG iters/col =";
+      for (arma::uword j = 0; j < pcgIters.n_elem; ++j) std::cout << " " << pcgIters(j);
+      std::cout << "\n";
+
+      for (size_t t = 0; t < idx.size(); ++t) {
+        TraitState& s = T[idx[t]];
+        const arma::uword c0 = colStart[t];
+        arma::fvec Sigma_iY = S.col(c0);
+        arma::fmat Sigma_iX(s.y.n_elem, s.X.n_cols);
+        if (s.X.n_cols > 0) Sigma_iX = S.cols(c0 + 1, c0 + s.X.n_cols);
+
+        s.coef = finishCoefficients_cpp(s.Y, s.X, s.W, s.tau, Sigma_iY, Sigma_iX);
+        s.eta  = s.coef.eta + s.offset;
+
+        const double rc = (s.p > 0)
+            ? rel_change_R_style(s.coef.alpha, s.alpha0_outer, tol_coef) : 0.0;
+        if (rc < tol_coef) s.inner_active = false;
+        else               s.alpha0_outer = s.coef.alpha;
+      }
+    }
+
+    // ---------------- per-trait AI-REML step (scalar arithmetic) -----------
+    for (int p : outer_idx) {
+      TraitState& s = T[p];
+      s.alpha_outer_prev = s.coef.alpha;
+
+      // Final IRLS build with the converged eta for this tau iteration.
+      if (is_binary) irls_binary_build  (s.eta, s.y, s.offset, s.mu, s.mu_eta, s.W, s.Y);
+      else           irls_gaussian_build(s.eta, s.y, s.offset, s.mu, s.mu_eta, s.W, s.Y);
+
+      if (is_binary) {
+        auto ai = getAIScore_cpp(s.Y, s.X, s.W, s.tau, s.coef.Sigma_iY,
+                                 s.coef.Sigma_iX, s.coef.cov,
+                                 nrun, maxiterPCG, tolPCG, trace_cut);
+
+        const double score    = static_cast<double>(ai.YPAPY - ai.Trace);
+        const double AI       = std::max(1e-12, static_cast<double>(ai.AI));
+        const double tau0_val = static_cast<double>(s.tau(1));
+        double Dtau, tau1_new;
+        if (it == 0) {   // R SAIGE line 345: conservative first step
+          Dtau     = tau0_val * tau0_val * score / static_cast<double>(s.n);
+          tau1_new = tau0_val + Dtau;
+        } else {
+          Dtau     = score / AI;
+          tau1_new = tau0_val + Dtau;
+        }
+        double step = 1.0;
+        while (tau1_new < 0.0 && step > 1e-10) { step *= 0.5; tau1_new = tau0_val + step * Dtau; }
+        tau1_new = std::max(0.0, tau1_new);
+
+        s.tau_prev = s.tau;
+        s.tau(1)   = static_cast<float>(tau1_new);
+
+        std::cout << "[lockstep] trait " << p << " it=" << it
+                  << " YPAPY=" << ai.YPAPY << " Trace=" << ai.Trace
+                  << " AI=" << AI << " Dtau=" << Dtau
+                  << " tau=[" << s.tau(0) << ", " << s.tau(1) << "]\n";
+
+        // R line 639: if(tau[2] == 0) break -> converged boundary solution.
+        if (it > 0 && s.tau(1) == 0.0f) { finalize(p, true, it + 1); continue; }
+
+        const double rc_tau = rel_change_R_style(s.tau, s.tau_prev, tol_coef);
+        if (it > 0 && rc_tau < tol_coef) { finalize(p, true, it + 1); continue; }
+
+        // R lines 643-646: large variance estimate -> i = maxiter; break
+        const double tau_max_val = static_cast<double>(*std::max_element(s.tau.begin(), s.tau.end()));
+        if (tau_max_val > 1.0 / (tol_coef * tol_coef)) {
+          std::cerr << "[warning] trait " << p << ": large variance estimate ("
+                    << tau_max_val << "), model not converged.\n";
+          finalize(p, false, maxiter);
+          continue;
+        }
+      } else {
+        arma::fmat Xq = s.X; arma::fvec Wq = s.W; arma::fvec tauq = s.tau;
+        arma::fmat covq = s.coef.cov;
+        auto aiq = getAIScore_q_cpp(s.Y, Xq, Wq, tauq, s.coef.Sigma_iY,
+                                    s.coef.Sigma_iX, covq,
+                                    nrun, maxiterPCG, tolPCG, trace_cut);
+
+        const double score0 = static_cast<double>(aiq.YPA0PY - aiq.Trace[0]);
+        const double score1 = static_cast<double>(aiq.YPAPY  - aiq.Trace[1]);
+        arma::fvec tau_new(2);
+
+        if (it == 0) {   // R SAIGE lines 891-892
+          const double t0 = static_cast<double>(s.tau(0));
+          const double t1 = static_cast<double>(s.tau(1));
+          tau_new[0] = static_cast<float>(std::max(0.0, t0 + t0 * t0 * score0 / (double)s.n));
+          tau_new[1] = static_cast<float>(std::max(0.0, t1 + t1 * t1 * score1 / (double)s.n));
+        } else {
+          arma::fvec sc(2);
+          sc[0] = static_cast<float>(score0);
+          sc[1] = static_cast<float>(score1);
+          arma::fmat AI = aiq.AI;
+          if (!AI.is_sympd()) { AI = 0.5f * (AI + AI.t()); }
+          arma::fvec delta = arma::solve(AI, sc, arma::solve_opts::likely_sympd + arma::solve_opts::fast);
+
+          // GMMAT zero-the-boundary-component trick (R fitglmmaiRPCG_q).
+          arma::uvec zeroVec(2);
+          zeroVec[0] = (s.tau(0) < tol_coef) ? 1u : 0u;
+          zeroVec[1] = (s.tau(1) < tol_coef) ? 1u : 0u;
+          auto pin_boundary = [&](arma::fvec& t) {
+            for (int j = 0; j < 2; ++j) if (zeroVec[j] && t[j] < tol_coef) t[j] = 0.0f;
+          };
+          tau_new = s.tau + delta;
+          pin_boundary(tau_new);
+          double step = 1.0;
+          while ((tau_new[0] < 0.0f || tau_new[1] < 0.0f) && step > 1e-10) {
+            step *= 0.5;
+            tau_new = s.tau + static_cast<float>(step) * delta;
+            pin_boundary(tau_new);
+          }
+          if (tau_new[0] < tol_coef) tau_new[0] = 0.0f;
+          if (tau_new[1] < tol_coef) tau_new[1] = 0.0f;
+        }
+
+        s.tau_prev = s.tau;
+        s.tau      = tau_new;
+
+        std::cout << "[lockstep] trait " << p << " it=" << it
+                  << " score=[" << score0 << ", " << score1 << "]"
+                  << " tau=[" << s.tau(0) << ", " << s.tau(1) << "]\n";
+
+        // R line 941: if(tau[1]<=0 | tau[2] <= 0) break
+        if (it > 0 && (s.tau(0) <= 0.0f || s.tau(1) <= 0.0f)) {
+          const bool boundary_ok = (s.tau(0) > 0.0f);
+          if (s.tau(1) < 0.0f) s.tau(1) = 0.0f;
+          finalize(p, boundary_ok, boundary_ok ? (it + 1) : maxiter);
+          continue;
+        }
+
+        const double rc_tau = rel_change_R_style(s.tau, s.tau_prev, tol_coef);
+        if (it > 0 && rc_tau < tol_coef) { finalize(p, true, it + 1); continue; }
+
+        // R lines 947-950
+        const double tau_max_val = static_cast<double>(*std::max_element(s.tau.begin(), s.tau.end()));
+        if (tau_max_val > 1.0 / (tol_coef * tol_coef)) {
+          std::cerr << "[warning] trait " << p << ": large variance estimate ("
+                    << tau_max_val << "), model not converged.\n";
+          finalize(p, false, maxiter);
+          continue;
+        }
+      }
+    }
+  }
+
+  // Anything still active hit maxiter: same fallthrough as the scalar drivers.
+  for (int p = 0; p < P; ++p)
+    if (!T[p].finalized) finalize(p, false, maxiter);
+
+  std::vector<FitNullResult> out(P);
+  for (int p = 0; p < P; ++p) out[p] = std::move(T[p].out);
+  return out;
+}
+
 // ---------- registration ----------
 
 void register_default_solvers() {

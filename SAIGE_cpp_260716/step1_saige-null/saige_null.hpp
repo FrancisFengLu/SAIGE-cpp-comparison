@@ -38,6 +38,16 @@ struct FitNullConfig {
   bool make_sparse_grm_only{false};  // NEW
   bool use_pcg_with_sparse_grm{false};  // false = direct solve (R default), true = PCG
 
+  // Tier-2 multi-phenotype: advance the P AI-REML loops in lockstep so the
+  // fixed-effect PCG solves of all still-active traits go through one batched
+  // multi-Sigma solve. OFF by default because it is not bit-identical to
+  // fitting each trait alone: psi*B in the batched kernel reduces in a
+  // different order than psi*b, so tau lands a few ULP away (the same class of
+  // difference the trace and variance-ratio block paths already carry). Tier-1
+  // (this flag false) keeps the property that a P>1 run reproduces each
+  // trait's solo run byte for byte.
+  bool multi_lockstep{false};
+
   // Convergence / runtime
   double tol{0.02};
   int    maxiter{20};
@@ -231,6 +241,16 @@ struct FitNullResult {
 
 
 // Optional library-level orchestrator (implemented in saige_null.cpp, if you use it)
+// Tier-2 lockstep: fit P phenotypes together. Same per-trait outputs as P
+// separate fit_null() calls, but the P AI-REML loops advance in lockstep so
+// the fixed-effect PCG solves of all still-active traits are issued as ONE
+// batched multi-Sigma solve (one pass of the packed 2-bit matrix per 8-column
+// block instead of one per column). Enabled by fit.multi_lockstep; falls back
+// to the per-trait path for P==1.
+std::vector<FitNullResult> fit_null_multi(const FitNullConfig& cfg,
+                                          const std::vector<Paths>& paths,
+                                          const std::vector<Design>& designs);
+
 FitNullResult fit_null(const FitNullConfig& cfg,
                        const Paths& paths,
                        const Design& design);
