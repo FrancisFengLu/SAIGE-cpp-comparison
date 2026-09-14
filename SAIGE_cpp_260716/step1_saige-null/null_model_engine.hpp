@@ -1,7 +1,14 @@
 #pragma once
+#include <memory>
+#include <vector>
 #include "saige_null.hpp"
 
 namespace saige {
+
+// Opaque per-trait state produced by NullModelEngine::prep() and consumed by
+// solve() / export_result(). Defined in null_model_engine.cpp so this header
+// stays free of Eigen (NullPrep holds the QR map).
+struct NullPrep;
 
 // ======= Solver / LOCO hook signatures =======
 
@@ -60,10 +67,28 @@ public:
   //  - writes a compact model artifact path into FitNullResult
   FitNullResult run(const Design& design);
 
+  // Three-phase form of run():
+  //     auto p = prep(design);
+  //     FitNullResult r = export_result(*p, solve(*p));
+  // is exactly run(design). The split exists so a lockstep multi-phenotype
+  // driver can prep P traits, solve all P together, then export each — see
+  // solve_multi() below.
+  std::shared_ptr<NullPrep> prep(const Design& design);
+  FitNullResult             solve(NullPrep& prep);
+  FitNullResult             export_result(NullPrep& prep, FitNullResult out);
+
 private:
   Paths        paths_;
   FitNullConfig cfg_;
   LocoRanges   chr_;
 };
+
+// Read-only views into a NullPrep, so callers outside null_model_engine.cpp
+// (the lockstep driver) can see what prep() produced without this header
+// having to expose the Eigen-carrying NullPrep definition.
+const Design&              nullprep_design   (const NullPrep&);
+const std::vector<double>& nullprep_offset   (const NullPrep&);
+const std::vector<double>& nullprep_beta_init(const NullPrep&);
+bool                       nullprep_is_binary(const NullPrep&);
 
 } // namespace saige

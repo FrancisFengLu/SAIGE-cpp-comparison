@@ -315,7 +315,42 @@ static std::string default_model_path(const std::string& prefix) {
   return prefix + "/nullmodel.json"; // directory-based: prefix is the model directory
 }
 
+// ===========================================================================
+// run() is split into three phases so that P phenotypes can be prepped, then
+// SOLVED TOGETHER in one lockstep AI-REML driver, then exported one by one:
+//
+//   run(d) == export_result(*p, solve(*p))   with p = prep(d)
+//
+// prep()   : QR / baseline GLM / covariate_offset folding / beta_init seeding.
+//            Touches no GRM and no PCG — pure per-trait setup.
+// solve()  : the registered single-trait GLMM solver (this is the phase the
+//            lockstep multi-trait driver replaces).
+// export_result(): LOCO, QR back-transform, nullmodel.json, obj_noK, .arma.
+//
+// NullPrep carries everything prep() computed that export_result() still needs.
+// It is defined here (not in the header) so the header stays Eigen-free.
+// ===========================================================================
+struct NullPrep {
+  Design              design;       // post-QR / post-covariate_offset design
+  std::vector<double> offset_glmm;  // offset handed to the GLMM solver
+  std::vector<double> beta_init;    // seed handed to the GLMM solver
+  QRMap               qrmap;
+  int                 p_orig{0};    // p BEFORE the QR may have reduced it
+  bool                is_binary{false};
+};
+
+const Design&              nullprep_design   (const NullPrep& p) { return p.design; }
+const std::vector<double>& nullprep_offset   (const NullPrep& p) { return p.offset_glmm; }
+const std::vector<double>& nullprep_beta_init(const NullPrep& p) { return p.beta_init; }
+bool                       nullprep_is_binary(const NullPrep& p) { return p.is_binary; }
+
 FitNullResult NullModelEngine::run(const Design& design_in_const) {
+  std::shared_ptr<NullPrep> p = prep(design_in_const);
+  FitNullResult out = solve(*p);
+  return export_result(*p, std::move(out));
+}
+
+std::shared_ptr<NullPrep> NullModelEngine::prep(const Design& design_in_const) {
   // Make a mutable copy so we can update X if QR transform is used
   Design design_in = design_in_const;
 
@@ -602,46 +637,50 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
                               std::to_string(design_in.n));
   }
 
-  // Warm start is fine to keep as-is
+
+  // beta_init seeding. Hoisted out of the solver dispatch below, where the
+  // binary and quantitative branches computed the SAME vector by the same
+  // three rules (the only difference was one extra log line).
   std::vector<double> beta_init;
   if (design_in.p > 0) {
+    if (cfg_.covariate_offset) {
+      // Intercept-only: use the re-fitted intercept
+      beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
+    } else if (cfg_.covariate_qr && qrmap.valid) {
+      beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
+      if (!is_binary)
+        std::cout << "[QR] Using glm.beta (QR space) as beta_init for GLMM solver\n";
+    } else {
       beta_init.assign(beta_cov.data(), beta_cov.data() + beta_cov.size());
+    }
   }
 
-  // --- Call GLMM solver via hooks (you plug in your existing C++ kernels) ---
+  auto prep_out = std::make_shared<NullPrep>();
+  prep_out->design      = std::move(design_in);
+  prep_out->offset_glmm = std::move(offset_glmm);
+  prep_out->beta_init   = std::move(beta_init);
+  prep_out->qrmap       = qrmap;
+  prep_out->p_orig      = p_orig;
+  prep_out->is_binary   = is_binary;
+  return prep_out;
+}
+
+// --- Call GLMM solver via hooks (you plug in your existing C++ kernels) ---
+FitNullResult NullModelEngine::solve(NullPrep& prep_in) {
+  Design& design_in                 = prep_in.design;
+  std::vector<double>& offset_glmm  = prep_in.offset_glmm;
+  std::vector<double>& beta_init    = prep_in.beta_init;
+
   FitNullResult out;
-  if (is_binary) {
+  if (prep_in.is_binary) {
     if (!g_binary_solver) {
       throw std::runtime_error("Binary/survival GLMM solver not registered. Call register_binary_solver().");
     }
-    std::vector<double> beta_init;
-    if (design_in.p > 0) {
-      if (cfg_.covariate_offset) {
-        // Intercept-only: use the re-fitted intercept
-        beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
-      } else if (cfg_.covariate_qr && qrmap.valid) {
-        beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
-      } else {
-        beta_init.assign(beta_cov.data(), beta_cov.data() + beta_cov.size());
-      }
-    }
-
     out = g_binary_solver(paths_, cfg_, design_in, offset_glmm, beta_init);
     log("glmm solver Called-b") ;
   } else {
     if (!g_quant_solver) {
       throw std::runtime_error("Quantitative GLMM solver not registered. Call register_quant_solver().");
-    }
-    std::vector<double> beta_init;
-    if (design_in.p > 0) {
-      if (cfg_.covariate_offset) {
-        beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
-      } else if (cfg_.covariate_qr && qrmap.valid) {
-        beta_init.assign(glm.beta.data(), glm.beta.data() + glm.beta.size());
-        std::cout << "[QR] Using glm.beta (QR space) as beta_init for GLMM solver\n";
-      } else {
-        beta_init.assign(beta_cov.data(), beta_cov.data() + beta_cov.size());
-      }
     }
     std::cout << "[DEBUG] Before quant_solver: design_in.p=" << design_in.p
               << " design_in.X.size()=" << design_in.X.size()
@@ -653,6 +692,16 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
   // debug
   log("glmm solver Called") ;
   //
+  return out;
+}
+
+FitNullResult NullModelEngine::export_result(NullPrep& prep_in, FitNullResult out) {
+  Design& design_in                = prep_in.design;
+  std::vector<double>& offset_glmm = prep_in.offset_glmm;
+  const QRMap& qrmap               = prep_in.qrmap;
+  const int  p_orig                = prep_in.p_orig;
+  const bool is_binary             = prep_in.is_binary;
+
 
   // --- LOCO batch -----------------------------------------------------------
   // Runs BEFORE the QR back-transform below, because Get_Coef_LOCO must solve in
@@ -920,5 +969,6 @@ FitNullResult NullModelEngine::run(const Design& design_in_const) {
 
   return out;
 }
+
 
 } // namespace saige
