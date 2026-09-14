@@ -896,15 +896,21 @@ static void design_take_rows(Design& d, const std::vector<size_t>& keep) {
   take_vec(d.offset);
   take_vec(d.event_time);
   take_str(d.iid);
-  // X
-  if (d.p>0){
-    arma::mat X(d.n, d.p);
-    for (int i=0;i<d.n;++i)
-      for (int j=0;j<d.p;++j)
-        X(i,j) = d.X[(size_t)i*(size_t)d.p + (size_t)j];
-    arma::mat Xk(n2, d.p);
-    for (int r=0;r<n2;++r) Xk.row(r) = X.row(keep[r]);
-    d.X.assign(Xk.begin(), Xk.end());
+  // X (row-major: d.X[i*p + j]).
+  // BUGFIX: this used to round-trip through an arma::mat and write the result
+  // back with d.X.assign(Xk.begin(), Xk.end()). Armadillo iterators walk
+  // COLUMN-major, so the row-major buffer every other reader assumes was left
+  // transposed whenever p > 1 — silently corrupting the covariates on the two
+  // paths that call this (duplicate-IID removal and the design.whitelist_ids
+  // filter). Copy rows directly instead; apply_row_subset
+  // (preprocess_engine.cpp:379) already did.
+  if (d.p>0 && !d.X.empty()){
+    std::vector<double> X2((size_t)n2 * (size_t)d.p);
+    for (int r=0;r<n2;++r) {
+      const double* src = &d.X[(size_t)keep[r]*(size_t)d.p];
+      std::copy(src, src + d.p, &X2[(size_t)r*(size_t)d.p]);
+    }
+    d.X.swap(X2);
   }
   d.n = n2;
 }
