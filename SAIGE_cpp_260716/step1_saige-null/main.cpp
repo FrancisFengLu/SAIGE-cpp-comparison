@@ -139,7 +139,7 @@ static void yaml_set_dotted(YAML::Node& root,
     YAML::Node next = node[k];
     if (!next || next.IsNull()) {
       node[k] = YAML::Node(YAML::NodeType::Map);
-      next = node[k];
+      next.reset(node[k]);
     } else if (!next.IsMap()) {
       // Don't smash existing non-map nodes when asked to go deeper
       throw std::runtime_error(
@@ -148,7 +148,11 @@ static void yaml_set_dotted(YAML::Node& root,
         (next.IsScalar() ? "a scalar" :
          next.IsSequence()? "a sequence" : "unknown") + ".");
     }
-    node = next;
+    // yaml-cpp: Node::operator= copies the value INTO the node this handle
+    // refers to, while reset() rebinds the handle. With '=' the first step
+    // wrote the child map over root itself, so any nested override such as
+    // '-o fit.nthreads=1' replaced the whole config with the 'fit' map.
+    node.reset(next);
   }
 
   // Set the leaf (this updates only the designated item)
