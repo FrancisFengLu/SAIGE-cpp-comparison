@@ -380,7 +380,13 @@ void buildMTContext(MTContext& t_ctx,
     // identity map and is flagged sameAsUnion; when every trait is, this whole
     // block reduces to the same-sample-set layout that existed before.
     t_ctx.unionIDs = t_unionIDs;
-    t_ctx.N = static_cast<int>(t_unionIDs.size());
+    // Models with no sampleIDs list (hand-built; step 1 and rda_to_arma.R both
+    // write one) give an empty union. validateMTModels only lets that through
+    // when every list is empty and every n agrees, so each trait is the
+    // same-set identity layout at that n -- which is what N was before sample
+    // maps existed. Taking the union's length there would make N zero.
+    t_ctx.N = t_unionIDs.empty() ? t_nms[t_order[0]].n
+                                 : static_cast<int>(t_unionIDs.size());
     t_ctx.samp.assign(P, MTTraitSamples());
     t_ctx.sampleSetsDiffer = false;
     {
