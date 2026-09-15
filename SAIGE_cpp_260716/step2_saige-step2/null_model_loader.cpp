@@ -705,6 +705,44 @@ NullModelData loadNullModel(const std::string & model_dir,
                       << " x " << data.locationMat.n_cols << std::endl;
             std::cout << "  sparseGRM_valueVec: " << data.valueVec.n_elem << " elements" << std::endl;
             std::cout << "  dimNum = " << data.dimNum << std::endl;
+
+            // The two files hold the sparse GRM K itself (step 1 saves the kinship
+            // it read, reindexed to this model's samples). SAIGEClass solves
+            // against Sigma, not K: getPCG1ofSigmaAndGtilde computes
+            // Sigma^{-1} gtilde for var(T). R builds Sigma from K in step 2,
+            // setSparseSigma_new (SAIGE_SPATest_Region.R): values * tau1, then the
+            // diagonal gets + 1/mu2 (binary) or + tau0 (quantitative), using the
+            // (LOCO-swapped) mu of the model being tested. Handing K
+            // over unchanged made var(T) roughly 1/mean(mu2) ~ 4x too large on
+            // every marker that takes the sparse path (all of them under
+            // isFastTest=false).
+            if (data.traitType != "binary" && data.traitType != "quantitative") {
+                throw std::runtime_error(
+                    "flagSparseGRM=true is only supported for binary and quantitative "
+                    "traits in step 2 (traitType=" + data.traitType + ")");
+            }
+            if (data.locationMat.n_rows != 2 ||
+                data.locationMat.n_cols != data.valueVec.n_elem) {
+                throw std::runtime_error(
+                    "sparseGRM_locationMat.arma must be 2 x nnz matching sparseGRM_valueVec.arma");
+            }
+            data.valueVec *= data.tau1;
+            arma::uword nDiag = 0;
+            for (arma::uword k = 0; k < data.valueVec.n_elem; ++k) {
+                const arma::uword r = data.locationMat(0, k);
+                if (r != data.locationMat(1, k)) continue;
+                if (r >= static_cast<arma::uword>(data.n)) {
+                    throw std::runtime_error(
+                        "sparseGRM_locationMat.arma has an index >= n");
+                }
+                data.valueVec(k) += (data.traitType == "binary")
+                                        ? 1.0 / data.mu2(r)
+                                        : data.tau0;
+                ++nDiag;
+            }
+            std::cout << "  sparse Sigma = tau1*K + "
+                      << (data.traitType == "binary" ? "diag(1/mu2)" : "tau0*I")
+                      << " (" << nDiag << " diagonal entries)" << std::endl;
         } else {
             // Do not fall back silently. The old code left flagSparseGRM=true while
             // zeroing dimNum, which is an inconsistent state the rest of the program
