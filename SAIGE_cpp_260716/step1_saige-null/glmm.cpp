@@ -803,14 +803,19 @@ if ((int)W.n_elem != n) throw std::runtime_error("W.n_elem!=n before AI");
       std::cout << "[STANDARD AI-REML] score / AI = " << score << " / " << AI << " = " << Dtau << std::endl;
     }
 
-    // Step halving when tau goes negative (R SAIGE behavior)
-    double step = 1.0;
-    while (tau1_new < 0.0 && step > 1e-10) {
-        step *= 0.5;
-        tau1_new = tau0_val + step * Dtau;
+    // Boundary handling, as R does it:
+    //  - pre-loop step (R/SAIGE_fitGLMM_fast.R:345): tau[2] = max(0, ...).
+    //  - main loop, fitglmmaiRPCG (src/SAIGE_fitGLMM_fast.cpp:5435): tau < tol
+    //    is set to exactly 0 BEFORE its `while (tau < 0)` step halving, so that
+    //    loop never runs for the binary update: any step landing below tol
+    //    (negative or not) gives tau1 = 0, and the R loop then stops on
+    //    `if(tau[2] == 0) break` (R:385, handled below).
+    const double step = 1.0;
+    if (it == 0) {
+      tau1_new = std::max(0.0, tau1_new);
+    } else if (static_cast<float>(tau1_new) < tol_coef) {
+      tau1_new = 0.0;
     }
-    // Final clamp to ensure non-negative
-    tau1_new = std::max(0.0, tau1_new);
 
     // ===== DETAILED DEBUG OUTPUT FOR ITERATION COMPARISON =====
     std::cout << "\n========== C++ ITERATION " << it << " ==========" << std::endl;
@@ -1789,9 +1794,10 @@ multi_glmm_solver(const std::vector<Paths>& paths,
           Dtau     = score / AI;
           tau1_new = tau0_val + Dtau;
         }
-        double step = 1.0;
-        while (tau1_new < 0.0 && step > 1e-10) { step *= 0.5; tau1_new = tau0_val + step * Dtau; }
-        tau1_new = std::max(0.0, tau1_new);
+        // R boundary handling, see binary_glmm_solver: max(0, .) on the
+        // pre-loop step, zero below tol (no step halving) in the main loop.
+        if (it == 0)                                          tau1_new = std::max(0.0, tau1_new);
+        else if (static_cast<float>(tau1_new) < tol_coef)    tau1_new = 0.0;
 
         s.tau_prev = s.tau;
         s.tau(1)   = static_cast<float>(tau1_new);
