@@ -314,7 +314,8 @@ bool locoChromLabelsMatch(const std::string & a, const std::string & b) {
 NullModelData loadNullModel(const std::string & model_dir,
                             const std::string & varianceRatio_file,
                             bool t_LOCO,
-                            const std::string & t_chrom) {
+                            const std::string & t_chrom,
+                            double t_relatednessCutoff) {
 
     NullModelData data;
 
@@ -725,6 +726,40 @@ NullModelData loadNullModel(const std::string & model_dir,
                 data.locationMat.n_cols != data.valueVec.n_elem) {
                 throw std::runtime_error(
                     "sparseGRM_locationMat.arma must be 2 x nnz matching sparseGRM_valueVec.arma");
+            }
+            // R step 2 drops every stored K entry below relatednessCutoff (step-2
+            // CLI --relatednessCutoff, default 0) right after subsetting and
+            // before scaling: setSparseSigma_new, `which(sparseGRM@x <
+            // relatednessCutoff)`. Strictly less, diagonal not exempt, applied to
+            // K (not Sigma). With the default 0 this removes negative kinships.
+            {
+                arma::uword nKeep = 0, nDropDiag = 0;
+                const arma::uword nnz0 = data.valueVec.n_elem;
+                for (arma::uword k = 0; k < nnz0; ++k) {
+                    if (data.valueVec(k) < t_relatednessCutoff) {
+                        if (data.locationMat(0, k) == data.locationMat(1, k)) ++nDropDiag;
+                        continue;
+                    }
+                    if (nKeep != k) {
+                        data.valueVec(nKeep) = data.valueVec(k);
+                        data.locationMat(0, nKeep) = data.locationMat(0, k);
+                        data.locationMat(1, nKeep) = data.locationMat(1, k);
+                    }
+                    ++nKeep;
+                }
+                if (nKeep != nnz0) {
+                    data.valueVec.resize(nKeep);
+                    data.locationMat.resize(2, nKeep);
+                    std::cout << "  Removing " << (nnz0 - nKeep)
+                              << " elements in the sparse GRM < " << t_relatednessCutoff
+                              << " (" << nDropDiag << " on the diagonal)" << std::endl;
+                    if (nDropDiag > 0) {
+                        std::cerr << "WARNING: relatednessCutoff=" << t_relatednessCutoff
+                                  << " removed " << nDropDiag << " diagonal entries of the "
+                                  << "sparse GRM; those samples get no 1/mu2 or tau0 term "
+                                  << "in Sigma." << std::endl;
+                    }
+                }
             }
             data.valueVec *= data.tau1;
             arma::uword nDiag = 0;

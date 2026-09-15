@@ -5304,6 +5304,9 @@ int main(int argc, char* argv[])
         bool useLOCO = config["LOCO"] ? config["LOCO"].as<bool>() : false;
         std::string locoChrom = config["chrom"] ? config["chrom"].as<std::string>() : "";
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
+        // R step 2 --relatednessCutoff (default 0): sparse GRM entries below it
+        // are dropped before Sigma is built (null_model_loader.cpp).
+        double relatednessCutoff = config["relatednessCutoff"] ? config["relatednessCutoff"].as<double>() : 0.0;
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
         // Weights beta parameters (default Beta(1,25))
@@ -5549,7 +5552,7 @@ int main(int argc, char* argv[])
         for (int ti = 0; ti < numTraits; ti++) {
             nms[ti] = loadNullModel(modelSpecs[ti].modelFile,
                                     modelSpecs[ti].varianceRatioFile,
-                                    useLOCO, locoChrom);
+                                    useLOCO, locoChrom, relatednessCutoff);
             const NullModelData& nmi = nms[ti];
             if (numTraits > 1) {
                 std::cout << "  --- [" << ti << "] " << modelSpecs[ti].traitName

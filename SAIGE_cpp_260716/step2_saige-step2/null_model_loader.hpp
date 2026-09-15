@@ -91,10 +91,13 @@ bool locoChromLabelsMatch(const std::string & a, const std::string & b);
 // per-chromosome set (mu, res, V, offset, XV, XVX, XVX_inv, XVX_inv_XV,
 // XXVX_inv, S_a) is overwritten from <model_dir>/chr<t_chrom>/.
 // See LOCO_FORMAT.md and R's readInGLMM.R:78-113.
+// t_relatednessCutoff: sparse GRM entries K_ij < cutoff are dropped before
+// Sigma is built (R step 2 --relatednessCutoff, setSparseSigma_new).
 NullModelData loadNullModel(const std::string & model_dir,
                             const std::string & varianceRatio_file,
                             bool t_LOCO = false,
-                            const std::string & t_chrom = "");
+                            const std::string & t_chrom = "",
+                            double t_relatednessCutoff = 0.0);
 
 // Load a single armadillo vector from binary file
 arma::vec loadArmaVec(const std::string & filepath);
