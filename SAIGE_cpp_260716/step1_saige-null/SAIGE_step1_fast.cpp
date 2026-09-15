@@ -6922,7 +6922,14 @@ void setStartEndIndex(int startIndex, int endIndex, int chromIndex){
   geno.Msub = 0;
   geno.chromIndex = chromIndex;
 
-  for(size_t i=0; i< geno.M; i++){
+  // Loop over alleleFreqVec, not geno.M. geno.M is the BIM row count, while
+  // alleleFreqVec (and startIndex/endIndex) live in the post-QC compacted
+  // marker space, which is shorter whenever any marker fails GRM QC (mid:
+  // 38262 vs 40000), so the old bound read past the end of alleleFreqVec.
+  // Msub is not consumed by any computation (getMsub() callers only store it),
+  // so this changes no output. Same loop exists upstream
+  // (SAIGE_fitGLMM_fast.cpp:5175).
+  for(size_t i=0; i< geno.alleleFreqVec.n_elem; i++){
 	if(i < startIndex || i > endIndex){
   		if(geno.alleleFreqVec[i] >= minMAFtoConstructGRM && geno.alleleFreqVec[i] <= 1-minMAFtoConstructGRM){
       
