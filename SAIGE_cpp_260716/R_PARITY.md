@@ -820,3 +820,49 @@ R-side runs use `conda activate RSAIGE_GPU` with
 holds the knob inventory and the R-flag mapping; `compare_out.py` does the
 column-wise diff (it joins `max_MAF` numerically and counts Inf-vs-finite
 mismatches explicitly, which a bare relative test silently passes).
+
+## 9. Addendum 2026-09-15 — three divergences found after the sparse pipe was connected
+
+All three were C++ implementation errors and are fixed; each fix was checked
+against R SAIGE 1.5.2 on identical inputs. None of them was reachable by the
+comparisons in §7: mid has no marker with MAF < 0.1 (so step 2 never took the
+sparse-Sigma path), and every step-1 configuration there had tau1 well above tol.
+
+| # | Where | What C++ did | What R does | Fix |
+|---|---|---|---|---|
+| S1 | step 2, sparse Sigma (`fdf1c7a`) | used the sparse GRM K itself as Sigma | builds Sigma = tau1*K + diag(1/mu2) (binary) or tau1*K + tau0*I (quant) in step 2 (`setSparseSigma_new`) | build Sigma in `null_model_loader.cpp`; per-marker identical to R after the fix |
+| S2 | step 1, binary AI-REML (`6bfb935`) | kept a tau1 step that landed below tol and halved negative steps | `fitglmmaiRPCG` (`SAIGE_fitGLMM_fast.cpp:5435`) sets tau < tol to 0 before its `while(tau<0)` halving, then `SAIGE_fitGLMM_fast.R:385` breaks on tau[2]==0 | zero tau1 below tol, max(0,.) on the conservative first step, no halving; single-trait and lockstep paths |
+| S3 | step 2, sparse GRM (`9535a41`) | kept every K entry | drops K entries with x < relatednessCutoff after subsetting, before scaling (`SAIGE_SPATest_Region.R:65`); step-2 CLI default 0, so negative kinships are dropped | same filter, new step-2 YAML key `relatednessCutoff` (default 0), applied per model |
+
+**Impact.**
+- S1: every marker on the sparse-Sigma path had its score variance inflated
+  (4.7x binary, 1.2-1.9x quant), pushing p-values toward 1: all markers when
+  isFastTest is false; with isFastTest true, markers with first-pass p < 0.05 and
+  4 < MAC <= 20.5; in region tests every marker with MAC <= 20.5.
+- S2: **not specific to sparse**. Any binary fit (dense CPU/GPU, sparse,
+  lockstep) whose AI-REML step lands below tol=0.02 -- traits with weak or no
+  genetic signal -- ended at a small positive tau1 where R returns 0. Examples:
+  y1 0.00327 vs 0; a weak simulated trait 0.0172 vs 0; mu differed by up to
+  5.5e-3 before the fix, 1.8e-7 after. Traits with clearly positive tau1 were
+  already identical and are byte-identical before/after the fix.
+- S3: with negative kinships in the sparse GRM, variance differed by up to 0.10%
+  and p-values by up to 0.2 log10 units; after the fix out.txt is byte-identical
+  to R (cutoff 0 and 0.3).
+
+**Verification.** Step-1 P=1 byte gate vs `fdf1c7a` (10 configs: dense binary
+GPU, dense quant CPU, LOCO binary CPU+GPU, LOCO quant CPU, sparse direct x3,
+lockstep CPU+GPU) all IDENTICAL -- none reach tau1 < tol. Step 2:
+run_p1_regression 11/0, run_mt_correctness 147/0, run_mt_subset_tests 184/0.
+
+**Left as is, deliberately.**
+- R treats the GRM cutoff three different ways: the step-1 fit uses
+  `drop0(tol=cutoff)` (drops |x| <= cutoff, keeps large negatives), step-1 VR drops
+  nothing, step 2 drops x < cutoff. C++ step 1 ignores the cutoff when reading a
+  GRM file (its `relatedness_cutoff`, default 0.05, only applies when C++ builds
+  the GRM). At R's default cutoff 0 the numbers agree; they differ only when a
+  user passes a non-zero cutoff to step 1 with a GRM containing small or negative
+  entries. Because R is internally inconsistent here, C++ does not copy the
+  step-1 behaviour; revisit if a user needs that exact combination.
+- If the step-2 cutoff exceeds a diagonal value, R (binary) recycles 1/W over the
+  surviving diagonal entries out of position (read from code, not run). C++
+  warns instead of reproducing the misalignment.
