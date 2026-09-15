@@ -36,6 +36,7 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -154,55 +155,39 @@ static void yaml_set_dotted(YAML::Node& root,
   node[parts.back()] = value;
 }
 
-static std::vector<std::string>
-read_column_from_csv(const std::string& csv_path, const std::string& col_name) {
-  std::ifstream f(csv_path);
-  if (!f) throw std::runtime_error("Failed to open design CSV: " + csv_path);
-
-  std::string line;
-  if (!std::getline(f, line)) throw std::runtime_error("Empty design CSV");
-
-  // header -> find column index
-  std::vector<std::string> header;
-  { std::istringstream iss(line); std::string tok;
-    while (std::getline(iss, tok, (line.find('\t') != std::string::npos ? '\t' : ','))) header.push_back(tok);
-  }
-  int idx = -1;
-  for (int i=0;i<(int)header.size();++i) if (header[i] == col_name) { idx = i; break; }
-  if (idx < 0) throw std::runtime_error("Column not found in design CSV: " + col_name);
-
-  // read the values
-  std::vector<std::string> out; out.reserve(1024);
-  char sep = (line.find('\t') != std::string::npos ? '\t' : ',');
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    std::vector<std::string> cells; cells.reserve(header.size());
-    std::string cell; std::istringstream iss2(line);
-    while (std::getline(iss2, cell, sep)) cells.push_back(cell);
-    if ((int)cells.size() <= idx) continue;
-    out.push_back(cells[idx]);
-  }
-  return out;
-}
-
-static std::vector<size_t>
-build_keep_index_from_sex(const std::vector<std::string>& sex_vec, const saige::FitNullConfig& cfg) {
-  std::vector<size_t> keep; keep.reserve(sex_vec.size());
-  const bool do_female = cfg.female_only;
-  const bool do_male   = cfg.male_only;
-
-  for (size_t i=0; i<sex_vec.size(); ++i) {
-    const auto& v = sex_vec[i];
-    if (do_female && v == cfg.female_code) { keep.push_back(i); continue; }
-    if (do_male   && v == cfg.male_code)   { keep.push_back(i); continue; }
-    if (!do_female && !do_male) keep.push_back(i); // nothing requested -> keep all
-  }
-  return keep;
-}
-
 // ------------------ YAML loaders ------------------
 static FitNullConfig load_cfg(const YAML::Node& y) {
   FitNullConfig c;
+
+  // Sex-specific fit (R: sexCol / FemaleOnly / MaleOnly / FemaleCode /
+  // MaleCode). These were declared in FitNullConfig but never parsed, so a
+  // config that set them silently fitted both sexes. Accepted under design:
+  // (next to the other column names and row filters) or under fit:; setting
+  // the same key in both places is an error rather than a silent pick.
+  {
+    const auto sd = y["design"];
+    const auto sf = y["fit"];
+    auto where = [&](const char* k) -> int {
+      const bool in_d = sd && sd.IsMap() && sd[k];
+      const bool in_f = sf && sf.IsMap() && sf[k];
+      if (in_d && in_f)
+        throw std::runtime_error(std::string("config: '") + k +
+                                 "' is set under both design: and fit:; set it in one place");
+      return in_d ? 1 : (in_f ? 2 : 0);
+    };
+    auto str_of = [&](const char* k, std::string& dst) {
+      if (int w = where(k)) dst = trim((w == 1 ? sd[k] : sf[k]).as<std::string>());
+    };
+    auto bool_of = [&](const char* k, bool& dst) {
+      if (int w = where(k)) dst = (w == 1 ? sd[k] : sf[k]).as<bool>();
+    };
+    str_of("sex_col", c.sex_col);
+    bool_of("female_only", c.female_only);
+    bool_of("male_only", c.male_only);
+    str_of("female_code", c.female_code);
+    str_of("male_code", c.male_code);
+  }
+
   const auto f = y["fit"];
   if (!f) return c;
 
@@ -670,16 +655,45 @@ static void drop_low_count_binaries_in_place(Design& d,
   // (optional) you can store xnames in Design if you have a slot
 }
 
+// ------------------ Sex-specific row filter ------------------
+// R (SAIGE_fitGLMM_fast.R:1189-1212): after complete.cases() on the phenotype /
+// covariate / ID columns, FemaleOnly keeps data[which(data[, sexCol] == FemaleCode), ]
+// (MaleOnly likewise), and stops if nothing is left. A missing sex value
+// compares NA and is dropped by which().
+struct SexRowFilter {
+  std::string col;    // design.sex_col
+  std::string code;   // female_code or male_code
+  std::string label;  // "female_only" / "male_only", for messages
+};
+
+// R compares with `==`: fread reads an all-numeric sex column as numbers, so a
+// file cell "1.0" matches the default code "1". Match on the exact string, or
+// numerically when both the cell and the code are plain numbers.
+static bool sex_code_matches(const std::string& v, const std::string& code) {
+  if (is_missing(v)) return false;
+  if (v == code) return true;
+  char* ev = nullptr; char* ec = nullptr;
+  const double a = std::strtod(v.c_str(), &ev);
+  const double b = std::strtod(code.c_str(), &ec);
+  return ev != v.c_str() && *ev == '\0' && ec != code.c_str() && *ec == '\0'
+         && std::isfinite(a) && a == b;
+}
+
 // ------------------ Design CSV/TSV/space parser + categorical encoding ------------------
 // Expected header columns (case-insensitive): <iid_col>, <y_col>, [offset], [time|event_time|eventTime], X...
 // iid_col and y_col default to "IID" and "y" for backward compatibility.
 // Rows where the phenotype cell is empty, "NA", or "NaN" are silently dropped.
+// With `sex` set, rows whose own sex cell does not match are dropped at the
+// same point, before categorical levels, min_covariate_count and the intercept
+// check are worked out, so a sex-specific run sees exactly what a design file
+// pre-filtered to that sex would give.
 static Design load_design_csv(const std::string& path,
                               int min_covariate_count,
                               bool categorical_drop_reference,
                               const std::vector<std::string>& covar_col_names = {},
                               const std::string& iid_col = "IID",
-                              const std::string& y_col   = "y")
+                              const std::string& y_col   = "y",
+                              const SexRowFilter* sex = nullptr)
 {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("Failed to open design file: " + path);
@@ -712,6 +726,13 @@ static Design load_design_csv(const std::string& path,
   if (idx_y < 0)
     throw std::runtime_error("Design file: phenotype column '" + y_col + "' not found. "
                              "Set design.y_col in YAML if your file uses a different name.");
+  int idx_sex = -1;
+  if (sex) {
+    idx_sex = find_col({sex->col.c_str()});
+    if (idx_sex < 0)
+      throw std::runtime_error("ERROR: column for sex '" + sex->col +
+                               "' (design.sex_col) does not exist in the design file " + path);
+  }
 
   // FIX: Only use columns specified in covar_col_names (not all numeric columns!)
   std::vector<int> x_idx;
@@ -781,6 +802,27 @@ static Design load_design_csv(const std::string& path,
       std::cout << "[design] dropped " << n_na
                 << " row(s) with missing phenotype or covariates (complete.cases)\n";
     rows = std::move(valid_rows);
+  }
+
+  // Sex-specific fit: keep rows whose sex cell matches the requested code.
+  if (sex) {
+    std::vector<std::vector<std::string>> kept;
+    kept.reserve(rows.size());
+    int n_other = 0, n_miss = 0;
+    const int before = (int)rows.size();
+    for (auto& row : rows) {
+      const std::string& v = row[idx_sex];
+      if (sex_code_matches(v, sex->code)) kept.push_back(std::move(row));
+      else if (is_missing(v))             ++n_miss;
+      else                                ++n_other;
+    }
+    rows = std::move(kept);
+    std::cout << "[design] " << sex->label << ": " << sex->col << " == " << sex->code
+              << " kept " << rows.size() << " of " << before << " row(s) ("
+              << n_other << " other value, " << n_miss << " missing sex)\n";
+    if (rows.empty())
+      throw std::runtime_error("ERROR: no samples in the phenotype are coded as " +
+                               sex->code + " in the column " + sex->col);
   }
   const int n = (int)rows.size();
 
@@ -1199,6 +1241,33 @@ int main(int argc, char** argv) {
   std::cout << "]" << (covar_col_names.empty() ? " (NO COVARIATES)" : "") << std::endl;
   std::cout << "[config] iid_col=" << iid_col_name << "  y_col=" << y_col_name << "\n";
 
+  // ===== Step 15: sex-specific fit (R SAIGE_fitGLMM_fast.R:1060-1072, 1189-1212) =====
+  // The filter itself runs inside load_design_csv on each row's own sex cell
+  // (stage A), so it drops the same samples for every phenotype and a trait's
+  // row set is (non-missing for that trait) AND (sex matches).
+  std::optional<SexRowFilter> sex_filter;
+  {
+    // R: if (FemaleOnly & MaleOnly) stop("Both FemaleOnly and MaleOnly are TRUE...")
+    if (cfg.female_only && cfg.male_only)
+      throw std::runtime_error(
+          "ERROR: Both female_only and male_only are true. "
+          "Please specify only one to run a sex-specific job.");
+    if ((cfg.female_only || cfg.male_only) && cfg.sex_col.empty())
+      throw std::runtime_error(
+          "ERROR: female_only or male_only is true but sex_col is not specified in config.");
+    if (cfg.female_only || cfg.male_only) {
+      sex_filter = SexRowFilter{cfg.sex_col,
+                                cfg.female_only ? cfg.female_code : cfg.male_code,
+                                cfg.female_only ? "female_only" : "male_only"};
+      std::cout << "[config] " << (cfg.female_only ? "Female" : "Male")
+                << "-specific model will be fitted: only samples coded as "
+                << sex_filter->code << " in column " << cfg.sex_col << " are included\n";
+    } else if (!cfg.sex_col.empty()) {
+      std::cout << "[config] sex_col=" << cfg.sex_col
+                << " is set but neither female_only nor male_only is true -> no sex filter\n";
+    }
+  }
+
   // Parse design (with categoricals) - using configurable column names
   auto T0 = std::chrono::steady_clock::now();
   // Everything from the CSV parse through the covariate-offset GLM is
@@ -1206,12 +1275,13 @@ int main(int argc, char** argv) {
   // CSV row order (before the FAM reorder below). Keeping that order is what
   // makes each trait of a P>1 run byte-identical to running it alone.
   // Stage A: parse + de-duplicate. This is what FIXES the row set (rows with a
-  // missing value in THIS phenotype or in a covariate are dropped by
-  // load_design_csv), so it has to run for every trait before the sample sets
-  // can be reconciled.
+  // missing value in THIS phenotype or in a covariate, and with sex_filter set
+  // rows of the other / missing sex, are dropped by load_design_csv), so it has
+  // to run for every trait before the sample sets can be reconciled.
   auto load_design_stageA = [&](const std::string& y_col_name) -> Design {
   Design design = load_design_csv(design_csv, min_cov_ct, drop_ref, covar_col_names,
-                                  iid_col_name, y_col_name);
+                                  iid_col_name, y_col_name,
+                                  sex_filter ? &*sex_filter : nullptr);
   add_intercept_if_missing(design);
 
   // ===== Step 7: Duplicate sample ID removal (R line 1437) =====
@@ -1238,8 +1308,8 @@ int main(int argc, char** argv) {
   };  // end load_design_stageA
 
   // Stage B: everything downstream that reads y (validity checks, optional
-  // inverse-normalisation, the covariate-offset GLM) plus the y-independent row
-  // filters (sex, whitelist) which drop the same rows for every trait. Runs
+  // inverse-normalisation, the covariate-offset GLM) plus the y-independent
+  // whitelist filter, which drops the same rows for every trait. Runs
   // AFTER the sample sets are reconciled, in the original order, on the CSV row
   // order — the covariate GLM accumulates over rows, so reordering first would
   // perturb beta in the last fp digits.
@@ -1296,30 +1366,6 @@ int main(int argc, char** argv) {
   }
   std::cout << "============================================" << std::endl;
 
-  // ===== Step 15: Sex-specific filter validation (R lines 1329-1330, 1459-1461) =====
-  // R: if (FemaleOnly & MaleOnly) stop("Both FemaleOnly and MaleOnly are TRUE...")
-  if (cfg.female_only && cfg.male_only) {
-    throw std::runtime_error(
-        "ERROR: Both female_only and male_only are true. "
-        "Please specify only one to run a sex-specific job.");
-  }
-  // R: if (!sexCol %in% colnames(data)) stop("ERROR! column for sex does not exist...")
-  if ((cfg.female_only || cfg.male_only) && cfg.sex_col.empty()) {
-    throw std::runtime_error(
-        "ERROR: female_only or male_only is true but sex_col is not specified in config.");
-  }
-  if (!cfg.sex_col.empty() && (cfg.female_only || cfg.male_only)) {
-    auto sex_vec = read_column_from_csv(design_csv, cfg.sex_col);  // throws if column not found
-    if ((int)sex_vec.size() != design.n) {
-      throw std::runtime_error("sex column length != design.n ("
-                              + std::to_string(sex_vec.size()) + " vs "
-                              + std::to_string(design.n) + ")");
-    }
-    auto keep = build_keep_index_from_sex(sex_vec, cfg);
-    apply_row_subset(design, keep);  // <<— the helper from 2a, make it visible or move it here
-    std::cout << "[design] after sex filter: n=" << design.n << "\n";
-  }
-
   // IID whitelist (optional)
   if (y["design"] && y["design"]["whitelist_ids"]) {
     std::ifstream w(y["design"]["whitelist_ids"].as<std::string>());
@@ -1333,14 +1379,6 @@ int main(int argc, char** argv) {
       std::cout << "[design] after whitelist: n=" << design.n << "\n";
     }
   }
-  // Sex-stratified filtering (if requested via YAML: design.sex_col + female_only/male_only)
-  try {
-    saige::PreprocessEngine::apply_sex_filter_if_requested(design, cfg);
-    std::cout << "[design] after sex filter: n=" << design.n << "\n";
-  } catch (const std::exception& e) {
-    std::cerr << "[design] sex filter skipped: " << e.what() << "\n";
-  }
-
   std::cout << "PATH" << paths.bed << "\n";
   // Ensure paths exist (unless sparse-only make)
   auto must_exist = [&](const std::string& p, const char* what){
@@ -1473,8 +1511,8 @@ int main(int argc, char** argv) {
   }
 
   // ===== Sample-set groups =====
-  // Traits are grouped by their FINAL row set (after stage B, whose sex /
-  // whitelist filters are the last thing that can drop rows), still in CSV
+  // Traits are grouped by their FINAL row set (after stage B, whose whitelist
+  // filter is the last thing that can drop rows), still in CSV
   // order, so equal iid sequences <=> equal sample sets. Groups are ordered by
   // first appearance and list their traits in config order. With P=1, with
   // identical sample sets, or after intersect_samples this is one group and
