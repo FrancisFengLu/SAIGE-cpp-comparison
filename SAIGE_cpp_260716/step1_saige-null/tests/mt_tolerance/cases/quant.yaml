@@ -1,0 +1,7 @@
+description: >
+  Quantitative traits with h2 ~ 0.6 (from the plink2 genetic score): two on
+  everyone, one on a 60% panel. Every solo fit must estimate
+  tau1/(tau0+tau1) >= 0.3.
+trait: quantitative
+traits: [qtF1, qtF2, qtS]
+checks: [lockstep_group, {strong_signal: {min_ratio: 0.3}}]

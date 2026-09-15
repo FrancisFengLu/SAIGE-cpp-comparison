@@ -1,0 +1,9 @@
+description: >
+  Same data as `sparse`, with use_pcg_with_sparse_grm: true (PCG on the sparse
+  Sigma instead of the direct solve).
+trait: binary
+data_case: sparse
+traits: [sA, sB, sC]
+sparse: fit
+fit: {use_sparse_grm_to_fit: true, use_pcg_with_sparse_grm: true}
+checks: [lockstep_group, nondegenerate, {sparse: {pcg: true}}]

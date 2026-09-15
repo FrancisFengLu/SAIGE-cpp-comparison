@@ -1,0 +1,9 @@
+description: >
+  LOCO on a 5-chromosome genotype file (mid: mid.bed with the BIM split into 5
+  chromosomes of 8,000 markers; small: /opt/saige/data/smallloco). Every run
+  must print "LOCO: on ... chroms: 1 2 3 4 5" for every trait and write chr1-chr5.
+trait: binary
+traits: [lF1, lF2, lS]
+plink: loco
+fit: {loco: true}
+checks: [lockstep_group, nondegenerate, loco]

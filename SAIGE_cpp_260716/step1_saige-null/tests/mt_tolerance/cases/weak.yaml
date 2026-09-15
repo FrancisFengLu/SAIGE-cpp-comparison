@@ -1,0 +1,7 @@
+description: >
+  Binary traits with no genetic component: the AI-REML tau1 update lands below
+  tol and is zeroed (step1 commit 6bfb935). At least one solo fit must end with
+  tau1 == 0, otherwise the boundary is not exercised.
+trait: binary
+traits: [wF1, wF2, wS]
+checks: [lockstep_group, {theta_zero: {min_traits: 1}}]

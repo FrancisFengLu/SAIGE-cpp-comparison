@@ -1,0 +1,12 @@
+description: >
+  QC boundary relative to the UNION of the traits' samples (no full-sample trait,
+  so the union is A1+A2+A3+B, 2% + 2% + 2% + the q4 missers). Designed marker
+  classes (counts verified by make_cases.py, recorded in the manifest):
+  (i) GRM marker in the union, MAF<0.01 in A1 (A1 = non-carriers of 12 markers);
+  (ii) GRM marker in the union, missing rate>0.15 in A2 (A2 holds 17% missers of
+  2 markers); (iii) MAF<0.01 in the union, GRM marker in A3 (A3 enriched for
+  carriers of 10 rare markers); (iv) missing rate>0.15 in the union (B = every
+  sample missing at q4), GRM marker in A1/A2/A3 (they hold no q4 misser).
+trait: binary
+traits: [qA1, qA1b, qA2, qA3, qB]
+checks: [lockstep_group, nondegenerate, qc_design]

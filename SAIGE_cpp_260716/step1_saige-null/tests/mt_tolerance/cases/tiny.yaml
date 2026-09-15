@@ -1,0 +1,7 @@
+description: >
+  Very small subsets next to a full-sample trait: tF on everyone, t5a/t5b on the
+  same random 5%, t10 on an independent random 10%. The subsets' GRM marker
+  counts differ from the full set's (checked at generation).
+trait: binary
+traits: [tF, t5a, t5b, t10]
+checks: [lockstep_group, nondegenerate]

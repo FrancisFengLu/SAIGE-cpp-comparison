@@ -1,0 +1,19 @@
+description: >
+  Categorical variance ratio (isCateVarianceRatio) with the sparse GRM loaded for
+  VR only (dense fit). Two MAC bins; R's default edges (10.5, 20.5] / >20.5 are
+  not used because saige-null's loader only keeps VR-eligible markers with
+  MAC >= 20, which leaves bin 1 with MAC == 20 markers only. The edge is 0.01*2N
+  per scale (mid 1000.5, small 200.5), so the full-sample trait, a 10% pair and a
+  20% subset all have markers in both bins (counted at generation). Every VR
+  file must have both bins with null/null_noXadj/sparse rows and every solo run
+  must report n > 0 markers in both bins.
+trait: binary
+traits: [cF, cS1, cS1b, cS2]
+sparse: vr
+fit:
+  use_sparse_grm_for_vr: true
+  isCateVarianceRatio: true
+fit_scale:
+  mid:   {cateVarRatioMinMACVecExclude: [20.5, 1000.5], cateVarRatioMaxMACVecInclude: [1000.5]}
+  small: {cateVarRatioMinMACVecExclude: [20.5, 200.5],  cateVarRatioMaxMACVecInclude: [200.5]}
+checks: [lockstep_group, nondegenerate, cate_vr]

@@ -1,0 +1,6 @@
+description: >
+  Zero missingness: 4 binary traits on every sample (mid.mp32 y1-y4 / simulated
+  on small). One sample set, so under lockstep all 4 traits lockstep together.
+trait: binary
+traits: [b1, b2, b3, b4]
+checks: [lockstep_group, nondegenerate]

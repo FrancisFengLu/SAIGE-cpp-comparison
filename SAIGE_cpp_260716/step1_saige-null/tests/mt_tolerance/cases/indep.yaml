@@ -1,0 +1,6 @@
+description: >
+  Independent missingness (mid.indep16.pheno.txt): y1-y4 each miss a different
+  5%. Four sample sets, one trait each -- lockstep has nothing to group here.
+trait: binary
+traits: [y1, y2, y3, y4]
+checks: [nondegenerate]

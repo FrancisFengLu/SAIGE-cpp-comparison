@@ -1,0 +1,55 @@
+# Tolerances for compare.py. Calibrated on saige-null ef455ff, GPU + CPU, nthreads 8,
+# mid (N=50,000 x M=40,000) and small (N=10,000 x M=20,000). Every number here, how it
+# was measured and what it must NOT hide are in THRESHOLDS.md -- change them together.
+#
+# metric:
+#   exact   every value must be equal (numbers parsed, so 1e-5 == 1.0e-05)
+#   rel     dev_i = max(|a_i - b_i| - slack_i, 0) / max(|a_i|, |b_i|, floor_i) , pass iff max_i dev_i <= tol
+#             floor_i = max(abs_floor, floor_frac * RMS(ref column))  -- keeps values near 0 from
+#                       inflating a relative difference; floor_frac 1.0 compares against the column's
+#                       own scale, which is what "same fit, different arithmetic" can be judged on
+#             slack_i = one unit in the last printed place when the value comes from text written with
+#                       `print_sig` significant digits (C++ default stream precision is 6)
+#             sa_floor_frac: S_a = colSums(X*res) is ~0 at convergence, so its floor is
+#                       sa_floor_frac * sum_i |X_ij res_i| (the score's absolute mass) instead
+#   log10p  dev = max |log10 a - log10 b|   (p-value columns; step 1 writes none today)
+defaults:
+  floor_frac: 1.0e-1
+items:
+  # --- fit results -----------------------------------------------------------
+  nullmodel.theta:   {metric: rel, tol: 5.0e-5, abs_floor: 1.0e-3, floor_frac: 0, print_sig: 6}
+  nullmodel.alpha:   {metric: rel, tol: 5.0e-5, abs_floor: 1.0e-2, floor_frac: 0, print_sig: 6}
+  arma.mu:           {metric: rel, tol: 5.0e-5, floor_frac: 1.0}
+  arma.res:          {metric: rel, tol: 5.0e-5, floor_frac: 1.0}
+  arma.S_a:          {metric: rel, tol: 5.0e-5, sa_floor_frac: 1.0}
+  arma.V:            {metric: rel, tol: 2.0e-5, floor_frac: 1.0e-1}
+  arma.XV:           {metric: rel, tol: 2.0e-5, floor_frac: 1.0}
+  arma.XVX:          {metric: rel, tol: 2.0e-5, floor_frac: 1.0e-1}
+  arma.XVX_inv:      {metric: rel, tol: 2.0e-5, floor_frac: 1.0e-1}
+  arma.XXVX_inv:     {metric: rel, tol: 2.0e-5, floor_frac: 1.0}
+  arma.XVX_inv_XV:   {metric: rel, tol: 2.0e-5, floor_frac: 1.0}
+  # --- genotype-derived ------------------------------------------------------
+  grm_diag:          {metric: rel, tol: 5.0e-5, floor_frac: 0, print_sig: 8}
+  # --- variance ratio --------------------------------------------------------
+  vr.ratio:          {metric: rel, tol: 2.0e-5, floor_frac: 0, print_sig: 6}
+  vr_markers.var1:   {metric: rel, tol: 2.0e-5, floor_frac: 0, print_sig: 6}
+  vr_markers.var2:   {metric: rel, tol: 2.0e-5, floor_frac: 0, print_sig: 6}
+  vr_markers.ratio:  {metric: rel, tol: 2.0e-5, floor_frac: 0, print_sig: 6}
+  vr_markers.AF:     {metric: rel, tol: 0.0, floor_frac: 0, print_sig: 6}   # integer counts: equal up to printing
+  vr_markers.pvalue: {metric: log10p, tol: 1.0e-4}                          # no p-value column in step 1 today
+  vr_markers.SNPIdx: {metric: exact}
+  vr_markers.MAC:    {metric: exact}
+  vr_markers.other:  {metric: exact}
+  # --- inputs and discrete decisions: must be identical ----------------------
+  arma.X:            {metric: exact}
+  arma.y:            {metric: exact}
+  arma.offset:       {metric: exact}
+  arma.sparseGRM:    {metric: exact}   # compared as a set of (row, col, value) triplets
+  cov.input:         {metric: exact}
+  cov.beta:          {metric: exact}
+  cov.fit:           {metric: exact}
+  cov.trace:         {metric: exact}
+  cov.other:         {metric: exact}
+  log.converged:     {metric: exact}
+  log.iterations:    {metric: exact}
+  log.loco_line:     {metric: exact}

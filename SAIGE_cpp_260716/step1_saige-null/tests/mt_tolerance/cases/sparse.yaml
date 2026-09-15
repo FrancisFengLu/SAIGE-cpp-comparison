@@ -1,0 +1,10 @@
+description: >
+  Sparse-GRM fit (use_sparse_grm_to_fit, direct sparse solve) with the synthetic
+  sgrm2 GRM whose phenotypes carry the sparse-GRM covariance. Traits sA/sB share
+  a sample set, sC and sD are on other sets, so every group subsets the GRM.
+  The dense GPU kernel is not used by a sparse fit, so gpu_tier4 does not apply.
+trait: binary
+traits: [sA, sB, sC, sD]
+sparse: fit
+fit: {use_sparse_grm_to_fit: true, use_pcg_with_sparse_grm: false}
+checks: [lockstep_group, nondegenerate, {sparse: {pcg: false}}]

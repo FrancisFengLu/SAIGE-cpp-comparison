@@ -1,0 +1,6 @@
+description: >
+  Block missingness (mid.block16.pheno.txt): y1-y3 on all 50,000, y9-y11 on one
+  fixed 60% panel. Two sample sets with 3 traits each.
+trait: binary
+traits: [y1, y2, y3, y9, y10, y11]
+checks: [lockstep_group, nondegenerate]

@@ -1,0 +1,11 @@
+description: >
+  Missing-genotype fill value round(2*f_pre) differs between a trait's samples and
+  the union. fF is on everyone (union = all samples); fS/fS2 are on a 10% subset
+  selected to push 2*f_pre across 0.5 / 1.5 on ~800 markers and to be enriched
+  for samples missing at those markers. The first 5 samples of the subset are the
+  ones with the most missing genotypes there, so the "Sample k: 0=..,1=..,2=.."
+  counts of the solo run are fill-sensitive (predicted exactly; the union fill
+  would change them).
+trait: binary
+traits: [fF, fS, fS2]
+checks: [lockstep_group, nondegenerate, fill_design]
