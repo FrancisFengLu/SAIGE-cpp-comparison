@@ -38,7 +38,7 @@ ifeq ($(HAS_NVCC),yes)
   CXXFLAGS  += -DSAIGE_WITH_CUDA
 endif
 
-all: gpu_matvec_test
+all: gpu_matvec_test gemv2bit_mask_test
 
 # --- Build rules ---
 # All .cu units in this dir (gpu_matvec.cu dispatches into the others).
@@ -75,14 +75,35 @@ gpu_matvec_test.o: gpu_matvec_test.cpp gpu_matvec.hpp ../bed_reader/packed_store
 ../bed_reader/marker_decoder.o:
 	$(MAKE) -C ../bed_reader marker_decoder.o
 
+# Scheme C stage B acceptance (B1/B2/B3 + the masking overhead timing).
+# Talks to gemv2bit.hpp directly — bind_trait's mask/correction lists have no
+# facade entry point. B1 needs the pre-scheme-C reference vectors in
+# /opt/saige/logs/scheme_c/b1_ref/ (see b1_baseline_manifest.txt).
+gemv2bit_mask_test: gemv2bit_mask_test.o $(CU_OBJS) \
+                    ../bed_reader/bed_reader.o \
+                    ../bed_reader/marker_decoder.o
+ifeq ($(HAS_NVCC),yes)
+	PATH=/usr/bin:/bin $(NVCC) -std=c++17 -arch=$(SM) \
+	    -ccbin /usr/bin/g++ \
+	    $^ -o $@ -lcublas -lcudart -lpthread
+else
+	@echo "gemv2bit_mask_test needs CUDA — skipped"
+endif
+
+gemv2bit_mask_test.o: gemv2bit_mask_test.cpp gemv2bit.hpp g2b_testdata.hpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 test: gpu_matvec_test
 	./gpu_matvec_test
 
+test-mask: gemv2bit_mask_test
+	./gemv2bit_mask_test
+
 clean:
-	rm -f *.o *.cu.o gpu_matvec_test
+	rm -f *.o *.cu.o gpu_matvec_test gemv2bit_mask_test
 
 # Tell make that .cu files are terminal sources; kills the spurious
 # "Circular gpu_matvec.cu <- gpu_matvec.cu.o" warning from implicit rules.
 .SUFFIXES: .cu
 
-.PHONY: all test clean
+.PHONY: all test test-mask clean

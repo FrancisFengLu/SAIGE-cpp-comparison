@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace saige::gpu::g2b {
 
@@ -177,6 +178,27 @@ gm_pass2(const unsigned int* __restrict__ Ap, int W32,
     for (int b = 0; b < 16; ++b) out[b] = acc[b];
 }
 
+// ------------------------------------------------- scheme C: row masking
+// Zero the rows this phenotype does not own. Applied to x right after the H2D
+// copy (so the caller's shared PCG vector is untouched) and again to the output
+// right before the D2H copy (so masked rows never carry a value back).
+// Pure stores, no accumulation: order-independent, determinism intact.
+__global__ void gm_mask_zero(float* __restrict__ v, const int* __restrict__ rows, int n)
+{
+    int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k < n) v[rows[k]] = 0.f;
+}
+
+// Same for a column-major block of `ncol` planes of pitch `pitch`.
+__global__ void gm_mask_zero_mc(float* __restrict__ v, int pitch, int ncol,
+                                const int* __restrict__ rows, int n)
+{
+    int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n*ncol) return;
+    int c = k / n, kk = k - c*n;
+    v[(size_t)c*pitch + rows[kk]] = 0.f;
+}
+
 // S = Σ_i x[i], single-block reduction (N elements, a few microseconds).
 // The result stays in device memory — it never goes back to the host.
 __global__ void gm_sumx(const float* __restrict__ x, int N, float* __restrict__ out)
@@ -197,15 +219,29 @@ __global__ void gm_sumx(const float* __restrict__ x, int N, float* __restrict__ 
 // ypitch is Ypart's row stride and is always the FULL marker count (not jn):
 // the full-GRM call and a LOCO range call share one buffer, so the stride has
 // to agree or any future cross-call reuse (warm start, say) reads skewed data.
+// cptr/crow/cdel are the marker-indexed CSR of this phenotype's fill
+// corrections (null when there are none); cptr is offset to j0 by the caller so
+// cptr[j]..cptr[j+1] is marker j0+j's segment, and markers outside the range
+// are skipped for free. One thread walks one segment in list order:
+//   raw[j] = Σ_i g[i,j] x[i] + Σ_{(i,j)} Δ·x[i]
+// and the scatter-add lands BEFORE the invStd scaling and the −2·f·S term,
+// which is what SCHEME_C_DESIGN §1 requires.
 __global__ void gm_pass1_finish(const float* __restrict__ Ypart, int ntile, int M, int ypitch,
                                 const float* __restrict__ freq, const float* __restrict__ invStd,
                                 const float* __restrict__ Sp,
+                                const int* __restrict__ cptr, const int* __restrict__ crow,
+                                const float* __restrict__ cdel, const float* __restrict__ x,
                                 float* __restrict__ Y, float* __restrict__ w)
 {
     int j = blockIdx.x*blockDim.x + threadIdx.x;
     if (j >= M) return;
     float s = 0.f;
     for (int t = 0; t < ntile; ++t) s += Ypart[(size_t)t*ypitch + j];
+    if (cptr) {
+        float cs = 0.f;
+        for (int k = cptr[j]; k < cptr[j+1]; ++k) cs += cdel[k]*x[crow[k]];
+        s += cs;
+    }
     float y = invStd[j] * (s - 2.f*freq[j]*(*Sp));
     Y[j] = y;
     w[j] = invStd[j] * y;
@@ -229,14 +265,30 @@ __global__ void gm_calcC(const float* __restrict__ freq, const float* __restrict
 // Pass-2 reduction + rank-one correction, then the facade's 1/M_pass scale.
 // (The R original stops at `Z[i] = s − C`; the division happens on the host
 // there. Folding inv_M in here keeps it off the host critical path.)
+// rptr/rcol/rdel are the SAMPLE-indexed CSR of the same correction list (null
+// when empty). One thread per sample walks its own sorted segment, so
+//   Z[i] = Σ_j g[i,j] w[j] + Σ_{(i,j)} Δ·w[j] − C
+// is summed in a fixed order without atomics. rcol is a GLOBAL marker index;
+// w is indexed by the range-local one, hence the −j0 and the range test.
 __global__ void gm_pass2_finish(const float* __restrict__ Zpart, int ntile, int N, int Npad,
                                 const float* __restrict__ Cp, float inv_M,
+                                const int* __restrict__ rptr, const int* __restrict__ rcol,
+                                const float* __restrict__ rdel, const float* __restrict__ w,
+                                int j0, int jn,
                                 float* __restrict__ Z)
 {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= N) return;
     float s = 0.f;
     for (int t = 0; t < ntile; ++t) s += Zpart[(size_t)t*Npad + i];
+    if (rptr) {
+        float cs = 0.f;
+        for (int k = rptr[i]; k < rptr[i+1]; ++k) {
+            int jl = rcol[k] - j0;
+            if ((unsigned)jl < (unsigned)jn) cs += rdel[k]*w[jl];
+        }
+        s += cs;
+    }
     Z[i] = (s - (*Cp)) * inv_M;
 }
 
@@ -439,13 +491,22 @@ __global__ void gm_colsum_mc(const float* __restrict__ X, int Npad, float* __res
 template<int NCOL>
 __global__ void gm_pass1_finish_mc(const float* __restrict__ Ypart, int ntile, int M, int ypitch,
                                    const float* __restrict__ freq, const float* __restrict__ invStd,
-                                   const float* __restrict__ S, float* __restrict__ w)
+                                   const float* __restrict__ S,
+                                   const int* __restrict__ cptr, const int* __restrict__ crow,
+                                   const float* __restrict__ cdel, const float* __restrict__ X,
+                                   int Npad,
+                                   float* __restrict__ w)
 {
     int t = blockIdx.x*blockDim.x + threadIdx.x;
     if (t >= M*NCOL) return;
     int j = t / NCOL, c = t % NCOL;
     float s = 0.f;
     for (int ti = 0; ti < ntile; ++ti) s += Ypart[((size_t)ti*NCOL + c)*ypitch + j];
+    if (cptr) {
+        float cs = 0.f;
+        for (int k = cptr[j]; k < cptr[j+1]; ++k) cs += cdel[k]*X[(size_t)c*Npad + crow[k]];
+        s += cs;
+    }
     float y = invStd[j] * (s - 2.f*freq[j]*S[c]);
     w[t] = invStd[j] * y;
 }
@@ -472,6 +533,8 @@ __global__ void gm_calcC_mc(const float* __restrict__ freq, const float* __restr
 template<int NCOL>
 __global__ void gm_pass2_finish_mc(const float* __restrict__ Zpart, int ntile, int N, int Npad,
                                    const float* __restrict__ C, float inv_M,
+                                   const int* __restrict__ rptr, const int* __restrict__ rcol,
+                                   const float* __restrict__ rdel, const float* __restrict__ w,
                                    float* __restrict__ Z)
 {
     size_t t = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
@@ -479,6 +542,13 @@ __global__ void gm_pass2_finish_mc(const float* __restrict__ Zpart, int ntile, i
     int c = t / N, i = t % N;
     float s = 0.f;
     for (int ti = 0; ti < ntile; ++ti) s += Zpart[((size_t)ti*NCOL + c)*Npad + i];
+    if (rptr) {
+        float cs = 0.f;
+        // w is marker-major [j*NCOL + c]; matvec_mat always runs the full
+        // marker range, so rcol is already the index w wants.
+        for (int k = rptr[i]; k < rptr[i+1]; ++k) cs += rdel[k]*w[(size_t)rcol[k]*NCOL + c];
+        s += cs;
+    }
     Z[t] = (s - C[c]) * inv_M;
 }
 
@@ -522,9 +592,9 @@ struct Ctx {
     int W32 = 0, Npad = 0, g1y = 0, g2y = 0;
     std::size_t bytes = 0;
 
+    // freq / invStd used to live here. Scheme C moved them into TraitBind so
+    // one uploaded matrix can serve several phenotypes' standardizations.
     unsigned int* Ap     = nullptr;   // M × W32 uint32, packed 2-bit
-    float*        freq   = nullptr;   // M
-    float*        invStd = nullptr;   // M
     float*        xv     = nullptr;   // Npad (tail permanently 0)
     float*        Zv     = nullptr;   // Npad
     float*        Ypart  = nullptr;   // g1y × M
@@ -552,12 +622,182 @@ std::size_t need_bytes(int N, int M)
     const Geom g = geom_of(N, M);
     const std::size_t f = sizeof(float);
     return (std::size_t)M * g.W32 * 4            // Ap
-         + 2 * (std::size_t)M * f                // freq, invStd
+         + 2 * (std::size_t)M * f                // freq, invStd (now TraitBind's)
          + 2 * (std::size_t)g.Npad * f           // xv, Zv
          + (std::size_t)g.g1y * M * f            // Ypart
          + (std::size_t)g.g2y * g.Npad * f       // Zpart
          + 2 * (std::size_t)M * f                // Yv, wv
          + 2 * f;                                // Sd, Cd
+}
+
+// --------------------------------------------------------------- TraitBind
+// One phenotype's view of the shared matrix: its standardization, the union
+// rows it does not own, and the cells where its missing-value fill differs
+// from the union's.
+//
+// The corrections arrive as a flat triplet list sorted by (col, row). We store
+// them TWICE on the device, as two CSR views:
+//   cptr/crow/cdel  indexed by marker  — pass 1 needs Σ over i for a fixed j
+//   rptr/rcol/rdel  indexed by sample  — pass 2 needs Σ over j for a fixed i
+// That is what buys determinism: each finish kernel already runs one thread
+// per marker / per sample, so the thread that owns the output element walks its
+// own contiguous, sorted segment and sums it serially. No atomicAdd, no
+// ordering dependence on block scheduling — two runs stay bit-identical, which
+// the pre-scheme-C kernel promised and the design keeps.
+// Cost: 2·n_corr·8 B + (M+1+N+1)·4 B per bind. At UKB scale (N=4e5, M=1.1e5)
+// the two index arrays are 2 MB per phenotype; the alternative (binary search
+// into one sorted list) would save that and cost a log per element.
+struct TraitBind {
+    Ctx*   ctx    = nullptr;
+    int    N = 0, M = 0;
+    float  inv_M  = 1.f;
+    float* freq   = nullptr;   // M
+    float* invStd = nullptr;   // M
+    int*   mask   = nullptr;   // n_mask union-local rows
+    int    n_mask = 0;
+    int    n_corr = 0;
+    int*   cptr   = nullptr;   // M+1
+    int*   crow   = nullptr;   // n_corr
+    float* cdel   = nullptr;   // n_corr
+    int*   rptr   = nullptr;   // N+1
+    int*   rcol   = nullptr;   // n_corr
+    float* rdel   = nullptr;   // n_corr
+    std::size_t bytes = 0;
+};
+
+std::size_t bind_bytes(int N, int M, int n_mask, int n_corr)
+{
+    const std::size_t f = sizeof(float), i4 = sizeof(int);
+    std::size_t b = 2 * (std::size_t)M * f            // freq, invStd
+                  + (std::size_t)n_mask * i4;         // mask
+    if (n_corr > 0)
+        b += (std::size_t)(M + 1) * i4 + (std::size_t)(N + 1) * i4
+           + 2 * (std::size_t)n_corr * (i4 + f);
+    return b;
+}
+
+void unbind_trait(TraitBind* t)
+{
+    if (!t) return;
+    if (t->freq)   cudaFree(t->freq);
+    if (t->invStd) cudaFree(t->invStd);
+    if (t->mask)   cudaFree(t->mask);
+    if (t->cptr)   cudaFree(t->cptr);
+    if (t->crow)   cudaFree(t->crow);
+    if (t->cdel)   cudaFree(t->cdel);
+    if (t->rptr)   cudaFree(t->rptr);
+    if (t->rcol)   cudaFree(t->rcol);
+    if (t->rdel)   cudaFree(t->rdel);
+    delete t;
+}
+
+TraitBind* bind_trait(Ctx* c,
+                      const float* freq, const float* invstd, float inv_M,
+                      const int* mask_rows, int n_mask,
+                      const int* corr_row, const int* corr_col,
+                      const float* corr_delta, int n_corr)
+{
+    if (!c || !freq || !invstd) return nullptr;
+    if (n_mask < 0 || n_corr < 0) return nullptr;
+    if (n_mask > 0 && !mask_rows) return nullptr;
+    if (n_corr > 0 && (!corr_row || !corr_col || !corr_delta)) return nullptr;
+
+    const int N = c->N, M = c->M;
+
+    // Validate on the host — a bad index here would be an out-of-bounds device
+    // read inside a finish kernel, which shows up as a wrong number, not a
+    // fault. Cheap: the lists are short by construction.
+    for (int k = 0; k < n_mask; ++k)
+        if (mask_rows[k] < 0 || mask_rows[k] >= N) {
+            std::fprintf(stderr, "[gemv2bit] bind_trait: mask_rows[%d]=%d outside [0,%d)\n",
+                         k, mask_rows[k], N);
+            return nullptr;
+        }
+    for (int k = 0; k < n_corr; ++k) {
+        if (corr_row[k] < 0 || corr_row[k] >= N || corr_col[k] < 0 || corr_col[k] >= M) {
+            std::fprintf(stderr, "[gemv2bit] bind_trait: corr[%d]=(%d,%d) outside [0,%d)x[0,%d)\n",
+                         k, corr_row[k], corr_col[k], N, M);
+            return nullptr;
+        }
+        // Sorted by col, then row (SCHEME_C_DESIGN §3.2 promises this). The
+        // marker CSR below is built by assuming it; say so loudly rather than
+        // producing a silently wrong segmentation.
+        if (k > 0 && (corr_col[k] < corr_col[k-1] ||
+                      (corr_col[k] == corr_col[k-1] && corr_row[k] <= corr_row[k-1]))) {
+            std::fprintf(stderr,
+                         "[gemv2bit] bind_trait: corrections not strictly sorted by "
+                         "(col,row) at k=%d: (%d,%d) after (%d,%d)\n",
+                         k, corr_row[k], corr_col[k], corr_row[k-1], corr_col[k-1]);
+            return nullptr;
+        }
+    }
+
+    TraitBind* t = new TraitBind();
+    t->ctx = c; t->N = N; t->M = M; t->inv_M = inv_M;
+    t->n_mask = n_mask; t->n_corr = n_corr;
+    t->bytes = bind_bytes(N, M, n_mask, n_corr);
+
+    auto fail = [&](const char* what, std::size_t nb, cudaError_t st) -> TraitBind* {
+        std::fprintf(stderr, "[gemv2bit] bind_trait: %s (%zu B) failed: %s\n",
+                     what, nb, cudaGetErrorString(st));
+        unbind_trait(t);
+        return nullptr;
+    };
+
+    cudaError_t st;
+    const std::size_t mf = (std::size_t)M * sizeof(float);
+    if ((st = cudaMalloc((void**)&t->freq,   mf)) != cudaSuccess) return fail("freq", mf, st);
+    if ((st = cudaMalloc((void**)&t->invStd, mf)) != cudaSuccess) return fail("invStd", mf, st);
+    if ((st = cudaMemcpy(t->freq,   freq,   mf, cudaMemcpyHostToDevice)) != cudaSuccess)
+        return fail("freq H2D", mf, st);
+    if ((st = cudaMemcpy(t->invStd, invstd, mf, cudaMemcpyHostToDevice)) != cudaSuccess)
+        return fail("invStd H2D", mf, st);
+
+    if (n_mask > 0) {
+        const std::size_t nb = (std::size_t)n_mask * sizeof(int);
+        if ((st = cudaMalloc((void**)&t->mask, nb)) != cudaSuccess) return fail("mask", nb, st);
+        if ((st = cudaMemcpy(t->mask, mask_rows, nb, cudaMemcpyHostToDevice)) != cudaSuccess)
+            return fail("mask H2D", nb, st);
+    }
+
+    if (n_corr > 0) {
+        // Marker CSR: the input is already sorted by col, so the segments are
+        // the input order and only the offsets need building.
+        std::vector<int> cptr(M + 1, 0);
+        for (int k = 0; k < n_corr; ++k) cptr[corr_col[k] + 1]++;
+        for (int j = 0; j < M; ++j) cptr[j+1] += cptr[j];
+
+        // Sample CSR: counting sort by row. Walking k in the input order means
+        // each row's segment comes out in ascending col — a fixed order, which
+        // is the whole point.
+        std::vector<int>   rptr(N + 1, 0), rcol(n_corr);
+        std::vector<float> rdel(n_corr);
+        for (int k = 0; k < n_corr; ++k) rptr[corr_row[k] + 1]++;
+        for (int i = 0; i < N; ++i) rptr[i+1] += rptr[i];
+        {
+            std::vector<int> cur(rptr.begin(), rptr.end() - 1);
+            for (int k = 0; k < n_corr; ++k) {
+                const int d = cur[corr_row[k]]++;
+                rcol[d] = corr_col[k];
+                rdel[d] = corr_delta[k];
+            }
+        }
+
+        struct { void** p; const void* src; std::size_t nb; const char* name; } bufs[] = {
+            {(void**)&t->cptr, cptr.data(), (std::size_t)(M+1)*sizeof(int),   "cptr"},
+            {(void**)&t->crow, corr_row,    (std::size_t)n_corr*sizeof(int),  "crow"},
+            {(void**)&t->cdel, corr_delta,  (std::size_t)n_corr*sizeof(float),"cdel"},
+            {(void**)&t->rptr, rptr.data(), (std::size_t)(N+1)*sizeof(int),   "rptr"},
+            {(void**)&t->rcol, rcol.data(), (std::size_t)n_corr*sizeof(int),  "rcol"},
+            {(void**)&t->rdel, rdel.data(), (std::size_t)n_corr*sizeof(float),"rdel"},
+        };
+        for (auto& b : bufs) {
+            if ((st = cudaMalloc(b.p, b.nb)) != cudaSuccess) return fail(b.name, b.nb, st);
+            if ((st = cudaMemcpy(*b.p, b.src, b.nb, cudaMemcpyHostToDevice)) != cudaSuccess)
+                return fail(b.name, b.nb, st);
+        }
+    }
+    return t;
 }
 
 int         ctx_N(const Ctx* c)     { return c ? c->N : 0; }
@@ -568,8 +808,6 @@ void destroy(Ctx* c)
 {
     if (!c) return;
     if (c->Ap)     cudaFree(c->Ap);
-    if (c->freq)   cudaFree(c->freq);
-    if (c->invStd) cudaFree(c->invStd);
     if (c->xv)     cudaFree(c->xv);
     if (c->Zv)     cudaFree(c->Zv);
     if (c->Ypart)  cudaFree(c->Ypart);
@@ -609,9 +847,9 @@ std::size_t mc_scratch_bytes(const Ctx* c)
 static Ctx* create_impl(const unsigned char* flat,
                         const unsigned char* const* row_ptrs,
                         std::size_t stride_bytes,
-                        int N, int M, const float* freq, const float* invstd)
+                        int N, int M)
 {
-    if ((!flat && !row_ptrs) || !freq || !invstd || N <= 0 || M <= 0) return nullptr;
+    if ((!flat && !row_ptrs) || N <= 0 || M <= 0) return nullptr;
 
     const Geom g = geom_of(N, M);
     // cudaMemcpy2D would silently truncate/overrun if a source row were wider
@@ -637,8 +875,6 @@ static Ctx* create_impl(const unsigned char* flat,
 
     struct { void** p; std::size_t bytes; const char* name; } bufs[] = {
         {(void**)&c->Ap,     ap_bytes,                                  "Ap"},
-        {(void**)&c->freq,   (std::size_t)M * sizeof(float),            "freq"},
-        {(void**)&c->invStd, (std::size_t)M * sizeof(float),            "invStd"},
         {(void**)&c->xv,     (std::size_t)g.Npad * sizeof(float),       "xv"},
         {(void**)&c->Zv,     (std::size_t)g.Npad * sizeof(float),       "Zv"},
         {(void**)&c->Ypart,  (std::size_t)g.g1y * M * sizeof(float),    "Ypart"},
@@ -681,12 +917,6 @@ static Ctx* create_impl(const unsigned char* flat,
     }
     if (st == cudaSuccess)
         st = cudaMemset(c->xv, 0, (std::size_t)g.Npad * sizeof(float));
-    if (st == cudaSuccess)
-        st = cudaMemcpy(c->freq, freq, (std::size_t)M * sizeof(float),
-                        cudaMemcpyHostToDevice);
-    if (st == cudaSuccess)
-        st = cudaMemcpy(c->invStd, invstd, (std::size_t)M * sizeof(float),
-                        cudaMemcpyHostToDevice);
     if (st != cudaSuccess) {
         std::fprintf(stderr, "[gemv2bit] upload failed: %s\n", cudaGetErrorString(st));
         destroy(c);
@@ -696,21 +926,25 @@ static Ctx* create_impl(const unsigned char* flat,
 }
 
 Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
-            int N, int M, const float* freq, const float* invstd)
+            int N, int M)
 {
-    return create_impl(packed, nullptr, stride_bytes, N, M, freq, invstd);
+    return create_impl(packed, nullptr, stride_bytes, N, M);
 }
 
 Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
-                 int N, int M, const float* freq, const float* invstd)
+                 int N, int M)
 {
-    return create_impl(nullptr, row_ptrs, stride_bytes, N, M, freq, invstd);
+    return create_impl(nullptr, row_ptrs, stride_bytes, N, M);
 }
 
-bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
+bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
                   const float* x, float* ret)
 {
-    if (!c || !x || !ret) return false;
+    if (!c || !t || !x || !ret) return false;
+    if (t->ctx != c) {
+        std::fprintf(stderr, "[gemv2bit] matvec_range: bind belongs to another Ctx\n");
+        return false;
+    }
     if (jn == 0) { std::memset(ret, 0, (std::size_t)c->N * sizeof(float)); return true; }
     if (j0 < 0 || jn < 0 || j0 + jn > c->M) {
         std::fprintf(stderr, "[gemv2bit] marker range [%d, %d) out of bounds M=%d\n",
@@ -720,6 +954,12 @@ bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
 
     G2B_CHECK_FALSE(cudaMemcpy(c->xv, x, (std::size_t)c->N * sizeof(float),
                                cudaMemcpyHostToDevice));
+    // Mask on the DEVICE, after the upload: the host's PCG vectors are shared
+    // across the phenotypes in a mask group, so the caller must not be made to
+    // pre-mask (and must not have its buffer written to).
+    if (t->n_mask)
+        gm_mask_zero<<<(t->n_mask + G_NTHREAD - 1)/G_NTHREAD, G_NTHREAD>>>(
+            c->xv, t->mask, t->n_mask);
 
     const int M   = jn;
     const int g1x = (M + G_MTILE1 - 1)/G_MTILE1;
@@ -733,12 +973,22 @@ bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
     gm_pass1<<<dim3(g1x, c->g1y), G_NTHREAD>>>(c->Ap, c->W32, c->xv, c->Ypart,
                                                j0, M, c->M);
     gm_pass1_finish<<<(M + G_NTHREAD - 1)/G_NTHREAD, G_NTHREAD>>>(
-        c->Ypart, c->g1y, M, c->M, c->freq + j0, c->invStd + j0, c->Sd, c->Yv, c->wv);
-    gm_calcC<<<1, G_NTHREAD>>>(c->freq + j0, c->wv, M, c->Cd);
+        c->Ypart, c->g1y, M, c->M, t->freq + j0, t->invStd + j0, c->Sd,
+        t->cptr ? t->cptr + j0 : nullptr, t->crow, t->cdel, c->xv,
+        c->Yv, c->wv);
+    gm_calcC<<<1, G_NTHREAD>>>(t->freq + j0, c->wv, M, c->Cd);
     gm_pass2<<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->wv, c->Zpart,
                                             j0, M, c->Npad);
     gm_pass2_finish<<<(c->N + G_NTHREAD - 1)/G_NTHREAD, G_NTHREAD>>>(
-        c->Zpart, g2y, c->N, c->Npad, c->Cd, inv_M, c->Zv);
+        c->Zpart, g2y, c->N, c->Npad, c->Cd, t->inv_M,
+        t->rptr, t->rcol, t->rdel, c->wv, j0, M,
+        c->Zv);
+    // Masked rows carry a finite but meaningless value (that row of A dotted
+    // with w); zero them so the union result is substitutable for the
+    // single-phenotype one in the caller's shared PCG vectors.
+    if (t->n_mask)
+        gm_mask_zero<<<(t->n_mask + G_NTHREAD - 1)/G_NTHREAD, G_NTHREAD>>>(
+            c->Zv, t->mask, t->n_mask);
 
     G2B_CHECK_FALSE(cudaGetLastError());   // launch config errors surface here
     G2B_CHECK_FALSE(cudaMemcpy(ret, c->Zv, (std::size_t)c->N * sizeof(float),
@@ -753,11 +1003,15 @@ bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
 // big2's 5.7 GB), so padding only costs arithmetic — and arithmetic is not the
 // wall below ncol=8. A zero column contributes 0 to S, to C and to both
 // passes, so the real columns come out bit-identical to the unpadded case.
-bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret)
+bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret)
 {
-    if (!c || !X || !ret || ncol < 0) return false;
+    if (!c || !t || !X || !ret || ncol < 0) return false;
+    if (t->ctx != c) {
+        std::fprintf(stderr, "[gemv2bit] matvec_mat: bind belongs to another Ctx\n");
+        return false;
+    }
     if (ncol == 0) return true;
-    if (ncol == 1) return matvec_range(c, 0, c->M, inv_M, X, ret);
+    if (ncol == 1) return matvec_range(c, t, 0, c->M, X, ret);
 
     const int N = c->N, M = c->M;
 
@@ -805,6 +1059,11 @@ bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret)
         if (nb < NC)
             G2B_CHECK_FALSE(cudaMemset(c->Xmc + (std::size_t)nb*c->Npad, 0,
                                        (std::size_t)(NC - nb)*c->Npad*sizeof(float)));
+        // Every column gets masked, padding columns included (they are already
+        // zero, so it is a no-op there — not worth a second launch config).
+        if (t->n_mask)
+            gm_mask_zero_mc<<<((std::size_t)t->n_mask*NC + G_NTHREAD - 1)/G_NTHREAD,
+                              G_NTHREAD>>>(c->Xmc, c->Npad, NC, t->mask, t->n_mask);
 
         const int T      = NC/2;
         const int g1x    = (M + G_NWARP*GMC_MPW - 1)/(G_NWARP*GMC_MPW);
@@ -816,26 +1075,31 @@ bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret)
         switch (NC) {
         case 2:
             gm_pass1_mc<2><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
-            gm_pass1_finish_mc<2><<<(M*2 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
-            gm_calcC_mc<2><<<2, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass1_finish_mc<2><<<(M*2 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
+            gm_calcC_mc<2><<<2, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<2><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<2><<<(int)(((std::size_t)N*2 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            gm_pass2_finish_mc<2><<<(int)(((std::size_t)N*2 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         case 4:
             gm_pass1_mc<4><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
-            gm_pass1_finish_mc<4><<<(M*4 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
-            gm_calcC_mc<4><<<4, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass1_finish_mc<4><<<(M*4 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
+            gm_calcC_mc<4><<<4, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<4><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<4><<<(int)(((std::size_t)N*4 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            gm_pass2_finish_mc<4><<<(int)(((std::size_t)N*4 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         default:
             gm_pass1_mc<8><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
-            gm_pass1_finish_mc<8><<<(M*8 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, c->freq, c->invStd, c->Smc, c->Wmc);
-            gm_calcC_mc<8><<<8, G_NTHREAD>>>(c->freq, c->Wmc, M, c->Cmc);
+            gm_pass1_finish_mc<8><<<(M*8 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
+            gm_calcC_mc<8><<<8, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<8><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<8><<<(int)(((std::size_t)N*8 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, c->Zmc);
+            gm_pass2_finish_mc<8><<<(int)(((std::size_t)N*8 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         }
+        // Same reason as the single-column path: the union's extra rows must
+        // not come back with a value. Zmc is column-major with ld = N.
+        if (t->n_mask)
+            gm_mask_zero_mc<<<((std::size_t)t->n_mask*nb + G_NTHREAD - 1)/G_NTHREAD,
+                              G_NTHREAD>>>(c->Zmc, N, nb, t->mask, t->n_mask);
         G2B_CHECK_FALSE(cudaGetLastError());
 
         // The first nb columns are contiguous in Zmc (column-major, ld = N).

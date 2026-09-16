@@ -151,6 +151,13 @@ struct Handle {
 
   // Tier-4 context (gemv2bit.cu). Owns its own device buffers.
   saige::gpu::g2b::Ctx* g2b = nullptr;
+  // Scheme C split the tier-4 standardization out of the matrix: the Ctx holds
+  // only the packed bytes, a TraitBind holds freq/invStd/inv_M (plus, once the
+  // multi-phenotype loader is wired up, that phenotype's row mask and fill
+  // corrections). This facade is still single-phenotype, so it makes exactly
+  // one bind, with no mask and no corrections — the degenerate case that
+  // SCHEME_C_DESIGN B1 requires to be bit-identical to the old kernel.
+  saige::gpu::g2b::TraitBind* g2b_bind = nullptr;
 };
 
 // -------- G5: custom kernels operating on packed 2-bit bytes --------------
@@ -323,14 +330,19 @@ static bool init_handle(Handle* h,
     // is what made host RSS 23.2/29 GiB at UKB scale.) The scattered-row form
     // avoids the gather too, at the cost of M small H2D copies, once.
     h->g2b = src.flat
-        ? saige::gpu::g2b::create(src.flat->raw(), src.nbyte,
-                                  h->N, h->M, freq.data(), invstd.data())
-        : saige::gpu::g2b::create_rows(src.rows, src.nbyte,
-                                       h->N, h->M, freq.data(), invstd.data());
+        ? saige::gpu::g2b::create(src.flat->raw(), src.nbyte, h->N, h->M)
+        : saige::gpu::g2b::create_rows(src.rows, src.nbyte, h->N, h->M);
     if (!h->g2b) {
       std::fprintf(stderr, "[gpu_matvec] tier-4 create failed"
                            " (need %zu MB, free %zu MB)\n",
                    tier4_need >> 20, free_b >> 20);
+      return false;
+    }
+    h->g2b_bind = saige::gpu::g2b::bind_trait(
+        h->g2b, freq.data(), invstd.data(), 1.0f / static_cast<float>(h->M),
+        nullptr, 0, nullptr, nullptr, nullptr, 0);
+    if (!h->g2b_bind) {
+      std::fprintf(stderr, "[gpu_matvec] tier-4 bind_trait failed\n");
       return false;
     }
     h->tier       = 4;
@@ -424,6 +436,9 @@ static void free_handle(Handle* h) {
   if (h->d_freq)        cudaFree(h->d_freq);
   if (h->d_invstd)      cudaFree(h->d_invstd);
   if (h->cublas)        cublasDestroy(h->cublas);
+  // Unbind before destroy: the bind holds device buffers of its own and
+  // (harmlessly) a back-pointer to the Ctx.
+  if (h->g2b_bind)      saige::gpu::g2b::unbind_trait(h->g2b_bind);
   if (h->g2b)           saige::gpu::g2b::destroy(h->g2b);
   // No memset(h, 0, sizeof(*h)) here: Handle holds two std::vector<float>
   // members, and zeroing them out from under the destructor leaked their
@@ -435,6 +450,7 @@ static void free_handle(Handle* h) {
   h->d_packed = nullptr;
   h->cublas   = nullptr;
   h->g2b      = nullptr;
+  h->g2b_bind = nullptr;
   h->packed   = nullptr;
   h->tier     = 0;
 }
@@ -499,14 +515,14 @@ void destroy(Handle* h) {
 
 int tier(const Handle* h) { return h ? h->tier : 0; }
 
-bool matvec_mat_available(const Handle* h) { return h && h->tier == 4 && h->g2b; }
+bool matvec_mat_available(const Handle* h) {
+  return h && h->tier == 4 && h->g2b && h->g2b_bind;
+}
 
 bool matvec_mat(Handle* h, const float* U, int k, float* out_KU) {
   if (!h || !U || !out_KU || k < 0) return false;
-  if (h->tier != 4 || !h->g2b) return false;   // no batch kernel below tier 4
-  return saige::gpu::g2b::matvec_mat(h->g2b, k,
-                                     1.0f / static_cast<float>(h->M),
-                                     U, out_KU);
+  if (h->tier != 4 || !h->g2b || !h->g2b_bind) return false;  // no batch kernel below tier 4
+  return saige::gpu::g2b::matvec_mat(h->g2b, h->g2b_bind, k, U, out_KU);
 }
 
 bool matvec(Handle* h, const float* u, float* out_Au) {
@@ -515,9 +531,8 @@ bool matvec(Handle* h, const float* u, float* out_Au) {
   // ---- tier 4: 2-bit resident + rank-one standardization ----
   // Whole-GRM range [0, M); gemv2bit uploads u and applies 1/M itself.
   if (h->tier == 4) {
-    return saige::gpu::g2b::matvec_range(h->g2b, 0, h->M,
-                                         1.0f / static_cast<float>(h->M),
-                                         u, out_Au);
+    if (!h->g2b_bind) return false;
+    return saige::gpu::g2b::matvec_range(h->g2b, h->g2b_bind, 0, h->M, u, out_Au);
   }
 
   // Push u once to the device.

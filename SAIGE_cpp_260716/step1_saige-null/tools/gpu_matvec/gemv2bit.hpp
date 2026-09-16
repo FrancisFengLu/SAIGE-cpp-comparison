@@ -30,26 +30,48 @@
 //   assertion note in create().
 //
 // Reductions use partial buffers, never atomicAdd: float addition order is
-// therefore fixed and two runs are bit-identical.
+// therefore fixed and two runs are bit-identical. The scheme-C fill-correction
+// scatter-adds below preserve that — see the TraitBind comment.
+//
+// ---------------------------------------------------------------------------
+// Scheme C (optimization/missing_mt/SCHEME_C_DESIGN.md §3.3): the matrix and
+// the standardization are separate objects. One Ctx holds the packed genotypes
+// of the UNION of several phenotypes' sample sets; one TraitBind per phenotype
+// holds that phenotype's freq / invStd / 1/M_t, the union-local rows it does
+// NOT own, and the cells where its missing-value fill differs from the union's.
+// Switching traits is a pointer swap — the matrix is never re-uploaded.
+//
+// With a bind whose mask and correction lists are both empty the kernels run
+// exactly the arithmetic above; that degenerate case is bit-identical to the
+// pre-scheme-C code (acceptance B1, baseline in b1_baseline_manifest.txt).
 #pragma once
 
 #include <cstddef>
 
 namespace saige::gpu::g2b {
 
-struct Ctx;   // opaque; defined in gemv2bit.cu
+struct Ctx;         // opaque; defined in gemv2bit.cu
+struct TraitBind;   // opaque; defined in gemv2bit.cu
 
 // Device bytes tier 4 needs for this problem size, for the tier decision in
 // gpu_matvec.cu. Pure arithmetic, touches no CUDA state.
+// Includes 2·M floats that used to be Ctx's freq/invStd and now belong to the
+// first TraitBind — the figure is unchanged on purpose so the tier threshold
+// does not move, and it stays an honest estimate for the single-trait case.
+// Each ADDITIONAL bind costs bind_bytes() on top.
 std::size_t need_bytes(int N, int M);
 
-// Upload the packed bytes + per-marker vectors and allocate all device
-// scratch. `packed` is M rows × stride_bytes bytes, variant-major — pass
-// PackedFlat::raw() / PackedFlat::nbyte() directly, no gather buffer.
+// Device bytes one bind_trait() allocates. n_mask/n_corr are the list lengths.
+std::size_t bind_bytes(int N, int M, int n_mask, int n_corr);
+
+// Upload the packed bytes and allocate all device scratch. `packed` is M rows
+// × stride_bytes bytes, variant-major — pass PackedFlat::raw() /
+// PackedFlat::nbyte() directly, no gather buffer.
 // Inputs are NOT retained: the caller may free them on return.
 // Returns nullptr on any CUDA failure (caller falls back to a lower tier/CPU).
+// No freq/invStd here any more: see bind_trait().
 Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
-            int N, int M, const float* freq, const float* invstd);
+            int N, int M);
 
 // Same, but the marker rows are scattered: row_ptrs[m] points at marker m's
 // `stride_bytes` packed bytes. Uploads row by row (M small H2D copies, once)
@@ -58,13 +80,56 @@ Ctx* create(const unsigned char* packed, std::size_t stride_bytes,
 // Needed by SAIGE's legacy genoVecofPointers storage, which is one heap
 // allocation per marker and has no contiguous buffer to hand over.
 Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
-                 int N, int M, const float* freq, const float* invstd);
+                 int N, int M);
 
-// ret = inv_M · B_std (B_stdᵀ x) over the marker range [j0, j0+jn).
-// x and ret are host float32, length N. inv_M is applied by the last kernel,
-// so no extra host-side pass over N.
-// jn == M and j0 == 0 is the full-GRM case the PCG iteration walks.
-bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
+// Bind one phenotype's standardization + row mask + fill corrections to `c`.
+// Several binds may coexist on one Ctx; switching between them costs nothing.
+// All inputs are copied to the device and may be freed on return.
+//
+//   freq, invstd  length M (the Ctx's full marker count). invstd[j] == 0 marks
+//                 a marker this phenotype's QC dropped: it contributes nothing
+//                 to either pass, exactly as §1 requires.
+//   inv_M         1/M_t, M_t = #{j : this phenotype's passQC}. Applied by the
+//                 last kernel, so no extra host pass over N.
+//   mask_rows     n_mask union-local sample indices in [0,N) that this
+//                 phenotype does NOT own. The kernels zero x on those rows ON
+//                 THE DEVICE after upload (the host's PCG vectors are shared
+//                 across the group, so the caller must not have to pre-mask),
+//                 and zero `ret` on them before copying back — see below.
+//   corr_*        n_corr triplets (row, col, delta): at union-local sample
+//                 `row`, marker `col`, this phenotype's fill differs from the
+//                 union's by `delta` ∈ {−2,−1,1,2}. Must be sorted by col, then
+//                 by row (§3.2 already promises that ordering), and each
+//                 (row,col) may appear at most once.
+//
+// Returns nullptr on bad arguments or any CUDA failure.
+//
+// Determinism: the corrections are turned into two CSR views at bind time —
+// one indexed by marker (pass 1), one by sample (pass 2) — so each scatter-add
+// is summed by a single thread walking a contiguous, sorted segment. No
+// atomicAdd anywhere, and two runs stay bit-identical.
+//
+// ret ON MASKED ROWS IS ZERO. §1 of the design defines Z[i] for every i of the
+// union, which on a row this phenotype does not own is a perfectly finite but
+// meaningless number (that row of A dotted with w). Handing it back would put
+// junk into the caller's shared PCG vectors — every host-side dot product would
+// pick it up, even though the next matvec re-masks x. Zeroing is the only
+// contract that makes the union result substitutable for the single-trait one.
+TraitBind* bind_trait(Ctx* c,
+                      const float* freq, const float* invstd, float inv_M,
+                      const int* mask_rows, int n_mask,
+                      const int* corr_row, const int* corr_col,
+                      const float* corr_delta, int n_corr);
+
+void unbind_trait(TraitBind* t);
+
+// ret = inv_M · B_std (B_stdᵀ x) over the marker range [j0, j0+jn), under the
+// standardization/mask/corrections of `t`. x and ret are host float32, length
+// N (the UNION's N — x is masked on the device, ret comes back zeroed on the
+// masked rows). jn == M and j0 == 0 is the full-GRM case the PCG walks.
+// Corrections whose marker falls outside [j0, j0+jn) are skipped, so a LOCO
+// range stays consistent with the full call.
+bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
                   const float* x, float* ret);
 
 // Multi-RHS analogue: ret = inv_M · A_std (A_stdᵀ X) over ALL markers.
@@ -72,9 +137,11 @@ bool matvec_range(Ctx* c, int j0, int jn, float inv_M,
 // drops straight in). ncol is unbounded — the implementation walks it in
 // chunks of 8 and rounds each chunk up to {2,4,8} with zero columns. ncol == 1
 // forwards to matvec_range.
+// Every column is masked independently on the device; every output column
+// comes back zeroed on the masked rows.
 // Device scratch for this path is allocated lazily on the first call, so a run
 // that never batches pays nothing for it.
-bool matvec_mat(Ctx* c, int ncol, float inv_M, const float* X, float* ret);
+bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret);
 
 // Device bytes matvec_mat() will lazily allocate on first use, for logging.
 std::size_t mc_scratch_bytes(const Ctx* c);
