@@ -295,19 +295,9 @@ def case_tiny(ctx, problems):
     return write_case(ctx, "tiny", traits, dict(predicted=pred))
 
 
-def _minor_allele_count(G, st, J, idx):
-    """minor-allele count (w.r.t. `st` frequencies) of markers J over samples idx (missing -> 0)."""
-    sub = G[J][:, idx].astype(np.int64)
-    miss = sub == 3
-    sub[miss] = 0
-    a1 = sub.sum(1)
-    nn = (~miss).sum(1)
-    return np.where(st["alt"][J] < 0.5, a1, 2 * nn - a1)
-
-
 def case_qc(ctx, problems):
-    """Four subset traits whose GRM marker lists differ from the UNION of all trait samples,
-    in both directions and for both reasons (MAF, missing rate)."""
+    """Five traits on four subsets whose GRM marker lists differ from the one of the UNION of all
+    the case's samples, in both directions and for both reasons (MAF, missing rate)."""
     G, full, N = ctx.G, ctx.full, ctx.N
     rng = np.random.default_rng(SEEDS["qc"])
     nA = int(0.02 * N)

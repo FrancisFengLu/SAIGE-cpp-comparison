@@ -50,6 +50,9 @@ bug 模拟里该规则的偏差范围。阈值取在两者之间：噪声之上�
   这条规则只有 §5 的合成测试走到过。
 - 稀疏 GRM（`sparseGRM_locationMat/valueVec.arma`）按 (row, col, value) 三元组集合比，
   顺序不同不算错（另外报告顺序是否一致），值必须完全相等。
+- `converged` / `iterations` / LOCO 那行**不在 nullmodel.json 里**，只在运行日志打印，所以
+  比较器默认要求日志（单跑 `<rundir>.log`，多表型跑里按 `Phenotype:` 分块）。日志找不到
+  就算失败，除非显式 `--no-log`。
 
 ## 3. 标定数据
 
