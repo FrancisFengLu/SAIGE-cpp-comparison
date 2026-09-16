@@ -48,6 +48,17 @@ struct FitNullConfig {
   // trait's solo run byte for byte.
   bool multi_lockstep{false};
 
+  // Scheme C (optimization/missing_mt/SCHEME_C_DESIGN.md): load the UNION of a
+  // group's sample sets once and mask each phenotype's missing rows in the
+  // multiplication, instead of one full genotype load per distinct sample set.
+  // OFF by default for the same reason as lockstep: the union has extra zero
+  // rows, so the fp32 block sums land a few ulp away from the solo run's (§4).
+  // Only pays when the sample sets overlap heavily — mask_min_coverage is the
+  // whole cost model (§6): a phenotype joins a mask group only while every
+  // member still covers at least this fraction of the group's union.
+  bool   mask_missing{false};
+  double mask_min_coverage{0.8};
+
   // Convergence / runtime
   double tol{0.02};
   int    maxiter{20};

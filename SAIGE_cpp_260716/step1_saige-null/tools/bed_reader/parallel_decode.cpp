@@ -69,6 +69,12 @@ struct PerThreadState {
   // Same, for the (much smaller) variance-ratio pool:
   std::vector<MappedBlock>   vr_blocks;
   std::vector<std::size_t>   vr_orig_idx;
+  // Scheme C §3.1 — this chunk's fill corrections, one list per trait. Chunks
+  // are contiguous ascending marker ranges merged in thread order, and the
+  // decoder hands back each marker's missing rows ascending, so concatenating
+  // these in thread order is already sorted strictly by (col, row).
+  std::vector<std::vector<int>>   corr_row, corr_col;
+  std::vector<std::vector<float>> corr_delta;
   std::exception_ptr         err;            // first exception (if any)
 };
 
@@ -143,8 +149,14 @@ ParallelDecodeResult parallel_decode_bed(
   const bool want_mcells   = (aux != nullptr) && aux->collect_missing_cells;
   const bool want_keep     = (aux != nullptr) && aux->collect_keep && P > 0;
   const bool pack_if_keep  = (aux != nullptr) && aux->pack_if_keep && P > 0;
+  const bool want_corr     = (aux != nullptr) && aux->collect_corrections && P > 0;
   if (aux != nullptr && aux->pack_if_keep && P == 0)
     throw std::runtime_error("parallel_decode_bed: pack_if_keep needs exclusion sets");
+  if (want_corr && aux->in_trait == nullptr)
+    throw std::runtime_error("parallel_decode_bed: collect_corrections needs in_trait");
+  if (want_corr && !aux->collect_tally)
+    throw std::runtime_error("parallel_decode_bed: collect_corrections needs collect_tally");
+  const unsigned char* in_trait = want_corr ? aux->in_trait : nullptr;
 
   std::vector<TraitTally>       tally_all;
   std::vector<std::vector<int>> mcells_all;
@@ -175,13 +187,19 @@ ParallelDecodeResult parallel_decode_bed(
           std::vector<unsigned char> packed(nbyte_out);
 
           const bool use_aux =
-              want_tally || want_mcells || want_keep || pack_if_keep;
+              want_tally || want_mcells || want_keep || pack_if_keep || want_corr;
           DecodeAux dx;
           bool      keep_this = false;
           if (use_aux) {
             dx.excl         = excl;
             dx.keep_any_trait = (want_keep || pack_if_keep) ? &keep_this : nullptr;
             dx.pack_if_keep = pack_if_keep;
+          }
+          std::vector<int> miss_scratch;     // reused; never grows past one marker
+          if (want_corr) {
+            st.corr_row.resize(P);
+            st.corr_col.resize(P);
+            st.corr_delta.resize(P);
           }
 
           for (std::size_t i = lo; i < hi; ++i) {
@@ -193,7 +211,8 @@ ParallelDecodeResult parallel_decode_bed(
             if (use_aux) {
               dx.tally = want_tally
                   ? &tally_all[i * static_cast<std::size_t>(P)] : nullptr;
-              dx.missing_rows = want_mcells ? &mcells_all[i] : nullptr;
+              dx.missing_rows = want_mcells ? &mcells_all[i]
+                                            : (want_corr ? &miss_scratch : nullptr);
               keep_this = false;
             }
             decode_marker(raw.data(), reader.n_samples(),
@@ -203,6 +222,34 @@ ParallelDecodeResult parallel_decode_bed(
                           use_aux ? &dx : nullptr);
             if (use_aux && (want_keep || pack_if_keep))
               keep_all[i] = keep_this ? 1 : 0;
+
+            if (want_corr && s.numMissing > 0) {
+              // §1 step 4: the union matrix stores fill_U in every missing
+              // cell; a trait whose round(2*f_pre) landed elsewhere needs the
+              // difference scatter-added back. Recomputed from the integer
+              // tallies, through the decoder's OWN arithmetic block, so the
+              // fill value here is the same object A1 compares bit for bit.
+              const std::vector<int>& mrows =
+                  want_mcells ? mcells_all[i] : miss_scratch;
+              const TraitTally* row = &tally_all[i * static_cast<std::size_t>(P)];
+              for (int q = 0; q < P; ++q) {
+                MarkerStats st_q; bool pvr_q = false;
+                marker_stats_from_counts(s.alleleRaw - row[q].alleleRawExcl,
+                                         s.numMissing - row[q].numMissingExcl,
+                                         static_cast<std::size_t>(excl->n_t[q]),
+                                         min_maf, max_miss, vr, drawn, st_q, pvr_q);
+                const int d = st_q.fillin - s.fillin;
+                if (d == 0) continue;
+                const unsigned char* mine =
+                    in_trait + static_cast<std::size_t>(q) * Nnomissing;
+                for (int r : mrows) {
+                  if (mine[r] == 0) continue;      // masked out anyway: x_r == 0
+                  st.corr_row[q].push_back(r);
+                  st.corr_col[q].push_back(static_cast<int>(i));
+                  st.corr_delta[q].push_back(static_cast<float>(d));
+                }
+              }
+            }
 
             st.passQC_flags[i - lo] = s.passQC ? 1 : 0;
             st.passVR_flags[i - lo] = passVR ? 1 : 0;
@@ -261,6 +308,34 @@ ParallelDecodeResult parallel_decode_bed(
   result.tally         = std::move(tally_all);
   result.missing_cells = std::move(mcells_all);
   result.keep_union    = std::move(keep_all);
+
+  // Concatenate the per-thread correction lists in thread order == ascending
+  // marker order, so each trait's list comes out strictly sorted by (col, row).
+  if (want_corr) {
+    result.corr_row.resize(P);
+    result.corr_col.resize(P);
+    result.corr_delta.resize(P);
+    for (int q = 0; q < P; ++q) {
+      std::size_t n = 0;
+      for (int t = 0; t < nthreads; ++t)
+        if (!state[t].corr_row.empty()) n += state[t].corr_row[q].size();
+      result.corr_row[q].reserve(n);
+      result.corr_col[q].reserve(n);
+      result.corr_delta[q].reserve(n);
+      for (int t = 0; t < nthreads; ++t) {
+        if (state[t].corr_row.empty()) continue;
+        auto& sr = state[t].corr_row[q];
+        auto& sc = state[t].corr_col[q];
+        auto& sd = state[t].corr_delta[q];
+        result.corr_row[q].insert(result.corr_row[q].end(), sr.begin(), sr.end());
+        result.corr_col[q].insert(result.corr_col[q].end(), sc.begin(), sc.end());
+        result.corr_delta[q].insert(result.corr_delta[q].end(), sd.begin(), sd.end());
+        sr.clear(); sr.shrink_to_fit();
+        sc.clear(); sc.shrink_to_fit();
+        sd.clear(); sd.shrink_to_fit();
+      }
+    }
+  }
 
   // Merge per-marker stats / passQC  (sequential, cheap — M * small stats)
   for (int t = 0; t < nthreads; ++t) {

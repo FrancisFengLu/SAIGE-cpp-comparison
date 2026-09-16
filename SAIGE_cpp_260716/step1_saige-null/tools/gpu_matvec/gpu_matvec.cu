@@ -158,6 +158,14 @@ struct Handle {
   // one bind, with no mask and no corrections — the degenerate case that
   // SCHEME_C_DESIGN B1 requires to be bit-identical to the old kernel.
   saige::gpu::g2b::TraitBind* g2b_bind = nullptr;
+
+  // Scheme C: one bind per phenotype sharing this Ctx (gpu_matvec.hpp
+  // add_bind/select_bind). Empty on every single-phenotype run, so the
+  // pre-scheme-C path allocates nothing extra and takes no extra branch that
+  // can change the arithmetic.
+  std::vector<saige::gpu::g2b::TraitBind*> binds;
+  int   active_bind    = -1;      // index into `binds`; -1 == use g2b_bind
+  float inv_M_override = 0.0f;    // 0 == use 1/M
 };
 
 // -------- G5: custom kernels operating on packed 2-bit bytes --------------
@@ -440,6 +448,10 @@ static void free_handle(Handle* h) {
   // Unbind before destroy: the bind holds device buffers of its own and
   // (harmlessly) a back-pointer to the Ctx.
   if (h->g2b_bind)      saige::gpu::g2b::unbind_trait(h->g2b_bind);
+  for (auto*& b : h->binds) { if (b) saige::gpu::g2b::unbind_trait(b); b = nullptr; }
+  h->binds.clear();
+  h->active_bind    = -1;
+  h->inv_M_override = 0.0f;
   if (h->g2b)           saige::gpu::g2b::destroy(h->g2b);
   // No memset(h, 0, sizeof(*h)) here: Handle holds two std::vector<float>
   // members, and zeroing them out from under the destructor leaked their
@@ -516,15 +528,56 @@ void destroy(Handle* h) {
 
 int tier(const Handle* h) { return h ? h->tier : 0; }
 
+// The bind in force: a scheme-C phenotype bind when one is selected, else the
+// handle's own create()-time bind.
+static inline saige::gpu::g2b::TraitBind* live_bind(Handle* h) {
+  if (h->active_bind >= 0 && h->active_bind < (int)h->binds.size())
+    return h->binds[h->active_bind];
+  return h->g2b_bind;
+}
+
+static inline float live_inv_M(const Handle* h) {
+  return h->inv_M_override > 0.0f ? h->inv_M_override
+                                  : 1.0f / static_cast<float>(h->M);
+}
+
+int add_bind(Handle* h,
+             const float* freq, const float* invstd,
+             const int* mask_rows, int n_mask,
+             const int* corr_row, const int* corr_col,
+             const float* corr_delta, int n_corr) {
+  if (!h || !freq || !invstd) return -1;
+  if (h->tier != 4 || !h->g2b) return -1;   // only tier 4 has the masked kernels
+  saige::gpu::g2b::TraitBind* b = saige::gpu::g2b::bind_trait(
+      h->g2b, freq, invstd, mask_rows, n_mask, corr_row, corr_col, corr_delta, n_corr);
+  if (!b) return -1;
+  h->binds.push_back(b);
+  return static_cast<int>(h->binds.size()) - 1;
+}
+
+bool select_bind(Handle* h, int id) {
+  if (!h) return false;
+  if (id < 0) { h->active_bind = -1; return true; }
+  if (id >= (int)h->binds.size()) return false;
+  h->active_bind = id;
+  return true;
+}
+
+void set_inv_M(Handle* h, float inv_M) {
+  if (h) h->inv_M_override = (inv_M > 0.0f) ? inv_M : 0.0f;
+}
+
 bool matvec_mat_available(const Handle* h) {
-  return h && h->tier == 4 && h->g2b && h->g2b_bind;
+  return h && h->tier == 4 && h->g2b &&
+         (h->g2b_bind || !h->binds.empty());
 }
 
 bool matvec_mat(Handle* h, const float* U, int k, float* out_KU) {
   if (!h || !U || !out_KU || k < 0) return false;
-  if (h->tier != 4 || !h->g2b || !h->g2b_bind) return false;  // no batch kernel below tier 4
-  return saige::gpu::g2b::matvec_mat(h->g2b, h->g2b_bind, k,
-                                     1.0f / static_cast<float>(h->M), U, out_KU);
+  if (h->tier != 4 || !h->g2b) return false;  // no batch kernel below tier 4
+  saige::gpu::g2b::TraitBind* b = live_bind(h);
+  if (!b) return false;
+  return saige::gpu::g2b::matvec_mat(h->g2b, b, k, live_inv_M(h), U, out_KU);
 }
 
 bool matvec(Handle* h, const float* u, float* out_Au) {
@@ -533,9 +586,10 @@ bool matvec(Handle* h, const float* u, float* out_Au) {
   // ---- tier 4: 2-bit resident + rank-one standardization ----
   // Whole-GRM range [0, M); gemv2bit uploads u and applies 1/M itself.
   if (h->tier == 4) {
-    if (!h->g2b_bind) return false;
-    return saige::gpu::g2b::matvec_range(h->g2b, h->g2b_bind, 0, h->M,
-                                        1.0f / static_cast<float>(h->M), u, out_Au);
+    saige::gpu::g2b::TraitBind* b = live_bind(h);
+    if (!b) return false;
+    return saige::gpu::g2b::matvec_range(h->g2b, b, 0, h->M,
+                                         live_inv_M(h), u, out_Au);
   }
 
   // Push u once to the device.

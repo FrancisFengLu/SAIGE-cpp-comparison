@@ -88,6 +88,39 @@ bool matvec_mat_available(const Handle* h);
 // matvec_mat_available() first to tell those apart.
 bool matvec_mat(Handle* h, const float* U, int k, float* out_KU);
 
+// ---------------------------------------------------------------------------
+// Scheme C (optimization/missing_mt/SCHEME_C_DESIGN.md §3.3/§3.4): one uploaded
+// matrix, several phenotypes. The Handle is created over the UNION's packed
+// bytes (N = |U|, M = the §2 keep set); each phenotype then adds ONE bind
+// carrying its own freq/invStd, the union-local rows it does not own, and the
+// cells where its missing-value fill differs from the union's. Switching
+// phenotypes is select_bind() — a pointer swap, no re-upload.
+//
+// Only tier 4 has the masked kernels; add_bind returns -1 on any other tier,
+// which the caller must treat as "masking is not available here", never as a
+// silent per-trait fallback to the wrong standardization.
+//
+// Ordering/uniqueness of the correction triplets is REQUIRED (strictly
+// increasing in (col,row)) — gemv2bit.hpp documents why, and bind_trait
+// refuses a list that violates it.
+//
+// Returns the bind id (>= 0) or -1.
+int add_bind(Handle* h,
+             const float* freq, const float* invstd,
+             const int* mask_rows, int n_mask,
+             const int* corr_row, const int* corr_col,
+             const float* corr_delta, int n_corr);
+
+// Make bind `id` the one matvec()/matvec_mat() use. id < 0 restores the
+// handle's own create()-time bind. False if the id does not exist.
+bool select_bind(Handle* h, int id);
+
+// 1/M_t for the ACTIVE phenotype: the number of uploaded markers that pass
+// THAT phenotype's QC, which is not the uploaded marker count once the §2 keep
+// rule has widened the pack. Pass 0 to go back to 1/M (the default, and what
+// every non-scheme-C caller wants).
+void set_inv_M(Handle* h, float inv_M);
+
 // Release all device buffers held by h.
 void destroy(Handle* h);
 

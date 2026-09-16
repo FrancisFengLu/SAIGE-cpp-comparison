@@ -31,6 +31,13 @@ bool matvec_mat_available(const Handle*) { return false; }
 
 bool matvec_mat(Handle*, const float*, int, float*) { return false; }
 
+int  add_bind(Handle*, const float*, const float*, const int*, int,
+              const int*, const int*, const float*, int) { return -1; }
+
+bool select_bind(Handle*, int id) { return id < 0; }
+
+void set_inv_M(Handle*, float) {}
+
 void destroy(Handle*) {}
 
 int tier(const Handle*) { return 0; }

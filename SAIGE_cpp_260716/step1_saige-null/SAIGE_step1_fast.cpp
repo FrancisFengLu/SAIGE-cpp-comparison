@@ -21,6 +21,7 @@
 #include "bed_reader.hpp"      // PR-5: parallel pread-backed BED reader
 #include "marker_decoder.hpp"  // PR-5: decode + QC + repack
 #include "parallel_decode.hpp" // PR-5: parallel_decode_bed()
+#include "mask_stats.hpp"      // scheme C: per-trait stats over a union decode
 #include "packed_store.hpp"    // option 3: PackedFlat primary storage
 #include "gpu_matvec.hpp"      // G3: optional cuBLAS K·u acceleration
 #include "tools/avx2_kernel/avx2_kernel.hpp"  // Phase-1: fused 2-bit decode kernels
@@ -101,6 +102,12 @@ public:
         // Same routing for the variance-ratio pool. Never released to the GPU
         // (VR estimation is host-side), so no released_ guard is needed.
         inline unsigned char packed_byte_vr(std::size_t snp_idx, std::size_t byte_idx) const {
+          // Scheme C §7: each phenotype owns its own VR pool, packed on its own
+          // rows. activeVrStore_ points at the active one; it is null off the
+          // mask path, where this is exactly the code that was here before.
+          if (activeVrStore_) {
+            return activeVrStore_->raw()[snp_idx * activeVrStore_->nbyte() + byte_idx];
+          }
           if (use_packed_flat_vr_) {
             return packed_flat_vr_.raw()[snp_idx * packed_flat_vr_.nbyte() + byte_idx];
           }
@@ -157,6 +164,69 @@ public:
                         static_cast<std::size_t>(use_packed_flat_ ? 1 : 0)) / (1024ULL*1024ULL)
                     << " MB freed)\n";
         }
+        // ===== scheme C: union load + per-trait row masking ======================
+        // optimization/missing_mt/SCHEME_C_DESIGN.md. When maskMode_ is false
+        // every member below is untouched and every method behaves exactly as
+        // it did before scheme C — that is checkpoint 1's whole point.
+        //
+        // In mask mode the packed store holds the UNION's rows (N_union_ of
+        // them) and the §2 keep set of markers; `Nnomissing`, alleleFreqVec,
+        // invstdvVec, MACVec, the marker count and the VR pool are all swapped
+        // to the ACTIVE phenotype's by activate_trait(). Everything outside
+        // this class therefore keeps seeing one phenotype of n_t samples.
+        struct MaskTrait {
+          std::string        name;
+          int                n_t = 0;        // |S_t|
+          int                M_t = 0;        // #markers of the pack passing THIS trait's QC
+          std::vector<int>   scatter;        // n_t union-local rows, ascending
+          std::vector<int>   mask_rows;      // union rows NOT owned, ascending
+          std::vector<float> freq, invstd;   // length = packed rows (keep set)
+          std::vector<int>   mac;
+          // §1 step 4 — cells where this trait's fill differs from the union's.
+          // Strictly ascending in (col,row); col is a PACKED row index.
+          std::vector<int>   corr_row, corr_col;
+          std::vector<float> corr_delta;
+          int                gpu_bind = -1;
+          // §7: the VR pool stays per-trait, packed on S_t's own rows, so it is
+          // bit-identical to what a solo run builds.
+          saige::PackedFlat  vr_store;
+          std::vector<float> vr_freq, vr_invstd;
+          std::vector<int>   vr_mac, vr_idx;
+          int                vr_n = 0;
+          // GRM diagonal over S_t's rows (unnormalized), computed once.
+          arma::fvec         diag_std;
+          bool               diag_ready = false;
+        };
+        bool                     maskMode_   = false;
+        std::size_t              N_union_    = 0;
+        int                      activeTrait_ = -1;
+        std::vector<MaskTrait>   maskTraits_;
+        const saige::PackedFlat* activeVrStore_ = nullptr;
+        // Inputs handed to setGenoObj by the mask path (owned by the caller).
+        const std::vector<std::vector<int>>* maskExclIn_    = nullptr;
+        const std::vector<std::vector<int>>* maskScatterIn_ = nullptr;
+        const std::vector<std::string>*      maskNamesIn_   = nullptr;
+
+        // Rows the PACKED STORE has: the union's in mask mode, Nnomissing
+        // otherwise. Get_OneSNP_Geno / Get_OneSNP_StdGeno decode this many.
+        inline std::size_t store_rows() const {
+          return maskMode_ ? N_union_ : Nnomissing;
+        }
+        // Bytes per VR-pool row. Identical to m_size_of_esi off the mask path.
+        inline std::size_t vr_nbyte() const {
+          if (maskMode_ && activeVrStore_) return activeVrStore_->nbyte();
+          if (use_packed_flat_vr_)         return packed_flat_vr_.nbyte();
+          return (std::size_t)m_size_of_esi;
+        }
+        // Raw {0,1,2} of one packed cell (post-fill, union row index).
+        inline int packed_geno_at(std::size_t snp_idx, std::size_t row) const {
+          const unsigned char byte = packed_byte(snp_idx, row >> 2);
+          const int code = (byte >> ((row & 3) << 1)) & 0x3;
+          const int b = code & 1;
+          const int a = (code >> 1) & 1;
+          return 2 - (a + b);
+        }
+
 	//arma::fvec g_cateVarRatioMinMACVecExclude;
 	//arma::fvec g_cateVarRatioMaxMACVecInclude;
 	float g_minMACVarRatio;
@@ -321,7 +391,11 @@ public:
 	
 
         arma::ivec * Get_OneSNP_Geno(size_t SNPIdx){
-                m_OneSNP_Geno.zeros(Nnomissing);
+                // store_rows() == Nnomissing off the mask path; in mask mode a
+                // packed row covers the UNION, so the caller gets a
+                // union-length vector and does its own gather.
+                const size_t nrow_ = store_rows();
+                m_OneSNP_Geno.zeros(nrow_);
 
 		//avoid large continuous memory usage
 		int indexOfVectorPointer = SNPIdx/numMarkersofEachArray;
@@ -343,7 +417,7 @@ public:
 				m_OneSNP_Geno[ind] = bufferGeno;
                                 ind++;
                                 geno1 = geno1 >> 1;
-                                //if(ind >= Nnomissing){
+                                //if(ind >= nrow_){
 
                                 ////printf("%d, %d-%d-%d-%f-%d\n",Start_idx, genoVec[i] ,a ,b , m_OneSNP_Geno[ind-1] , m_size_of_esi);
                                 //        return & m_OneSNP_Geno;
@@ -361,7 +435,7 @@ public:
                                 m_OneSNP_Geno[ind] = bufferGeno;
                                 ind++;
                                 geno1 = geno1 >> 1;
-                                if(ind >= Nnomissing){
+                                if(ind >= nrow_){
 
                                 ////printf("%d, %d-%d-%d-%f-%d\n",Start_idx, genoVec[i] ,a ,b , m_OneSNP_Geno[ind-1] , m_size_of_esi);
                                         return & m_OneSNP_Geno;
@@ -372,6 +446,9 @@ public:
        }
    
         arma::ivec * Get_OneSNP_Geno_forVarRatio(size_t SNPIdx){
+                // The VR pool is packed on THIS phenotype's rows, with its own
+                // byte stride (identical to m_size_of_esi off the mask path).
+                const size_t vrb_ = vr_nbyte();
                 m_OneSNP_Geno.zeros(Nnomissing);
 
 		//avoid large continuous memory usage
@@ -379,11 +456,11 @@ public:
                 int SNPIdxinVec = SNPIdx % numMarkersofEachArray;
 		////////////////
 
-                size_t Start_idx = m_size_of_esi * SNPIdxinVec;
+                size_t Start_idx = vrb_ * SNPIdxinVec;
                 size_t ind= 0;
                 unsigned char geno1;
                 int bufferGeno;
-                for(size_t i=Start_idx; i< Start_idx+m_size_of_esi-1; i++){
+                for(size_t i=Start_idx; i< Start_idx+vrb_-1; i++){
                         //geno1 = genoVec[i];
 			geno1 = packed_byte_vr(indexOfVectorPointer, i);
                         for(int j=0; j<4; j++){
@@ -402,7 +479,7 @@ public:
                         }
                 }
 
-		size_t i = Start_idx+m_size_of_esi-1;
+		size_t i = Start_idx+vrb_-1;
 		geno1 = packed_byte_vr(indexOfVectorPointer, i);
                 for(int j=0; j<4; j++){
                                 int b = geno1 & 1 ;
@@ -634,7 +711,10 @@ public:
                 int SNPIdxinVec = SNPIdx % numMarkersofEachArray;
                 ////////////////
 		//std::cout << "indexOfVectorPointer " << indexOfVectorPointer << std::endl;
- 		out->zeros(Nnomissing);
+ 		// store_rows(): the packed row's own length. Off the mask path
+ 		// this is Nnomissing, exactly as before.
+ 		const size_t nrow_ = store_rows();
+ 		out->zeros(nrow_);
 		//std::cout << "m_size_of_esi " << m_size_of_esi << std::endl;
 		//std::cout << "SNPIdxinVec " << SNPIdxinVec << std::endl;
 		//std::cout << "genoVecofPointers[indexOfVectorPointer]->size() " << genoVecofPointers[indexOfVectorPointer]->size() << std::endl;
@@ -677,7 +757,7 @@ public:
 			ind++;
     			geno1 = geno1 >> 1;
     			
-//    			if(ind >= Nnomissing){
+//    			if(ind >= nrow_){
 //				cout << "Get_OneSNP_StdGeno " << SNPIdx << endl; 
 //				cout << "Nnomissing " << Nnomissing << endl; 
 //				stdGenoLookUpArr.clear();
@@ -698,7 +778,7 @@ public:
                         ind++;
                         geno1 = geno1 >> 1;
 
-                        if(ind >= Nnomissing){
+                        if(ind >= nrow_){
                                 stdGenoLookUpArr.clear();
                                 return 1;
                         }
@@ -711,7 +791,43 @@ public:
  	}
 
 
+	// Scheme C §3.4: the GRM diagonal is a per-phenotype quantity — this
+	// trait's freq/invstd (markers its own QC dropped carry invstd_t == 0 and
+	// fall out on their own), its own fill in the missing cells, and, at the
+	// call sites that divide, its own M_t. Accumulated over the UNION's rows
+	// in marker order (same order a solo run uses) and gathered to S_t's rows,
+	// so m.grm_diag.txt has n_t lines exactly like the solo file.
+	arma::fvec * Get_Diagof_StdGeno_masked(){
+		MaskTrait& T = maskTraits_[activeTrait_];
+		if(!T.diag_ready){
+			arma::fvec acc(N_union_, arma::fill::zeros);
+			arma::fvec tmp;
+			const std::size_t Mrows = packed_n_markers();
+			std::size_t ci = 0;
+			for(std::size_t i = 0; i < Mrows; i++){
+				Get_OneSNP_StdGeno(i, &tmp);
+				// §1 step 4: the packed cell holds fill_U; this trait wants
+				// fill_U + delta. Applied before the square, so the diagonal
+				// agrees with the kernel's corrected product.
+				while(ci < T.corr_col.size() &&
+				      (std::size_t)T.corr_col[ci] == i){
+					const int r = T.corr_row[ci];
+					const float g = (float)packed_geno_at(i, (std::size_t)r);
+					tmp[r] = (g + T.corr_delta[ci] - 2.0f*T.freq[i]) * T.invstd[i];
+					ci++;
+				}
+				acc += tmp % tmp;
+			}
+			T.diag_std.set_size(T.n_t);
+			for(int k = 0; k < T.n_t; k++) T.diag_std[k] = acc[T.scatter[k]];
+			T.diag_ready = true;
+		}
+		m_DiagStd = T.diag_std;
+		return & m_DiagStd;
+	}
+
 	arma::fvec * Get_Diagof_StdGeno(){
+		if(maskMode_) return Get_Diagof_StdGeno_masked();
 	
 		arma::fvec * temp = &m_OneSNP_StdGeno;
 		// Not yet calculated
@@ -834,6 +950,262 @@ public:
   	//This function is used instead of using a constructor because using constructor can not take
   	//genofile as an argument from runModel.R 
         //genofile is the predix for plink bim, bed, fam, files   
+	// ======================= scheme C: union load ============================
+	// optimization/missing_mt/SCHEME_C_DESIGN.md §1-§3. One decode over the
+	// union U of the group's sample sets produces, in the same pass:
+	//   · the §2 keep set (a marker survives iff SOME trait's QC keeps it) and
+	//     its packed bytes,
+	//   · every trait's integer deductions, from which its freq / invstd /
+	//     passQC / M_t are rebuilt through the decoder's OWN arithmetic (A1:
+	//     bit-identical to decoding S_t on its own),
+	//   · every trait's fill corrections, emitted directly — §3.1 forbids
+	//     materializing the union's missing-cell list (~3.9 GB at UKB shape).
+	// The VR pool is NOT taken from this pass: §7 keeps it per trait, packed on
+	// that trait's own rows, which is both correct (its MACs differ) and
+	// bit-identical to a solo run.
+	void setup_mask_union(saige::BedReaderPool& reader,
+	                      const saige::VarRatioRule& vr_rule,
+	                      const std::vector<unsigned char>& vr_drawn,
+	                      int nthreads_env)
+	{
+		const int P = (int)maskExclIn_->size();
+		maskMode_ = true;
+		N_union_  = Nnomissing;
+		maskTraits_.clear();
+		maskTraits_.resize(P);
+
+		std::vector<int> n_t(P);
+		std::vector<unsigned char> in_trait((std::size_t)P * N_union_, 0);
+		for (int t = 0; t < P; ++t) {
+			MaskTrait& T = maskTraits_[t];
+			T.name      = maskNamesIn_ ? (*maskNamesIn_)[t] : std::to_string(t);
+			T.scatter   = (*maskScatterIn_)[t];
+			T.mask_rows = (*maskExclIn_)[t];
+			T.n_t       = (int)T.scatter.size();
+			n_t[t]      = T.n_t;
+			for (int r : T.scatter)
+				in_trait[(std::size_t)t * N_union_ + (std::size_t)r] = 1;
+		}
+
+		saige::ExclusionSets es;
+		es.P    = P;
+		es.excl = maskExclIn_->data();
+		es.n_t  = n_t.data();
+
+		saige::ParallelDecodeAux aux;
+		aux.excl                = &es;
+		aux.collect_tally       = true;
+		aux.collect_keep        = true;
+		aux.pack_if_keep        = true;
+		aux.collect_corrections = true;
+		aux.in_trait            = in_trait.data();
+
+		auto par_res = saige::parallel_decode_bed(
+		    reader, ptrsubSampleInGeno.data(), N_union_,
+		    static_cast<std::size_t>(M), minMAFtoConstructGRM, maxMissingRate,
+		    nthreads_env, vr_rule,
+		    vr_drawn.empty() ? nullptr : vr_drawn.data(), &aux);
+
+		// Same per-marker debug lines the non-mask parallel path prints, over
+		// the union's own stats.
+		for (int i = 0; i < (int)M && i < 20; ++i) {
+			const auto& st = par_res.stats[i];
+			const float maf_dbg = std::min(st.altFreq, 1.0f - st.altFreq);
+			std::cout << "Marker " << i
+			          << ": freq=" << st.altFreq
+			          << ", maf=" << maf_dbg
+			          << ", missRate=" << st.missingRate
+			          << ", passQC=" << int(st.passQC)
+			          << std::endl;
+		}
+
+		// §2: the pack is the keep set, NOT the union's own pass-QC set.
+		// MarkerswithMAFge_..._indVec indexes BIM rows and must mark exactly
+		// what the store holds, because the compacted marker space (LOCO
+		// ranges, sparse-GRM subset indices) is derived from it.
+		MarkerswithMAFge_minMAFtoConstructGRM_indVec.reserve(M);
+		for (std::size_t i = 0; i < M; ++i)
+			MarkerswithMAFge_minMAFtoConstructGRM_indVec.push_back(
+			    par_res.keep_union[i] != 0);
+
+		const std::size_t Mkeep = par_res.store.n_stored();
+		origPlinkIdx0.assign(par_res.orig_plink_idx.begin(),
+		                     par_res.orig_plink_idx.end());
+		packed_flat_     = std::move(par_res.store);
+		use_packed_flat_ = true;
+		numberofMarkerswithMAFge_minMAFtoConstructGRM = (int)Mkeep;
+
+		std::vector<int> bim2keep(M, -1);
+		for (std::size_t k = 0; k < Mkeep; ++k)
+			bim2keep[origPlinkIdx0[k]] = (int)k;
+
+		// ---- per-trait stats + corrections ----
+		std::vector<saige::TraitMarkerStats> ts(P);
+		for (int t = 0; t < P; ++t) {
+			MaskTrait& T = maskTraits_[t];
+			saige::compute_trait_stats(
+			    par_res.stats.data(), M, par_res.tally.data(), P, t, n_t[t],
+			    minMAFtoConstructGRM, maxMissingRate, vr_rule,
+			    vr_drawn.empty() ? nullptr : vr_drawn.data(), ts[t]);
+
+			T.freq.assign(Mkeep, 0.0f);
+			T.invstd.assign(Mkeep, 0.0f);
+			T.mac.assign(Mkeep, 0);
+			int mt = 0;
+			for (std::size_t k = 0; k < Mkeep; ++k) {
+				const std::size_t j = (std::size_t)origPlinkIdx0[k];
+				T.freq[k]   = ts[t].freq[j];
+				T.invstd[k] = ts[t].invstd[j];
+				T.mac[k]    = ts[t].mac[j];
+				if (ts[t].passQC[j]) ++mt;
+			}
+			// If these disagree the §2 keep rule dropped a marker that this
+			// trait's QC keeps — the GRM would silently lose it.
+			if (mt != ts[t].M_t)
+				throw std::runtime_error(
+				    "scheme C: trait " + T.name + " has M_t=" +
+				    std::to_string(ts[t].M_t) + " but only " +
+				    std::to_string(mt) + " of its QC markers are in the union pack");
+			T.M_t = mt;
+
+			// Corrections: BIM marker index -> packed row. Entries on markers
+			// the pack dropped, or on columns this trait zeroes (invstd_t == 0),
+			// contribute nothing — dropping them only shortens the list.
+			// Remapping is monotone, so the (col,row) ordering bind_trait
+			// demands survives.
+			const auto& cr = par_res.corr_row[t];
+			const auto& cc = par_res.corr_col[t];
+			const auto& cd = par_res.corr_delta[t];
+			T.corr_row.reserve(cc.size());
+			T.corr_col.reserve(cc.size());
+			T.corr_delta.reserve(cc.size());
+			for (std::size_t q = 0; q < cc.size(); ++q) {
+				const int k = bim2keep[(std::size_t)cc[q]];
+				if (k < 0) continue;
+				if (T.invstd[k] == 0.0f) continue;
+				T.corr_row.push_back(cr[q]);
+				T.corr_col.push_back(k);
+				T.corr_delta.push_back(cd[q]);
+			}
+			std::cout << "[mask] trait " << T.name << ": n_t=" << T.n_t
+			          << " (union " << N_union_ << ", cov="
+			          << (double)T.n_t / (double)N_union_ << ")"
+			          << "  M_t=" << T.M_t << "/" << Mkeep
+			          << "  masked_rows=" << T.mask_rows.size()
+			          << "  fill_corrections=" << T.corr_col.size()
+			          << " (of " << cc.size() << " raw)" << std::endl;
+		}
+
+		// ---- §7: per-trait VR pool, packed on that trait's own rows ----
+		if (isVarRatio) {
+			saige::BedLut lut_vr;
+			saige::build_bed_lookup(lut_vr);
+			std::vector<unsigned char> raw(reader.n_bytes_per_marker());
+			for (int t = 0; t < P; ++t) {
+				MaskTrait& T = maskTraits_[t];
+				std::vector<int> trait_ptrsub(T.n_t);
+				for (int k = 0; k < T.n_t; ++k)
+					trait_ptrsub[k] = ptrsubSampleInGeno[T.scatter[k]];
+				std::vector<int> vr_markers;
+				for (std::size_t j = 0; j < M; ++j)
+					if (ts[t].passVR[j]) vr_markers.push_back((int)j);
+				const std::size_t nb = ((std::size_t)T.n_t + 3) / 4;
+				T.vr_store.init(vr_markers.size(), nb);
+				T.vr_store.set_n_stored(vr_markers.size());
+				std::vector<unsigned char> packed_vr(nb);
+				T.vr_freq.reserve(vr_markers.size());
+				T.vr_invstd.reserve(vr_markers.size());
+				T.vr_mac.reserve(vr_markers.size());
+				T.vr_idx.reserve(vr_markers.size());
+				for (std::size_t q = 0; q < vr_markers.size(); ++q) {
+					const int j = vr_markers[q];
+					reader.read_marker(0, (std::size_t)j, raw.data());
+					saige::MarkerStats st;
+					bool pvr = false;
+					saige::decode_marker(raw.data(), reader.n_samples(),
+					                     trait_ptrsub.data(), (std::size_t)T.n_t,
+					                     minMAFtoConstructGRM, maxMissingRate,
+					                     lut_vr, vr_rule,
+					                     vr_drawn.empty() ? false : (vr_drawn[j] != 0),
+					                     st, pvr, packed_vr.data());
+					if (!pvr)
+						throw std::runtime_error(
+						    "scheme C: trait " + T.name + " marker " +
+						    std::to_string(j) + " claimed for VR by the rebuilt "
+						    "stats but not by its own decode");
+					T.vr_store.write(q, packed_vr.data());
+					const float Std_i = std::sqrt(2.0f * st.altFreq * (1.0f - st.altFreq));
+					T.vr_invstd.push_back(Std_i == 0.0f ? 0.0f : 1.0f / Std_i);
+					T.vr_freq.push_back(st.altFreq);
+					T.vr_mac.push_back(st.mac);
+					T.vr_idx.push_back(j);
+				}
+				T.vr_n = (int)vr_markers.size();
+				std::cout << "[mask] trait " << T.name << ": VR pool "
+				          << T.vr_n << " markers, " << T.vr_store.bytes()
+				          << " bytes" << std::endl;
+			}
+		}
+
+		// The tail of setGenoObj copies the *0 staging vectors into the arma
+		// members; seed them with trait 0 so that code runs untouched.
+		// activate_trait() overwrites them for whichever trait is fitting.
+		{
+			MaskTrait& T0 = maskTraits_[0];
+			invstdvVec0.assign(T0.invstd.begin(), T0.invstd.end());
+			alleleFreqVec0.assign(T0.freq.begin(), T0.freq.end());
+			MACVec0.assign(T0.mac.begin(), T0.mac.end());
+			if (isVarRatio) {
+				invstdvVec0_forVarRatio.assign(T0.vr_invstd.begin(), T0.vr_invstd.end());
+				alleleFreqVec0_forVarRatio.assign(T0.vr_freq.begin(), T0.vr_freq.end());
+				MACVec0_forVarRatio.assign(T0.vr_mac.begin(), T0.vr_mac.end());
+				markerIndexVec0_forVarRatio.assign(T0.vr_idx.begin(), T0.vr_idx.end());
+				numberofMarkers_varRatio = T0.vr_n;
+			}
+		}
+		std::cout << "[option-3] use_packed_flat_=true  packed_flat_.n_stored=" << packed_flat_.n_stored()
+		          << "  packed_flat_.nbyte=" << packed_flat_.nbyte()
+		          << "  bytes=" << packed_flat_.bytes()
+		          << std::endl;
+	}
+
+	// Switch the object to phenotype `t` (SCHEME_C_DESIGN.md §3.4). Everything
+	// outside this class then sees one phenotype of n_t samples: the vectors it
+	// sizes off getNnomissing(), the marker count it divides by, the VR pool it
+	// reads, the GRM diagonal it writes out.
+	void activate_trait(int t)
+	{
+		if (!maskMode_) return;
+		if (t < 0 || t >= (int)maskTraits_.size())
+			throw std::runtime_error("activate_trait: index out of range");
+		activeTrait_ = t;
+		MaskTrait& T = maskTraits_[t];
+		Nnomissing = (std::size_t)T.n_t;
+		numberofMarkerswithMAFge_minMAFtoConstructGRM = T.M_t;
+		alleleFreqVec = arma::fvec(T.freq.data(),   T.freq.size());
+		invstdvVec    = arma::fvec(T.invstd.data(), T.invstd.size());
+		MACVec        = arma::conv_to<arma::ivec>::from(
+		                    arma::Col<int>(const_cast<int*>(T.mac.data()),
+		                                   T.mac.size(), false, true));
+		activeVrStore_ = &T.vr_store;
+		if (isVarRatio) {
+			use_packed_flat_vr_       = true;
+			numberofMarkers_varRatio  = T.vr_n;
+			alleleFreqVec_forVarRatio = arma::fvec(T.vr_freq.data(), T.vr_freq.size());
+			invstdvVec_forVarRatio    = arma::fvec(T.vr_invstd.data(), T.vr_invstd.size());
+			MACVec_forVarRatio = arma::conv_to<arma::ivec>::from(
+			    arma::Col<int>(const_cast<int*>(T.vr_mac.data()), T.vr_mac.size(), false, true));
+			markerIndexVec_forVarRatio = arma::conv_to<arma::ivec>::from(
+			    arma::Col<int>(const_cast<int*>(T.vr_idx.data()), T.vr_idx.size(), false, true));
+		}
+		// The diagonal is per trait; drop the cached one (it is kept inside
+		// MaskTrait, so a second activation of the same trait is free).
+		m_DiagStd.reset();
+		if (T.diag_ready) m_DiagStd = T.diag_std;
+		m_DiagStd_LOCO.reset();
+		mtx_DiagStd_LOCO.reset();
+	}
+
   	void setGenoObj(std::string bedfile, std::string bimfile, std::string famfile, std::vector<int> & subSampleInGeno, std::vector<bool> & indicatorGenoSamplesWithPheno, float memoryChunk, bool  isDiagofKinSetAsOne){
 		auto t_start = std::chrono::steady_clock::now();
 		auto t_prev = t_start;
@@ -1097,6 +1469,15 @@ public:
 			saige::BedReaderPool reader(bedfile,
 			                             static_cast<std::size_t>(N),
 			                             nthreads_env);
+
+			// Scheme C: the caller handed us the group's per-trait exclusion
+			// sets, so this is a UNION load. Everything the traits need that
+			// is not the matrix is rebuilt in setup_mask_union().
+			if (maskExclIn_ != nullptr) {
+				setup_mask_union(reader, vr_rule, vr_drawn, nthreads_env);
+				elapsed("BED marker loop (PARALLEL union: read+decode+store)");
+			} else {
+
 			auto par_res = saige::parallel_decode_bed(
 			    reader,
 			    ptrsubSampleInGeno.data(),
@@ -1189,6 +1570,7 @@ public:
 			          << "  bytes=" << packed_flat_.bytes()
 			          << std::endl;
 			elapsed("BED marker loop (PARALLEL: read+decode+store)");
+			}  // end of the non-mask parallel path
 		} else {
 		// ========================= serial fallback (VR path) =================
 		// Seek to start of genotype data (skip 3-byte BED header) once
@@ -1515,6 +1897,41 @@ void init_global_geno(const std::string& bed, const std::string& bim, const std:
   geno.setGenoObj(bed, bim, fam, subSampleInGeno, indicatorGenoSamplesWithPheno, 1.0f, setKinDiagtoOne);
 }
 
+// Scheme C (SCHEME_C_DESIGN.md §3.4). Same call, but `subSampleInGeno` is the
+// UNION of the group's sample sets and each phenotype hands in the union-local
+// rows it does NOT own (`excl`, ascending) and the ones it does (`scatter`,
+// ascending — its solo row order, because both are sorted by FAM row).
+// After this returns the object is on phenotype 0; activate_trait_for_fit()
+// moves it.
+void init_global_geno_masked(const std::string& bed, const std::string& bim,
+                             const std::string& fam,
+                             std::vector<int> & subSampleInGeno,
+                             std::vector<bool> & indicatorGenoSamplesWithPheno,
+                             bool setKinDiagtoOne,
+                             double minMAFforGRM, double maxMissRateforGRM,
+                             const std::vector<std::vector<int>>& excl,
+                             const std::vector<std::vector<int>>& scatter,
+                             const std::vector<std::string>& names) {
+  if (excl.size() != scatter.size() || excl.size() != names.size())
+    throw std::runtime_error("init_global_geno_masked: excl/scatter/names size mismatch");
+  geno.maskExclIn_    = &excl;
+  geno.maskScatterIn_ = &scatter;
+  geno.maskNamesIn_   = &names;
+  try {
+    init_global_geno(bed, bim, fam, subSampleInGeno, indicatorGenoSamplesWithPheno,
+                     setKinDiagtoOne, minMAFforGRM, maxMissRateforGRM);
+  } catch (...) {
+    geno.maskExclIn_ = nullptr; geno.maskScatterIn_ = nullptr; geno.maskNamesIn_ = nullptr;
+    throw;
+  }
+  // The caller's vectors were only needed for the decode; do not keep pointers
+  // into them alive past this point.
+  geno.maskExclIn_ = nullptr; geno.maskScatterIn_ = nullptr; geno.maskNamesIn_ = nullptr;
+  geno.activate_trait(0);
+}
+
+bool mask_mode_active() { return geno.maskMode_; }
+
 // Forward declaration
 arma::fvec get_GRMdiagVec();
 
@@ -1547,9 +1964,15 @@ void output_grm_diagonal(const std::string& out_path) {
   // DEBUG: 检查 subSampleInGeno 和 indicatorWithPheno
   std::cout << "\n=== DEBUG: ptrsubSampleInGeno for samples 1-5 ===" << std::endl;
   std::vector<int>& subSample = geno.ptrsubSampleInGeno;
-  std::cout << "subSampleInGeno size: " << subSample.size() << std::endl;
+  // In mask mode ptrsubSampleInGeno indexes the UNION, so row s of THIS
+  // phenotype is union row scatter[s].
+  const std::vector<int>* scat = geno.maskMode_
+      ? &geno.maskTraits_[(std::size_t)geno.activeTrait_].scatter : nullptr;
+  auto urow = [&](int s) { return scat ? (*scat)[s] : s; };
+  std::cout << "subSampleInGeno size: "
+            << (scat ? scat->size() : subSample.size()) << std::endl;
   for (int s = 0; s < 5; s++) {
-    std::cout << "Sample " << (s+1) << " -> FAM index " << subSample[s] << std::endl;
+    std::cout << "Sample " << (s+1) << " -> FAM index " << subSample[urow(s)] << std::endl;
   }
 
   // DEBUG: 统计样本1-5的基因型分布
@@ -1578,13 +2001,36 @@ void output_grm_diagonal(const std::string& out_path) {
   if (!s_grmdiag_scan_valid || s_grmdiag_scan_markers != totalMarkers) {
     for (int s = 0; s < 5; s++)
       s_grmdiag_scan_count[s][0] = s_grmdiag_scan_count[s][1] = s_grmdiag_scan_count[s][2] = 0;
-    for (int m = 0; m < totalMarkers; m++) {
+    // Off the mask path the store holds exactly this trait's GRM markers, so
+    // [0, totalMarkers) is them. In mask mode the store is the §2 keep set: the
+    // markers THIS trait keeps are the ones with invstd_t != 0, and the missing
+    // cells hold fill_U, so the fill corrections have to be replayed — the
+    // `fill` case is built so these counts notice.
+    const int n_scan = geno.maskMode_ ? (int)geno.packed_n_markers() : totalMarkers;
+    for (int m = 0; m < n_scan; m++) {
+      if (geno.maskMode_ &&
+          geno.maskTraits_[(std::size_t)geno.activeTrait_].invstd[m] == 0.0f) continue;
       const arma::ivec* rawGeno = geno.Get_OneSNP_Geno(m);
       for (int s = 0; s < 5; s++) {
-        int g = (*rawGeno)[s];
+        int g = (*rawGeno)[urow(s)];
         if (g == 0) s_grmdiag_scan_count[s][0]++;
         else if (g == 1) s_grmdiag_scan_count[s][1]++;
         else if (g == 2) s_grmdiag_scan_count[s][2]++;
+      }
+    }
+    if (geno.maskMode_) {
+      const auto& T = geno.maskTraits_[(std::size_t)geno.activeTrait_];
+      int first5[5];
+      for (int s = 0; s < 5; s++) first5[s] = urow(s);
+      for (std::size_t c = 0; c < T.corr_col.size(); ++c) {
+        for (int s = 0; s < 5; s++) {
+          if (T.corr_row[c] != first5[s]) continue;
+          const int gU = geno.packed_geno_at((std::size_t)T.corr_col[c],
+                                             (std::size_t)T.corr_row[c]);
+          const int gT = gU + (int)T.corr_delta[c];
+          if (gU >= 0 && gU <= 2) s_grmdiag_scan_count[s][gU]--;
+          if (gT >= 0 && gT <= 2) s_grmdiag_scan_count[s][gT]++;
+        }
       }
     }
     s_grmdiag_scan_markers = totalMarkers;
@@ -2111,6 +2557,19 @@ int                 g_gpu_state     = 0;      // 0=unknown, 1=use, 2=permanent C
 // SAIGE_GPU_VERIFY=1 — makes the GPU dispatch a no-op for that one call.
 bool                g_gpu_in_verify = false;
 
+// ---- scheme C scatter/gather (SCHEME_C_DESIGN.md §3.4) --------------------
+// The fit's vectors are n_t long and stay that way; only the multiplication is
+// wrapped. scatter writes the phenotype's rows into a |U|-long buffer whose
+// other rows are zero (that IS §1's "b_i = 0 for i not in S_t"), gather takes
+// the owned rows back out. The device-side mask kernel re-zeros x anyway, so it
+// is the second gate, not the first.
+arma::fvec g_mask_x, g_mask_r;
+bool       g_mask_x_dirty = true;   // set on every trait switch
+
+// Point the handle at the active phenotype's bind and its 1/M_t.
+void gpu_apply_active_trait();
+bool gpu_masked_matvec(saige::gpu::Handle* h, const float* b_n, float* out_n);
+
 // G3: lazily create the Handle on first use when SAIGE_USE_GPU=1 is set by
 // main.cpp and packed_flat_ is populated. Returns nullptr whenever the caller
 // should run on the CPU. Silent fallback on any failure.
@@ -2136,7 +2595,10 @@ saige::gpu::Handle* gpu_handle_or_null() {
 			// counterparts the class already maintains.
 			std::vector<float> freq_h(geno.alleleFreqVec.begin(), geno.alleleFreqVec.end());
 			std::vector<float> invstd_h(geno.invstdvVec.begin(),  geno.invstdvVec.end());
-			const int N = (int)geno.getNnomissing();
+			// store_rows(): the uploaded matrix's row count. Off the mask
+			// path that is getNnomissing(); in mask mode it is |U|, while
+			// getNnomissing() is the active phenotype's n_t.
+			const int N = (int)geno.store_rows();
 			// Allow forcing tier via SAIGE_GPU_TIER={1,3,4}; default 0 = auto
 			// (auto prefers 4 = 2-bit resident + rank-one standardization,
 			//  then 3 = 2-bit resident + per-element standardization,
@@ -2161,6 +2623,36 @@ saige::gpu::Handle* gpu_handle_or_null() {
 			}
 			if (g_gpu_handle) {
 				g_gpu_state = 1;
+				// Scheme C §3.3/§3.4: one bind per phenotype on the shared
+				// Ctx. Only tier 4 has the masked kernels — a lower tier here
+				// means the mask group cannot be served, and saying so beats
+				// running every trait against the union's standardization.
+				if (geno.maskMode_) {
+					if (saige::gpu::tier(g_gpu_handle) != 4)
+						throw std::runtime_error(
+						    "fit.mask_missing needs GPU tier 4 (the packed 2-bit "
+						    "kernels); this handle came up at tier " +
+						    std::to_string(saige::gpu::tier(g_gpu_handle)) +
+						    ". Re-run with fit.mask_missing: false.");
+					for (auto& T : geno.maskTraits_) {
+						const int nc = (int)T.corr_col.size();
+						T.gpu_bind = saige::gpu::add_bind(
+						    g_gpu_handle, T.freq.data(), T.invstd.data(),
+						    T.mask_rows.empty() ? nullptr : T.mask_rows.data(),
+						    (int)T.mask_rows.size(),
+						    nc ? T.corr_row.data()   : nullptr,
+						    nc ? T.corr_col.data()   : nullptr,
+						    nc ? T.corr_delta.data() : nullptr, nc);
+						if (T.gpu_bind < 0)
+							throw std::runtime_error(
+							    "scheme C: gpu bind_trait failed for phenotype " + T.name);
+					}
+					std::cout << "[mask] bound " << geno.maskTraits_.size()
+					          << " phenotypes to one tier-4 union matrix (N_union="
+					          << geno.N_union_ << ", M_pack="
+					          << geno.packed_n_markers() << ")" << std::endl;
+					gpu_apply_active_trait();
+				}
 				std::cout << "[parallelCrossProd] GPU tier="
 				          << saige::gpu::tier(g_gpu_handle)
 				          << " enabled (source="
@@ -2201,6 +2693,33 @@ void gpu_mark_failed(const char* where) {
 	g_gpu_state  = 2;
 }
 
+void gpu_apply_active_trait() {
+	if (!geno.maskMode_ || g_gpu_state != 1 || g_gpu_handle == nullptr) return;
+	const int t = geno.activeTrait_;
+	if (t < 0) return;
+	const auto& T = geno.maskTraits_[(std::size_t)t];
+	if (T.gpu_bind < 0) return;               // binds not built yet
+	if (!saige::gpu::select_bind(g_gpu_handle, T.gpu_bind))
+		throw std::runtime_error("scheme C: select_bind failed for phenotype " + T.name);
+	saige::gpu::set_inv_M(g_gpu_handle,
+	                      T.M_t > 0 ? 1.0f / (float)T.M_t : 0.0f);
+	g_mask_x_dirty = true;
+}
+
+bool gpu_masked_matvec(saige::gpu::Handle* h, const float* b_n, float* out_n) {
+	const auto& T = geno.maskTraits_[(std::size_t)geno.activeTrait_];
+	const arma::uword NU = (arma::uword)geno.N_union_;
+	if (g_mask_x.n_elem != NU) { g_mask_x.set_size(NU); g_mask_x_dirty = true; }
+	if (g_mask_r.n_elem != NU) g_mask_r.set_size(NU);
+	// Rows this phenotype does not own are written once and then stay zero:
+	// the scatter below only ever touches rows it owns.
+	if (g_mask_x_dirty) { g_mask_x.zeros(); g_mask_x_dirty = false; }
+	for (int k = 0; k < T.n_t; ++k) g_mask_x[T.scatter[k]] = b_n[k];
+	if (!saige::gpu::matvec(h, g_mask_x.memptr(), g_mask_r.memptr())) return false;
+	for (int k = 0; k < T.n_t; ++k) out_n[k] = g_mask_r[T.scatter[k]];
+	return true;
+}
+
 }  // namespace
 
 // INTERNAL: Parallel computation helper for cross products
@@ -2231,6 +2750,19 @@ arma::fvec parallelCrossProd(arma::fcolvec & bVec) {
 			const char* v = std::getenv("SAIGE_GPU_VERIFY");
 			return v && std::string(v) == "1";
 		}();
+		if (s_gpu_handle && geno.maskMode_) {
+			// Scheme C: scatter to |U|, multiply, gather back to n_t.
+			arma::fvec out((arma::uword)geno.getNnomissing());
+			if (gpu_masked_matvec(s_gpu_handle, bVec.memptr(), out.memptr()))
+				return out;
+			gpu_mark_failed("parallelCrossProd");
+			// There is no CPU equivalent of the union+mask path (§7 keeps the
+			// CPU on grouping), so falling through would compute a different
+			// phenotype's GRM. Stop instead.
+			throw std::runtime_error(
+			    "scheme C: the masked GPU matvec failed and there is no CPU "
+			    "fallback for fit.mask_missing. Re-run with mask_missing: false.");
+		}
 		if (s_gpu_handle) {
 			arma::fvec out((arma::uword)geno.getNnomissing());
 			if (saige::gpu::matvec(s_gpu_handle, bVec.memptr(), out.memptr())) {
@@ -2695,6 +3227,31 @@ arma::fmat parallelCrossProdMat(const arma::fmat& Bmat) {
 	// the whole packed matrix once per column, which is the very cost the
 	// batch kernel exists to avoid).
 	if (saige::gpu::Handle* h = gpu_handle_or_null()) {
+		if (geno.maskMode_) {
+			// Same scatter/gather as the single-column path, column by column.
+			const auto& T  = geno.maskTraits_[(std::size_t)geno.activeTrait_];
+			const arma::uword NU = (arma::uword)geno.N_union_;
+			arma::fmat Xu(NU, k, arma::fill::zeros);
+			for (arma::uword j = 0; j < k; ++j) {
+				const float* src = Bmat.colptr(j);
+				float*       dst = Xu.colptr(j);
+				for (int r = 0; r < T.n_t; ++r) dst[T.scatter[r]] = src[r];
+			}
+			arma::fmat Ru(NU, k);
+			if (saige::gpu::matvec_mat(h, Xu.memptr(), (int)k, Ru.memptr())) {
+				arma::fmat out(N, k);
+				for (arma::uword j = 0; j < k; ++j) {
+					const float* src = Ru.colptr(j);
+					float*       dst = out.colptr(j);
+					for (int r = 0; r < T.n_t; ++r) dst[r] = src[T.scatter[r]];
+				}
+				return out;
+			}
+			gpu_mark_failed("parallelCrossProdMat");
+			throw std::runtime_error(
+			    "scheme C: the masked GPU batch matvec failed and there is no CPU "
+			    "fallback for fit.mask_missing. Re-run with mask_missing: false.");
+		}
 		if (saige::gpu::matvec_mat_available(h)) {
 			arma::fmat out(N, k);
 			if (saige::gpu::matvec_mat(h, Bmat.memptr(), (int)k, out.memptr()))
@@ -3273,6 +3830,28 @@ arma::fmat getCrossprodMatAndKinMat_traceCached(const arma::fmat& Umat, int colS
 //      switches: main.cpp re-subsets and re-sets them for the new group.
 //   5. output_grm_diagonal's samples-1..5 count cache.
 // ---------------------------------------------------------------------------
+// Scheme C §3.4: move the whole step-1 world to phenotype `t` of the mask
+// group. Everything keyed on "which phenotype" — the GPU bind and its 1/M_t,
+// the psi*U probe cache (psi is per phenotype now, so the cache CANNOT be
+// shared: two traits of one group can draw the same U and would silently reuse
+// the wrong psi*U), the samples-1..5 scan — is switched or invalidated here.
+// No-op when mask_missing is off.
+void activate_trait_for_fit(int t)
+{
+	if (!geno.maskMode_) return;
+	geno.activate_trait(t);
+	g_traceUcache.reset();
+	g_traceAUcache.reset();
+	s_grmdiag_scan_valid   = false;
+	s_grmdiag_scan_markers = -1;
+	gpu_apply_active_trait();
+	std::cout << "[mask] active phenotype -> "
+	          << geno.maskTraits_[(std::size_t)t].name
+	          << "  n_t=" << geno.getNnomissing()
+	          << "  M_t=" << geno.getnumberofMarkerswithMAFge_minMAFtoConstructGRM()
+	          << std::endl;
+}
+
 void reset_step1_state_for_new_sample_set()
 {
 	// 1. GPU

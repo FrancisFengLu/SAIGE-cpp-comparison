@@ -253,6 +253,8 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
   if (get("multi_lockstep")) c.multi_lockstep = get("multi_lockstep").as<bool>();
+  if (get("mask_missing")) c.mask_missing = get("mask_missing").as<bool>();
+  if (get("mask_min_coverage")) c.mask_min_coverage = get("mask_min_coverage").as<double>();
   if (get("use_blocked_gemv")) c.use_blocked_gemv = get("use_blocked_gemv").as<bool>();
   if (get("gemv_block_size")) c.gemv_block_size = get("gemv_block_size").as<int>();
   if (get("gemv_verify")) c.gemv_verify = get("gemv_verify").as<bool>();
@@ -1531,7 +1533,9 @@ int main(int argc, char** argv) {
     if (g == groups.size()) groups.emplace_back();
     groups[g].push_back(k);
   }
-  const size_t G = groups.size();
+  // Not const: fit.mask_missing may merge these base groups into fewer
+  // "mask groups", each of which is one genotype load (see below).
+  size_t G = groups.size();
   auto group_traits = [&](size_t g) {
     std::string s;
     for (size_t k : groups[g]) { if (!s.empty()) s += " "; s += models[k].y_col; }
@@ -1562,9 +1566,11 @@ int main(int argc, char** argv) {
   // This matches R's: indicatorGenoSamplesWithPheno = (sampleListwithGeno$IndexGeno %in% dataMerge_sort$IndexGeno)
   std::vector<std::vector<int>>  group_subSampleInGeno(G);
   std::vector<std::vector<bool>> group_indicatorWithPheno(G);
+  int N_fam_total = 0;
   {
     auto fam_iids = read_fam_iids(paths.fam);
     int N_fam = static_cast<int>(fam_iids.size());
+    N_fam_total = N_fam;
 
     // Create mapping from IID to FAM index (1-based)
     std::unordered_map<std::string,int> fam_pos; fam_pos.reserve(N_fam*2);
@@ -1644,6 +1650,143 @@ int main(int argc, char** argv) {
               << ", indicatorWithPheno.size()=" << indicatorWithPheno.size() << std::endl;
     }
   }
+
+  // ===== Scheme C: mask groups (optimization/missing_mt/SCHEME_C_DESIGN.md §6) =====
+  // The sample-set groups above are the unit of "identical rows". fit.mask_missing
+  // relaxes that: several of them share ONE genotype load over their union, and
+  // each phenotype zeroes the union rows it does not own inside the
+  // multiplication. Worth it only when the sets overlap heavily, because every
+  // multiplication then reads |U| rows instead of |S_t| — mask_min_coverage is
+  // the whole cost model.
+  //
+  // A mask group holding a single sample set is kept, not unwound: it is the
+  // degenerate case (empty exclusion list, empty correction list, per-trait
+  // stats equal to the union's) and it must reproduce the non-masked run.
+  struct MaskInfo {
+    bool                          on = false;
+    std::vector<std::vector<int>> excl;      // per sample set: union rows NOT owned
+    std::vector<std::vector<int>> scatter;   // per sample set: union rows owned
+    std::vector<std::string>      names;     // per sample set
+    std::vector<int>              member_bind;  // per trait of the group
+  };
+  std::vector<MaskInfo> unit_mask(G);
+  if (cfg.mask_missing) {
+    std::string why;
+    if (!cfg.use_gpu)
+      why = "fit.use_gpu is off — SCHEME_C_DESIGN.md §7 keeps the CPU path on grouping";
+    else if (cfg.loco)
+      why = "fit.loco is on — per-chromosome M_t and diagonals are the second cut (§7)";
+    else if (cfg.use_sparse_grm_to_fit)
+      why = "fit.use_sparse_grm_to_fit is on — the sparse fit never goes through the psi kernel (§7)";
+    if (!why.empty()) {
+      std::cout << "[mask] fit.mask_missing requested but NOT used: " << why
+                << ". Falling back to sample-set grouping.\n";
+    } else {
+      // Greedy (§6): largest sample set first; a set joins an existing mask
+      // group only if every member still covers >= mask_min_coverage of the
+      // resulting union.
+      std::vector<size_t> order(G);
+      std::iota(order.begin(), order.end(), size_t{0});
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return group_subSampleInGeno[a].size() > group_subSampleInGeno[b].size();
+      });
+      std::vector<std::vector<size_t>> units;    // base-group indices
+      std::vector<std::vector<int>>    uni;      // FAM 1-based union, ascending
+      for (size_t gi : order) {
+        const std::vector<int>& sg = group_subSampleInGeno[gi];
+        bool placed = false;
+        for (size_t u = 0; u < units.size() && !placed; ++u) {
+          std::vector<int> cand;
+          cand.reserve(uni[u].size() + sg.size());
+          std::set_union(uni[u].begin(), uni[u].end(), sg.begin(), sg.end(),
+                         std::back_inserter(cand));
+          double mincov = (double)sg.size() / (double)cand.size();
+          for (size_t bg : units[u])
+            mincov = std::min(mincov,
+                              (double)group_subSampleInGeno[bg].size() / (double)cand.size());
+          if (mincov >= cfg.mask_min_coverage) {
+            units[u].push_back(gi);
+            uni[u] = std::move(cand);
+            placed = true;
+          }
+        }
+        if (!placed) { units.push_back({gi}); uni.push_back(sg); }
+      }
+      // Order the units by their earliest phenotype so the log reads in config
+      // order; the fit itself does not depend on it.
+      std::vector<size_t> uorder(units.size());
+      std::iota(uorder.begin(), uorder.end(), size_t{0});
+      std::stable_sort(uorder.begin(), uorder.end(), [&](size_t a, size_t b) {
+        auto first_of = [&](size_t u) {
+          size_t f = designs.size();
+          for (size_t bg : units[u]) f = std::min(f, groups[bg].front());
+          return f;
+        };
+        return first_of(a) < first_of(b);
+      });
+
+      std::vector<std::vector<size_t>> new_groups;
+      std::vector<std::vector<int>>    new_sub;
+      std::vector<std::vector<bool>>   new_ind;
+      std::vector<MaskInfo>            new_mask;
+      for (size_t uu : uorder) {
+        // Base groups of this unit, in config order.
+        std::vector<size_t> bgs = units[uu];
+        std::stable_sort(bgs.begin(), bgs.end(), [&](size_t a, size_t b) {
+          return groups[a].front() < groups[b].front();
+        });
+        const std::vector<int>& U = uni[uu];
+        std::unordered_map<int,int> pos;               // FAM 1-based -> union row
+        pos.reserve(U.size() * 2);
+        for (size_t i = 0; i < U.size(); ++i) pos.emplace(U[i], (int)i);
+
+        MaskInfo mi;
+        mi.on = true;
+        std::vector<size_t> members;
+        for (size_t bi = 0; bi < bgs.size(); ++bi) {
+          const size_t bg = bgs[bi];
+          const std::vector<int>& sg = group_subSampleInGeno[bg];
+          std::vector<int> sc; sc.reserve(sg.size());
+          for (int fam1 : sg) sc.push_back(pos.at(fam1));
+          std::vector<char> own(U.size(), 0);
+          for (int r : sc) own[(size_t)r] = 1;
+          std::vector<int> ex;
+          ex.reserve(U.size() - sc.size());
+          for (size_t i = 0; i < U.size(); ++i) if (!own[i]) ex.push_back((int)i);
+          mi.scatter.push_back(std::move(sc));
+          mi.excl.push_back(std::move(ex));
+          mi.names.push_back(group_traits(bg));
+          for (size_t k : groups[bg]) { members.push_back(k); mi.member_bind.push_back((int)bi); }
+        }
+        std::vector<bool> ind(N_fam_total, false);
+        for (int fam1 : U) ind[(size_t)fam1 - 1] = true;
+        new_groups.push_back(std::move(members));
+        new_sub.push_back(U);
+        new_ind.push_back(std::move(ind));
+        new_mask.push_back(std::move(mi));
+      }
+      groups                 = std::move(new_groups);
+      group_subSampleInGeno  = std::move(new_sub);
+      group_indicatorWithPheno = std::move(new_ind);
+      unit_mask              = std::move(new_mask);
+      G                      = groups.size();
+      std::cout << "\n[mask] fit.mask_missing: " << designs.size()
+                << " phenotypes over " << G << " mask group(s), min coverage "
+                << cfg.mask_min_coverage << ":\n";
+      for (size_t g = 0; g < G; ++g) {
+        std::cout << "    mask group " << (g + 1) << "/" << G << ": union n="
+                  << group_subSampleInGeno[g].size() << ", "
+                  << unit_mask[g].scatter.size() << " sample set(s):";
+        for (size_t b = 0; b < unit_mask[g].scatter.size(); ++b)
+          std::cout << "  [" << unit_mask[g].names[b] << " n="
+                    << unit_mask[g].scatter[b].size() << " cov="
+                    << (double)unit_mask[g].scatter[b].size() /
+                       (double)group_subSampleInGeno[g].size() << "]";
+        std::cout << "\n";
+      }
+    }
+  }
+
   Design& design = designs[0];
   const std::vector<int>& subSampleInGeno = group_subSampleInGeno[0];
 
@@ -1797,7 +1940,9 @@ int main(int argc, char** argv) {
   if (gi > 0) reset_step1_state_for_new_sample_set();
   if (G > 1) {
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "=== sample-set group " << (gi + 1) << "/" << G << ": n=" << design.n
+    std::cout << "=== sample-set group " << (gi + 1) << "/" << G << ": n="
+              << (unit_mask[gi].on ? (int)subSampleInGeno.size() : design.n)
+              << (unit_mask[gi].on ? "  (union)" : "")
               << "  traits(" << members.size() << "): " << group_traits(gi) << "\n";
     std::cout << std::string(70, '=') << "\n";
   }
@@ -1813,7 +1958,16 @@ int main(int argc, char** argv) {
     // init_global_geno takes non-const refs; it copies them into the genotype object.
     std::vector<int>  sub_copy = subSampleInGeno;
     std::vector<bool> ind_copy = group_indicatorWithPheno[gi];
-    init_global_geno(paths.bed, paths.bim, paths.fam, sub_copy, ind_copy, cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm);
+    if (unit_mask[gi].on) {
+      // Scheme C: one decode over the union, per-trait stats / corrections /
+      // VR pools rebuilt from it (SCHEME_C_DESIGN.md §1-§3, §7).
+      init_global_geno_masked(paths.bed, paths.bim, paths.fam, sub_copy, ind_copy,
+                              cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm,
+                              unit_mask[gi].excl, unit_mask[gi].scatter,
+                              unit_mask[gi].names);
+    } else {
+      init_global_geno(paths.bed, paths.bim, paths.fam, sub_copy, ind_copy, cfg.isDiagofKinSetAsOne, cfg.min_maf_grm, cfg.max_miss_grm);
+    }
   }
   {
     auto t = std::chrono::steady_clock::now();
@@ -2009,7 +2163,14 @@ int main(int argc, char** argv) {
   // per-trait path (psi*B reduces in a different order), and tier-1's
   // "a P>1 run reproduces each solo run exactly" property is worth keeping as
   // the default. A group with one trait always takes the per-trait path.
-  const bool use_lockstep = (cfg.multi_lockstep && members.size() > 1);
+  // §3.4: masking and lockstep are mutually exclusive in the first cut —
+  // lockstep fits several phenotypes at once and one global activate_trait()
+  // cannot serve them. Say so; never turn it off silently.
+  if (cfg.multi_lockstep && unit_mask[gi].on && members.size() > 1)
+    std::cout << "[mask] fit.multi_lockstep is OFF for this group: masking fits one "
+                 "phenotype at a time (SCHEME_C_DESIGN.md §3.4).\n";
+  const bool use_lockstep =
+      (cfg.multi_lockstep && members.size() > 1 && !unit_mask[gi].on);
   std::vector<FitNullResult> lockstep_fits;
   if (use_lockstep) {
     std::cout << "\n" << std::string(70, '#') << "\n";
@@ -2055,6 +2216,11 @@ int main(int argc, char** argv) {
       std::cout << "\n" << std::string(70, '#') << "\n";
     }
     auto T_ph = std::chrono::steady_clock::now();
+
+    // Scheme C §3.4: point the genotype object (and the GPU bind, the psi*U
+    // cache, the GRM-diagonal caches) at this phenotype. No-op when masking is
+    // off, which is what keeps the non-masked path untouched.
+    if (unit_mask[gi].on) activate_trait_for_fit(unit_mask[gi].member_bind[k]);
 
     FitNullResult out = use_lockstep ? std::move(lockstep_fits[k])
                                      : saige::fit_null(cfg, mpaths, designs[mi]);

@@ -18,6 +18,33 @@ void init_global_geno(const std::string& bed,
                       double minMAFforGRM,
                       double maxMissRateforGRM);
 
+// Scheme C (optimization/missing_mt/SCHEME_C_DESIGN.md §3.4): load the UNION of
+// a group's sample sets once and mask rows per phenotype.
+//   subSampleInGeno / indicatorGenoSamplesWithPheno — the UNION's
+//   excl[t]    — union-local rows phenotype t does NOT own, ascending
+//   scatter[t] — union-local rows it DOES own, ascending (== its solo row order)
+//   names[t]   — phenotype name, for the log and error messages
+// Leaves the object on phenotype 0. activate_trait_for_fit() switches.
+void init_global_geno_masked(const std::string& bed,
+                             const std::string& bim,
+                             const std::string& fam,
+                             std::vector<int> & subSampleInGeno,
+                             std::vector<bool> & indicatorGenoSamplesWithPheno,
+                             bool setKinDiagtoOne,
+                             double minMAFforGRM,
+                             double maxMissRateforGRM,
+                             const std::vector<std::vector<int>>& excl,
+                             const std::vector<std::vector<int>>& scatter,
+                             const std::vector<std::string>& names);
+
+// Switch the genotype object, the GPU bind, the psi*U cache and the GRM-diagonal
+// caches to phenotype `t` of the mask group. No-op when masking is off, so it
+// is safe to call unconditionally before every fit.
+void activate_trait_for_fit(int t);
+
+// True once init_global_geno_masked() has built a mask group.
+bool mask_mode_active();
+
 void output_grm_diagonal(const std::string& out_path);
 
 // Forward declaration of genoClass

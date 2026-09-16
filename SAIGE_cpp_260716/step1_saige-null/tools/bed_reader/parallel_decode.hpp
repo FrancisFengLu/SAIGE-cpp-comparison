@@ -59,6 +59,14 @@ struct ParallelDecodeResult {
   std::vector<std::vector<int>>        missing_cells;
   // Per-marker §2 union-pack rule: 1 iff some trait's passQC_t is true.
   std::vector<char>                    keep_union;
+
+  // Per-trait fill corrections (SCHEME_C_DESIGN.md §1 step 4), P lists, each
+  // already sorted strictly ascending in (col, row) — which is what
+  // gpu::g2b::bind_trait demands. Produced INSTEAD of `missing_cells`: at the
+  // UKB shape that list is ~3.9 GB and its only consumer is this table (§3.1).
+  std::vector<std::vector<int>>        corr_row;    // union-local sample index
+  std::vector<std::vector<int>>        corr_col;    // marker index (union order)
+  std::vector<std::vector<float>>      corr_delta;  // fill_t - fill_U
 };
 
 // Scheme-C options for parallel_decode_bed. Default-constructed == today.
@@ -74,6 +82,13 @@ struct ParallelDecodeAux {
   // per-trait), though `vr` is still applied when computing each trait's
   // passQC_t, which is what makes keep_union right.
   bool pack_if_keep          = false;
+  // §3.1: build result.corr_* in the same pass. Needs `in_trait`, a
+  // P * Nnomissing 0/1 bitmap (trait-major: in_trait[t*Nnomissing + i] != 0 iff
+  // union row i belongs to S_t). The union's missing-cell list is NOT
+  // materialized in this mode — each marker's missing rows live in a per-thread
+  // scratch vector for exactly as long as it takes to turn them into entries.
+  bool collect_corrections   = false;
+  const unsigned char* in_trait = nullptr;
 };
 
 // Decode the first `M` markers of the BED in parallel using `nthreads`
