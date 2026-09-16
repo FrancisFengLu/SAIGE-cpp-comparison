@@ -58,6 +58,11 @@ struct FitNullConfig {
   // member still covers at least this fraction of the group's union.
   bool   mask_missing{false};
   double mask_min_coverage{0.8};
+  // Acceptance C2 only (SCHEME_C_DESIGN.md §5): "" | "freq" | "qc" | "corr"
+  // removes exactly one of §1's steps from the per-trait rebuild, so the gate
+  // can be shown to catch each of them. Anything but "" prints a loud line and
+  // produces deliberately wrong numbers.
+  std::string scheme_c_break{};
 
   // Convergence / runtime
   double tol{0.02};

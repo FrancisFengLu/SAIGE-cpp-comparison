@@ -255,6 +255,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("multi_lockstep")) c.multi_lockstep = get("multi_lockstep").as<bool>();
   if (get("mask_missing")) c.mask_missing = get("mask_missing").as<bool>();
   if (get("mask_min_coverage")) c.mask_min_coverage = get("mask_min_coverage").as<double>();
+  if (get("scheme_c_break")) c.scheme_c_break = get("scheme_c_break").as<std::string>();
   if (get("use_blocked_gemv")) c.use_blocked_gemv = get("use_blocked_gemv").as<bool>();
   if (get("gemv_block_size")) c.gemv_block_size = get("gemv_block_size").as<int>();
   if (get("gemv_verify")) c.gemv_verify = get("gemv_verify").as<bool>();
@@ -1678,6 +1679,20 @@ int main(int argc, char** argv) {
       why = "fit.loco is on — per-chromosome M_t and diagonals are the second cut (§7)";
     else if (cfg.use_sparse_grm_to_fit)
       why = "fit.use_sparse_grm_to_fit is on — the sparse fit never goes through the psi kernel (§7)";
+    else if (cfg.use_sparse_grm_for_vr || cfg.make_sparse_grm_only)
+      // Not in §7's list, but it has to be: the subset sparse GRM below is
+      // built ONCE per group from designs[members[0]], because until now every
+      // trait of a group had the same rows. A mask group holds several sample
+      // sets, so that subset would be the wrong matrix (and the wrong
+      // dimension) for every trait but the first.
+      why = "a sparse GRM is loaded (use_sparse_grm_for_vr / make_sparse_grm_only) — "
+            "it is subset once per group from one trait's sample set, which a mask "
+            "group does not have";
+    else if (cfg.use_blocked_gemv || cfg.gemv_verify)
+      // parallelCrossProd_blocked is a CPU path over the packed store; under
+      // masking it would read the union's rows with the trait's marker count.
+      why = "fit.use_blocked_gemv / fit.gemv_verify select a CPU K.u path, and §7 keeps "
+            "the CPU on grouping";
     if (!why.empty()) {
       std::cout << "[mask] fit.mask_missing requested but NOT used: " << why
                 << ". Falling back to sample-set grouping.\n";
@@ -1959,6 +1974,7 @@ int main(int argc, char** argv) {
     std::vector<int>  sub_copy = subSampleInGeno;
     std::vector<bool> ind_copy = group_indicatorWithPheno[gi];
     if (unit_mask[gi].on) {
+      set_scheme_c_break(cfg.scheme_c_break);
       // Scheme C: one decode over the union, per-trait stats / corrections /
       // VR pools rebuilt from it (SCHEME_C_DESIGN.md §1-§3, §7).
       init_global_geno_masked(paths.bed, paths.bim, paths.fam, sub_copy, ind_copy,

@@ -47,6 +47,12 @@ float minMAFtoConstructGRM = 0;
 // which is called from R functions like SAIGE_fitNULLGLMM() and SAIGE_fitNULLGLMM_fast()
 // The class methods are accessed through various Rcpp::export functions
 //This is a class with attritbutes about the genotype informaiton 
+// Acceptance C2 (SCHEME_C_DESIGN.md §5): which of §1's steps to leave out of
+// the per-trait rebuild, so the tolerance gate can be shown to catch each one.
+// Empty in every real run; set_scheme_c_break() is the only writer.
+enum class SchemeCBreak { kNone, kUnionFreq, kUnionQC, kNoCorr };
+static std::string g_scheme_c_break;
+
 class genoClass{
 private:
         //COPY from RVTEST:
@@ -1071,6 +1077,25 @@ public:
 		for (std::size_t k = 0; k < Mkeep; ++k)
 			bim2keep[origPlinkIdx0[k]] = (int)k;
 
+		// ---- deliberate breaks, for the C2 half of the acceptance ----
+		// SCHEME_C_DESIGN.md §5 row C2: a gate that cannot catch these is not a
+		// gate. Each value below removes exactly one of §1's steps 2/3/4 and
+		// nothing else, so the gate's verdict names the step. Off unless the
+		// env var is set, and it prints what it did — this is a test hook, not
+		// a supported mode.
+		SchemeCBreak brk = SchemeCBreak::kNone;
+		{
+			const std::string& b = g_scheme_c_break;
+			if      (b == "freq") brk = SchemeCBreak::kUnionFreq;
+			else if (b == "qc")   brk = SchemeCBreak::kUnionQC;
+			else if (b == "corr") brk = SchemeCBreak::kNoCorr;
+			else if (!b.empty())
+				throw std::runtime_error("fit.scheme_c_break: expected freq|qc|corr, got " + b);
+			if (brk != SchemeCBreak::kNone)
+				std::cout << "[mask] *** DELIBERATELY BROKEN: fit.scheme_c_break="
+				          << b << " (acceptance C2) ***" << std::endl;
+		}
+
 		// ---- per-trait stats + corrections ----
 		std::vector<saige::TraitMarkerStats> ts(P);
 		for (int t = 0; t < P; ++t) {
@@ -1091,9 +1116,30 @@ public:
 				T.mac[k]    = ts[t].mac[j];
 				if (ts[t].passQC[j]) ++mt;
 			}
+			if (brk == SchemeCBreak::kUnionFreq) {
+				// §1 step 2 skipped: the union's freq/invstd for everyone.
+				for (std::size_t k = 0; k < Mkeep; ++k) {
+					const std::size_t j = (std::size_t)origPlinkIdx0[k];
+					const float f = par_res.stats[j].altFreq;
+					const float sd = std::sqrt(2.0f * f * (1.0f - f));
+					T.freq[k]   = f;
+					T.invstd[k] = (ts[t].passQC[j] && sd != 0.0f) ? 1.0f / sd : 0.0f;
+				}
+			} else if (brk == SchemeCBreak::kUnionQC) {
+				// §1 step 3 skipped: the UNION's QC list decides which markers
+				// enter this trait's GRM, and M_t counts the union's.
+				mt = 0;
+				for (std::size_t k = 0; k < Mkeep; ++k) {
+					const std::size_t j = (std::size_t)origPlinkIdx0[k];
+					const bool pq = par_res.stats[j].passQC;
+					const float sd = std::sqrt(2.0f * T.freq[k] * (1.0f - T.freq[k]));
+					T.invstd[k] = (pq && sd != 0.0f) ? 1.0f / sd : 0.0f;
+					if (pq) ++mt;
+				}
+			}
 			// If these disagree the §2 keep rule dropped a marker that this
 			// trait's QC keeps — the GRM would silently lose it.
-			if (mt != ts[t].M_t)
+			if (mt != ts[t].M_t && brk != SchemeCBreak::kUnionQC)
 				throw std::runtime_error(
 				    "scheme C: trait " + T.name + " has M_t=" +
 				    std::to_string(ts[t].M_t) + " but only " +
@@ -1111,7 +1157,9 @@ public:
 			T.corr_row.reserve(cc.size());
 			T.corr_col.reserve(cc.size());
 			T.corr_delta.reserve(cc.size());
-			for (std::size_t q = 0; q < cc.size(); ++q) {
+			for (std::size_t q = 0; q < cc.size() && brk != SchemeCBreak::kNoCorr; ++q) {
+				// §1 step 4 skipped when kNoCorr: every missing cell keeps the
+				// union's fill.
 				const int k = bim2keep[(std::size_t)cc[q]];
 				if (k < 0) continue;
 				if (T.invstd[k] == 0.0f) continue;
@@ -1963,6 +2011,8 @@ void init_global_geno_masked(const std::string& bed, const std::string& bim,
 }
 
 bool mask_mode_active() { return geno.maskMode_; }
+
+void set_scheme_c_break(const std::string& which) { g_scheme_c_break = which; }
 
 // Forward declaration
 arma::fvec get_GRMdiagVec();

@@ -3,6 +3,10 @@
 #
 #   run_gate.sh <saige-null> [--gpu|--cpu] [--small] [--cases a,b,c] [--workdir DIR]
 #               [--lockstep] [--nthreads N] [--solo-vs-solo] [--no-cache] [--label NAME]
+#               [--fit KEY=VALUE ...]
+#
+# --fit sets a fit.* key on the MULTI run only (the solo runs stay the plain
+# P=1 reference), e.g. --fit mask_missing=true --fit mask_min_coverage=0.0.
 #
 # For every case (cases/*.yaml): each trait alone (P=1; cached under
 # WORKDIR/ref_cache keyed by binary md5 + rendered config + input md5s), then all
@@ -11,7 +15,7 @@
 # Default workdir /opt/saige/logs/mt_gate, default device CPU, default nthreads 8.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ $# -lt 1 ]]; then sed -n '2,12p' "$0"; exit 2; fi
+if [[ $# -lt 1 ]]; then sed -n '2,16p' "$0"; exit 2; fi
 if [[ -z "${R_HOME:-}" || -z "${CONDA_PREFIX:-}" ]]; then
   # saige-null embeds R (RNG streams) and links the conda env's libraries
   set +u

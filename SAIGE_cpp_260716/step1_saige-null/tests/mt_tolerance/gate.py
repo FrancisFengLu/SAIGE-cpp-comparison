@@ -74,13 +74,18 @@ def load_manifest(workdir, scale, data_case):
     return m
 
 
-def render_config(case, man, scale_plink, nthreads, traits, rundir, lockstep):
+def render_config(case, man, scale_plink, nthreads, traits, rundir, lockstep, extra_fit=None):
     fit = dict(FIT_DEFAULTS)
     fit["trait"] = case["trait"]
     fit["nthreads"] = nthreads
     fit.update(case["fit"])
     fit.update((case.get("fit_scale") or {}).get(man["scale"], {}))
     fit["multi_lockstep"] = bool(lockstep)
+    # --fit KEY=VALUE, applied to the MULTI run only: the solo runs are the
+    # reference and must stay what a plain P=1 run produces (they are also
+    # cached on a key that does not see these).
+    if extra_fit:
+        fit.update(extra_fit)
     plink = man["loco_plink"] if case["plink"] == "loco" else scale_plink
     paths = {"plinkFile": plink, "out_prefix": f"{rundir}/m", "out_prefix_vr": f"{rundir}/mvr",
              "overwrite_varratio": True}
@@ -315,6 +320,9 @@ def main(argv=None):
                     help="do not run anything new for the multi side if this label already has a finished "
                          "multi run; recompute checks and comparisons (e.g. after editing thresholds.yaml)")
     ap.add_argument("--label", help="run label (default derived from binary/mode)")
+    ap.add_argument("--fit", action="append", default=[], metavar="KEY=VALUE",
+                    help="extra fit.* key for the MULTI run only (repeatable), e.g. "
+                         "--fit mask_missing=true --fit mask_min_coverage=0.0")
     ap.add_argument("--thresholds", default=compare.DEFAULT_THRESHOLDS)
     a = ap.parse_args(argv)
 
@@ -328,13 +336,21 @@ def main(argv=None):
     for c in cases:
         if not os.path.exists(os.path.join(CASES_DIR, f"{c}.yaml")):
             raise SystemExit(f"unknown case {c}")
-    mode = dict(gpu=gpu, lockstep=a.lockstep)
-    label = a.label or f"{scale}-{'gpu' if gpu else 'cpu'}{'-lock' if a.lockstep else ''}-t{a.nthreads}-{bin_md5[:8]}"
+    extra_fit = {}
+    for kv in a.fit:
+        if "=" not in kv:
+            raise SystemExit(f"--fit expects KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        extra_fit[k] = yaml.safe_load(v)
+    mode = dict(gpu=gpu, lockstep=a.lockstep, extra_fit=extra_fit)
+    fit_tag = ("-" + "-".join(f"{k}{v}" for k, v in sorted(extra_fit.items()))) if extra_fit else ""
+    label = a.label or (f"{scale}-{'gpu' if gpu else 'cpu'}{'-lock' if a.lockstep else ''}"
+                        f"{fit_tag}-t{a.nthreads}-{bin_md5[:8]}")
     rundir_root = os.path.join(a.workdir, "runs", label)
     os.makedirs(rundir_root, exist_ok=True)
     scale_plink = f"/opt/saige/data/{scale}"
     log(f"binary {binary} md5 {bin_md5}; {'GPU' if gpu else 'CPU'}; scale {scale}; nthreads {a.nthreads}; "
-        f"lockstep {a.lockstep}; label {label}")
+        f"lockstep {a.lockstep}; extra fit {extra_fit or '{}'}; label {label}")
 
     rows, case_rows, all_ok = [], [], True
     for cname in cases:
@@ -374,7 +390,8 @@ def main(argv=None):
             solos[t] = rd
         mdir = os.path.join(cdir, "multi")
         mmeta = os.path.join(cdir, "multi_meta.json")
-        cfg = render_config(case, man, scale_plink, a.nthreads, traits, mdir, a.lockstep)
+        cfg = render_config(case, man, scale_plink, a.nthreads, traits, mdir, a.lockstep,
+                            extra_fit=extra_fit)
         if a.reuse_runs and os.path.exists(mmeta):
             mm = json.load(open(mmeta))
             rc, msecs = mm["rc"], mm["seconds"]

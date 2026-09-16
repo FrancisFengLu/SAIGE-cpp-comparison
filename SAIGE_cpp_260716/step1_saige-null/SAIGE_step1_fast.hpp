@@ -45,6 +45,11 @@ void activate_trait_for_fit(int t);
 // True once init_global_geno_masked() has built a mask group.
 bool mask_mode_active();
 
+// Acceptance C2 (SCHEME_C_DESIGN.md §5): "" | "freq" | "qc" | "corr". Anything
+// but "" removes one of §1's steps from the per-trait rebuild so the gate can
+// be shown to catch it, and says so on stdout. Never set in a real run.
+void set_scheme_c_break(const std::string& which);
+
 void output_grm_diagonal(const std::string& out_path);
 
 // Forward declaration of genoClass
