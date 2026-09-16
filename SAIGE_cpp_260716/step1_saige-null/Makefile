@@ -180,7 +180,10 @@ INCLUDES        += -I$(BED_READER_DIR)
 # TU is linked so saige-null still exports saige::gpu::{available,…} symbols
 # as no-ops.
 GPU_MATVEC_DIR  := tools/gpu_matvec
-GPU_MATVEC_TEST := $(GPU_MATVEC_DIR)/gpu_matvec_test.cpp
+# Every standalone test binary under tools/gpu_matvec has its own main() and
+# must be kept OUT of the saige-null link (GPU_EXTRA_SRC globs *.cpp there).
+GPU_MATVEC_TEST := $(GPU_MATVEC_DIR)/gpu_matvec_test.cpp \
+                   $(GPU_MATVEC_DIR)/gemv2bit_mask_test.cpp
 # nvcc location: a CUDA toolkit installed from the .run/.deb puts it under
 # /usr/local/cuda*/bin, NOT /usr/bin (the old default here silently disabled
 # the whole GPU path — HAS_CUDA evaluated to "no" and the stub got linked).

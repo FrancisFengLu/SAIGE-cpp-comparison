@@ -144,9 +144,25 @@ Trait make_trait(const std::vector<unsigned char>& packed, std::size_t stride,
 // w[j]   = invstd[j]·Y[j]
 // Z[i]   = Σ_j g[i,j] w[j] + Σ_{(i,j)} Δ·w[j] − C,  C = Σ_j 2 f[j] w[j]
 // ret    = Z · inv_M,  and 0 on the masked rows (see gemv2bit.hpp on why).
+void ref_matvec_range(const std::vector<unsigned char>& packed, std::size_t stride,
+                      int N, int M, int j0, int jn,
+                      const Trait& t, const std::vector<float>& b,
+                      std::vector<double>& ret);
+
 void ref_matvec(const std::vector<unsigned char>& packed, std::size_t stride,
                 int N, int M, const Trait& t, const std::vector<float>& b,
                 std::vector<double>& ret) {
+  ref_matvec_range(packed, stride, N, M, 0, M, t, b, ret);
+}
+
+// [j0, j0+jn) only. Corrections whose marker falls outside the range are
+// skipped — matching what the kernel does, which is what makes a LOCO slice
+// consistent with the full call.
+void ref_matvec_range(const std::vector<unsigned char>& packed, std::size_t stride,
+                      int N, int M, int j0, int jn,
+                      const Trait& t, const std::vector<float>& b,
+                      std::vector<double>& ret) {
+  (void)M;
   std::vector<double> x(N);
   double S = 0;
   for (int i = 0; i < N; ++i) {
@@ -154,8 +170,8 @@ void ref_matvec(const std::vector<unsigned char>& packed, std::size_t stride,
     S += x[i];
   }
 
-  std::vector<double> w(M, 0.0);
-  for (int j = 0; j < M; ++j) {
+  std::vector<double> w(j0 + jn, 0.0);
+  for (int j = j0; j < j0 + jn; ++j) {
     double raw = 0;
     for (int i = 0; i < N; ++i)
       raw += static_cast<double>(geno_at(packed.data(), stride, j, i)) * x[i];
@@ -167,16 +183,17 @@ void ref_matvec(const std::vector<unsigned char>& packed, std::size_t stride,
   }
 
   double C = 0;
-  for (int j = 0; j < M; ++j) C += 2.0 * static_cast<double>(t.freq[j]) * w[j];
+  for (int j = j0; j < j0 + jn; ++j) C += 2.0 * static_cast<double>(t.freq[j]) * w[j];
 
   ret.assign(N, 0.0);
-  for (int j = 0; j < M; ++j) {
+  for (int j = j0; j < j0 + jn; ++j) {
     if (w[j] == 0.0) continue;
     for (int i = 0; i < N; ++i)
       ret[i] += static_cast<double>(geno_at(packed.data(), stride, j, i)) * w[j];
   }
   for (std::size_t k = 0; k < t.cdel.size(); ++k)
-    ret[t.crow[k]] += static_cast<double>(t.cdel[k]) * w[t.ccol[k]];
+    if (t.ccol[k] >= j0 && t.ccol[k] < j0 + jn)
+      ret[t.crow[k]] += static_cast<double>(t.cdel[k]) * w[t.ccol[k]];
   for (int i = 0; i < N; ++i) {
     ret[i] = (ret[i] - C) * static_cast<double>(t.inv_M);
     if (!t.is_mask.empty() && t.is_mask[i]) ret[i] = 0.0;
@@ -285,6 +302,21 @@ static void b2() {
   std::printf("  matvec_range : max|Δ|=%.4g  rel_max=%.4g  rel_L2=%.4g  %s\n",
               r.max_abs, r.rel_max, r.rel_l2, r.rel_l2 <= 1e-6 ? "PASS" : "FAIL(>1e-6)");
   if (r.rel_l2 > 1e-6) ++g_fail;
+
+  // Sub-range under mask + corrections: the marker CSR is offset to j0 and the
+  // sample CSR is filtered by the range test, so both need their own check.
+  {
+    const int j0 = M/3, jn = M/2;
+    std::vector<double> rs;
+    ref_matvec_range(packed, stride, N, M, j0, jn, tr, b, rs);
+    std::vector<float> gs(N, 0.f);
+    if (!g2b::matvec_range(c, t, j0, jn, b.data(), gs.data())) ++g_fail;
+    Rel r2 = relerr(rs, gs);
+    std::printf("  range[%d,%d) : max|Δ|=%.4g  rel_max=%.4g  rel_L2=%.4g  %s\n",
+                j0, j0+jn, r2.max_abs, r2.rel_max, r2.rel_l2,
+                r2.rel_l2 <= 1e-6 ? "PASS" : "FAIL(>1e-6)");
+    if (r2.rel_l2 > 1e-6) ++g_fail;
+  }
 
   // The caller must not have to pre-mask, and must get zeros back on the rows
   // it does not own. Both are contract, so both get asserted.
@@ -504,7 +536,99 @@ static void timing() {
   std::printf("  mask+correction overhead mean %+.2f%%   min %+.2f%%\n",
               100.0*(tot[2]-tot[0])/tot[0], 100.0*(best[2]-best[0])/best[0]);
 
+  // How the correction lists scale. The design says "a few hundred" cells, but
+  // that is a guess about real missingness — the pass-2 CSR walk is serial
+  // within a sample, so a list concentrated on few rows is the shape that
+  // would hurt. Random cells are the benign case; report it as the floor.
+  std::printf("  -- correction count sweep (mask fixed at 20%%, cells random) --\n");
+  for (int nc : {2000, 20000, 200000}) {
+    Trait tv = make_trait(packed, stride, N, M, freq, invstd, 0.20, nc, 0.0,
+                          0x7720ull + nc);
+    g2b::TraitBind* tb2 = g2b::bind_trait(
+        c, tv.freq.data(), tv.invstd.data(), tv.inv_M,
+        tv.mask.data(), (int)tv.mask.size(),
+        tv.crow.data(), tv.ccol.data(), tv.cdel.data(), (int)tv.cdel.size());
+    if (!tb2) { std::fprintf(stderr, "  sweep bind failed at %d\n", nc); ++g_fail; continue; }
+    double bmin = 1e30, bref = 1e30;
+    for (int r = 0; r < 5; ++r) {
+      g2b::matvec_range(c, plain, 0, M, x.data(), out.data());
+      g2b::matvec_range(c, tb2,   0, M, x.data(), out.data());
+    }
+    for (int r = 0; r < 25; ++r) {
+      auto a0 = std::chrono::steady_clock::now();
+      g2b::matvec_range(c, plain, 0, M, x.data(), out.data());
+      auto a1 = std::chrono::steady_clock::now();
+      g2b::matvec_range(c, tb2, 0, M, x.data(), out.data());
+      auto a2 = std::chrono::steady_clock::now();
+      bref = std::min(bref, std::chrono::duration<double,std::milli>(a1-a0).count());
+      bmin = std::min(bmin, std::chrono::duration<double,std::milli>(a2-a1).count());
+    }
+    std::printf("  %7zu corrections   min %7.3f ms  vs plain %7.3f ms  %+.2f%%  (bind %zu MB)\n",
+                tv.cdel.size(), bmin, bref, 100.0*(bmin-bref)/bref,
+                g2b::bind_bytes(N, M, (int)tv.mask.size(), (int)tv.cdel.size()) >> 20);
+    g2b::unbind_trait(tb2);
+  }
+
   g2b::unbind_trait(plain); g2b::unbind_trait(full); g2b::unbind_trait(maskonly);
+  g2b::destroy(c);
+}
+
+// ====================================== S: several binds on one matrix
+// The whole point of the split is that switching phenotypes does not touch the
+// matrix. Bind two phenotypes to one Ctx, interleave their matvecs, and require
+// each to return exactly what it returned before the other existed.
+static void coexist() {
+  std::printf("\n================ S: two binds on one Ctx ===========================\n");
+  const int N = 20000, M = 3000;
+  std::vector<unsigned char> packed; std::size_t stride = 0;
+  std::vector<float> freq, invstd;
+  gen_matrix(N, M, 0x51A6E2ull, packed, stride, freq, invstd);
+
+  Trait a = make_trait(packed, stride, N, M, freq, invstd, 0.20, 400, 0.05, 0x5A11ull);
+  Trait bb = make_trait(packed, stride, N, M, freq, invstd, 0.07, 150, 0.02, 0x5A22ull);
+
+  g2b::Ctx* c = g2b::create(packed.data(), stride, N, M);
+  g2b::TraitBind* ta = g2b::bind_trait(c, a.freq.data(), a.invstd.data(), a.inv_M,
+                                       a.mask.data(), (int)a.mask.size(),
+                                       a.crow.data(), a.ccol.data(), a.cdel.data(),
+                                       (int)a.cdel.size());
+  std::vector<float> x; gen_vec(N, 0x5A33ull, x);
+  std::vector<float> ra0(N, 0.f), ra1(N, 0.f), rb(N, 0.f);
+  if (!c || !ta || !g2b::matvec_range(c, ta, 0, M, x.data(), ra0.data())) {
+    std::fprintf(stderr, "S setup failed\n"); ++g_fail; return;
+  }
+
+  // Second bind arrives AFTER the first has already run.
+  g2b::TraitBind* tb = g2b::bind_trait(c, bb.freq.data(), bb.invstd.data(), bb.inv_M,
+                                       bb.mask.data(), (int)bb.mask.size(),
+                                       bb.crow.data(), bb.ccol.data(), bb.cdel.data(),
+                                       (int)bb.cdel.size());
+  if (!tb) { std::fprintf(stderr, "S second bind failed\n"); ++g_fail; return; }
+  g2b::matvec_range(c, tb, 0, M, x.data(), rb.data());
+  g2b::matvec_range(c, ta, 0, M, x.data(), ra1.data());
+
+  const int bd = bitdiff(ra0, ra1);
+  std::printf("  phenotype A before/after B ran: %d/%d words differ  %s\n",
+              bd, N, bd ? "*** FAIL ***" : "bit-identical");
+  if (bd) ++g_fail;
+
+  int same = 0;
+  for (int i = 0; i < N; ++i) if (std::memcmp(&ra1[i], &rb[i], sizeof(float)) == 0) ++same;
+  std::printf("  A vs B outputs identical on %d/%d rows  %s\n", same, N,
+              same < N/2 ? "PASS (binds really differ)"
+                         : "*** FAIL: the bind is being ignored ***");
+  if (same >= N/2) ++g_fail;
+
+  g2b::unbind_trait(ta);
+  // B must still work after A is gone — unbind frees only its own buffers.
+  std::vector<float> rb2(N, 0.f);
+  g2b::matvec_range(c, tb, 0, M, x.data(), rb2.data());
+  const int bd2 = bitdiff(rb, rb2);
+  std::printf("  phenotype B after A unbound:   %d/%d words differ  %s\n",
+              bd2, N, bd2 ? "*** FAIL ***" : "bit-identical");
+  if (bd2) ++g_fail;
+
+  g2b::unbind_trait(tb);
   g2b::destroy(c);
 }
 
@@ -518,6 +642,7 @@ int main(int argc, char** argv) {
   b1(refdir);
   b2();
   b3();
+  coexist();
   if (do_timing) timing();
   std::printf("\n%s (%d failing check(s))\n", g_fail ? "FAILED" : "ALL CHECKS PASSED", g_fail);
   return g_fail ? 1 : 0;
