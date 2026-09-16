@@ -822,15 +822,15 @@ public:
 		return on;
 	}
 
-	// The fast path reads packed rows through raw pointers, so it needs the
-	// geometry Get_OneSNP_StdGeno assumes: one marker per legacy vector (or the
-	// flat store), ceil(rows/4) bytes per row, all of them present. A released
-	// host store fails here and takes the legacy path, which throws as before.
-	bool diag_fast_ok(std::size_t m1) const {
+	// Markers [0, m1) can be read cell by cell (packed_row_ptr / packed_geno_at)
+	// and give what Get_OneSNP_Geno / Get_OneSNP_StdGeno decode: one marker per
+	// legacy vector (or the flat store), ceil(rows/4) bytes per row, all of them
+	// present. A released host store fails here and its callers take the
+	// full-decode path, which throws as before.
+	bool packed_rows_ok(std::size_t m1) const {
 		const std::size_t nrow = store_rows();
-		if (nrow == 0 || numMarkersofEachArray != 1 || !packed_rows_contiguous()) return false;
+		if (numMarkersofEachArray != 1 || !packed_rows_contiguous()) return false;
 		if (m_size_of_esi <= 0 || (std::size_t)m_size_of_esi != (nrow + 3) / 4) return false;
-		if (alleleFreqVec.n_elem < m1 || invstdvVec.n_elem < m1) return false;
 		const std::size_t esi = (std::size_t)m_size_of_esi;
 		if (use_packed_flat_)
 			return m1 <= packed_flat_.n_stored() && packed_flat_.nbyte() >= esi;
@@ -838,6 +838,10 @@ public:
 		for (std::size_t m = 0; m < m1; ++m)
 			if (!genoVecofPointers[m] || genoVecofPointers[m]->size() < esi) return false;
 		return true;
+	}
+	bool diag_fast_ok(std::size_t m1) const {
+		return store_rows() > 0 && alleleFreqVec.n_elem >= m1 && invstdvVec.n_elem >= m1 &&
+		       packed_rows_ok(m1);
 	}
 
 	// Corrections as setup_mask_union emits them: strictly ascending (col,row),
@@ -2357,16 +2361,49 @@ void output_grm_diagonal(const std::string& out_path) {
     // cells hold fill_U, so the fill corrections have to be replayed — the
     // `fill` case is built so these counts notice.
     const int n_scan = geno.maskMode_ ? (int)geno.packed_n_markers() : totalMarkers;
+    // Only rows urow(0..4) are counted, so only their cells are read: when
+    // packed_rows_ok() holds, packed_geno_at(m, r) is the value
+    // Get_OneSNP_Geno(m)[r] holds (the same 2-(a+b) on the same byte). Under
+    // the mask the five rows are wherever S_t's first five sit in the union.
+    // Otherwise every marker is decoded in full, as before.
+    int scan_rows[5];
+    for (int s = 0; s < 5; s++) scan_rows[s] = urow(s);
+    bool cells = n_scan > 0 && geno.packed_rows_ok((std::size_t)n_scan);
+    for (int s = 0; s < 5 && cells; s++)
+      cells = scan_rows[s] >= 0 && (std::size_t)scan_rows[s] < geno.store_rows();
+    const auto scan_t0 = std::chrono::steady_clock::now();
     for (int m = 0; m < n_scan; m++) {
       if (geno.maskMode_ &&
           geno.maskTraits_[(std::size_t)geno.activeTrait_].invstd[m] == 0.0f) continue;
-      const arma::ivec* rawGeno = geno.Get_OneSNP_Geno(m);
+      const arma::ivec* rawGeno = cells ? nullptr : geno.Get_OneSNP_Geno(m);
       for (int s = 0; s < 5; s++) {
-        int g = (*rawGeno)[urow(s)];
+        int g = cells ? geno.packed_geno_at((std::size_t)m, (std::size_t)scan_rows[s])
+                      : (int)(*rawGeno)[urow(s)];
         if (g == 0) s_grmdiag_scan_count[s][0]++;
         else if (g == 1) s_grmdiag_scan_count[s][1]++;
         else if (g == 2) s_grmdiag_scan_count[s][2]++;
       }
+    }
+    if (cells && genoClass::diag_selfcheck_on()) {
+      // SAIGE_DIAG_SELFCHECK=1: redo the counts with the full decode.
+      const double cells_s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - scan_t0).count();
+      int ref[5][3] = {{0}};
+      const auto t1 = std::chrono::steady_clock::now();
+      for (int m = 0; m < n_scan; m++) {
+        if (geno.maskMode_ &&
+            geno.maskTraits_[(std::size_t)geno.activeTrait_].invstd[m] == 0.0f) continue;
+        const arma::ivec* rawGeno = geno.Get_OneSNP_Geno(m);
+        for (int s = 0; s < 5; s++) {
+          int g = (*rawGeno)[urow(s)];
+          if (g >= 0 && g <= 2) ref[s][g]++;
+        }
+      }
+      const double full_s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t1).count();
+      const bool same = std::memcmp(ref, s_grmdiag_scan_count, sizeof(ref)) == 0;
+      std::fprintf(stderr, "[diag-selfcheck] samples1-5 scan markers=%d cells=%.3fs full=%.3fs -> %s\n",
+                   n_scan, cells_s, full_s, same ? "IDENTICAL" : "DIFFER");
     }
     if (geno.maskMode_) {
       const auto& T = geno.maskTraits_[(std::size_t)geno.activeTrait_];
