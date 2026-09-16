@@ -804,6 +804,18 @@ public:
 			arma::fvec tmp;
 			const std::size_t Mrows = packed_n_markers();
 			std::size_t ci = 0;
+			// Same two debug artifacts the non-masked path emits, over THIS
+			// trait's row 0 and its first 3 GRM markers.
+			std::ofstream stdgeno_file(saige_env_path("SAIGE_DEBUG_DIR", "cpp_stdgeno.txt"));
+			stdgeno_file << "# StdGeno values for first 3 markers, all samples\n";
+			stdgeno_file << "# Columns: Sample, Marker0, Marker1, Marker2\n";
+			std::ofstream sample0_file(saige_env_path("SAIGE_DEBUG_DIR", "cpp_sample0_cumsum.txt"));
+			sample0_file << "# Sample 0 stdGeno^2 cumulative sum by marker\n";
+			sample0_file << "# Columns: Marker, stdGeno[0], stdGeno^2[0], cumsum\n";
+			arma::fmat first3_stdgeno(T.n_t, 3, arma::fill::zeros);
+			const int row0 = T.scatter.empty() ? 0 : T.scatter[0];
+			float sample0_cumsum = 0;
+			int   ndbg = 0;
 			for(std::size_t i = 0; i < Mrows; i++){
 				Get_OneSNP_StdGeno(i, &tmp);
 				// §1 step 4: the packed cell holds fill_U; this trait wants
@@ -817,7 +829,27 @@ public:
 					ci++;
 				}
 				acc += tmp % tmp;
+				if(T.invstd[i] != 0.0f){
+					if(ndbg < 3){
+						for(int q = 0; q < T.n_t; q++)
+							first3_stdgeno(q, ndbg) = tmp[T.scatter[q]];
+					}
+					const float val0 = tmp[row0];
+					sample0_cumsum += val0 * val0;
+					if(ndbg < 100 || ndbg % 1000 == 0)
+						sample0_file << ndbg << "\t" << val0 << "\t" << val0*val0
+						             << "\t" << sample0_cumsum << "\n";
+					ndbg++;
+				}
 			}
+			sample0_file << "FINAL\t-\t-\t" << sample0_cumsum << "\n";
+			sample0_file.close();
+			std::cout << "DEBUG: Sample 0 final cumsum = " << sample0_cumsum << std::endl;
+			for(int q = 0; q < T.n_t; q++)
+				stdgeno_file << q << "\t" << first3_stdgeno(q,0) << "\t"
+				             << first3_stdgeno(q,1) << "\t" << first3_stdgeno(q,2) << "\n";
+			stdgeno_file.close();
+			std::cout << "DEBUG: Wrote stdGeno (SAIGE_DEBUG_DIR, if set)" << std::endl;
 			T.diag_std.set_size(T.n_t);
 			for(int k = 0; k < T.n_t; k++) T.diag_std[k] = acc[T.scatter[k]];
 			T.diag_ready = true;
