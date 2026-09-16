@@ -647,10 +647,12 @@ std::size_t need_bytes(int N, int M)
 // Cost: 2·n_corr·8 B + (M+1+N+1)·4 B per bind. At UKB scale (N=4e5, M=1.1e5)
 // the two index arrays are 2 MB per phenotype; the alternative (binary search
 // into one sorted list) would save that and cost a log per element.
+// 1/M_t is deliberately NOT here: the normalizing marker count is per CALL
+// (a LOCO slice's M_t is the count inside [j0, j0+jn)), so one bind serves
+// every chromosome instead of 23 binds each duplicating the CSRs below.
 struct TraitBind {
     Ctx*   ctx    = nullptr;
     int    N = 0, M = 0;
-    float  inv_M  = 1.f;
     float* freq   = nullptr;   // M
     float* invStd = nullptr;   // M
     int*   mask   = nullptr;   // n_mask union-local rows
@@ -692,7 +694,7 @@ void unbind_trait(TraitBind* t)
 }
 
 TraitBind* bind_trait(Ctx* c,
-                      const float* freq, const float* invstd, float inv_M,
+                      const float* freq, const float* invstd,
                       const int* mask_rows, int n_mask,
                       const int* corr_row, const int* corr_col,
                       const float* corr_delta, int n_corr)
@@ -733,7 +735,7 @@ TraitBind* bind_trait(Ctx* c,
     }
 
     TraitBind* t = new TraitBind();
-    t->ctx = c; t->N = N; t->M = M; t->inv_M = inv_M;
+    t->ctx = c; t->N = N; t->M = M;
     t->n_mask = n_mask; t->n_corr = n_corr;
     t->bytes = bind_bytes(N, M, n_mask, n_corr);
 
@@ -937,7 +939,7 @@ Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
     return create_impl(nullptr, row_ptrs, stride_bytes, N, M);
 }
 
-bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
+bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn, float inv_M,
                   const float* x, float* ret)
 {
     if (!c || !t || !x || !ret) return false;
@@ -980,7 +982,7 @@ bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
     gm_pass2<<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->wv, c->Zpart,
                                             j0, M, c->Npad);
     gm_pass2_finish<<<(c->N + G_NTHREAD - 1)/G_NTHREAD, G_NTHREAD>>>(
-        c->Zpart, g2y, c->N, c->Npad, c->Cd, t->inv_M,
+        c->Zpart, g2y, c->N, c->Npad, c->Cd, inv_M,
         t->rptr, t->rcol, t->rdel, c->wv, j0, M,
         c->Zv);
     // Masked rows carry a finite but meaningless value (that row of A dotted
@@ -1003,7 +1005,8 @@ bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
 // big2's 5.7 GB), so padding only costs arithmetic — and arithmetic is not the
 // wall below ncol=8. A zero column contributes 0 to S, to C and to both
 // passes, so the real columns come out bit-identical to the unpadded case.
-bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret)
+bool matvec_mat(Ctx* c, TraitBind* t, int ncol, float inv_M,
+                const float* X, float* ret)
 {
     if (!c || !t || !X || !ret || ncol < 0) return false;
     if (t->ctx != c) {
@@ -1011,7 +1014,7 @@ bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret)
         return false;
     }
     if (ncol == 0) return true;
-    if (ncol == 1) return matvec_range(c, t, 0, c->M, X, ret);
+    if (ncol == 1) return matvec_range(c, t, 0, c->M, inv_M, X, ret);
 
     const int N = c->N, M = c->M;
 
@@ -1078,21 +1081,21 @@ bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret)
             gm_pass1_finish_mc<2><<<(M*2 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
             gm_calcC_mc<2><<<2, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<2><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<2><<<(int)(((std::size_t)N*2 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
+            gm_pass2_finish_mc<2><<<(int)(((std::size_t)N*2 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         case 4:
             gm_pass1_mc<4><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
             gm_pass1_finish_mc<4><<<(M*4 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
             gm_calcC_mc<4><<<4, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<4><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<4><<<(int)(((std::size_t)N*4 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
+            gm_pass2_finish_mc<4><<<(int)(((std::size_t)N*4 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         default:
             gm_pass1_mc<8><<<dim3(g1x, c->g1y_mc), G_NTHREAD>>>(c->Ap, c->W32, c->Xmc, c->Npad, c->Ymcp, 0, M, M);
             gm_pass1_finish_mc<8><<<(M*8 + 255)/256, 256>>>(c->Ymcp, c->g1y_mc, M, M, t->freq, t->invStd, c->Smc, t->cptr, t->crow, t->cdel, c->Xmc, c->Npad, c->Wmc);
             gm_calcC_mc<8><<<8, G_NTHREAD>>>(t->freq, c->Wmc, M, c->Cmc);
             gm_pass2_mc<8><<<dim3(g2x, g2y), G_NTHREAD>>>(c->Ap, c->W32, c->Wmc, c->Zmcp, 0, M, c->Npad, mtile2);
-            gm_pass2_finish_mc<8><<<(int)(((std::size_t)N*8 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, t->inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
+            gm_pass2_finish_mc<8><<<(int)(((std::size_t)N*8 + 255)/256), 256>>>(c->Zmcp, g2y, N, c->Npad, c->Cmc, inv_M, t->rptr, t->rcol, t->rdel, c->Wmc, c->Zmc);
             break;
         }
         // Same reason as the single-column path: the union's extra rows must

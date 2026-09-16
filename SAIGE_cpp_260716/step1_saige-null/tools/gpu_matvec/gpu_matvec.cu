@@ -338,8 +338,9 @@ static bool init_handle(Handle* h,
                    tier4_need >> 20, free_b >> 20);
       return false;
     }
+    // No mask, no corrections — and 1/M is passed per call, not bound.
     h->g2b_bind = saige::gpu::g2b::bind_trait(
-        h->g2b, freq.data(), invstd.data(), 1.0f / static_cast<float>(h->M),
+        h->g2b, freq.data(), invstd.data(),
         nullptr, 0, nullptr, nullptr, nullptr, 0);
     if (!h->g2b_bind) {
       std::fprintf(stderr, "[gpu_matvec] tier-4 bind_trait failed\n");
@@ -522,7 +523,8 @@ bool matvec_mat_available(const Handle* h) {
 bool matvec_mat(Handle* h, const float* U, int k, float* out_KU) {
   if (!h || !U || !out_KU || k < 0) return false;
   if (h->tier != 4 || !h->g2b || !h->g2b_bind) return false;  // no batch kernel below tier 4
-  return saige::gpu::g2b::matvec_mat(h->g2b, h->g2b_bind, k, U, out_KU);
+  return saige::gpu::g2b::matvec_mat(h->g2b, h->g2b_bind, k,
+                                     1.0f / static_cast<float>(h->M), U, out_KU);
 }
 
 bool matvec(Handle* h, const float* u, float* out_Au) {
@@ -532,7 +534,8 @@ bool matvec(Handle* h, const float* u, float* out_Au) {
   // Whole-GRM range [0, M); gemv2bit uploads u and applies 1/M itself.
   if (h->tier == 4) {
     if (!h->g2b_bind) return false;
-    return saige::gpu::g2b::matvec_range(h->g2b, h->g2b_bind, 0, h->M, u, out_Au);
+    return saige::gpu::g2b::matvec_range(h->g2b, h->g2b_bind, 0, h->M,
+                                        1.0f / static_cast<float>(h->M), u, out_Au);
   }
 
   // Push u once to the device.

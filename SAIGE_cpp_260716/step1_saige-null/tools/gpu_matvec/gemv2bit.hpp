@@ -89,8 +89,6 @@ Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
 //   freq, invstd  length M (the Ctx's full marker count). invstd[j] == 0 marks
 //                 a marker this phenotype's QC dropped: it contributes nothing
 //                 to either pass, exactly as §1 requires.
-//   inv_M         1/M_t, M_t = #{j : this phenotype's passQC}. Applied by the
-//                 last kernel, so no extra host pass over N.
 //   mask_rows     n_mask union-local sample indices in [0,N) that this
 //                 phenotype does NOT own. The kernels zero x on those rows ON
 //                 THE DEVICE after upload (the host's PCG vectors are shared
@@ -98,9 +96,19 @@ Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
 //                 and zero `ret` on them before copying back — see below.
 //   corr_*        n_corr triplets (row, col, delta): at union-local sample
 //                 `row`, marker `col`, this phenotype's fill differs from the
-//                 union's by `delta` ∈ {−2,−1,1,2}. Must be sorted by col, then
-//                 by row (§3.2 already promises that ordering), and each
-//                 (row,col) may appear at most once.
+//                 union's by `delta` ∈ {−2,−1,1,2}.
+//                 ORDER AND UNIQUENESS ARE REQUIRED, not advisory: the list
+//                 must be STRICTLY increasing in (col, row). Strictly, because
+//                 Δ = fill_t − fill_U is one value per cell — a repeated
+//                 (row,col) would be scatter-added twice and is a builder bug.
+//                 bind_trait checks this on the host and refuses, rather than
+//                 letting a bad segmentation produce quiet wrong numbers.
+//
+// NOTE what a bind deliberately does NOT hold: 1/M_t. The marker count that
+// normalizes the result is per CALL, not per phenotype — a LOCO slice's M_t is
+// the number of markers in [j0, j0+jn) passing THIS phenotype's QC, which the
+// host already knows. Keeping it out means one bind per phenotype serves every
+// chromosome instead of 23 binds each carrying a duplicate copy of the CSRs.
 //
 // Returns nullptr on bad arguments or any CUDA failure.
 //
@@ -109,14 +117,16 @@ Ctx* create_rows(const unsigned char* const* row_ptrs, std::size_t stride_bytes,
 // is summed by a single thread walking a contiguous, sorted segment. No
 // atomicAdd anywhere, and two runs stay bit-identical.
 //
-// ret ON MASKED ROWS IS ZERO. §1 of the design defines Z[i] for every i of the
-// union, which on a row this phenotype does not own is a perfectly finite but
-// meaningless number (that row of A dotted with w). Handing it back would put
-// junk into the caller's shared PCG vectors — every host-side dot product would
-// pick it up, even though the next matvec re-masks x. Zeroing is the only
-// contract that makes the union result substitutable for the single-trait one.
+// ret ON MASKED ROWS IS ZERO — a REQUIREMENT of the contract, not an
+// implementation detail, and callers may rely on it. §1 of the design defines
+// Z[i] for every i of the union; on a row this phenotype does not own that is a
+// finite but meaningless number (that row of A dotted with w). Handing it back
+// would put junk into the caller's SHARED PCG vectors, where the damage is done
+// by the host-side reductions — r·r, r·z — before the next matvec's re-mask of
+// x can undo anything. Zeroing is what makes the union result substitutable for
+// the single-phenotype one.
 TraitBind* bind_trait(Ctx* c,
-                      const float* freq, const float* invstd, float inv_M,
+                      const float* freq, const float* invstd,
                       const int* mask_rows, int n_mask,
                       const int* corr_row, const int* corr_col,
                       const float* corr_delta, int n_corr);
@@ -127,9 +137,18 @@ void unbind_trait(TraitBind* t);
 // standardization/mask/corrections of `t`. x and ret are host float32, length
 // N (the UNION's N — x is masked on the device, ret comes back zeroed on the
 // masked rows). jn == M and j0 == 0 is the full-GRM case the PCG walks.
-// Corrections whose marker falls outside [j0, j0+jn) are skipped, so a LOCO
-// range stays consistent with the full call.
-bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
+//
+// inv_M is 1/M_t for THIS range: the number of markers in [j0, j0+jn) that pass
+// this phenotype's QC. It is a call argument and not part of the bind exactly
+// so a LOCO run can reuse one bind for all 23 slices. Applied by the last
+// kernel, so no extra host pass over N.
+//
+// Corrections whose marker falls outside [j0, j0+jn) are SKIPPED — in both
+// passes, and by construction: pass 1 gets the marker CSR offset to j0 so out
+// of range segments are never visited, and pass 2 tests (col − j0) ∈ [0, jn)
+// because its CSR stores a global marker index while w is range-local. A LOCO
+// slice therefore agrees with the corresponding part of the full call.
+bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn, float inv_M,
                   const float* x, float* ret);
 
 // Multi-RHS analogue: ret = inv_M · A_std (A_stdᵀ X) over ALL markers.
@@ -138,10 +157,12 @@ bool matvec_range(Ctx* c, TraitBind* t, int j0, int jn,
 // chunks of 8 and rounds each chunk up to {2,4,8} with zero columns. ncol == 1
 // forwards to matvec_range.
 // Every column is masked independently on the device; every output column
-// comes back zeroed on the masked rows.
+// comes back zeroed on the masked rows. inv_M is 1/M_t over ALL markers, same
+// per-call rule as matvec_range.
 // Device scratch for this path is allocated lazily on the first call, so a run
 // that never batches pays nothing for it.
-bool matvec_mat(Ctx* c, TraitBind* t, int ncol, const float* X, float* ret);
+bool matvec_mat(Ctx* c, TraitBind* t, int ncol, float inv_M,
+                const float* X, float* ret);
 
 // Device bytes matvec_mat() will lazily allocate on first use, for logging.
 std::size_t mc_scratch_bytes(const Ctx* c);

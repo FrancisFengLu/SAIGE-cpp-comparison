@@ -218,8 +218,7 @@ static void b1(const std::string& refdir) {
 
     g2b::Ctx* c = g2b::create(packed.data(), stride, N, M);
     if (!c) { std::fprintf(stderr, "B1 create failed (case %d)\n", k); ++g_fail; return; }
-    g2b::TraitBind* t = g2b::bind_trait(c, freq.data(), invstd.data(),
-                                        1.0f/(float)M, nullptr, 0,
+    g2b::TraitBind* t = g2b::bind_trait(c, freq.data(), invstd.data(), nullptr, 0,
                                         nullptr, nullptr, nullptr, 0);
     if (!t) { std::fprintf(stderr, "B1 bind failed (case %d)\n", k); ++g_fail; g2b::destroy(c); return; }
 
@@ -240,22 +239,21 @@ static void b1(const std::string& refdir) {
       if (d) ++g_fail;
     };
 
-    if (!g2b::matvec_range(c, t, 0, M, x.data(), got.data())) { ++g_fail; }
+    if (!g2b::matvec_range(c, t, 0, M, 1.0f/(float)M, x.data(), got.data())) { ++g_fail; }
     check(tag + "_range_full", got);
 
+    // Same bind, different range, different 1/M_t — which is the whole reason
+    // inv_M is a call argument and not part of the bind (a LOCO run does this
+    // 23 times per phenotype).
     const int j0 = M/3, jn = M/2;
-    g2b::TraitBind* tsub = g2b::bind_trait(c, freq.data(), invstd.data(),
-                                           1.0f/(float)jn, nullptr, 0,
-                                           nullptr, nullptr, nullptr, 0);
     std::fill(got.begin(), got.end(), 0.f);
-    if (!tsub || !g2b::matvec_range(c, tsub, j0, jn, x.data(), got.data())) { ++g_fail; }
+    if (!g2b::matvec_range(c, t, j0, jn, 1.0f/(float)jn, x.data(), got.data())) { ++g_fail; }
     check(tag + "_range_sub", got);
-    g2b::unbind_trait(tsub);
 
     for (int nc : kNcol) {
       std::vector<float> X; gen_vec((std::size_t)N*nc, cs[k].seed ^ (0xC0ull + nc), X);
       std::vector<float> KU((std::size_t)N*nc, 0.f);
-      if (!g2b::matvec_mat(c, t, nc, X.data(), KU.data())) { ++g_fail; }
+      if (!g2b::matvec_mat(c, t, nc, 1.0f/(float)M, X.data(), KU.data())) { ++g_fail; }
       check(tag + "_mat" + std::to_string(nc), KU);
     }
 
@@ -287,7 +285,7 @@ static void b2() {
 
   g2b::Ctx* c = g2b::create(packed.data(), stride, N, M);
   g2b::TraitBind* t = g2b::bind_trait(
-      c, tr.freq.data(), tr.invstd.data(), tr.inv_M,
+      c, tr.freq.data(), tr.invstd.data(),
       tr.mask.data(), (int)tr.mask.size(),
       tr.crow.data(), tr.ccol.data(), tr.cdel.data(), (int)tr.cdel.size());
   if (!c || !t) { std::fprintf(stderr, "B2 setup failed\n"); ++g_fail; return; }
@@ -297,10 +295,15 @@ static void b2() {
   ref_matvec(packed, stride, N, M, tr, b, ref);
 
   std::vector<float> got(N, 0.f);
-  if (!g2b::matvec_range(c, t, 0, M, b.data(), got.data())) { ++g_fail; }
+  if (!g2b::matvec_range(c, t, 0, M, tr.inv_M, b.data(), got.data())) { ++g_fail; }
   Rel r = relerr(ref, got);
-  std::printf("  matvec_range : max|Δ|=%.4g  rel_max=%.4g  rel_L2=%.4g  %s\n",
-              r.max_abs, r.rel_max, r.rel_l2, r.rel_l2 <= 1e-6 ? "PASS" : "FAIL(>1e-6)");
+  // GATED ON rel_L2 ONLY. rel_max is printed because it is the number that
+  // says how bad a single element can get, but it is not a threshold: fp32
+  // reduction error grows like √M, so a max-norm gate calibrated at M=3000
+  // would fail at UKB's M=1.1e5 for no reason other than the problem being
+  // bigger. Same reason §4 refuses to gate anything bit-exact here.
+  std::printf("  matvec_range : max|Δ|=%.4g  rel_max=%.4g (ungated)  rel_L2=%.4g  %s\n",
+              r.max_abs, r.rel_max, r.rel_l2, r.rel_l2 <= 1e-6 ? "PASS" : "FAIL(rel_L2>1e-6)");
   if (r.rel_l2 > 1e-6) ++g_fail;
 
   // Sub-range under mask + corrections: the marker CSR is offset to j0 and the
@@ -308,13 +311,22 @@ static void b2() {
   {
     const int j0 = M/3, jn = M/2;
     std::vector<double> rs;
-    ref_matvec_range(packed, stride, N, M, j0, jn, tr, b, rs);
+    Trait trng = tr;
+    {
+      int mt = 0;
+      for (int j = j0; j < j0+jn; ++j) if (tr.invstd[j] != 0.0f) ++mt;
+      trng.inv_M = 1.0f/(float)mt;
+    }
+    ref_matvec_range(packed, stride, N, M, j0, jn, trng, b, rs);
     std::vector<float> gs(N, 0.f);
-    if (!g2b::matvec_range(c, t, j0, jn, b.data(), gs.data())) ++g_fail;
+    // Same bind, a different range and a different inv_M.
+    int Mt_rng = 0;
+    for (int j = j0; j < j0+jn; ++j) if (tr.invstd[j] != 0.0f) ++Mt_rng;
+    if (!g2b::matvec_range(c, t, j0, jn, 1.0f/(float)Mt_rng, b.data(), gs.data())) ++g_fail;
     Rel r2 = relerr(rs, gs);
-    std::printf("  range[%d,%d) : max|Δ|=%.4g  rel_max=%.4g  rel_L2=%.4g  %s\n",
+    std::printf("  range[%d,%d) : max|Δ|=%.4g  rel_max=%.4g (ungated)  rel_L2=%.4g  %s\n",
                 j0, j0+jn, r2.max_abs, r2.rel_max, r2.rel_l2,
-                r2.rel_l2 <= 1e-6 ? "PASS" : "FAIL(>1e-6)");
+                r2.rel_l2 <= 1e-6 ? "PASS" : "FAIL(rel_L2>1e-6)");
     if (r2.rel_l2 > 1e-6) ++g_fail;
   }
 
@@ -328,7 +340,7 @@ static void b2() {
 
   // Determinism with the scatter-adds live.
   std::vector<float> got2(N, 0.f);
-  g2b::matvec_range(c, t, 0, M, b.data(), got2.data());
+  g2b::matvec_range(c, t, 0, M, tr.inv_M, b.data(), got2.data());
   const int bd = bitdiff(got, got2);
   std::printf("  inter-run: %d/%d words differ  %s\n", bd, N,
               bd ? "*** NONDETERMINISTIC ***" : "bit-identical");
@@ -366,7 +378,7 @@ static void b2() {
     std::vector<float> col; gen_vec(N, 0xB2C0ull + cc, col);
     std::copy(col.begin(), col.end(), X.begin() + (std::size_t)cc*N);
   }
-  if (!g2b::matvec_mat(c, t, nc, X.data(), KU.data())) { ++g_fail; }
+  if (!g2b::matvec_mat(c, t, nc, tr.inv_M, X.data(), KU.data())) { ++g_fail; }
   double worst_l2 = 0, worst_max = 0;
   for (int cc = 0; cc < nc; ++cc) {
     std::vector<float> col(X.begin() + (std::size_t)cc*N,
@@ -378,8 +390,8 @@ static void b2() {
     worst_l2 = std::max(worst_l2, rc.rel_l2);
     worst_max = std::max(worst_max, rc.rel_max);
   }
-  std::printf("  matvec_mat(3): worst rel_max=%.4g  worst rel_L2=%.4g  %s\n",
-              worst_max, worst_l2, worst_l2 <= 1e-6 ? "PASS" : "FAIL(>1e-6)");
+  std::printf("  matvec_mat(3): worst rel_max=%.4g (ungated)  worst rel_L2=%.4g  %s\n",
+              worst_max, worst_l2, worst_l2 <= 1e-6 ? "PASS" : "FAIL(rel_L2>1e-6)");
   if (worst_l2 > 1e-6) ++g_fail;
 
   g2b::unbind_trait(t);
@@ -423,18 +435,18 @@ static void b3() {
 
   g2b::Ctx* cu = g2b::create(packed.data(), stride, N, M);
   g2b::TraitBind* tu = g2b::bind_trait(
-      cu, tr.freq.data(), tr.invstd.data(), tr.inv_M,
+      cu, tr.freq.data(), tr.invstd.data(),
       tr.mask.data(), (int)tr.mask.size(),
       tr.crow.data(), tr.ccol.data(), tr.cdel.data(), (int)tr.cdel.size());
   g2b::Ctx* co = g2b::create(own.data(), stride_t, Nt, M);
   g2b::TraitBind* to = g2b::bind_trait(co, tr.freq.data(), tr.invstd.data(),
-                                       tr.inv_M, nullptr, 0,
+                                       nullptr, 0,
                                        nullptr, nullptr, nullptr, 0);
   if (!cu || !tu || !co || !to) { std::fprintf(stderr, "B3 setup failed\n"); ++g_fail; return; }
 
   std::vector<float> ru(N, 0.f), ro(Nt, 0.f);
-  if (!g2b::matvec_range(cu, tu, 0, M, b.data(), ru.data())) ++g_fail;
-  if (!g2b::matvec_range(co, to, 0, M, b_own.data(), ro.data())) ++g_fail;
+  if (!g2b::matvec_range(cu, tu, 0, M, tr.inv_M, b.data(), ru.data())) ++g_fail;
+  if (!g2b::matvec_range(co, to, 0, M, tr.inv_M, b_own.data(), ro.data())) ++g_fail;
 
   double max_abs = 0, max_ref = 0, num = 0, den = 0;
   int arg = -1;
@@ -488,15 +500,14 @@ static void timing() {
 
   g2b::Ctx* c = g2b::create(packed.data(), stride, N, M);
   if (!c) { std::fprintf(stderr, "timing create failed (VRAM?)\n"); ++g_fail; return; }
-  g2b::TraitBind* plain = g2b::bind_trait(c, freq.data(), invstd.data(),
-                                          1.0f/(float)M, nullptr, 0,
+  g2b::TraitBind* plain = g2b::bind_trait(c, freq.data(), invstd.data(), nullptr, 0,
                                           nullptr, nullptr, nullptr, 0);
   g2b::TraitBind* full = g2b::bind_trait(
-      c, tr.freq.data(), tr.invstd.data(), tr.inv_M,
+      c, tr.freq.data(), tr.invstd.data(),
       tr.mask.data(), (int)tr.mask.size(),
       tr.crow.data(), tr.ccol.data(), tr.cdel.data(), (int)tr.cdel.size());
   g2b::TraitBind* maskonly = g2b::bind_trait(
-      c, tr.freq.data(), tr.invstd.data(), tr.inv_M,
+      c, tr.freq.data(), tr.invstd.data(),
       tr.mask.data(), (int)tr.mask.size(), nullptr, nullptr, nullptr, 0);
   if (!plain || !full || !maskonly) { std::fprintf(stderr, "timing bind failed\n"); ++g_fail; return; }
 
@@ -518,11 +529,11 @@ static void timing() {
   double tot[3] = {0,0,0}, best[3] = {1e30,1e30,1e30};
   const int reps = 60;
   for (int r = 0; r < 5; ++r)
-    for (int k = 0; k < 3; ++k) g2b::matvec_range(c, v[k], 0, M, x.data(), out.data());
+    for (int k = 0; k < 3; ++k) g2b::matvec_range(c, v[k], 0, M, 1.0f/(float)M, x.data(), out.data());
   for (int r = 0; r < reps; ++r) {
     for (int k = 0; k < 3; ++k) {
       auto t0 = std::chrono::steady_clock::now();
-      g2b::matvec_range(c, v[k], 0, M, x.data(), out.data());
+      g2b::matvec_range(c, v[k], 0, M, 1.0f/(float)M, x.data(), out.data());
       auto t1 = std::chrono::steady_clock::now();
       const double ms = std::chrono::duration<double, std::milli>(t1-t0).count();
       tot[k] += ms;
@@ -545,20 +556,20 @@ static void timing() {
     Trait tv = make_trait(packed, stride, N, M, freq, invstd, 0.20, nc, 0.0,
                           0x7720ull + nc);
     g2b::TraitBind* tb2 = g2b::bind_trait(
-        c, tv.freq.data(), tv.invstd.data(), tv.inv_M,
+        c, tv.freq.data(), tv.invstd.data(),
         tv.mask.data(), (int)tv.mask.size(),
         tv.crow.data(), tv.ccol.data(), tv.cdel.data(), (int)tv.cdel.size());
     if (!tb2) { std::fprintf(stderr, "  sweep bind failed at %d\n", nc); ++g_fail; continue; }
     double bmin = 1e30, bref = 1e30;
     for (int r = 0; r < 5; ++r) {
-      g2b::matvec_range(c, plain, 0, M, x.data(), out.data());
-      g2b::matvec_range(c, tb2,   0, M, x.data(), out.data());
+      g2b::matvec_range(c, plain, 0, M, 1.0f/(float)M, x.data(), out.data());
+      g2b::matvec_range(c, tb2,   0, M, tv.inv_M, x.data(), out.data());
     }
     for (int r = 0; r < 25; ++r) {
       auto a0 = std::chrono::steady_clock::now();
-      g2b::matvec_range(c, plain, 0, M, x.data(), out.data());
+      g2b::matvec_range(c, plain, 0, M, 1.0f/(float)M, x.data(), out.data());
       auto a1 = std::chrono::steady_clock::now();
-      g2b::matvec_range(c, tb2, 0, M, x.data(), out.data());
+      g2b::matvec_range(c, tb2, 0, M, tv.inv_M, x.data(), out.data());
       auto a2 = std::chrono::steady_clock::now();
       bref = std::min(bref, std::chrono::duration<double,std::milli>(a1-a0).count());
       bmin = std::min(bmin, std::chrono::duration<double,std::milli>(a2-a1).count());
@@ -588,24 +599,24 @@ static void coexist() {
   Trait bb = make_trait(packed, stride, N, M, freq, invstd, 0.07, 150, 0.02, 0x5A22ull);
 
   g2b::Ctx* c = g2b::create(packed.data(), stride, N, M);
-  g2b::TraitBind* ta = g2b::bind_trait(c, a.freq.data(), a.invstd.data(), a.inv_M,
+  g2b::TraitBind* ta = g2b::bind_trait(c, a.freq.data(), a.invstd.data(),
                                        a.mask.data(), (int)a.mask.size(),
                                        a.crow.data(), a.ccol.data(), a.cdel.data(),
                                        (int)a.cdel.size());
   std::vector<float> x; gen_vec(N, 0x5A33ull, x);
   std::vector<float> ra0(N, 0.f), ra1(N, 0.f), rb(N, 0.f);
-  if (!c || !ta || !g2b::matvec_range(c, ta, 0, M, x.data(), ra0.data())) {
+  if (!c || !ta || !g2b::matvec_range(c, ta, 0, M, a.inv_M, x.data(), ra0.data())) {
     std::fprintf(stderr, "S setup failed\n"); ++g_fail; return;
   }
 
   // Second bind arrives AFTER the first has already run.
-  g2b::TraitBind* tb = g2b::bind_trait(c, bb.freq.data(), bb.invstd.data(), bb.inv_M,
+  g2b::TraitBind* tb = g2b::bind_trait(c, bb.freq.data(), bb.invstd.data(),
                                        bb.mask.data(), (int)bb.mask.size(),
                                        bb.crow.data(), bb.ccol.data(), bb.cdel.data(),
                                        (int)bb.cdel.size());
   if (!tb) { std::fprintf(stderr, "S second bind failed\n"); ++g_fail; return; }
-  g2b::matvec_range(c, tb, 0, M, x.data(), rb.data());
-  g2b::matvec_range(c, ta, 0, M, x.data(), ra1.data());
+  g2b::matvec_range(c, tb, 0, M, bb.inv_M, x.data(), rb.data());
+  g2b::matvec_range(c, ta, 0, M, a.inv_M,  x.data(), ra1.data());
 
   const int bd = bitdiff(ra0, ra1);
   std::printf("  phenotype A before/after B ran: %d/%d words differ  %s\n",
@@ -622,7 +633,7 @@ static void coexist() {
   g2b::unbind_trait(ta);
   // B must still work after A is gone — unbind frees only its own buffers.
   std::vector<float> rb2(N, 0.f);
-  g2b::matvec_range(c, tb, 0, M, x.data(), rb2.data());
+  g2b::matvec_range(c, tb, 0, M, bb.inv_M, x.data(), rb2.data());
   const int bd2 = bitdiff(rb, rb2);
   std::printf("  phenotype B after A unbound:   %d/%d words differ  %s\n",
               bd2, N, bd2 ? "*** FAIL ***" : "bit-identical");
