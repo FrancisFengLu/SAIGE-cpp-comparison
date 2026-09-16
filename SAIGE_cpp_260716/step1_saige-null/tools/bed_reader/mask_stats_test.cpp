@@ -375,9 +375,20 @@ int main(int argc, char** argv) {
       if (ts[t].M_t != M_solo)
         a1.report("M_t", trait_names[t], 0, std::to_string(ts[t].M_t),
                   std::to_string(M_solo));
-      std::printf("  A1 %-6s  M_t=%d (solo %d)  markers=%zu  %s\n",
+      // How far the trait's own QC / VR verdict is from the union's — i.e. how
+      // much work the per-trait recomputation is actually doing. A version that
+      // reused the union's passQC (or skipped the VR rule per trait) would have
+      // to be wrong on exactly this many markers.
+      std::size_t dqc = 0, dvr = 0, dfreq = 0;
+      for (std::size_t j = 0; j < M; ++j) {
+        if ((ts[t].passQC[j] != 0) != uni.stats[j].passQC) ++dqc;
+        if ((ts[t].passVR[j] != 0) != bool(uni.passVR[j]))  ++dvr;
+        if (!fsame(ts[t].freq[j], uni.stats[j].altFreq))    ++dfreq;
+      }
+      std::printf("  A1 %-6s  M_t=%d (solo %d)  markers=%zu  %s"
+                  "   vs union: passQC differs on %zu, passVR on %zu, freq on %zu\n",
                   trait_names[t].c_str(), ts[t].M_t, M_solo, M,
-                  a1.n == 0 ? "bit-identical" : "MISMATCH");
+                  a1.n == 0 ? "bit-identical" : "MISMATCH", dqc, dvr, dfreq);
     }
 
     // ---------------- §2 union-keep rule ---------------------------------

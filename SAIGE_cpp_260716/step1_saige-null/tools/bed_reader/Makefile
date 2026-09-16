@@ -84,4 +84,23 @@ mask-test: mask_stats_test
 	./mask_stats_test $(MASK_GENO).bed $(MASK_GENO).fam \
 	    $(MASK_DATA)/$(MASK_SCALE)/$(MASK_CASE).pheno.txt $(MASK_ARGS)
 
-.PHONY: all test pipeline-test parallel-test mask-test clean
+# Full stage-A gate: every case, VR off and on, plus a synthetic P=8 run where
+# each trait drops its own 1-8% (the biobank-like regime none of the gate cases
+# covers). Non-zero exit on the first failure.
+MASK_CASES ?= qc fill tiny block nomiss indep vrcate
+mask-gate: mask_stats_test
+	@set -e; for c in $(MASK_CASES); do \
+	  for v in "" "--vr 20,-1" "--vr 20.5,200.5"; do \
+	    echo "=== $(MASK_SCALE)/$$c  VR[$$v] ==="; \
+	    ./mask_stats_test $(MASK_GENO).bed $(MASK_GENO).fam \
+	        $(MASK_DATA)/$(MASK_SCALE)/$$c.pheno.txt --threads 8 $$v 2>/dev/null \
+	      | grep -E "A1 mismatches|A2 mismatches|keep-rule|pack_if_keep|missing-cell|PASS|FAIL"; \
+	  done; \
+	done; \
+	echo "=== $(MASK_SCALE)/synth 8 traits x 1-8% ==="; \
+	./mask_stats_test $(MASK_GENO).bed $(MASK_GENO).fam \
+	    $(MASK_DATA)/$(MASK_SCALE)/$(firstword $(MASK_CASES)).pheno.txt \
+	    --threads 8 --vr 20,-1 --synth 8,8,7 2>/dev/null \
+	  | grep -E "A1 mismatches|A2 mismatches|keep-rule|pack_if_keep|missing-cell|PASS|FAIL"
+
+.PHONY: all test pipeline-test parallel-test mask-test mask-gate clean
