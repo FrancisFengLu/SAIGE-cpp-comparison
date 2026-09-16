@@ -44,6 +44,7 @@
 #include "parallel_decode.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -313,9 +314,52 @@ int main(int argc, char** argv) {
     pa.collect_tally         = true;
     pa.collect_missing_cells = true;
     pa.collect_keep          = true;
+    // Time the plain union decode first, so the extra cost of the scheme-C
+    // outputs is visible. The tally loop is O(Σ_t |U∖S_t|) against the main
+    // loop's O(|U|), so a low-coverage group pays more for the tallies than
+    // for the decode itself — the same ratio §6's mask_min_coverage governs.
+    const auto t0 = std::chrono::steady_clock::now();
+    auto uni_plain = saige::parallel_decode_bed(
+        reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
+        vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), nullptr);
+    const auto t1 = std::chrono::steady_clock::now();
     auto uni = saige::parallel_decode_bed(
         reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
         vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), &pa);
+    const auto t2 = std::chrono::steady_clock::now();
+    {   // tallies + keep only, so the missing-cell materialization is separable
+        saige::ParallelDecodeAux pt = pa;
+        pt.collect_missing_cells = false;
+        auto tmp = saige::parallel_decode_bed(
+            reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
+            vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), &pt);
+        (void)tmp;
+    }
+    const auto t3 = std::chrono::steady_clock::now();
+    const double s_plain = std::chrono::duration<double>(t1 - t0).count();
+    const double s_aux   = std::chrono::duration<double>(t2 - t1).count();
+    const double s_tal   = std::chrono::duration<double>(t3 - t2).count();
+    long excl_total = 0;
+    for (int t = 0; t < P; ++t) excl_total += long(excl[t].size());
+    std::printf("union decode: %.3f s plain | %.3f s +tallies/keep (+%.0f%%) | "
+                "%.3f s +missing cells (+%.0f%%)   Σ|U∖S_t| / |U| = %.2f\n",
+                s_plain, s_tal, 100.0 * (s_tal - s_plain) / s_plain,
+                s_aux, 100.0 * (s_aux - s_plain) / s_plain,
+                double(excl_total) / double(nU));
+
+    // The aux outputs must not disturb the stats the plain decode produces.
+    int drift = 0;
+    for (std::size_t j = 0; j < M; ++j) {
+      const auto& a = uni.stats[j];
+      const auto& b = uni_plain.stats[j];
+      if (!fsame(a.altFreq, b.altFreq) || !fsame(a.missingRate, b.missingRate) ||
+          a.alleleCount != b.alleleCount || a.mac != b.mac ||
+          a.numMissing != b.numMissing || a.passQC != b.passQC ||
+          a.alleleRaw != b.alleleRaw || a.fillin != b.fillin ||
+          bool(uni.passVR[j]) != bool(uni_plain.passVR[j])) ++drift;
+    }
+    if (drift) std::printf("  FAIL [aux drift] %d markers differ between the "
+                           "aux and no-aux union decode\n", drift);
 
     std::vector<int> fill_U(M);
     for (std::size_t j = 0; j < M; ++j) fill_U[j] = uni.stats[j].fillin;
@@ -545,8 +589,9 @@ int main(int argc, char** argv) {
     std::printf("pack_if_keep store mismatches  : %d\n", pack_fail);
     std::printf("missing-cell list mismatches   : %d\n", mcell_fail);
 
+    std::printf("aux-vs-no-aux stat drift       : %d\n", drift);
     const bool ok = (a1.n == 0 && a2.n == 0 && keep_mismatch == 0 &&
-                     pack_fail == 0 && mcell_fail == 0);
+                     pack_fail == 0 && mcell_fail == 0 && drift == 0);
     std::printf("%s\n", ok ? "MASK_STATS_TEST PASS" : "MASK_STATS_TEST FAIL");
     return ok ? 0 : 1;
   } catch (const std::exception& e) {
