@@ -797,6 +797,306 @@ public:
  	}
 
 
+	// ===== GRM diagonal d_r = Σ_m z_rm², without the per-marker scalar decode ====
+	// The legacy loop (diag_compute_legacy) decodes marker m into a length-N
+	// fvec and adds z∘z into the accumulator, so every row r gets
+	//     acc_r ← acc_r + (z_rm · z_rm)        for m = m0, m0+1, ... in order,
+	// in fp32. fp32 addition is not associative: that sequence IS the value.
+	// diag_accumulate performs the same sequence for every row, faster:
+	//   · rows are cut into contiguous ranges, one per TBB task; each task walks
+	//     the markers in ascending order, so no row's sequence changes;
+	//   · z_rm·z_rm comes from a per-marker 4-entry table indexed by the 2-bit
+	//     code, filled from the same setStdGenoLookUpArr values with the same
+	//     single float multiply the legacy z∘z does;
+	//   · the add is a plain addss/addps. This TU is built -ffp-contract=off
+	//     and the kernel has no fmadd, so the multiply is never fused into it.
+	// A mask trait's fill corrections replace the table value on their cells
+	// with the legacy formula before the square, as the legacy loop does.
+	// SAIGE_DIAG_SELFCHECK=1 re-runs the scalar kernel and the legacy loop and
+	// compares bit patterns (one stderr line per computation, with wall times).
+	static bool diag_selfcheck_on() {
+		static const bool on = [] {
+			const char* e = std::getenv("SAIGE_DIAG_SELFCHECK");
+			return e && *e && std::string(e) != "0";
+		}();
+		return on;
+	}
+
+	// The fast path reads packed rows through raw pointers, so it needs the
+	// geometry Get_OneSNP_StdGeno assumes: one marker per legacy vector (or the
+	// flat store), ceil(rows/4) bytes per row, all of them present. A released
+	// host store fails here and takes the legacy path, which throws as before.
+	bool diag_fast_ok(std::size_t m1) const {
+		const std::size_t nrow = store_rows();
+		if (nrow == 0 || numMarkersofEachArray != 1 || !packed_rows_contiguous()) return false;
+		if (m_size_of_esi <= 0 || (std::size_t)m_size_of_esi != (nrow + 3) / 4) return false;
+		if (alleleFreqVec.n_elem < m1 || invstdvVec.n_elem < m1) return false;
+		const std::size_t esi = (std::size_t)m_size_of_esi;
+		if (use_packed_flat_)
+			return m1 <= packed_flat_.n_stored() && packed_flat_.nbyte() >= esi;
+		if (m1 > genoVecofPointers.size()) return false;
+		for (std::size_t m = 0; m < m1; ++m)
+			if (!genoVecofPointers[m] || genoVecofPointers[m]->size() < esi) return false;
+		return true;
+	}
+
+	// Corrections as setup_mask_union emits them: strictly ascending (col,row),
+	// rows inside the store. Under that order the legacy while-loop applies
+	// exactly column m's entries while marker m is decoded, which is what the
+	// per-column ranges in diag_accumulate / diag_debug_fast reproduce.
+	bool diag_corr_ok(const MaskTrait& T, std::size_t m1) const {
+		const std::size_t nc = T.corr_col.size();
+		if (T.corr_row.size() != nc || T.corr_delta.size() != nc) return false;
+		if (T.freq.size() < m1 || T.invstd.size() < m1) return false;
+		const std::size_t nrow = store_rows();
+		for (std::size_t c = 0; c < nc; ++c) {
+			if (T.corr_col[c] < 0 || T.corr_row[c] < 0 ||
+			    (std::size_t)T.corr_row[c] >= nrow) return false;
+			if (c > 0 && (T.corr_col[c] < T.corr_col[c - 1] ||
+			              (T.corr_col[c] == T.corr_col[c - 1] &&
+			               T.corr_row[c] <= T.corr_row[c - 1]))) return false;
+		}
+		return true;
+	}
+
+	// acc[r] += sq4[code of row r] for rows [lo, hi) of one packed row p.
+	static void diag_add_rows(const unsigned char* p, const float* sq4, float* acc,
+	                          std::size_t lo, std::size_t hi, bool simd) {
+		std::size_t r = lo;
+#if SAIGE_AVX2_KERNEL_AVAILABLE
+		if (simd && hi >= lo + 16) {
+			for (; r & 7; ++r) acc[r] += sq4[(p[r >> 2] >> ((r & 3) << 1)) & 3];
+			// Two packed bytes hold the 8 codes of rows r..r+7. permutevar_ps
+			// selects with the low 2 bits of each control element, within its
+			// 128-bit lane, so both lanes carry the same 4-entry table.
+			const __m256  tbl = _mm256_setr_ps(sq4[0], sq4[1], sq4[2], sq4[3],
+			                                   sq4[0], sq4[1], sq4[2], sq4[3]);
+			const __m256i sh  = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+			for (; r + 8 <= hi; r += 8) {
+				const std::size_t b = r >> 2;
+				const __m256i w = _mm256_set1_epi32((int)p[b] | ((int)p[b + 1] << 8));
+				const __m256  v = _mm256_permutevar_ps(tbl, _mm256_srlv_epi32(w, sh));
+				_mm256_storeu_ps(acc + r, _mm256_add_ps(_mm256_loadu_ps(acc + r), v));
+			}
+		}
+#endif
+		(void)simd;
+		for (; r < hi; ++r) acc[r] += sq4[(p[r >> 2] >> ((r & 3) << 1)) & 3];
+	}
+
+	// acc[r] += z_rm² for markers [m0, m1) and every store row r, per-row
+	// order as the legacy loop (see the block comment). Callers have checked
+	// diag_fast_ok(m1) and, with T, diag_corr_ok(*T, m1).
+	void diag_accumulate(std::size_t m0, std::size_t m1, float* acc,
+	                     const MaskTrait* T, bool simd) {
+		if (m1 <= m0) return;
+		const std::size_t nrow = store_rows();
+		const std::size_t nm   = m1 - m0;
+		// sq[4k + c] = z² for code c of marker m0+k. Code c has bits b = c&1 and
+		// a = c>>1; Get_OneSNP_StdGeno writes lut(2-(a+b)) for it.
+		std::vector<float> sq(4 * nm);
+		{
+			arma::fvec lut(3);
+			for (std::size_t k = 0; k < nm; ++k) {
+				setStdGenoLookUpArr(alleleFreqVec[m0 + k], invstdvVec[m0 + k], lut);
+				for (unsigned c = 0; c < 4; ++c) {
+					const float z = lut(2 - (int)(((c >> 1) & 1u) + (c & 1u)));
+					sq[4 * k + c] = z * z;
+				}
+			}
+		}
+		// [cb[k], cb[k+1]) = T's corrections on marker m0+k, rows ascending.
+		std::vector<std::size_t> cb;
+		if (T) {
+			cb.resize(nm + 1);
+			const std::size_t nc = T->corr_col.size();
+			std::size_t c = 0;
+			for (std::size_t k = 0; k <= nm; ++k) {
+				while (c < nc && (std::size_t)T->corr_col[c] < m0 + k) ++c;
+				cb[k] = c;
+			}
+		}
+		// ~64 row ranges, each a multiple of 8 rows so the AVX2 loop starts
+		// aligned; a range's slice of acc stays in L2 across all markers.
+		const std::size_t chunk  = std::max<std::size_t>(8, ((nrow + 63) / 64 + 7) & ~(std::size_t)7);
+		const std::size_t nchunk = (nrow + chunk - 1) / chunk;
+
+		struct RowRanges : public RcppParallel::Worker {
+			genoClass* g = nullptr; const MaskTrait* T = nullptr;
+			const float* sq = nullptr; const std::size_t* cb = nullptr; float* acc = nullptr;
+			std::size_t m0 = 0, nm = 0, nrow = 0, chunk = 0; bool simd = true;
+			void operator()(std::size_t qb, std::size_t qe) {
+				for (std::size_t q = qb; q < qe; ++q) {
+					const std::size_t lo = q * chunk;
+					const std::size_t hi = std::min(nrow, lo + chunk);
+					for (std::size_t k = 0; k < nm; ++k) {
+						const std::size_t m = m0 + k;
+						const unsigned char* p = g->packed_row_ptr(m);
+						const float* s = sq + 4 * k;
+						std::size_t cur = lo;
+						if (T) {
+							const int* rows = T->corr_row.data();
+							std::size_t c = (std::size_t)(std::lower_bound(
+							    rows + cb[k], rows + cb[k + 1], (int)lo) - rows);
+							for (; c < cb[k + 1] && (std::size_t)rows[c] < hi; ++c) {
+								const std::size_t r = (std::size_t)rows[c];
+								genoClass::diag_add_rows(p, s, acc, cur, r, simd);
+								const float gv = (float)g->packed_geno_at(m, r);
+								const float z = (gv + T->corr_delta[c] - 2.0f*T->freq[m]) * T->invstd[m];
+								acc[r] += z * z;
+								cur = r + 1;
+							}
+						}
+						genoClass::diag_add_rows(p, s, acc, cur, hi, simd);
+					}
+				}
+			}
+		} task;
+		task.g = this; task.T = T; task.sq = sq.data(); task.cb = T ? cb.data() : nullptr;
+		task.acc = acc; task.m0 = m0; task.nm = nm; task.nrow = nrow; task.chunk = chunk;
+		task.simd = simd;
+		RcppParallel::parallelFor(0, nchunk, task, 1);
+	}
+
+	// The loop the fast path replaced, unchanged: the fallback when its
+	// preconditions fail, and the reference SAIGE_DIAG_SELFCHECK compares to.
+	// first3/val0, when given, receive what the callers print: *temp of the
+	// first three counted markers (all rows off the mask path, S_t's rows under
+	// it; counted = invstd_t != 0 under the mask, every marker otherwise) and
+	// (*temp)[row0] of every marker.
+	void diag_compute_legacy(std::size_t m0, std::size_t m1, arma::fvec& acc, arma::fvec* temp,
+	                         const MaskTrait* T, arma::fmat* first3, std::vector<float>* val0) {
+		std::size_t ci = 0;
+		int ndbg = 0;
+		const int row0 = (T && !T->scatter.empty()) ? T->scatter[0] : 0;
+		for (std::size_t i = m0; i < m1; i++) {
+			Get_OneSNP_StdGeno(i, temp);
+			if (T) {
+				// §1 step 4: the packed cell holds fill_U; this trait wants
+				// fill_U + delta. Applied before the square, so the diagonal
+				// agrees with the kernel's corrected product.
+				while (ci < T->corr_col.size() &&
+				       (std::size_t)T->corr_col[ci] == i) {
+					const int r = T->corr_row[ci];
+					const float g = (float)packed_geno_at(i, (std::size_t)r);
+					(*temp)[r] = (g + T->corr_delta[ci] - 2.0f*T->freq[i]) * T->invstd[i];
+					ci++;
+				}
+				acc += (*temp) % (*temp);
+			} else {
+				acc = acc + (*temp) % (*temp);
+			}
+			if (first3 && (!T || T->invstd[i] != 0.0f)) {
+				if (ndbg < 3) {
+					if (T) for (int q = 0; q < T->n_t; q++) (*first3)(q, ndbg) = (*temp)[T->scatter[q]];
+					else   first3->col(ndbg) = *temp;
+				}
+				ndbg++;
+			}
+			if (val0) (*val0)[i - m0] = (*temp)[row0];
+		}
+	}
+
+	// The debug values diag_compute_legacy records, without decoding every
+	// marker: full rows for the three printed markers, the one row0 cell for
+	// the rest.
+	void diag_debug_fast(std::size_t m1, arma::fvec* temp, const MaskTrait* T,
+	                     arma::fmat& first3, std::vector<float>& val0) {
+		const int row0 = (T && !T->scatter.empty()) ? T->scatter[0] : 0;
+		arma::fvec lut(3);
+		std::size_t ci = 0;
+		int ndbg = 0;
+		for (std::size_t i = 0; i < m1; ++i) {
+			const std::size_t c0 = ci;   // [c0, ci) = column i's corrections
+			if (T) while (ci < T->corr_col.size() && (std::size_t)T->corr_col[ci] == i) ++ci;
+			const bool counted = !T || T->invstd[i] != 0.0f;
+			if (counted && ndbg < 3) {
+				Get_OneSNP_StdGeno(i, temp);
+				for (std::size_t c = c0; c < ci; ++c) {
+					const int r = T->corr_row[c];
+					const float g = (float)packed_geno_at(i, (std::size_t)r);
+					(*temp)[r] = (g + T->corr_delta[c] - 2.0f*T->freq[i]) * T->invstd[i];
+				}
+				if (T) for (int q = 0; q < T->n_t; q++) first3(q, ndbg) = (*temp)[T->scatter[q]];
+				else   first3.col(ndbg) = *temp;
+				val0[i] = (*temp)[row0];
+			} else {
+				setStdGenoLookUpArr(alleleFreqVec[i], invstdvVec[i], lut);
+				float z = lut(packed_geno_at(i, (std::size_t)row0));
+				for (std::size_t c = c0; c < ci; ++c) {
+					if (T->corr_row[c] != row0) continue;
+					const float g = (float)packed_geno_at(i, (std::size_t)row0);
+					z = (g + T->corr_delta[c] - 2.0f*T->freq[i]) * T->invstd[i];
+				}
+				val0[i] = z;
+			}
+			if (counted) ndbg++;
+		}
+	}
+
+	void diag_selfcheck(const std::string& what, std::size_t m0, std::size_t m1,
+	                    const float* fast, double fast_s, const MaskTrait* T,
+	                    const arma::fmat* first3, const std::vector<float>* val0) {
+		using clk = std::chrono::steady_clock;
+		const std::size_t nrow = store_rows();
+		arma::fvec sc(nrow, arma::fill::zeros), lg(nrow, arma::fill::zeros), tmp;
+		const auto t0 = clk::now();
+		diag_accumulate(m0, m1, sc.memptr(), T, false);
+		const auto t1 = clk::now();
+		arma::fmat f3;
+		std::vector<float> v0;
+		if (first3) { f3.zeros(first3->n_rows, 3); v0.assign(m1 - m0, 0.0f); }
+		diag_compute_legacy(m0, m1, lg, &tmp, T, first3 ? &f3 : nullptr, first3 ? &v0 : nullptr);
+		const auto t2 = clk::now();
+		auto ndiff = [](const float* a, const float* b, std::size_t n) {
+			std::size_t d = 0;
+			for (std::size_t i = 0; i < n; ++i) d += std::memcmp(a + i, b + i, sizeof(float)) != 0;
+			return d;
+		};
+		const std::size_t d_simd   = ndiff(fast, lg.memptr(), nrow);
+		const std::size_t d_scalar = ndiff(sc.memptr(), lg.memptr(), nrow);
+		std::size_t d_dbg = 0, n_dbg = 0;
+		if (first3) {
+			d_dbg += ndiff(val0->data(), v0.data(), v0.size());
+			n_dbg += v0.size();
+			int ncounted = 0;
+			for (std::size_t i = m0; i < m1; ++i) ncounted += (!T || T->invstd[i] != 0.0f);
+			for (int j = 0; j < std::min(ncounted, 3); ++j) {
+				d_dbg += ndiff(first3->colptr(j), f3.colptr(j), f3.n_rows);
+				n_dbg += f3.n_rows;
+			}
+		}
+		std::fprintf(stderr,
+		    "[diag-selfcheck] %s rows=%zu markers=[%zu,%zu) simd=%.3fs scalar=%.3fs legacy=%.3fs"
+		    " | differing cells: simd %zu scalar %zu debug %zu/%zu -> %s\n",
+		    what.c_str(), nrow, m0, m1, fast_s,
+		    std::chrono::duration<double>(t1 - t0).count(),
+		    std::chrono::duration<double>(t2 - t1).count(),
+		    d_simd, d_scalar, d_dbg, n_dbg,
+		    (d_simd == 0 && d_scalar == 0 && d_dbg == 0) ? "IDENTICAL" : "DIFFER");
+	}
+
+	// d_r over markers [0, m1) into acc (zeros, store_rows() long), plus the
+	// debug values the two callers print. Fast when the preconditions hold,
+	// the legacy loop otherwise; the results are the same bits either way.
+	void diag_compute(std::size_t m1, arma::fvec& acc, arma::fvec* temp, const MaskTrait* T,
+	                  arma::fmat& first3, std::vector<float>& val0) {
+		const bool fast = acc.n_elem == store_rows() && diag_fast_ok(m1) &&
+		                  (!T || diag_corr_ok(*T, m1));
+		if (!fast) {
+			diag_compute_legacy(0, m1, acc, temp, T, &first3, &val0);
+			return;
+		}
+		const auto t0 = std::chrono::steady_clock::now();
+		diag_accumulate(0, m1, acc.memptr(), T, true);
+		diag_debug_fast(m1, temp, T, first3, val0);
+		const double fast_s = std::chrono::duration<double>(
+		    std::chrono::steady_clock::now() - t0).count();
+		if (diag_selfcheck_on())
+			diag_selfcheck(T ? "mask trait " + T->name : std::string("diag"), 0, m1,
+			               acc.memptr(), fast_s, T, &first3, &val0);
+	}
+
 	// Scheme C §3.4: the GRM diagonal is a per-phenotype quantity — this
 	// trait's freq/invstd (markers its own QC dropped carry invstd_t == 0 and
 	// fall out on their own), its own fill in the missing cells, and, at the
@@ -809,7 +1109,6 @@ public:
 			arma::fvec acc(N_union_, arma::fill::zeros);
 			arma::fvec tmp;
 			const std::size_t Mrows = packed_n_markers();
-			std::size_t ci = 0;
 			// Same two debug artifacts the non-masked path emits, over THIS
 			// trait's row 0 and its first 3 GRM markers.
 			std::ofstream stdgeno_file(saige_env_path("SAIGE_DEBUG_DIR", "cpp_stdgeno.txt"));
@@ -819,28 +1118,15 @@ public:
 			sample0_file << "# Sample 0 stdGeno^2 cumulative sum by marker\n";
 			sample0_file << "# Columns: Marker, stdGeno[0], stdGeno^2[0], cumsum\n";
 			arma::fmat first3_stdgeno(T.n_t, 3, arma::fill::zeros);
-			const int row0 = T.scatter.empty() ? 0 : T.scatter[0];
 			float sample0_cumsum = 0;
 			int   ndbg = 0;
+			// acc over the union's rows, with this trait's fill corrections
+			// (diag_compute_legacy has the loop this used to be).
+			std::vector<float> val0s(Mrows);
+			diag_compute(Mrows, acc, &tmp, &T, first3_stdgeno, val0s);
 			for(std::size_t i = 0; i < Mrows; i++){
-				Get_OneSNP_StdGeno(i, &tmp);
-				// §1 step 4: the packed cell holds fill_U; this trait wants
-				// fill_U + delta. Applied before the square, so the diagonal
-				// agrees with the kernel's corrected product.
-				while(ci < T.corr_col.size() &&
-				      (std::size_t)T.corr_col[ci] == i){
-					const int r = T.corr_row[ci];
-					const float g = (float)packed_geno_at(i, (std::size_t)r);
-					tmp[r] = (g + T.corr_delta[ci] - 2.0f*T.freq[i]) * T.invstd[i];
-					ci++;
-				}
-				acc += tmp % tmp;
 				if(T.invstd[i] != 0.0f){
-					if(ndbg < 3){
-						for(int q = 0; q < T.n_t; q++)
-							first3_stdgeno(q, ndbg) = tmp[T.scatter[q]];
-					}
-					const float val0 = tmp[row0];
+					const float val0 = val0s[i];
 					sample0_cumsum += val0 * val0;
 					if(ndbg < 100 || ndbg % 1000 == 0)
 						sample0_file << ndbg << "\t" << val0 << "\t" << val0*val0
@@ -866,7 +1152,7 @@ public:
 
 	arma::fvec * Get_Diagof_StdGeno(){
 		if(maskMode_) return Get_Diagof_StdGeno_masked();
-	
+
 		arma::fvec * temp = &m_OneSNP_StdGeno;
 		// Not yet calculated
 		//cout << "size(m_DiagStd)[0] " << size(m_DiagStd)[0] << endl;
@@ -886,38 +1172,20 @@ public:
 			sample0_file << "# Sample 0 stdGeno^2 cumulative sum by marker\n";
 			sample0_file << "# Columns: Marker, stdGeno[0], stdGeno^2[0], cumsum\n";
 
-			for(size_t i=0; i< numberofMarkerswithMAFge_minMAFtoConstructGRM; i++){
-				//if(alleleFreqVec[i] >= minMAFtoConstructGRM && alleleFreqVec[i] <= 1-minMAFtoConstructGRM){
+			// m_DiagStd over all GRM markers, plus the first 3 markers' stdGeno
+			// and sample 0's value per marker (diag_compute_legacy has the
+			// loop this used to be).
+			const std::size_t Mg = (std::size_t)numberofMarkerswithMAFge_minMAFtoConstructGRM;
+			std::vector<float> val0s(Mg);
+			diag_compute(Mg, m_DiagStd, temp, nullptr, first3_stdgeno, val0s);
 
-
-				Get_OneSNP_StdGeno(i, temp);
-
-				// Save first 3 markers' stdGeno
-				if(i < 3) {
-					first3_stdgeno.col(i) = *temp;
-				}
-
-				/*if(i == 0){
-					cout << "setgeno mark7 " << i <<  endl;
-					for(int j=0; j<10; ++j)
-					{
-                				cout << (*temp)[j] << ' ';
-                			}
-                			cout << endl;
-				}
-				*/
-				m_DiagStd = m_DiagStd + (*temp) % (*temp);
-
+			for(size_t i=0; i< Mg; i++){
 				// DEBUG: Track sample 0's cumsum
-				float val0 = (*temp)[0];
+				float val0 = val0s[i];
 				sample0_cumsum += val0 * val0;
 				if(i < 100 || i % 1000 == 0) {
 					sample0_file << i << "\t" << val0 << "\t" << val0*val0 << "\t" << sample0_cumsum << "\n";
 				}
-
-				//}
-		//		std::cout << "i " << i << std::endl;
-		//		std::cout << "numberofMarkerswithMAFge_minMAFtoConstructGRM " << numberofMarkerswithMAFge_minMAFtoConstructGRM << std::endl;
 			}
 
 			sample0_file << "FINAL\t-\t-\t" << sample0_cumsum << "\n";
@@ -10172,17 +10440,49 @@ void set_Diagof_StdGeno_LOCO(){
 //  std::cout << "debug1" << std::endl;
     int starti, endi;
     arma::fvec * temp = &geno.m_OneSNP_StdGeno;
+  // Each chromosome's partial sum is the same per-row, marker-ordered fp32
+  // sequence the loop below adds, so genoClass::diag_accumulate yields the
+  // same bits (see the comment above it). The preconditions are checked once,
+  // over the widest marker range any chromosome reads. LOCO is never on under
+  // masking (main.cpp falls back to grouping), so no fill corrections here.
+  std::size_t loco_mend = 0;
+  bool loco_ranges_ok = true;
+  for(size_t k=0; k< chrlength; k++){
+    starti = geno.startIndexVec[k];
+    endi = geno.endIndexVec[k];
+    if((starti != -1) && (endi != -1)){
+      if (starti < 0) loco_ranges_ok = false;
+      else if (endi >= starti) loco_mend = std::max(loco_mend, (std::size_t)endi + 1);
+    }
+  }
+  const bool loco_fast = loco_ranges_ok && !geno.maskMode_ &&
+                         geno.mtx_DiagStd_LOCO.n_rows == geno.store_rows() &&
+                         geno.diag_fast_ok(loco_mend);
 for(size_t k=0; k< chrlength; k++){
    starti = geno.startIndexVec[k];
    endi = geno.endIndexVec[k];
 //  std::cout << "debug2" << std::endl;
   if((starti != -1) && (endi != -1)){
+   if (loco_fast) {
+    if (endi >= starti) {
+      const auto t0 = std::chrono::steady_clock::now();
+      geno.diag_accumulate((std::size_t)starti, (std::size_t)endi + 1,
+                           geno.mtx_DiagStd_LOCO.colptr(k), nullptr, true);
+      geno.Msub_MAFge_minMAFtoConstructGRM_byChr[k] += endi - starti + 1;
+      if (geno.diag_selfcheck_on())
+        geno.diag_selfcheck("LOCO chromosome slot " + std::to_string(k), (std::size_t)starti,
+                            (std::size_t)endi + 1, geno.mtx_DiagStd_LOCO.colptr(k),
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                            nullptr, nullptr, nullptr);
+    }
+   } else {
   	for(int i=starti; i<= endi; i++){
          		geno.Get_OneSNP_StdGeno(i, temp);
 	 		(geno.mtx_DiagStd_LOCO).col(k) = (geno.mtx_DiagStd_LOCO).col(k) + (*temp) % (*temp);
 	 		geno.Msub_MAFge_minMAFtoConstructGRM_byChr[k] = geno.Msub_MAFge_minMAFtoConstructGRM_byChr[k] + 1;
 
   	}
+   }
   (geno.mtx_DiagStd_LOCO).col(k) = *geno.Get_Diagof_StdGeno() -  (geno.mtx_DiagStd_LOCO).col(k);
   }
 }	
