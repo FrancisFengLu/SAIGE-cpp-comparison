@@ -1,0 +1,61 @@
+# B1 baseline: tier-4 outputs of the pre-scheme-C kernel
+
+[case0] N=5000 M=700 stride=1250
+in.packed                    n=875000   fnv1a=697c97807a58e1d9
+in.freq                      n=700      fnv1a=6b594cf40c26f79a
+in.invstd                    n=700      fnv1a=c6332a83e113860f
+in.x                         n=5000     fnv1a=f83ce392139901ab
+case0_range_full             n=5000     fnv1a=de70d11131cab5b4
+case0_range_sub              n=5000     fnv1a=3ea06c14d62b72bb
+in.X1                        n=5000     fnv1a=e54eee7908656d94
+case0_mat1                   n=5000     fnv1a=4c2c05ae03db048f
+in.X2                        n=10000    fnv1a=0e1705c23b8337c7
+case0_mat2                   n=10000    fnv1a=2e23be0d7619a3f7
+in.X3                        n=15000    fnv1a=bc4f414eae7d2b28
+case0_mat3                   n=15000    fnv1a=ed62bc2fade02ef4
+in.X5                        n=25000    fnv1a=d707d30388100e16
+case0_mat5                   n=25000    fnv1a=b86b0d4c196c0c2b
+in.X8                        n=40000    fnv1a=c6aa5dae6f61bb9d
+case0_mat8                   n=40000    fnv1a=52c3cc19f9b60898
+in.X9                        n=45000    fnv1a=36c6ab95eb8c52d4
+case0_mat9                   n=45000    fnv1a=ae433ee068ad633e
+
+[case1] N=20000 M=3000 stride=5000
+in.packed                    n=15000000 fnv1a=efaa5414f1574778
+in.freq                      n=3000     fnv1a=bd71c7c80f50826f
+in.invstd                    n=3000     fnv1a=e931030d15f649a3
+in.x                         n=20000    fnv1a=57580e36d425f907
+case1_range_full             n=20000    fnv1a=d0d0db87b5597c33
+case1_range_sub              n=20000    fnv1a=888d9442bad95ab4
+in.X1                        n=20000    fnv1a=7f48f0c682d3a956
+case1_mat1                   n=20000    fnv1a=87c74b82d62d9b0c
+in.X2                        n=40000    fnv1a=fc486707a71153bb
+case1_mat2                   n=40000    fnv1a=368bf141c87cf70c
+in.X3                        n=60000    fnv1a=ae3a31f43af7194f
+case1_mat3                   n=60000    fnv1a=3465e903f81c5848
+in.X5                        n=100000   fnv1a=16ed0c4b21c85d28
+case1_mat5                   n=100000   fnv1a=e2a0f10dd7e88e14
+in.X8                        n=160000   fnv1a=b07fb3c685e1af5b
+case1_mat8                   n=160000   fnv1a=93f30028e5ac42bd
+in.X9                        n=180000   fnv1a=5afd6f7c71335454
+case1_mat9                   n=180000   fnv1a=655cc3113503a7c4
+
+[case2] N=33000 M=1500 stride=8250
+in.packed                    n=12375000 fnv1a=d526b176a6d35f27
+in.freq                      n=1500     fnv1a=1d85b2582ee6238a
+in.invstd                    n=1500     fnv1a=e4585c43ddefdb8f
+in.x                         n=33000    fnv1a=71c811210effbaf4
+case2_range_full             n=33000    fnv1a=3ceb0131f11b2336
+case2_range_sub              n=33000    fnv1a=8504dbe278e87241
+in.X1                        n=33000    fnv1a=720c83c8f4e3b57c
+case2_mat1                   n=33000    fnv1a=68203fbeb035febf
+in.X2                        n=66000    fnv1a=fa81fe13d06001d7
+case2_mat2                   n=66000    fnv1a=5de7a4a07529c701
+in.X3                        n=99000    fnv1a=f23d658adbe0e088
+case2_mat3                   n=99000    fnv1a=4dafcaa1b5a951e5
+in.X5                        n=165000   fnv1a=dd7ec80a46930a23
+case2_mat5                   n=165000   fnv1a=09d90c99648ad17d
+in.X8                        n=264000   fnv1a=7b9dcd12eae99a01
+case2_mat8                   n=264000   fnv1a=e50613b577d66ea9
+in.X9                        n=297000   fnv1a=1f04e2985a298983
+case2_mat9                   n=297000   fnv1a=c556b8d2118c8adb
