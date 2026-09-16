@@ -32,63 +32,12 @@ void build_bed_lookup(BedLut& out) {
   }
 }
 
-void decode_marker(const unsigned char* raw,
-                   std::size_t N,
-                   const int* ptrsub, std::size_t Nnomissing,
-                   float min_maf, float max_miss,
-                   const BedLut& lut,
-                   MarkerStats& stats,
-                   unsigned char* packed_out) {
-  const VarRatioRule no_vr;
-  bool passVR = false;
-  decode_marker(raw, N, ptrsub, Nnomissing, min_maf, max_miss, lut,
-                no_vr, /*vr_drawn=*/false, stats, passVR, packed_out);
-}
-
-void decode_marker(const unsigned char* raw,
-                   std::size_t N,
-                   const int* ptrsub, std::size_t Nnomissing,
-                   float min_maf, float max_miss,
-                   const BedLut& lut,
-                   const VarRatioRule& vr, bool vr_drawn,
-                   MarkerStats& stats,
-                   bool& passVR,
-                   unsigned char* packed_out) {
-  const std::size_t nbyte_in  = (N + 3) / 4;
-  const std::size_t nbyte_out = (Nnomissing + 3) / 4;
-
-  // Pass 1: decode raw BED byte stream into a length-N per-FAM-sample
-  // bufferGeno vector on the stack/heap. We only SUM + COUNT over the
-  // phenotyped samples, using ptrsub (which is 1-based FAM index per GRM slot).
-  //
-  // Using a fixed-size 16KB stack buffer when possible; otherwise heap.
-  // On UKB N=408970 → 409 KB, need heap.
-  // (SAIGE's current code uses a thread_local N-length vector.)
-  static thread_local std::vector<int> genoAll;
-  if (genoAll.size() < N) genoAll.assign(N, 0);
-
-  for (std::size_t i = 0; i < nbyte_in; ++i) {
-    const unsigned char byte = raw[i];
-    const int* l = lut[byte];
-    const std::size_t base = i * 4;
-    for (int j = 0; j < 4; ++j) {
-      const std::size_t fam_idx = base + j;
-      if (fam_idx >= N) break;
-      genoAll[fam_idx] = l[j];
-    }
-  }
-
-  // Tally over phenotyped samples (GRM slots 0..Nnomissing-1).
-  int alleleCount = 0;
-  int numMissing  = 0;
-  for (std::size_t k = 0; k < Nnomissing; ++k) {
-    const int g = genoAll[ptrsub[k] - 1];
-    if (g == 3) {
-      ++numMissing;
-    } else {
-      alleleCount += g;
-    }
-  }
+void marker_stats_from_counts(int alleleRaw, int numMissing,
+                              std::size_t Nnomissing,
+                              float min_maf, float max_miss,
+                              const VarRatioRule& vr, bool vr_drawn,
+                              MarkerStats& stats, bool& passVR) {
+  int alleleCount = alleleRaw;
 
   // First-pass altFreq over *non-missing* phenotyped samples.
   const int    n_nonmiss = static_cast<int>(Nnomissing) - numMissing;
@@ -135,8 +84,137 @@ void decode_marker(const unsigned char* raw,
   stats.mac         = mac;
   stats.numMissing  = numMissing;
   stats.passQC      = passQC;
+  stats.alleleRaw   = alleleRaw;
+  stats.fillin      = fillin;
+}
 
-  if (!passQC && !passVR) {
+void decode_marker(const unsigned char* raw,
+                   std::size_t N,
+                   const int* ptrsub, std::size_t Nnomissing,
+                   float min_maf, float max_miss,
+                   const BedLut& lut,
+                   MarkerStats& stats,
+                   unsigned char* packed_out) {
+  const VarRatioRule no_vr;
+  bool passVR = false;
+  decode_marker(raw, N, ptrsub, Nnomissing, min_maf, max_miss, lut,
+                no_vr, /*vr_drawn=*/false, stats, passVR, packed_out, nullptr);
+}
+
+void decode_marker(const unsigned char* raw,
+                   std::size_t N,
+                   const int* ptrsub, std::size_t Nnomissing,
+                   float min_maf, float max_miss,
+                   const BedLut& lut,
+                   const VarRatioRule& vr, bool vr_drawn,
+                   MarkerStats& stats,
+                   bool& passVR,
+                   unsigned char* packed_out) {
+  decode_marker(raw, N, ptrsub, Nnomissing, min_maf, max_miss, lut,
+                vr, vr_drawn, stats, passVR, packed_out, nullptr);
+}
+
+void decode_marker(const unsigned char* raw,
+                   std::size_t N,
+                   const int* ptrsub, std::size_t Nnomissing,
+                   float min_maf, float max_miss,
+                   const BedLut& lut,
+                   const VarRatioRule& vr, bool vr_drawn,
+                   MarkerStats& stats,
+                   bool& passVR,
+                   unsigned char* packed_out,
+                   const DecodeAux* aux) {
+  const std::size_t nbyte_in  = (N + 3) / 4;
+  const std::size_t nbyte_out = (Nnomissing + 3) / 4;
+
+  // Pass 1: decode raw BED byte stream into a length-N per-FAM-sample
+  // bufferGeno vector on the stack/heap. We only SUM + COUNT over the
+  // phenotyped samples, using ptrsub (which is 1-based FAM index per GRM slot).
+  //
+  // Using a fixed-size 16KB stack buffer when possible; otherwise heap.
+  // On UKB N=408970 → 409 KB, need heap.
+  // (SAIGE's current code uses a thread_local N-length vector.)
+  static thread_local std::vector<int> genoAll;
+  if (genoAll.size() < N) genoAll.assign(N, 0);
+
+  for (std::size_t i = 0; i < nbyte_in; ++i) {
+    const unsigned char byte = raw[i];
+    const int* l = lut[byte];
+    const std::size_t base = i * 4;
+    for (int j = 0; j < 4; ++j) {
+      const std::size_t fam_idx = base + j;
+      if (fam_idx >= N) break;
+      genoAll[fam_idx] = l[j];
+    }
+  }
+
+  // Tally over phenotyped samples (GRM slots 0..Nnomissing-1).
+  int alleleCount = 0;
+  int numMissing  = 0;
+  if (aux != nullptr && aux->missing_rows != nullptr) {
+    // Same loop, plus the union-local index of every missing cell. The branch
+    // is hoisted out of the loop so the default path keeps its exact shape.
+    std::vector<int>& mrows = *aux->missing_rows;
+    mrows.clear();
+    for (std::size_t k = 0; k < Nnomissing; ++k) {
+      const int g = genoAll[ptrsub[k] - 1];
+      if (g == 3) {
+        ++numMissing;
+        mrows.push_back(static_cast<int>(k));
+      } else {
+        alleleCount += g;
+      }
+    }
+  } else {
+    for (std::size_t k = 0; k < Nnomissing; ++k) {
+      const int g = genoAll[ptrsub[k] - 1];
+      if (g == 3) {
+        ++numMissing;
+      } else {
+        alleleCount += g;
+      }
+    }
+  }
+
+  marker_stats_from_counts(alleleCount, numMissing, Nnomissing,
+                           min_maf, max_miss, vr, vr_drawn, stats, passVR);
+  const bool passQC = stats.passQC;
+  const int  fillin = stats.fillin;
+
+  // ---- scheme C: per-trait deductions + the §2 union-pack rule -------------
+  // Cost is O(Σ_t |U∖S_t|), not O(P·N): only the excluded rows are visited.
+  // genoAll is still hot from the pass above.
+  bool keep_any = false;
+  if (aux != nullptr && aux->excl != nullptr && aux->excl->P > 0) {
+    const ExclusionSets& es = *aux->excl;
+    const bool want_keep = (aux->keep_any_trait != nullptr) || aux->pack_if_keep;
+    for (int t = 0; t < es.P; ++t) {
+      int a_excl = 0, m_excl = 0;
+      for (int u : es.excl[t]) {
+        const int g = genoAll[ptrsub[u] - 1];
+        if (g == 3) ++m_excl; else a_excl += g;
+      }
+      if (aux->tally != nullptr) {
+        aux->tally[t].alleleRawExcl  = a_excl;
+        aux->tally[t].numMissingExcl = m_excl;
+      }
+      if (want_keep && !keep_any) {
+        MarkerStats ts;
+        bool        tvr = false;
+        marker_stats_from_counts(stats.alleleRaw - a_excl,
+                                 numMissing - m_excl,
+                                 static_cast<std::size_t>(es.n_t[t]),
+                                 min_maf, max_miss, vr, vr_drawn, ts, tvr);
+        if (ts.passQC) keep_any = true;
+      }
+    }
+    if (aux->keep_any_trait != nullptr) *aux->keep_any_trait = keep_any;
+  }
+
+  const bool want_pack = (aux != nullptr && aux->pack_if_keep)
+      ? keep_any
+      : (passQC || passVR);
+  if (!want_pack) {
     // Don't waste cycles packing; caller won't use packed_out.
     std::memset(packed_out, 0, nbyte_out);
     return;

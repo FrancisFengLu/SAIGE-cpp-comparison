@@ -18,12 +18,14 @@ endif
 SRC_SMOKE    := bed_reader.cpp bed_reader_test.cpp
 SRC_PIPELINE := bed_reader.cpp marker_decoder.cpp bed_pipeline_test.cpp
 SRC_PARALLEL := bed_reader.cpp marker_decoder.cpp parallel_decode.cpp bed_parallel_test.cpp
+SRC_MASK     := bed_reader.cpp marker_decoder.cpp parallel_decode.cpp mask_stats.cpp mask_stats_test.cpp
 
 OBJ_SMOKE    := $(SRC_SMOKE:.cpp=.o)
 OBJ_PIPELINE := $(SRC_PIPELINE:.cpp=.o)
 OBJ_PARALLEL := $(SRC_PARALLEL:.cpp=.o)
+OBJ_MASK     := $(SRC_MASK:.cpp=.o)
 
-all: bed_reader_test bed_pipeline_test bed_parallel_test
+all: bed_reader_test bed_pipeline_test bed_parallel_test mask_stats_test
 
 bed_reader_test: $(OBJ_SMOKE)
 	$(CXX) $(CXXFLAGS) $^ -o $@
@@ -34,7 +36,11 @@ bed_pipeline_test: $(OBJ_PIPELINE)
 bed_parallel_test: $(OBJ_PARALLEL)
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lpthread
 
-%.o: %.cpp bed_reader.hpp marker_decoder.hpp packed_store.hpp parallel_decode.hpp
+# Scheme C stage A — gates A1/A2 of optimization/missing_mt/SCHEME_C_DESIGN.md.
+mask_stats_test: $(OBJ_MASK)
+	$(CXX) $(CXXFLAGS) $^ -o $@ -lpthread
+
+%.o: %.cpp bed_reader.hpp marker_decoder.hpp packed_store.hpp parallel_decode.hpp mask_stats.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Default smoke test against the UKB data used this session.
@@ -63,7 +69,19 @@ parallel-test: bed_parallel_test
 	    $(PAR_N_MARKERS) $(PAR_THREADS)
 
 clean:
-	rm -f $(OBJ_SMOKE) $(OBJ_PIPELINE) $(OBJ_PARALLEL) \
-	      bed_reader_test bed_pipeline_test bed_parallel_test
+	rm -f $(OBJ_SMOKE) $(OBJ_PIPELINE) $(OBJ_PARALLEL) $(OBJ_MASK) \
+	      bed_reader_test bed_pipeline_test bed_parallel_test mask_stats_test
 
-.PHONY: all test pipeline-test parallel-test clean
+# Scheme C stage A gate. MASK_CASE picks the tolerance-gate case whose sample
+# sets the run uses; qc and fill are the two built to make per-trait QC lists
+# and per-trait fill values diverge.
+MASK_SCALE ?= small
+MASK_CASE  ?= qc
+MASK_DATA  ?= /opt/saige/logs/mt_gate/data
+MASK_GENO  ?= /opt/saige/data/$(MASK_SCALE)
+MASK_ARGS  ?=
+mask-test: mask_stats_test
+	./mask_stats_test $(MASK_GENO).bed $(MASK_GENO).fam \
+	    $(MASK_DATA)/$(MASK_SCALE)/$(MASK_CASE).pheno.txt $(MASK_ARGS)
+
+.PHONY: all test pipeline-test parallel-test mask-test clean

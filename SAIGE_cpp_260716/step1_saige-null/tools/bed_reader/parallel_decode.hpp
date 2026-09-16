@@ -50,6 +50,30 @@ struct ParallelDecodeResult {
   PackedFlat                 vr_store;
   std::vector<bool>          passVR;         // length M
   std::vector<std::size_t>   vr_orig_idx;    // length vr_store.n_stored()
+
+  // ---- scheme C extras (empty unless a ParallelDecodeAux asked for them) ----
+  // Per-trait deductions, marker-major: tally[j * P + t].
+  std::vector<TraitTally>              tally;
+  // Per-marker union-local indices of the missing cells (empty vector when the
+  // marker has no missing genotype).
+  std::vector<std::vector<int>>        missing_cells;
+  // Per-marker §2 union-pack rule: 1 iff some trait's passQC_t is true.
+  std::vector<char>                    keep_union;
+};
+
+// Scheme-C options for parallel_decode_bed. Default-constructed == today.
+struct ParallelDecodeAux {
+  const ExclusionSets* excl = nullptr;       // required by everything below
+  bool collect_tally         = false;        // fill result.tally (P*M)
+  bool collect_missing_cells = false;        // fill result.missing_cells (M)
+  bool collect_keep          = false;        // fill result.keep_union (M)
+  // When true, `store` holds the markers the §2 keep rule selects instead of
+  // the union's own pass-QC markers, and `orig_plink_idx` their indices.
+  // `stats` / `passQC` still report the UNION's own QC either way. The VR store
+  // is not built in this mode (SCHEME_C_DESIGN.md §7 keeps the VR pool
+  // per-trait), though `vr` is still applied when computing each trait's
+  // passQC_t, which is what makes keep_union right.
+  bool pack_if_keep          = false;
 };
 
 // Decode the first `M` markers of the BED in parallel using `nthreads`
@@ -70,6 +94,7 @@ ParallelDecodeResult parallel_decode_bed(
     float          max_miss,
     int            nthreads,
     const VarRatioRule&  vr       = VarRatioRule{},
-    const unsigned char* vr_drawn = nullptr);
+    const unsigned char* vr_drawn = nullptr,
+    const ParallelDecodeAux* aux  = nullptr);
 
 } // namespace saige

@@ -110,7 +110,8 @@ ParallelDecodeResult parallel_decode_bed(
     float          max_miss,
     int            nthreads,
     const VarRatioRule&  vr,
-    const unsigned char* vr_drawn) {
+    const unsigned char* vr_drawn,
+    const ParallelDecodeAux* aux) {
   if (nthreads < 1) nthreads = 1;
   if (nthreads > reader.n_threads())
     throw std::runtime_error(
@@ -134,6 +135,24 @@ ParallelDecodeResult parallel_decode_bed(
 
   std::vector<PerThreadState> state(nthreads);
 
+  // -------- scheme C staging (per-marker, disjoint writes, so allocate up
+  // front and let the workers write straight into it) --------
+  const ExclusionSets* excl = (aux != nullptr) ? aux->excl : nullptr;
+  const int  P             = (excl != nullptr) ? excl->P : 0;
+  const bool want_tally    = (aux != nullptr) && aux->collect_tally && P > 0;
+  const bool want_mcells   = (aux != nullptr) && aux->collect_missing_cells;
+  const bool want_keep     = (aux != nullptr) && aux->collect_keep && P > 0;
+  const bool pack_if_keep  = (aux != nullptr) && aux->pack_if_keep && P > 0;
+  if (aux != nullptr && aux->pack_if_keep && P == 0)
+    throw std::runtime_error("parallel_decode_bed: pack_if_keep needs exclusion sets");
+
+  std::vector<TraitTally>       tally_all;
+  std::vector<std::vector<int>> mcells_all;
+  std::vector<char>             keep_all;
+  if (want_tally)  tally_all.assign(M * static_cast<std::size_t>(P), TraitTally{});
+  if (want_mcells) mcells_all.resize(M);
+  if (want_keep || pack_if_keep) keep_all.assign(M, 0);
+
   // -------- Pass 1 — parallel decode --------
   {
     std::vector<std::thread> threads;
@@ -155,23 +174,52 @@ ParallelDecodeResult parallel_decode_bed(
           std::vector<unsigned char> raw(nbyte_in);
           std::vector<unsigned char> packed(nbyte_out);
 
+          const bool use_aux =
+              want_tally || want_mcells || want_keep || pack_if_keep;
+          DecodeAux dx;
+          bool      keep_this = false;
+          if (use_aux) {
+            dx.excl         = excl;
+            dx.keep_any_trait = (want_keep || pack_if_keep) ? &keep_this : nullptr;
+            dx.pack_if_keep = pack_if_keep;
+          }
+
           for (std::size_t i = lo; i < hi; ++i) {
             reader.read_marker(t, i, raw.data());
             MarkerStats& s = st.stats[i - lo];
             const bool drawn =
                 (vr.enabled && vr_drawn != nullptr) ? (vr_drawn[i] != 0) : false;
             bool passVR = false;
+            if (use_aux) {
+              dx.tally = want_tally
+                  ? &tally_all[i * static_cast<std::size_t>(P)] : nullptr;
+              dx.missing_rows = want_mcells ? &mcells_all[i] : nullptr;
+              keep_this = false;
+            }
             decode_marker(raw.data(), reader.n_samples(),
                           ptrsub, Nnomissing,
                           min_maf, max_miss,
-                          lut, vr, drawn, s, passVR, packed.data());
-            if (s.passQC) {
-              st.passQC_flags[i - lo] = 1;
+                          lut, vr, drawn, s, passVR, packed.data(),
+                          use_aux ? &dx : nullptr);
+            if (use_aux && (want_keep || pack_if_keep))
+              keep_all[i] = keep_this ? 1 : 0;
+
+            st.passQC_flags[i - lo] = s.passQC ? 1 : 0;
+            st.passVR_flags[i - lo] = passVR ? 1 : 0;
+
+            if (pack_if_keep) {
+              // §2: the union pack keeps a marker iff some trait keeps it.
+              // The VR store is per-trait in this mode, so it is not built.
+              if (keep_this) {
+                push_row(st.packed_blocks, st.pass_orig_idx.size(),
+                         packed.data(), nbyte_out);
+                st.pass_orig_idx.push_back(i);
+              }
+            } else if (s.passQC) {
               push_row(st.packed_blocks, st.pass_orig_idx.size(),
                        packed.data(), nbyte_out);
               st.pass_orig_idx.push_back(i);
             } else if (passVR) {
-              st.passVR_flags[i - lo] = 1;
               push_row(st.vr_blocks, st.vr_orig_idx.size(),
                        packed.data(), nbyte_out);
               st.vr_orig_idx.push_back(i);
@@ -210,6 +258,9 @@ ParallelDecodeResult parallel_decode_bed(
     result.vr_store.set_n_stored(total_vr);
   }
   result.vr_orig_idx.resize(total_vr);
+  result.tally         = std::move(tally_all);
+  result.missing_cells = std::move(mcells_all);
+  result.keep_union    = std::move(keep_all);
 
   // Merge per-marker stats / passQC  (sequential, cheap — M * small stats)
   for (int t = 0; t < nthreads; ++t) {
