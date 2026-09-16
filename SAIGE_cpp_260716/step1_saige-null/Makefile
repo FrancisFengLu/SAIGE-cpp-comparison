@@ -167,7 +167,8 @@ SOURCES := $(wildcard *.cpp)
 BED_READER_DIR  := tools/bed_reader
 BED_READER_TESTS := $(BED_READER_DIR)/bed_reader_test.cpp \
                     $(BED_READER_DIR)/bed_pipeline_test.cpp \
-                    $(BED_READER_DIR)/bed_parallel_test.cpp
+                    $(BED_READER_DIR)/bed_parallel_test.cpp \
+                    $(BED_READER_DIR)/mask_stats_test.cpp
 BED_READER_SRC   := $(filter-out $(BED_READER_TESTS), $(wildcard $(BED_READER_DIR)/*.cpp))
 SOURCES         += $(BED_READER_SRC)
 INCLUDES        += -I$(BED_READER_DIR)
