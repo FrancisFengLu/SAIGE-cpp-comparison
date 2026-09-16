@@ -28,6 +28,8 @@
 //     --traits a,b,c      trait columns (default: all but IID and x*)
 //     --markers N         first N markers only (default: all)
 //     --threads T         decode threads (default 4)
+//     --reps R            interleaved timing repetitions (default 3)
+//     --price-only        print the decode timing table and stop (no A1/A2)
 //     --min-maf F         default 0.01
 //     --max-miss F        default 0.15
 //     --vr MIN[,MAX]      enable the variance-ratio rule (MAX -1 == open bin)
@@ -146,7 +148,7 @@ int main(int argc, char** argv) {
   if (argc < 4) {
     std::fprintf(stderr,
       "usage: %s <bed> <fam> <pheno.tsv> [--traits a,b] [--markers N] "
-      "[--threads T] [--min-maf F] [--max-miss F] [--vr MIN[,MAX]] "
+      "[--threads T] [--reps R] [--min-maf F] [--max-miss F] [--vr MIN[,MAX]] "
       "[--vrdraw PATH] [--synth P,PCT,SEED]\n", argv[0]);
     return 2;
   }
@@ -158,6 +160,8 @@ int main(int argc, char** argv) {
   std::string vrdraw_bin = "/opt/saige/logs/mt_gate/data/vrdraw";
   long  n_markers_arg = -1;
   int   nthreads      = 4;
+  int   reps          = 3;
+  bool  price_only    = false;
   float min_maf       = 0.01f;
   float max_miss      = 0.15f;
   for (int i = 4; i < argc; ++i) {
@@ -169,6 +173,8 @@ int main(int argc, char** argv) {
     if      (a == "--traits")   trait_arg     = next();
     else if (a == "--markers")  n_markers_arg = std::atol(next().c_str());
     else if (a == "--threads")  nthreads      = std::atoi(next().c_str());
+    else if (a == "--reps")     reps = std::max(1, std::atoi(next().c_str()));
+    else if (a == "--price-only") price_only  = true;
     else if (a == "--min-maf")  min_maf       = std::atof(next().c_str());
     else if (a == "--max-miss") max_miss      = std::atof(next().c_str());
     else if (a == "--vr")       vr_arg        = next();
@@ -314,38 +320,73 @@ int main(int argc, char** argv) {
     pa.collect_tally         = true;
     pa.collect_missing_cells = true;
     pa.collect_keep          = true;
-    // Time the plain union decode first, so the extra cost of the scheme-C
-    // outputs is visible. The tally loop is O(Σ_t |U∖S_t|) against the main
-    // loop's O(|U|), so a low-coverage group pays more for the tallies than
-    // for the decode itself — the same ratio §6's mask_min_coverage governs.
-    const auto t0 = std::chrono::steady_clock::now();
-    auto uni_plain = saige::parallel_decode_bed(
-        reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
-        vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), nullptr);
-    const auto t1 = std::chrono::steady_clock::now();
-    auto uni = saige::parallel_decode_bed(
-        reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
-        vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), &pa);
-    const auto t2 = std::chrono::steady_clock::now();
-    {   // tallies + keep only, so the missing-cell materialization is separable
-        saige::ParallelDecodeAux pt = pa;
-        pt.collect_missing_cells = false;
-        auto tmp = saige::parallel_decode_bed(
+    // Price the scheme-C outputs against a plain decode. The tally loop is
+    // O(Σ_t |U∖S_t|) against the main loop's O(|U|), so a low-coverage group
+    // pays more for the tallies than for the decode itself — the same ratio
+    // §6's mask_min_coverage governs.
+    //
+    // Timed by INTERLEAVING the three variants (plain, +tallies, +cells,
+    // plain, ...) and taking the MIN, not by running each variant's repeats
+    // together and taking the mean. Three variants timed back to back are three
+    // different points on whatever else the machine is doing, and the first
+    // version of this table was measured with an orphaned saige-null run
+    // holding the load average at 14 on 8 vCPUs — the percentages it produced
+    // were mostly scheduling. Min over interleaved reps is the standard fix;
+    // the mean is printed next to it so the spread stays visible.
+    saige::ParallelDecodeAux pt = pa;
+    pt.collect_missing_cells = false;        // tallies + keep only
+    std::vector<double> t_plain, t_tally, t_cells;
+    saige::ParallelDecodeResult uni, uni_plain;
+    for (int r = 0; r < reps; ++r) {
+      auto clk = std::chrono::steady_clock::now();
+      auto tick = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double d = std::chrono::duration<double>(now - clk).count();
+        clk = now;
+        return d;
+      };
+      {
+        auto a = saige::parallel_decode_bed(
+            reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
+            vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), nullptr);
+        t_plain.push_back(tick());
+        if (r == reps - 1) uni_plain = std::move(a);
+      }
+      {
+        auto b = saige::parallel_decode_bed(
             reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
             vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), &pt);
-        (void)tmp;
+        t_tally.push_back(tick());
+        (void)b;
+      }
+      {
+        auto c = saige::parallel_decode_bed(
+            reader, ptr_U.data(), nU, M, min_maf, max_miss, nthreads,
+            vr, vr_drawn.empty() ? nullptr : vr_drawn.data(), &pa);
+        t_cells.push_back(tick());
+        if (r == reps - 1) uni = std::move(c);
+      }
     }
-    const auto t3 = std::chrono::steady_clock::now();
-    const double s_plain = std::chrono::duration<double>(t1 - t0).count();
-    const double s_aux   = std::chrono::duration<double>(t2 - t1).count();
-    const double s_tal   = std::chrono::duration<double>(t3 - t2).count();
+    auto vmin  = [](const std::vector<double>& v) {
+      return *std::min_element(v.begin(), v.end());
+    };
+    auto vmean = [](const std::vector<double>& v) {
+      double s = 0; for (double x : v) s += x; return s / double(v.size());
+    };
+    const double s_plain = vmin(t_plain), s_tal = vmin(t_tally), s_aux = vmin(t_cells);
     long excl_total = 0;
     for (int t = 0; t < P; ++t) excl_total += long(excl[t].size());
-    std::printf("union decode: %.3f s plain | %.3f s +tallies/keep (+%.0f%%) | "
-                "%.3f s +missing cells (+%.0f%%)   Σ|U∖S_t| / |U| = %.2f\n",
-                s_plain, s_tal, 100.0 * (s_tal - s_plain) / s_plain,
-                s_aux, 100.0 * (s_aux - s_plain) / s_plain,
-                double(excl_total) / double(nU));
+    std::printf("union decode, %d interleaved reps (min | mean s):\n"
+                "  plain           %7.3f | %7.3f\n"
+                "  +tallies/keep   %7.3f | %7.3f   %+.0f%% on min\n"
+                "  +missing cells  %7.3f | %7.3f   %+.0f%% on min\n"
+                "  Sum|U-S_t| / |U| = %.2f   |U| = %zu   N(fam) = %zu\n",
+                reps,
+                s_plain, vmean(t_plain),
+                s_tal,   vmean(t_tally), 100.0 * (s_tal - s_plain) / s_plain,
+                s_aux,   vmean(t_cells), 100.0 * (s_aux - s_plain) / s_plain,
+                double(excl_total) / double(nU), nU, N);
+    if (price_only) return 0;
 
     // The aux outputs must not disturb the stats the plain decode produces.
     int drift = 0;
@@ -360,6 +401,7 @@ int main(int argc, char** argv) {
     }
     if (drift) std::printf("  FAIL [aux drift] %d markers differ between the "
                            "aux and no-aux union decode\n", drift);
+    uni_plain = saige::ParallelDecodeResult{};   // its PackedFlat is the whole matrix
 
     std::vector<int> fill_U(M);
     for (std::size_t j = 0; j < M; ++j) fill_U[j] = uni.stats[j].fillin;
@@ -454,6 +496,20 @@ int main(int argc, char** argv) {
     }
     std::printf("  keep (any trait passQC) = %zu / %zu   union's own passQC = %zu\n",
                 n_keep, M, n_union_passQC);
+    // Third derivation: mask_stats' standalone re-derivation from the tallies.
+    {
+      std::vector<char> keep_ms;
+      saige::union_keep_flags(uni.stats.data(), M, uni.tally.data(), P, n_t.data(),
+                              min_maf, max_miss, vr,
+                              vr_drawn.empty() ? nullptr : vr_drawn.data(), keep_ms);
+      for (std::size_t j = 0; j < M; ++j)
+        if (keep_ms[j] != uni.keep_union[j]) {
+          if (keep_mismatch < 8)
+            std::printf("  FAIL [keep/union_keep_flags] marker=%zu %d vs %d\n",
+                        j, int(keep_ms[j]), int(uni.keep_union[j]));
+          ++keep_mismatch;
+        }
+    }
 
     // pack_if_keep decode: same rows, byte-identical to the ordinary pack.
     saige::ParallelDecodeAux pk = pa;
