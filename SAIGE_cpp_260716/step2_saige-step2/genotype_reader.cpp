@@ -672,6 +672,30 @@ void PlinkClass::copyFusedCodes_ts(const FusedMarkerStats& fs, uint8_t* t_codes)
     }
 }
 
+void PlinkClass::copyFusedPacked_ts(const FusedMarkerStats& fs, uint8_t* t_out) const
+{
+    if (!tlsFusedValid || tlsFusedIdx != fs.gIndex) {
+        throw std::runtime_error(
+            "copyFusedPacked_ts: thread-local packed cache does not hold marker " +
+            std::to_string(fs.gIndex) + " (Stage A must precede it on the same thread).");
+    }
+    const uint32_t nb = (m_N + 3u) / 4u;
+    if (m_posIsIdentity) {
+        // m_posSampleInPlink[i] == i, so the first nb bytes of the .bed row
+        // already ARE the analysis samples in analysis order.
+        std::memcpy(t_out, tlsFusedBuf.data(), (size_t)nb);
+    } else {
+        const uint8_t* codes = tlsFusedCodes.data();
+        std::memset(t_out, 0, (size_t)nb);
+        for (uint32_t i = 0; i < m_N; ++i)
+            t_out[i >> 2] |= (uint8_t)(codes[i] << ((i & 3u) * 2));
+    }
+    if (m_N & 3u) {
+        const unsigned keep = (1u << ((m_N & 3u) * 2)) - 1u;
+        t_out[nb - 1] = (uint8_t)(t_out[nb - 1] & keep);
+    }
+}
+
 // Stage B (pure). Mirrors UTIL.cpp::imputeGenoAndFlip on the 4-entry table.
 void finalizeFusedStats(PlinkClass::FusedMarkerStats& fs,
                         int t_impute_case,

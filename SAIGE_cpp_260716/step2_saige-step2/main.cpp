@@ -56,6 +56,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "genotype_reader.hpp"
 #include "saige_test.hpp"
 #include "saige_mt.hpp"
+#include "gpu_step2.hpp"
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
@@ -189,6 +190,23 @@ bool g_mtBatch = true;
 // Config key mtMemBudgetGB: total marker-block scratch across all threads,
 // used to pick a block width when mtBlockSize is absent.
 double g_mtMemBudgetGB = 1.5;
+
+// ---- GPU path for single-variant, quantitative-only runs (gpu/gpu_step2.hpp)
+// Config key useGPU (default false). OFF means the binary behaves exactly as it
+// did before the GPU work existed: mainMarkerMTGpu is never entered and the
+// dispatch below is unchanged. A build without USE_CUDA=1 links the stub, so
+// even useGPU: true then prints a refusal and runs on the CPU.
+bool g_gpuStep2   = false;
+// Config key gpuDevice: which CUDA device (default 0).
+int  g_gpuDevice  = 0;
+// Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
+// of the multi-trait block width. Only moves batch boundaries; see the
+// determinism note in mainMarkerMTGpu.
+int  g_gpuBlockSize = 16384;
+// Config key gpuPrecision: "fp64" (default) or "fp32" for the decode and the
+// GEMM. fp64 costs about 40% more GEMM time on a V100 -- a few percent of a
+// real run -- and agrees with the CPU path near 1e-15 rather than near 1e-6.
+bool g_gpuFp64    = true;
 
 // Output file prefix strings
 std::string g_outputFilePrefixGroup;
@@ -2129,6 +2147,637 @@ struct MTBlockWork {
     }
 };
 
+// ============================================================================
+// mainMarkerMTGpu -- single-variant testing with the sample-space reductions on
+// the GPU. Config key `useGPU`; default off. ADDITIVE: nothing in
+// mainMarkerMT or mainMarkerInCPP is changed by it, and with useGPU absent or
+// false this function is never entered.
+//
+// Returns false, having done nothing, when its gate is not satisfied; the
+// caller then runs the CPU loop. The refusal reason is printed once.
+//
+// ---------------------------------------------------------------------------
+// The gate
+// ---------------------------------------------------------------------------
+// saige_test.cpp gates SPA, Firth and ER on traitType != "quantitative", so on
+// a quantitative trait the whole per-marker test is the score statistic and its
+// variance -- which scoreTestBatchMT gets from four sample-space reductions
+// (see gpu/gpu_step2.hpp). That is what goes on the device. Refused here,
+// before a marker is read, so the refusal is one printed line rather than a
+// silent divergence: binary / survival traits, conditional analysis,
+// isnoadjCov, sparse-GRM-first-pass traits, traits whose sample list is not the
+// union's, non-PLINK input, and the scalar-decode rollback switch. Region and
+// set-based tests never reach here at all (different entry point).
+//
+// ---------------------------------------------------------------------------
+// Per-marker fallback
+// ---------------------------------------------------------------------------
+// Inside the gate, single (marker, trait) pairs can still leave the batch
+// result: a fast-test trait whose cheap p-value crosses pval_cutoff_for_fastTest
+// is re-scored through the sparse-GRM PCG. Those take exactly the scalar path
+// mainMarkerMT would have taken -- the same SAIGEClass::getMarkerPval with the
+// same PerMarkerCtx -- on a genotype column rebuilt from the marker's packed
+// codes and its own code->dosage table, which is the identical arithmetic
+// PlinkClass::fillOneMarkerFusedDense_ts performs. Markers failing QC are not
+// scored on either path.
+//
+// ---------------------------------------------------------------------------
+// Shape: read phase, one device call, finalize phase
+// ---------------------------------------------------------------------------
+// The CPU loop's parallel unit is a block of Bblk markers owned end to end by
+// one thread. A GPU wants a far wider batch than Bblk, so this loop works in
+// SUPERBLOCKS of nSub*Bblk markers:
+//
+//   phase 1  omp parallel over the superblock's blocks: read, QC, impute/flip,
+//            write the marker's packed 2-bit codes and its 4-entry dosage table
+//            straight into the reducer's pinned staging buffers. NO N-length
+//            dosage vector is materialised -- that alone is 15% of a CPU P=8
+//            run (fillOneMarkerFusedDense_ts).
+//   phase 2  one reduce() for the superblock; inside, it streams in
+//            slotsPerPass batches with the H2D of one behind the decode+GEMM of
+//            the last.
+//   phase 3  omp parallel over the same blocks: copy the block's rows out of
+//            the result, run the O(p^2)/O(P) tail (scoreTestBatchMTQuantPre),
+//            then the same finalize / fallback / format code the CPU loop runs.
+//
+// A block's read and its finalize can land on different threads, so the state
+// that crosses the barrier lives in GpuBlk -- one per block -- rather than in
+// the per-thread MTBlockWork.
+//
+// Slots are assigned per block from the block's own base, so a marker failing
+// QC leaves an unused slot rather than shifting every later marker. That costs
+// the device one decode+GEMM column per QC failure, and the run prints the
+// fraction so the waste is visible. Compacting globally instead would make a
+// marker's column index depend on how many earlier markers passed, and the
+// column index feeds the GEMM tiling -- two runs could then differ in the last
+// bits for reasons that have nothing to do with the data.
+//
+// sum_i g_i^2 is NOT computed on the device. The host already has the marker's
+// 2-bit code counts, so sum_c count[c]*fd[c]^2 is exact in double and free.
+// The CPU path forms it as a sequential sum over N of the same terms, so the
+// two differ only by association -- and the counts-based form is the more
+// accurate of the two.
+// ============================================================================
+
+namespace {
+
+// Per-block state that has to survive the barrier between the read phase and
+// the finalize phase.
+struct GpuBlk {
+    std::vector<int>    colOf;     // block-local marker index -> slot in block
+    std::vector<double> MACc, AFc, ssc;
+    std::vector<double> fdc;       // 4 per slot: code -> final dosage
+    std::vector<char>   flipc;
+    arma::mat           VR;        // Bblk x P
+    int nUsed = 0;
+    void ensure(int B, int P) {
+        colOf.assign(B, -1);
+        MACc.assign(B, 0.0);
+        AFc.assign(B, 0.0);
+        ssc.assign(B, 0.0);
+        fdc.assign((std::size_t)B * 4, 0.0);
+        flipc.assign(B, 0);
+        if (VR.n_rows != (arma::uword)B || VR.n_cols != (arma::uword)P)
+            VR.set_size(B, P);
+        nUsed = 0;
+    }
+};
+
+}  // namespace
+
+bool mainMarkerMTGpu(
+    std::string & t_genoType,
+    std::vector<std::string> & t_genoIndex,
+    bool & t_isMoreOutput,
+    bool & t_isImputation,
+    bool & t_isFirth)
+{
+    const SAIGE::MTContext& ctx = g_mtctx;
+    const int P = static_cast<int>(g_saigeObjs.size());
+    const int q = static_cast<int>(t_genoIndex.size());
+
+    // ---------------- gate ----------------
+    std::string why;
+    if (P < 1)                                     why = "no models";
+    else if (t_genoType != "plink" || ptr_gPLINKobj == nullptr)
+                                                   why = "genoType is not plink";
+    else if (!g_fusedPlinkDecode)                  why = "SAIGE_STEP2_SCALAR_DECODE=1 is set";
+    else if (!g_mtBatch)                           why = "mtBatch is false";
+    else if (ctx.P != P || ctx.N <= 0)             why = "no multi-trait context (P == 1 needs `models:` with the GPU path)";
+    else if (ctx.sampleSetsDiffer)                 why = "the models do not share one sample list";
+    else if (ctx.sumPbin != 0 || ctx.nBin != 0)    why = "binary traits present";
+    else if ((int)ctx.batchQuantTraits.size() != P)
+                                                   why = "not every trait is quantitative and batchable";
+    if (why.empty()) {
+        for (int t = 0; t < P; t++) {
+            const SAIGE::TraitMeta& M = ctx.meta[t];
+            if (M.kind != SAIGE::TraitKind::Quantitative) { why = "trait '" + M.name + "' is not quantitative"; break; }
+            if (!M.batchable)   { why = "trait '" + M.name + "': " + SAIGE::batchableReason(M); break; }
+            if (M.isCondition)  { why = "trait '" + M.name + "' runs conditional analysis"; break; }
+            if (g_saigeObjs[t]->m_n != g_saigeObjs[0]->m_n) { why = "models disagree on n"; break; }
+        }
+    }
+    if (why.empty() && (int)ptr_gPLINKobj->getN() != g_saigeObjs[0]->m_n)
+        why = "the reader's sample count is not the models'";
+    if (why.empty() && !saige::gpu2::available(g_gpuDevice, &why))
+        { /* why already set by available() */ }
+
+    if (!why.empty()) {
+        std::cout << "  useGPU: refused, running on the CPU (" << why << ")" << std::endl;
+        return false;
+    }
+
+    const int n = g_saigeObjs[0]->m_n;
+
+    // ---------------- reducer ----------------
+    // B = [ Astack | Xstack | RES ], N x K column-major. Astack and Xstack are
+    // already N x sumP with trait t's block at colOff, so the concatenation is
+    // three memcpy-shaped copies and the result columns split back the same way.
+    const int sumP = ctx.sumP;
+    const int K = 2 * sumP + P;
+    int Bblk = g_mtBlockSize;
+    if (Bblk <= 0) {
+        const double budget = g_mtMemBudgetGB * 1024.0 * 1024.0 * 1024.0;
+        const double fit = budget / (16.0 * (double)n * (double)std::max(1, omp_get_max_threads()));
+        Bblk = 32;
+        while (Bblk * 2 <= (int)fit && Bblk < 256) Bblk *= 2;
+    }
+    if (Bblk < 1) Bblk = 1;
+
+    const int chunkSize = (g_marker_chunksize > 0 ? g_marker_chunksize : q);
+    int want = (g_gpuBlockSize > 0 ? g_gpuBlockSize : 16384);
+    int nSub = want / Bblk; if (nSub < 1) nSub = 1;
+    if (nSub * Bblk > chunkSize) { nSub = chunkSize / Bblk; if (nSub < 1) nSub = 1; }
+    const int slots = nSub * Bblk;
+
+    saige::gpu2::Reducer* R = nullptr;
+    {
+        std::vector<double> Bf((std::size_t)n * K);
+        std::memcpy(Bf.data(), ctx.Astack.memptr(), (std::size_t)n * sumP * sizeof(double));
+        std::memcpy(Bf.data() + (std::size_t)n * sumP, ctx.Xstack.memptr(),
+                    (std::size_t)n * sumP * sizeof(double));
+        std::memcpy(Bf.data() + (std::size_t)n * 2 * sumP, ctx.RES.memptr(),
+                    (std::size_t)n * P * sizeof(double));
+        R = saige::gpu2::create(g_gpuDevice, n, K, Bf.data(), slots, g_gpuFp64);
+    }
+    if (R == nullptr) {
+        std::cout << "  useGPU: refused, running on the CPU (device setup failed)" << std::endl;
+        return false;
+    }
+    const std::size_t bpv = saige::gpu2::bytesPerSlot(R);
+    unsigned char* hPk = saige::gpu2::packed(R);
+    float*         hLu = saige::gpu2::lut(R);
+
+    std::cout << "  useGPU: " << saige::gpu2::describe(g_gpuDevice)
+              << "; " << (g_gpuFp64 ? "fp64" : "fp32")
+              << ", K = " << K << " (2*" << sumP << " + " << P << ")"
+              << ", " << slots << " markers per device batch (" << nSub
+              << " x " << Bblk << "), "
+              << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
+              << std::endl;
+
+    // ---------------- per-trait one-time setup (as mainMarkerMT) ----------------
+    std::vector<char> isSingleVR(P, 0);
+    for (int t = 0; t < P; t++) {
+        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+        if ((obj->m_varRatio_null).n_elem == 1) {
+            obj->assignSingleVarianceRatio(obj->m_flagSparseGRM, obj->m_isnoadjCov);
+            isSingleVR[t] = 1;
+        }
+    }
+
+    std::vector<int>  mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
+    std::vector<long> nBatched(P, 0), nFallback(P, 0);
+    std::vector<MTTraitChunk> out(P);
+    long nSlotsUsed = 0, nSlotsTotal = 0;
+
+    // Coarse wall-clock stages, for the end-to-end breakdown the GPU work is
+    // supposed to be judged on. omp_get_wtime, summed over the serial sections
+    // -- phases 1 and 3 are measured around their parallel regions, so they
+    // include the barriers.
+    double tRead = 0, tGpu = 0, tFin = 0, tWrite = 0;
+
+    const int nThreadsHere = std::max(1, omp_get_max_threads());
+    std::vector<MTBlockWork> work(nThreadsHere);
+    std::vector<GpuBlk>      blks(nSub);
+
+    std::atomic<int> firstEndIdx{q};
+    const int imputeCase = string_to_case.at(g_impute_method);
+    static const uint8_t kMissCode = 0x1;   // PLINK 2-bit code 01 = missing
+
+    for (int chunkStart = 0; chunkStart < q; chunkStart += chunkSize) {
+        const int chunkEnd = std::min(chunkStart + chunkSize, q);
+        const int qc = chunkEnd - chunkStart;
+        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
+
+        std::vector<std::string> markerVec(qc), chrVec(qc), posVec(qc),
+                                 refVec(qc), altVec(qc);
+        std::vector<double> altFreqVec(qc, 0.0), altCountsVec(qc, 0.0),
+                            imputationInfoVec(qc, 0.0), missingRateVec(qc, 0.0);
+        for (int t = 0; t < P; t++) out[t].reset(qc);
+
+        const int nBlocks = (qc + Bblk - 1) / Bblk;
+
+        for (int sb = 0; sb < nBlocks; sb += nSub) {
+            const int sbEnd = std::min(sb + nSub, nBlocks);
+            const int nb = sbEnd - sb;
+
+            // ---------------- phase 1: read + QC + stage ----------------
+            double t0 = omp_get_wtime();
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int bi = 0; bi < nb; bi++) {
+                const int blk = sb + bi;
+                GpuBlk& S = blks[bi];
+                S.ensure(Bblk, P);
+                const int jj0 = blk * Bblk;
+                const int jj1 = std::min(jj0 + Bblk, qc);
+                const std::size_t slotBase = (std::size_t)bi * Bblk;
+
+                for (int jj = jj0; jj < jj1; jj++) {
+                    const int i = chunkStart + jj;
+                    if (i >= firstEndIdx.load(std::memory_order_relaxed)) continue;
+                    if ((i + 1) % g_marker_chunksize == 0) {
+                        #pragma omp critical(progress)
+                        std::cout << "Completed " << (i + 1) << "/" << q
+                                  << " markers in the chunk." << std::endl;
+                    }
+
+                    char* end;
+                    const uint64_t gIndex =
+                        std::strtoull(t_genoIndex.at(i).c_str(), &end, 10);
+                    PLINK::PlinkClass::FusedMarkerStats fs;
+                    if (!ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fs)) {
+                        #pragma omp critical(endflag)
+                        {
+                            if (i < firstEndIdx.load(std::memory_order_relaxed))
+                                firstEndIdx.store(i, std::memory_order_relaxed);
+                            g_markerTestEnd = true;
+                        }
+                        continue;
+                    }
+
+                    chrVec[jj]    = fs.chr;
+                    posVec[jj]    = std::to_string(fs.pd);
+                    refVec[jj]    = fs.ref;
+                    altVec[jj]    = fs.alt;
+                    markerVec[jj] = fs.marker;
+                    double altFreq   = fs.altFreq;
+                    double altCounts = fs.altCounts;
+                    altFreqVec[jj]        = altFreq;
+                    missingRateVec[jj]    = fs.missingRate;
+                    imputationInfoVec[jj] = fs.imputeInfo;
+
+                    // Pre-impute QC -- the same four tests, the same order.
+                    double MAF = std::min(altFreq, 1 - altFreq);
+                    double MAC = MAF * n * (1 - fs.missingRate) * 2;
+                    if ((fs.missingRate > g_missingRate_cutoff) ||
+                        (MAF < g_marker_minMAF_cutoff) ||
+                        (MAC < g_marker_minMAC_cutoff) ||
+                        (fs.imputeInfo < g_marker_minINFO_cutoff)) {
+                        continue;
+                    }
+
+                    PLINK::finalizeFusedStats(fs, imputeCase, g_dosage_zerod_cutoff,
+                                              g_dosage_zerod_MAC_cutoff, MAC);
+                    const bool flip = fs.flip;
+                    altFreq   = fs.altFreq_post;
+                    altCounts = fs.altCounts_post;
+
+                    MAC = std::min(altCounts, 2.0 * n - altCounts);
+                    MAF = std::min(altFreq, 1 - altFreq);
+                    if ((MAF < g_marker_minMAF_cutoff) ||
+                        (MAC < g_marker_minMAC_cutoff)) {
+                        continue;
+                    }
+                    altFreqVec[jj]   = altFreq;
+                    altCountsVec[jj] = altCounts;
+
+                    // ---- stage the marker for the device ----
+                    const int c = S.nUsed++;
+                    ptr_gPLINKobj->copyFusedPacked_ts(fs, hPk + (slotBase + c) * bpv);
+                    double ss = 0.0;
+                    for (int k = 0; k < 4; k++) {
+                        S.fdc[(std::size_t)c * 4 + k] = fs.fd[k];
+                        hLu[(slotBase + c) * 4 + k]   = (float)fs.fd[k];
+                        ss += fs.fd[k] * fs.fd[k] * (double)fs.counts[k];
+                    }
+                    (void)kMissCode;
+                    S.ssc[c]   = ss;
+                    S.colOf[jj - jj0] = c;
+                    S.MACc[c]  = MAC;
+                    S.AFc[c]   = altFreq;
+                    S.flipc[c] = flip ? 1 : 0;
+
+                    for (int t = 0; t < P; t++) {
+                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                        const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                        const bool noadjCur  = obj->m_isnoadjCov;
+                        bool dummyHas;
+                        S.VR(c, t) = isSingleVR[t]
+                            ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
+                            : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                    }
+                }
+                // Slots this block did not fill still reach the device (see the
+                // header comment). Give them an all-zero table so they decode to
+                // zeros and cannot produce a NaN that would poison a GEMM tile.
+                for (int c = S.nUsed; c < Bblk; c++) {
+                    std::memset(hPk + (slotBase + c) * bpv, 0, bpv);
+                    for (int k = 0; k < 4; k++) hLu[(slotBase + c) * 4 + k] = 0.f;
+                }
+            }
+            tRead += omp_get_wtime() - t0;
+
+            // ---------------- phase 2: the device ----------------
+            t0 = omp_get_wtime();
+            const int nSlotsThis = nb * Bblk;
+            if (!saige::gpu2::reduce(R, nSlotsThis)) {
+                saige::gpu2::destroy(R);
+                throw std::runtime_error(
+                    "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
+                    "without useGPU (or with useGPU: false) to finish on the CPU.");
+            }
+            tGpu += omp_get_wtime() - t0;
+            for (int bi = 0; bi < nb; bi++) nSlotsUsed += blks[bi].nUsed;
+            nSlotsTotal += nSlotsThis;
+
+            // ---------------- phase 3: tail + finalize ----------------
+            t0 = omp_get_wtime();
+            const bool fp64 = saige::gpu2::isFp64(R);
+            const float*  Cf = saige::gpu2::outCf(R);
+            const double* Cd = saige::gpu2::outCd(R);
+            const std::size_t ld = saige::gpu2::ldC(R);
+
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int bi = 0; bi < nb; bi++) {
+                const int blk = sb + bi;
+                GpuBlk& S = blks[bi];
+                MTBlockWork& W = work[omp_get_thread_num()];
+                const int jj0 = blk * Bblk;
+                const int jj1 = std::min(jj0 + Bblk, qc);
+                const std::size_t slotBase = (std::size_t)bi * Bblk;
+                const int B = S.nUsed;
+                if (B <= 0) continue;
+
+                W.res.resize(Bblk, P);
+                if (W.tmpG.n_elem != (arma::uword)n) {
+                    W.tmpG.set_size(n); W.gtilde.set_size(n);
+                }
+
+                // Unpack the device result into the scratch the tail reads.
+                W.scr.Zall.set_size(sumP, B);
+                W.scr.GWqnt.set_size(sumP, B);
+                W.scr.GR.set_size(B, P);
+                W.scr.Gsq.set_size(B);
+                #define SAIGE_GPU_C(k, j) \
+                    (fp64 ? Cd[(std::size_t)(k) * ld + slotBase + (j)] \
+                          : (double)Cf[(std::size_t)(k) * ld + slotBase + (j)])
+                for (int r = 0; r < sumP; r++)
+                    for (int j = 0; j < B; j++) W.scr.Zall(r, j) = SAIGE_GPU_C(r, j);
+                for (int r = 0; r < sumP; r++)
+                    for (int j = 0; j < B; j++) W.scr.GWqnt(r, j) = SAIGE_GPU_C(sumP + r, j);
+                for (int t = 0; t < P; t++)
+                    for (int j = 0; j < B; j++) W.scr.GR(j, t) = SAIGE_GPU_C(2 * sumP + t, j);
+                #undef SAIGE_GPU_C
+                for (int j = 0; j < B; j++) W.scr.Gsq[j] = S.ssc[j];
+
+                SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, 0, B,
+                                                S.VR, W.scr, W.res);
+
+                for (int jj = jj0; jj < jj1; jj++) {
+                    const int c = S.colOf[jj - jj0];
+                    if (c < 0) continue;
+                    const int i = chunkStart + jj;
+                    const double MAC = S.MACc[c];
+                    const double altFreq = S.AFc[c];
+                    const bool   flip = (S.flipc[c] != 0);
+                    const double* fdc = &S.fdc[(std::size_t)c * 4];
+                    bool gReady = false;       // dense column built on demand
+
+                    for (int t = 0; t < P; t++) {
+                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                        const SAIGE::TraitMeta& M = ctx.meta[t];
+                        MTTraitChunk& O = out[t];
+
+                        O.altFreq[jj]     = altFreqVec[jj];
+                        O.altCounts[jj]   = altCountsVec[jj];
+                        O.missingRate[jj] = missingRateVec[jj];
+                        O.imputeInfo[jj]  = imputationInfoVec[jj];
+
+                        // Fast-test recompute context, exactly as mainMarkerMT
+                        // computes it (main.cpp, "W1-1").
+                        const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                        const bool noadjCur  = obj->m_isnoadjCov;
+                        const bool fastEligible = obj->m_isFastTest;   // never binary here
+                        bool fastRecomputeSameCtx = false;
+                        if (fastEligible) {
+                            const bool probeSparse =
+                                (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                    ? false : obj->m_flagSparseGRM;
+                            bool dummyHas2;
+                            const double probeVR = isSingleVR[t]
+                                ? obj->computeSingleVarianceRatio(probeSparse, false)
+                                : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
+                            fastRecomputeSameCtx = (probeSparse == sparseCur) &&
+                                                   (noadjCur == false) &&
+                                                   (probeVR == S.VR(c, t));
+                        }
+
+                        // Can this pair keep the batch result? Quantitative, so
+                        // needSPA and needFirth are both structurally false and
+                        // only the fast-test recompute can take it away.
+                        bool needFast = false;
+                        if (fastEligible && !fastRecomputeSameCtx) {
+                            double pnum;
+                            try { pnum = std::stod(W.res.pvalStr[t][c]); }
+                            catch (const std::invalid_argument&) { pnum = 0; }
+                            catch (const std::out_of_range&)     { pnum = 0; }
+                            needFast = (pnum < obj->m_pval_cutoff_for_fastTest);
+                        }
+                        const bool useBatch = !needFast;
+
+                        double Beta = arma::datum::nan, seBeta = arma::datum::nan;
+                        double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
+                        double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
+                        double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
+                        std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+                        bool isSPAConverge = false;
+                        bool is_Firth = false, is_FirthConverge = false;
+
+                        if (useBatch) {
+                            Beta       = W.res.Beta(c, t);
+                            seBeta     = W.res.seBeta(c, t);
+                            Tstat      = W.res.Tstat(c, t);
+                            varT       = W.res.var1(c, t);
+                            pval       = W.res.pvalStr[t][c];
+                            pval_noSPA = pval;
+                            #pragma omp atomic
+                            nBatched[t]++;
+                        } else {
+                            // Rebuild the dense column exactly as
+                            // fillOneMarkerFusedDense_ts would have: g[i] is the
+                            // marker's final dosage table at sample i's code.
+                            if (!gReady) {
+                                const unsigned char* pk = hPk + (slotBase + c) * bpv;
+                                double* g = W.tmpG.memptr();
+                                for (int u = 0; u < n; u++)
+                                    g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                                arma::uword cz = 0;
+                                for (int u = 0; u < n; u++) if (g[u] == 0.0) cz++;
+                                W.idxZ.set_size(cz);
+                                W.idxNZ.set_size((arma::uword)n - cz);
+                                arma::uword a = 0, b = 0;
+                                for (int u = 0; u < n; u++) {
+                                    if (g[u] == 0.0) W.idxZ[a++] = (arma::uword)u;
+                                    else             W.idxNZ[b++] = (arma::uword)u;
+                                }
+                                gReady = true;
+                            }
+                            arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
+                            W.P2Vec.clear();
+                            bool is_gtilde = false;
+
+                            SAIGE::PerMarkerCtx ctx_first;
+                            ctx_first.flagSparseGRM_cur = sparseCur;
+                            ctx_first.isnoadjCov_cur    = noadjCur;
+                            ctx_first.erSeedStream      = (uint64_t)i + 1;
+                            ctx_first.varRatioVal       = S.VR(c, t);
+                            g_firthDefer = false;   // quantitative: never Firth
+
+                            obj->getMarkerPval(
+                                W.tmpG, W.idxNZ, W.idxZ,
+                                Beta, seBeta, pval, pval_noSPA,
+                                altFreq, Tstat, gy, varT,
+                                isSPAConverge, W.gtilde, is_gtilde,
+                                /*is_region*/ false, W.P2Vec,
+                                /*isCondition*/ false,
+                                Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                                Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                                is_Firth, is_FirthConverge,
+                                /*isER*/ false,
+                                ctx_first.isnoadjCov_cur,
+                                ctx_first.flagSparseGRM_cur,
+                                ctx_first);
+
+                            double pval_num;
+                            try { pval_num = std::stod(pval); }
+                            catch (const std::invalid_argument&) { pval_num = 0; }
+                            catch (const std::out_of_range&)     { pval_num = 0; }
+
+                            if (fastEligible && !fastRecomputeSameCtx &&
+                                pval_num < obj->m_pval_cutoff_for_fastTest) {
+                                SAIGE::PerMarkerCtx ctx_fast;
+                                ctx_fast.flagSparseGRM_cur =
+                                    (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                        ? false : obj->m_flagSparseGRM;
+                                ctx_fast.isnoadjCov_cur = false;
+                                {
+                                    bool dummyHas;
+                                    ctx_fast.varRatioVal = isSingleVR[t]
+                                        ? obj->computeSingleVarianceRatio(
+                                              ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur)
+                                        : obj->computeVarianceRatio(
+                                              MAC, ctx_fast.flagSparseGRM_cur,
+                                              ctx_fast.isnoadjCov_cur, dummyHas);
+                                }
+                                g_firthDefer = false;
+                                obj->getMarkerPval(
+                                    W.tmpG, W.idxNZ, W.idxZ,
+                                    Beta, seBeta, pval, pval_noSPA,
+                                    altFreq, Tstat, gy, varT,
+                                    isSPAConverge, W.gtilde, is_gtilde,
+                                    /*is_region*/ false, W.P2Vec,
+                                    /*isCondition*/ false,
+                                    Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                                    Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                                    is_Firth, is_FirthConverge,
+                                    false,
+                                    ctx_fast.isnoadjCov_cur,
+                                    ctx_fast.flagSparseGRM_cur,
+                                    ctx_fast);
+                            }
+                            #pragma omp atomic
+                            nFallback[t]++;
+                        }
+
+                        O.Beta[jj]   = Beta * (1 - 2 * flip);
+                        O.seBeta[jj] = seBeta;
+                        O.pval[jj]   = pval;
+                        O.pvalNA[jj] = pval_noSPA;
+                        O.Tstat[jj]  = Tstat * (1 - 2 * flip);
+                        O.varT[jj]   = varT;
+                        O.N[jj]      = n;
+                        (void)M;
+                    }
+                }
+            }
+            tFin += omp_get_wtime() - t0;
+        }  // superblock
+
+        // ---- write this chunk's rows, one file per trait (serial) ----
+        const double tw = omp_get_wtime();
+        for (int t = 0; t < P; t++) {
+            MTTraitChunk& O = out[t];
+            std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
+            int numtestChunk = 0;
+            writeOutfile_single(g_OutFiles_single[t],
+                                g_traitMeta[t],
+                                t_isImputation,
+                                t_isFirth,
+                                mFirth[t],
+                                mFirthConverge[t],
+                                chrVec, posVec, markerVec, refVec, altVec,
+                                O.altCounts, O.altFreq,
+                                O.imputeInfo, O.missingRate,
+                                O.Beta, O.seBeta, O.Tstat, O.varT,
+                                O.pval, O.pvalNA, spa,
+                                O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
+                                O.pval_c, O.pvalNA_c,
+                                O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
+                                O.N_case_hom, O.N_ctrl_het,
+                                O.N_case_het, O.N_ctrl_hom,
+                                O.N,
+                                /*printSummary*/ false,
+                                &numtestChunk);
+            numtestTotal[t] += numtestChunk;
+        }
+        for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+        tWrite += omp_get_wtime() - tw;
+    }  // chunk
+
+    double gH2D = 0, gDec = 0, gGemm = 0, gD2H = 0;
+    saige::gpu2::timings(R, &gH2D, &gDec, &gGemm, &gD2H);
+    saige::gpu2::destroy(R);
+
+    long totBatch = 0, totFall = 0;
+    for (int t = 0; t < P; t++) {
+        std::cout << "[" << g_traitMeta[t].name << "] " << numtestTotal[t]
+                  << " markers were tested (" << nBatched[t] << " on the GPU, "
+                  << nFallback[t] << " via the scalar CPU path)." << std::endl;
+        totBatch += nBatched[t];
+        totFall  += nFallback[t];
+    }
+    if (totBatch + totFall > 0) {
+        std::cout << "  GPU coverage: " << totBatch << " / " << (totBatch + totFall)
+                  << " pairs (" << (100.0 * (double)totBatch / (double)(totBatch + totFall))
+                  << "%)" << std::endl;
+    }
+    if (nSlotsTotal > 0) {
+        std::cout << "  device slots: " << nSlotsUsed << " / " << nSlotsTotal
+                  << " carried a marker ("
+                  << (100.0 * (double)nSlotsUsed / (double)nSlotsTotal)
+                  << "%; the rest are QC failures and block tails)" << std::endl;
+    }
+    std::cout << "  [gpu breakdown] read+QC+stage " << tRead << " s, device call "
+              << tGpu << " s, tail+finalize " << tFin << " s, output write "
+              << tWrite << " s" << std::endl;
+    std::cout << "  [gpu device time] H2D " << gH2D << " s, decode " << gDec
+              << " s, GEMM " << gGemm << " s, D2H " << gD2H << " s" << std::endl;
+
+    timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
+    return true;
+}
+
 void mainMarkerMT(
     std::string & t_genoType,
     std::vector<std::string> & t_genoIndex_prev,
@@ -2137,6 +2786,13 @@ void mainMarkerMT(
     bool & t_isImputation,
     bool & t_isFirth)
 {
+    // Config key useGPU. Off by default; when it is on and the run is inside
+    // the GPU path's gate, that path does the whole loop and this one is not
+    // entered. It prints why when it refuses.
+    if (g_gpuStep2 &&
+        mainMarkerMTGpu(t_genoType, t_genoIndex, t_isMoreOutput, t_isImputation, t_isFirth))
+        return;
+
     const SAIGE::MTContext& ctx = g_mtctx;
     const int P = static_cast<int>(g_saigeObjs.size());
     const bool differ = ctx.sampleSetsDiffer;
@@ -5138,6 +5794,14 @@ int main(int argc, char* argv[])
             std::cerr << "  LOCO:              true/false (default: false)" << std::endl;
             std::cerr << "  chrom:             chromosome being tested, e.g. \"1\" (required when LOCO=true)" << std::endl;
             std::cerr << std::endl;
+            std::cerr << "GPU (single-variant, quantitative traits only):" << std::endl;
+            std::cerr << "  useGPU:            true/false (default: false). Puts the sample-space" << std::endl;
+            std::cerr << "                     reductions on a CUDA device. Falls back to the CPU," << std::endl;
+            std::cerr << "                     printing why, for anything outside that case." << std::endl;
+            std::cerr << "  gpuDevice:         CUDA device index (default: 0)" << std::endl;
+            std::cerr << "  gpuBlockSize:      markers per device batch (default: 16384)" << std::endl;
+            std::cerr << "  gpuPrecision:      fp64 (default) or fp32" << std::endl;
+            std::cerr << std::endl;
             std::cerr << "LD matrix generation (requires groupFile):" << std::endl;
             std::cerr << "  isLDMatrix:        true/false (default: false)" << std::endl;
             std::cerr << "  ldmat_maxMAF:      max MAF for LD matrix (default: 0.5)" << std::endl;
@@ -5296,6 +5960,31 @@ int main(int argc, char* argv[])
         int fusedMode = config["fusedMode"] ? config["fusedMode"].as<int>() : 0;
         if (fusedMode < 0 || fusedMode > 2) fusedMode = 0;
         SAIGE::g_fusedMode = fusedMode;
+        // ---- GPU path for single-variant quantitative runs (gpu/gpu_step2.hpp)
+        // Default false. With it false nothing about this binary's behaviour
+        // changes; with it true the run still falls back to the CPU, printing
+        // why, unless every trait is quantitative and batchable, the input is
+        // PLINK, the models share one sample list, and a device is present.
+        g_gpuStep2 = config["useGPU"] ? config["useGPU"].as<bool>() : false;
+        if (config["gpuDevice"]) g_gpuDevice = config["gpuDevice"].as<int>();
+        if (config["gpuBlockSize"]) {
+            g_gpuBlockSize = config["gpuBlockSize"].as<int>();
+            if (g_gpuBlockSize < 1)
+                throw std::runtime_error("gpuBlockSize must be >= 1");
+        }
+        if (config["gpuPrecision"]) {
+            const std::string gp = config["gpuPrecision"].as<std::string>();
+            if (gp == "fp64")      g_gpuFp64 = true;
+            else if (gp == "fp32") g_gpuFp64 = false;
+            else throw std::runtime_error("gpuPrecision must be fp64 or fp32, not '" + gp + "'");
+        }
+        if (g_gpuStep2) {
+            std::string gpuWhy;
+            if (!saige::gpu2::available(g_gpuDevice, &gpuWhy)) {
+                std::cout << "useGPU: true, but no usable device (" << gpuWhy
+                          << "). The run will use the CPU." << std::endl;
+            }
+        }
         // ---- LOCO (leave-one-chromosome-out) ----
         // NOTE: R's step 2 defaults LOCO to TRUE. We default to false here
         // because the C++ step 1 does not yet emit chr<j>/ LOCO output, and
@@ -5721,9 +6410,10 @@ int main(int argc, char* argv[])
             tm.vrFile    = modelSpecs[ti].varianceRatioFile;
             tm.outFile   = modelSpecs[ti].outputFile;
             tm.traitType = nm.traitType;
-            if (numTraits > 1) {
-                // Multi-trait routes on `kind`, so an unrecognised traitType
-                // would silently pick the wrong kernel: reject it.
+            if (numTraits > 1 || g_gpuStep2) {
+                // Multi-trait -- and the GPU path, which shares that loop --
+                // routes on `kind`, so an unrecognised traitType would silently
+                // pick the wrong kernel: reject it.
                 tm.kind = SAIGE::traitKindFromString(tm.traitType);
             } else {
                 // Lenient on purpose: the single-trait path has never rejected
@@ -5770,7 +6460,11 @@ int main(int argc, char* argv[])
             ptr_gSAIGEobj = g_saigeObjs[0];
             g_OutFiles_single.resize(numTraits);
         }
-        if (numTraits > 1) {
+        // useGPU implements its path inside the multi-trait loop, so a one-model
+        // run with it on needs the stacked constants too. With useGPU off this
+        // condition is `numTraits > 1` exactly as before, and a P == 1 run
+        // builds nothing and prints nothing extra.
+        if (numTraits > 1 || g_gpuStep2) {
             SAIGE::printMTGateTable(g_traitMeta, useLOCO);
             // Stacked per-trait constants for the batch kernel. Building them
             // needs the loaded models, which are still alive here; nothing
@@ -6313,7 +7007,12 @@ int main(int argc, char* argv[])
             timing_mark("50_before_main_loop");  // TIMING_INSTRUMENT_REMOVE_ME
             // Design section 5: the fork is here, not inside the marker loop.
             // P == 1 calls the untouched function and cannot regress.
-            if (numTraits == 1) {
+            // P == 1 normally calls the untouched single-trait function. The GPU
+            // path is implemented in the multi-trait loop, so useGPU routes a
+            // one-model run there instead -- documented as a one-entry
+            // `models:` run, which produces the same columns. With useGPU off
+            // the dispatch is exactly what it always was.
+            if (numTraits == 1 && !g_gpuStep2) {
                 mainMarkerInCPP(
                     genoType,
                     nullModel.traitType,

@@ -234,6 +234,16 @@ public:
     // cached packed bytes; no file access.
     void copyFusedCodes_ts(const FusedMarkerStats& fs, uint8_t* t_codes) const;
 
+    // GPU path (gpu/gpu_step2.hpp): same precondition as copyFusedCodes_ts,
+    // but the codes come out in PLINK's OWN 2-bit packing -- (m_N+3)/4 bytes,
+    // sample i in bits 2*(i&3) of byte i>>2 -- which is what the device decode
+    // kernel reads. With the identity sample mapping this is a memcpy of the
+    // cached .bed row, so the genotype matrix reaches the GPU without ever
+    // being expanded on the host; otherwise it repacks the gathered codes.
+    // Bits past sample m_N-1 in the last byte are cleared, so the output is a
+    // pure function of the analysis samples.
+    void copyFusedPacked_ts(const FusedMarkerStats& fs, uint8_t* t_out) const;
+
     // Stage C. Requires the immediately preceding Stage A call on the SAME
     // thread with the same gIndex (packed bytes are cached thread_local).
     void fillOneMarkerFusedDense_ts(const FusedMarkerStats& fs,

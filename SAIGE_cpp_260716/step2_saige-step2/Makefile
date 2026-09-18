@@ -110,6 +110,33 @@ ifneq ($(strip $(ZSTD_LIBS)),)
   LIBS += $(ZSTD_LIBS)
 endif
 
+# ---- optional GPU path for step 2 (gpu/gpu_step2.hpp) ----------------------
+# DEFAULT OFF. Without USE_CUDA=1 the stub translation unit is linked, so
+# saige::gpu2::available() always says no, main()'s GPU gate can never be
+# satisfied, and the binary behaves exactly as it did before the GPU work
+# existed. Nothing in main.cpp is #ifdef'd on CUDA.
+#   make USE_CUDA=1            build with the CUDA kernels (needs nvcc)
+#   make USE_CUDA=1 SM=70      target a specific compute capability (V100 = 70)
+USE_CUDA ?= 0
+INCLUDES += -Igpu
+
+ifeq ($(USE_CUDA),1)
+  NVCC      ?= nvcc
+  NVCC_PATH := $(shell command -v $(NVCC) 2>/dev/null)
+  ifeq ($(strip $(NVCC_PATH)),)
+    $(error USE_CUDA=1 but nvcc is not on PATH; set NVCC=/path/to/nvcc)
+  endif
+  CUDA_HOME ?= $(patsubst %/bin/,%,$(dir $(NVCC_PATH)))
+  SM        ?= 70
+  NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(SM) -lineinfo -Xcompiler -fPIC
+  GPU_OBJ   := gpu/gpu_step2.cu.o
+  LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
+else
+  GPU_OBJ   := gpu/gpu_step2_stub.o
+endif
+
+MAKEFLAGS += --no-builtin-rules
+
 SOURCES := $(wildcard *.cpp)
 OBJECTS := $(SOURCES:.cpp=.o)
 DEPS    := $(OBJECTS:.o=.d)
@@ -118,14 +145,17 @@ TARGET  ?= saige-step2
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(OBJECTS) $(LIBS) -fopenmp -pthread -o $@
+$(TARGET): $(OBJECTS) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJECTS) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
+	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
+
 clean:
-	rm -f $(OBJECTS) $(DEPS) $(TARGET)
+	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET)
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml

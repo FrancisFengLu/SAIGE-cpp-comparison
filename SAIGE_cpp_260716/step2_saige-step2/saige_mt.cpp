@@ -616,6 +616,40 @@ static inline void sumRowsIntoRow(const arma::mat& t_stack,
     }
 }
 
+// The per-trait tail both batch kernels share: S and var2 for the block's
+// columns turn into the printed row through the SAME format_score_result the
+// scalar path calls, so the degenerate branches (var1 <= DBL_MIN, non-finite
+// stat, p underflow to the "%.1fE%d" form) cannot drift apart between the two.
+// Extracted, not duplicated, when the GPU kernel was added -- a second copy of
+// this loop is exactly the kind of thing that silently diverges.
+static void emitBlockResults(int t_t, int t_j0,
+                             const arma::vec& t_S, const arma::vec& t_var2,
+                             const arma::mat& t_VR, MTBlockResult& t_out)
+{
+    std::vector<std::string>& pstr = t_out.pvalStr[t_t];
+    std::vector<char>&        plog = t_out.pvalIsLog[t_t];
+    const arma::uword B = t_S.n_elem;
+    for (arma::uword j = 0; j < B; j++) {
+        const arma::uword jo = static_cast<arma::uword>(t_j0) + j;
+        const double v2 = t_var2[j];
+        const double v1 = v2 * t_VR(jo, t_t);
+        double Beta, seBeta, pval, TstatOut, var1Out, var2Out;
+        bool islogp = false;
+        std::string pvalStr;
+        format_score_result(t_S[j], v1, v2, Beta, seBeta, pvalStr, pval,
+                            islogp, TstatOut, var1Out, var2Out);
+        t_out.Beta(jo, t_t)    = Beta;
+        t_out.seBeta(jo, t_t)  = seBeta;
+        t_out.Tstat(jo, t_t)   = TstatOut;
+        t_out.var1(jo, t_t)    = var1Out;
+        t_out.var2(jo, t_t)    = var2Out;
+        t_out.StdStat(jo, t_t) = std::fabs(t_S[j]) / std::sqrt(v1);
+        t_out.pvalRaw(jo, t_t) = pval;
+        pstr[jo] = pvalStr;
+        plog[jo] = islogp ? 1 : 0;
+    }
+}
+
 void scoreTestBatchMT(const MTContext& t_ctx,
                       const std::vector<int>& t_traitSet,
                       const arma::mat& t_Gb,
@@ -805,30 +839,68 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             }
         }
 
-        std::vector<std::string>& pstr = t_out.pvalStr[t];
-        std::vector<char>&        plog = t_out.pvalIsLog[t];
-        for (arma::uword j = 0; j < B; j++) {
-            const arma::uword jo = static_cast<arma::uword>(t_j0) + j;
-            const double v2 = var2[j];
-            const double v1 = v2 * t_VR(jo, t);
-            double Beta, seBeta, pval, TstatOut, var1Out, var2Out;
-            bool islogp = false;
-            std::string pvalStr;
-            // Same function the scalar path calls, so the degenerate branches
-            // (var1 <= DBL_MIN, non-finite stat, p underflow to the "%.1fE%d"
-            // form) cannot drift apart.
-            format_score_result(S[j], v1, v2, Beta, seBeta, pvalStr, pval,
-                                islogp, TstatOut, var1Out, var2Out);
-            t_out.Beta(jo, t)    = Beta;
-            t_out.seBeta(jo, t)  = seBeta;
-            t_out.Tstat(jo, t)   = TstatOut;
-            t_out.var1(jo, t)    = var1Out;
-            t_out.var2(jo, t)    = var2Out;
-            t_out.StdStat(jo, t) = std::fabs(S[j]) / std::sqrt(v1);
-            t_out.pvalRaw(jo, t) = pval;
-            pstr[jo] = pvalStr;
-            plog[jo] = islogp ? 1 : 0;
-        }
+        emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// GPU-fed variant of scoreTestBatchMT: the sample-space reductions are already
+// in t_scr, so this does only the O(p^2) / O(P) tail.
+//
+// Scope, enforced by the caller's gate (main.cpp, mainMarkerMT): every trait in
+// t_traitSet is quantitative, batchable, and has the union's sample list. That
+// is the case in which scoreTestBatchMT's body reduces to Zall / GWqnt / Gsq /
+// GR -- no MU2bin, no MASKq, no MTBlockAdj -- which is exactly what the GPU
+// computes. Anything else keeps the CPU kernel.
+//
+// t_scr must hold, for the block columns [t_j0, t_j1) indexed 0-based:
+//   Zall   sumP x B    Astack^T G
+//   GWqnt  sumP x B    Xstack^T G
+//   GR     B x P       G^T RES      (only the t_traitSet columns are read)
+//   Gsq    B           colsum(G % G)
+// with STACK rows, i.e. row r is stack column r -- so the traits in t_traitSet
+// must start at stack column 0. Throws if they do not, rather than reading the
+// wrong rows.
+void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
+                              const std::vector<int>& t_traitSet,
+                              int t_j0, int t_j1,
+                              const arma::mat& t_VR,
+                              MTScratch& t_scr,
+                              MTBlockResult& t_out)
+{
+    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    if (t_traitSet.empty() || t_j1 <= t_j0) return;
+
+    int c0 = std::numeric_limits<int>::max();
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        if (M.kind != TraitKind::Quantitative)
+            throw std::runtime_error("scoreTestBatchMTQuantPre: non-quantitative trait");
+        if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion)
+            throw std::runtime_error("scoreTestBatchMTQuantPre: trait has its own sample list");
+        c0 = std::min(c0, M.colOff);
+    }
+    if (c0 != 0)
+        throw std::runtime_error("scoreTestBatchMTQuantPre: trait set does not start at stack column 0");
+
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        const arma::uword r0 = static_cast<arma::uword>(M.colOff);
+        const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
+        const auto Z_t = t_scr.Zall.rows(r0, r1);                    // p x B
+
+        // Identical expressions to scoreTestBatchMT's non-adjusted branch.
+        arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+        arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+        arma::rowvec gwz = arma::sum(t_scr.GWqnt.rows(r0, r1) % Z_t, 0);
+
+        arma::vec S    = (t_scr.GR.col(t) - saz.t()) / M.tau0;
+        arma::vec var2 = zxz.t() * M.tau0 + t_scr.Gsq - 2.0 * gwz.t();
+        if (S.n_elem != B || var2.n_elem != B)
+            throw std::runtime_error("scoreTestBatchMTQuantPre: prefilled scratch has the wrong width");
+
+        emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
     }
 }
 
