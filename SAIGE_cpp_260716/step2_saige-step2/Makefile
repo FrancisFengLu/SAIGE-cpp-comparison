@@ -151,6 +151,21 @@ all: $(TARGET) tools/sgs2txt
 tools/sgs2txt: tools/sgs2txt.cpp out_fast.o
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/sgs2txt.cpp out_fast.o $(LIBS) -o $@
 
+# The two analysis tools behind the sgsPrecision measurement in out_fast.hpp.
+# Not in `all`: they answer a question, they are not part of a run.
+#   sgs_fidelity  counts, per column, the fields an fp32 .sgs would print
+#                 differently, read off an fp64 .sgs
+#   out_fieldcmp  the same count between two actual text outputs -- the fp32
+#                 round-trip check, since `cmp` can only say "differs"
+.PHONY: sgs-tools
+sgs-tools: tools/sgs_fidelity tools/out_fieldcmp
+
+tools/sgs_fidelity: tools/sgs_fidelity.cpp sgs_format.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/sgs_fidelity.cpp -o $@
+
+tools/out_fieldcmp: tools/out_fieldcmp.cpp
+	$(CXX) $(CXXFLAGS) tools/out_fieldcmp.cpp -o $@
+
 $(TARGET): $(OBJECTS) $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
 
@@ -161,7 +176,8 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt
+	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt \
+	      tools/sgs_fidelity tools/out_fieldcmp
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml

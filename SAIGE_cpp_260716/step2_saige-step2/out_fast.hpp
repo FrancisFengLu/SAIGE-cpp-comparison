@@ -51,9 +51,52 @@
 //   output bytes       text -> sgs:  94 -> 72 MB, 752 -> 352 MB,
 //                      3.01 -> 1.31 GB, 12.03 -> 5.15 GB (2.33x at P=128)
 //
-// sgsPrecision: fp32 (default fp64) halves the floating-point columns again, and
-// is off for a reason: it costs the byte-identical round trip. Numbers pending
-// (logs/gpu_step2/writer/f32/).
+// ------------------------------------------------------------- fp32 ------
+// sgsPrecision: fp32 (default fp64) narrows every floating-point column to
+// float. Measured on the same sweep (tools/bench_sgs_precision.sh, run
+// 2026-09-18, logs/gpu_step2/writer/f32/bench4.out):
+//
+//                        P=1     P=8     P=32    P=128
+//   .sgs bytes  fp64   72.2 MB  352 MB  1.31 GB  5.15 GB
+//               fp32   44.2 MB  184 MB  0.66 GB  2.58 GB   (1.63x .. 1.99x)
+//   output write (s)   0.42/0.36  1.32/0.65  2.86/1.90  7.17/6.54   fp64/fp32
+//   end to end   (s)  66.48/66.50 68.48/68.47 84.20/83.68 169.4/171.7
+//   sgs2txt      (s)   4.9/4.4   9.6/8.0   34.0/30.6  127.3/122.9
+//
+// The file halves and the wall clock does not move. At P=128 writing is 7.2 s
+// of a 169 s run, and halving the bytes gives back 0.6 s of it, because the
+// fp32 writer has to convert a column before it can write it where the fp64
+// writer memcpy's it. The end-to-end column is inside the run-to-run spread
+// (three fp64 P=128 runs came out 165.1, 169.4, and the fp32 one 171.7).
+//
+// What it costs, counted exactly over the P=128 run (tools/sgs_fidelity.cpp,
+// cross-checked field for field against a real fp32 run at P=8):
+//
+//   column            fields         differ     max |dx/x|
+//   AC_Allele2     128,000,000            0     -           AC is an integer
+//   AF_Allele2     128,000,000            0     -           AC/1e5: 6 digits
+//   MissingRate    128,000,000            0     -           constant 0 here
+//   BETA           128,000,000    1,104,895     1e-5
+//   SE             128,000,000    1,178,101     1e-5
+//   Tstat          128,000,000    1,079,021     1e-5
+//   var            128,000,000    1,012,279     1e-5
+//   all %.6g       896,000,000    4,374,296     0.4882%
+//   p.value        128,000,000          470     max |d(-log10 p)| 4.45e-8
+//
+// 3.4% of ROWS are not byte-identical. No p-value crosses 5e-8 -- but this data
+// is a null simulation whose smallest p is 9.5e-9, and that is the whole
+// problem with the number. float's smallest normal is 1.2e-38 and its smallest
+// subnormal 1.4e-45, while the score test prints "%.6E" all the way down to
+// ~1e-308, so a real hit at p = 1e-50 does not round, it VANISHES. Forced with
+// tests/make_extreme_model.py (tools/check_sgs_fp32_extreme.sh): residuals
+// scaled by 6 put 147 of 5,000 markers below 1.2e-38 and the fp32 file printed
+// 0.000000E+00 for 81 of them; scaled by 15, 1,665 of 5,000 markers (33%) came
+// back as 0.000000E+00 where the text run had p down to 5.9E-716. Ironically
+// the p-values SAIGE already prints in the "%.1fE%d" underflow form survive:
+// those are kept verbatim in the exception list.
+//
+// So fp32 buys 2x on disk, ~0 on the clock, and costs the one property the
+// format was built to have. Default stays fp64.
 //
 // Round trip verified by tools/sgs2txt + cmp at every P: 128 traits x 1,000,000
 // markers = 128,000,000 rows byte-identical at P=128, and on a file with 2%

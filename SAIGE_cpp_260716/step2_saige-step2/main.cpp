@@ -210,9 +210,10 @@ bool g_outputFormatSgs = false;
 // Config key sgsPrecision: "fp64" (default) or "fp32", the on-disk width of the
 // .sgs floating-point columns. fp64 is what the program computed, so sgs2txt
 // reproduces the text byte for byte. fp32 halves those columns and gives that
-// up: the text prints 6-7 significant digits and a float carries ~7.2, so some
-// fields land on the other side of the last printed digit (out_fast.hpp has the
-// measured rates). Only touches the file, never the numbers the run computed or
+// up: the text prints 6-7 significant digits and a float carries ~7.2, so 0.5%
+// of fields land on the other side of the last printed digit -- and a p-value
+// below 1.2e-38 does not land anywhere, a float cannot hold it (out_fast.hpp
+// has the counts). Only touches the file, never the numbers the run computed or
 // the text a text run writes.
 bool g_sgsF32 = false;
 // Config key gpuDevice: which CUDA device (default 0).
@@ -2363,7 +2364,8 @@ bool mainMarkerMTGpu(
                   << std::endl;
         if (g_sgsF32)
             std::cout << "  sgsPrecision: fp32 -- sgs2txt output is close to, not "
-                         "identical to, a text run" << std::endl;
+                         "identical to, a text run, and any p-value below 1.2e-38 "
+                         "is lost (a float cannot hold it)" << std::endl;
     }
 
     const int nThreadsHere = std::max(1, omp_get_max_threads());
@@ -5865,8 +5867,9 @@ int main(int argc, char* argv[])
             std::cerr << "  sgsPrecision:      fp64 (default) or fp32, the width of the .sgs" << std::endl;
             std::cerr << "                     floating-point columns. fp64 round-trips to the" << std::endl;
             std::cerr << "                     exact text; fp32 halves those columns and does" << std::endl;
-            std::cerr << "                     not (a small fraction of fields change their last" << std::endl;
-            std::cerr << "                     printed digit). outputFormat: sgs only." << std::endl;
+            std::cerr << "                     not: 0.5% of fields change their last printed" << std::endl;
+            std::cerr << "                     digit and any p-value below 1.2e-38 is lost." << std::endl;
+            std::cerr << "                     outputFormat: sgs only." << std::endl;
             std::cerr << std::endl;
             std::cerr << "LD matrix generation (requires groupFile):" << std::endl;
             std::cerr << "  isLDMatrix:        true/false (default: false)" << std::endl;

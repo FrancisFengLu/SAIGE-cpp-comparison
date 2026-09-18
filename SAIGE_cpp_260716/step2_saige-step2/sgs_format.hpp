@@ -27,7 +27,9 @@
 // E_CONST32 / E_PVAL32) and GIVES THAT GUARANTEE UP. A float carries ~7.2
 // decimal digits, the text prints 6 ("%.6g") or 7 ("%.6E"), and the narrowing
 // moves a value across the last printed digit's rounding boundary often enough
-// to matter -- the measured rates are in out_fast.hpp. The integer and flag
+// to matter (0.49% of fields over a 10^6 x 128 run), and, worse, float cannot
+// hold a p-value below 1.2e-38 at all while the text prints them down to
+// ~1e-308 -- out_fast.hpp has the counts. The integer and flag
 // columns (N, N_case, N_ctrl, Is.SPA) are untouched either way. The
 // encoding byte says which width a column is, so one reader handles both and
 // files written before the option existed still read. Default is fp64.
