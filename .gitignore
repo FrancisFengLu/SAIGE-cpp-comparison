@@ -14,6 +14,8 @@ SAIGE_cpp_260716/step1_saige-null/saige-null
 SAIGE_cpp_260716/step2_saige-step2/saige-step2
 SAIGE_cpp_260716/step2_saige-step2/saige-step2.cuda
 SAIGE_cpp_260716/step2_saige-step2/tools/sgs2txt
+SAIGE_cpp_260716/step2_saige-step2/tools/sgs_fidelity
+SAIGE_cpp_260716/step2_saige-step2/tools/out_fieldcmp
 SAIGE_cpp_260716/step1_saige-null/tools/bed_reader/bed_reader_test
 SAIGE_cpp_260716/step1_saige-null/tools/bed_reader/bed_pipeline_test
 SAIGE_cpp_260716/step1_saige-null/tools/bed_reader/bed_parallel_test
