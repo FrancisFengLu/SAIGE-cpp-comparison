@@ -216,5 +216,52 @@ if [ $DOB -eq 1 ]; then
   echo
 fi
 
+# ==========================================================================
+# PART C — the gate must REFUSE what it cannot do, out loud, and still produce
+# the CPU answer. A silent wrong number is the failure mode this guards.
+# ==========================================================================
+if [ $DOB -eq 1 ]; then
+  echo "=== C. gate refusals (useGPU: true on things the path cannot do) ==="
+  caseC() {  # caseC <name> <expected substring> <cfg>
+    local name=$1 want=$2 cfg=$3
+    run "$NEW" "$cfg" "$WORK/C_$name.log"
+    local line; line=$(grep -m1 "useGPU: refused" "$WORK/C_$name.log")
+    if [ -z "$line" ]; then
+      echo "  $name: NOT REFUSED -- the gate let this through"; FAIL=1; return
+    fi
+    case "$line" in
+      *"$want"*) printf "  %-22s refused: %s\n" "$name" "${line#*refused, running on the CPU }";;
+      *) echo "  $name: refused for the WRONG reason: $line"; FAIL=1;;
+    esac
+  }
+  gen 8 "$WORK/C_bin_out"   "$DATA/data/g5k" "$BINMODELS" "useGPU: true" > "$WORK/C_bin.yaml"
+  caseC binary_traits "binary traits present" "$WORK/C_bin.yaml"
+
+  # One binary model in front of seven quantitative ones: mixed is refused whole.
+  { gen 7 "$WORK/C_mix_out" "$DATA/data/g5k" "$MODELS" "useGPU: true"
+    echo "  - traitName: b1"
+    echo "    modelFile: $BINMODELS/m/y1"
+    echo "    varianceRatioFile: $BINMODELS/mvr_y1.varianceRatio.txt"
+    echo "    outputFile: $WORK/C_mix_out/b1.txt"; } > "$WORK/C_mix.yaml"
+  caseC mixed_traits "binary traits present" "$WORK/C_mix.yaml"
+
+  gen 8 "$WORK/C_nobatch_out" "$DATA/data/g5k" "$MODELS" "useGPU: true" "mtBatch: false" > "$WORK/C_nobatch.yaml"
+  caseC mtBatch_false "mtBatch is false" "$WORK/C_nobatch.yaml"
+
+  # Conditional analysis makes every trait non-batchable (saige_mt.cpp).
+  COND=$(awk 'NR<=2{print $2}' "$DATA/data/g5k.bim" | paste -sd,)
+  gen 8 "$WORK/C_cond_out" "$DATA/data/g5k" "$MODELS" "useGPU: true" "condition: $COND" > "$WORK/C_cond.yaml"
+  caseC conditional "isCondition=true" "$WORK/C_cond.yaml"
+
+  # The scalar-decode rollback switch: no packed bytes to hand the device.
+  SAIGE_STEP2_SCALAR_DECODE=1 "$NEW" "$WORK/B_q8_fp64.gpu.yaml" > "$WORK/C_scalar.log" 2>&1
+  if grep -q "useGPU: refused.*SCALAR_DECODE" "$WORK/C_scalar.log"; then
+    echo "  scalar_decode         refused: SAIGE_STEP2_SCALAR_DECODE=1 is set"
+  else
+    echo "  scalar_decode: NOT REFUSED -- the gate let this through"; FAIL=1
+  fi
+  echo
+fi
+
 if [ $FAIL -eq 0 ]; then echo "ACCEPTANCE: PASS"; else echo "ACCEPTANCE: FAIL"; fi
 exit $FAIL
