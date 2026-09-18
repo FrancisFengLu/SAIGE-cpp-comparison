@@ -32,10 +32,12 @@
 // for devices where fp64 runs at 1/32 or 1/64 rate (L4, A10, consumer parts)
 // and for measuring the fp32 error itself.
 //
-// The dosage TABLE stays float in both modes: three of its four entries are
-// exact small integers and the fourth is the imputed mean, and it is the
-// ACCUMULATION, not the inputs, that sets the error -- the same conclusion the
-// step-1 bf16 experiment reached (CLAUDE.md).
+// The dosage TABLE is double in both modes and narrowed inside the kernel for
+// fp32. Three of its four entries are exact small integers, but the fourth is
+// the imputed mean 2*altFreq -- narrowing that on the host would put a 6e-8
+// relative error into every missing cell before the reduction starts, which is
+// a difference from the CPU's INPUT rather than from its arithmetic. It costs
+// 32 bytes per marker to carry.
 
 #include "gpu_step2.hpp"
 
@@ -61,13 +63,25 @@ namespace {
 
 thread_local std::string lastErr;
 
-// code -> dosage, from the four floats the host put in lut[4*marker..+4).
-// Two predicated selects; no local array (which would land in local memory)
-// and no shared-memory lookup (which would bank-conflict across codes).
-__device__ __forceinline__ float pick(const float4 L, unsigned c)
+// The marker's four dosages, held in registers.
+template <typename T> struct Lut4 { T v0, v1, v2, v3; };
+
+template <typename T>
+__device__ __forceinline__ Lut4<T> loadLut(const double* __restrict__ lut, int m)
 {
-    const float a = (c & 1u) ? L.y : L.x;
-    const float b = (c & 1u) ? L.w : L.z;
+    const double2* d = reinterpret_cast<const double2*>(lut) + 2 * m;
+    const double2 a = d[0], b = d[1];
+    return Lut4<T>{(T)a.x, (T)a.y, (T)b.x, (T)b.y};
+}
+
+// code -> dosage. Two predicated selects; no local array (which would land in
+// local memory) and no shared-memory lookup (which would bank-conflict across
+// codes).
+template <typename T>
+__device__ __forceinline__ T pick(const Lut4<T>& L, unsigned c)
+{
+    const T a = (c & 1u) ? L.v1 : L.v0;
+    const T b = (c & 1u) ? L.v3 : L.v2;
     return (c & 2u) ? b : a;
 }
 
@@ -88,18 +102,18 @@ __device__ __forceinline__ void storeQuad(double* p, double a, double b, double 
 template <typename T>
 __global__ void __launch_bounds__(256)
 decode_lut_x4(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
-              const float* __restrict__ lut, T* __restrict__ dG)
+              const double* __restrict__ lut, T* __restrict__ dG)
 {
     const int m = blockIdx.x;
     const uint8_t* __restrict__ row = packed + (std::size_t)m * bpv;
-    const float4 L = reinterpret_cast<const float4*>(lut)[m];
+    const Lut4<T> L = loadLut<T>(lut, m);
     T* __restrict__ o = dG + (std::size_t)m * N;
     const int nq = N >> 2;
     for (int b = threadIdx.x; b < nq; b += blockDim.x) {
         const unsigned p = row[b];
         storeQuad(o + 4 * b,
-                  (T)pick(L, p & 3u),        (T)pick(L, (p >> 2) & 3u),
-                  (T)pick(L, (p >> 4) & 3u), (T)pick(L, (p >> 6) & 3u));
+                  pick(L, p & 3u),        pick(L, (p >> 2) & 3u),
+                  pick(L, (p >> 4) & 3u), pick(L, (p >> 6) & 3u));
     }
 }
 
@@ -107,14 +121,14 @@ decode_lut_x4(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
 template <typename T>
 __global__ void __launch_bounds__(256)
 decode_lut_any(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
-               const float* __restrict__ lut, T* __restrict__ dG)
+               const double* __restrict__ lut, T* __restrict__ dG)
 {
     const int m = blockIdx.x;
     const uint8_t* __restrict__ row = packed + (std::size_t)m * bpv;
-    const float4 L = reinterpret_cast<const float4*>(lut)[m];
+    const Lut4<T> L = loadLut<T>(lut, m);
     T* __restrict__ o = dG + (std::size_t)m * N;
     for (int i = threadIdx.x; i < N; i += blockDim.x)
-        o[i] = (T)pick(L, (unsigned)((row[i >> 2] >> ((i & 3) * 2)) & 3u));
+        o[i] = pick(L, (unsigned)((row[i >> 2] >> ((i & 3) * 2)) & 3u));
 }
 
 }  // namespace
@@ -130,14 +144,14 @@ struct Reducer {
 
     // pinned host staging
     unsigned char* hPacked = nullptr;
-    float*         hLut    = nullptr;
+    double*        hLut    = nullptr;
     void*          hC      = nullptr;
 
     // device
     void*          dB   = nullptr;      // N x K
     void*          dC   = nullptr;      // maxSlots x K
     unsigned char* dPk[2]  = {nullptr, nullptr};
-    float*         dLut[2] = {nullptr, nullptr};
+    double*        dLut[2] = {nullptr, nullptr};
     void*          dG[2]   = {nullptr, nullptr};
 
     cudaStream_t   st[2] = {nullptr, nullptr};
@@ -222,7 +236,7 @@ Reducer* create(int t_device, int t_N, int t_K, const double* t_B, int t_maxSlot
 
     if (cudaHostAlloc((void**)&r->hPacked, (std::size_t)t_maxSlots * r->bpv,
                       cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (cudaHostAlloc((void**)&r->hLut, (std::size_t)t_maxSlots * 4 * sizeof(float),
+    if (cudaHostAlloc((void**)&r->hLut, (std::size_t)t_maxSlots * 4 * sizeof(double),
                       cudaHostAllocDefault) != cudaSuccess) return fail();
     if (cudaHostAlloc(&r->hC, (std::size_t)t_maxSlots * t_K * r->esz,
                       cudaHostAllocDefault) != cudaSuccess) return fail();
@@ -236,7 +250,7 @@ Reducer* create(int t_device, int t_N, int t_K, const double* t_B, int t_maxSlot
     if (!dev(&r->dC, (std::size_t)t_maxSlots * t_K * r->esz)) return fail();
     for (int b = 0; b < 2; ++b) {
         if (!dev((void**)&r->dPk[b],  (std::size_t)r->slotsPerPass * r->bpv)) return fail();
-        if (!dev((void**)&r->dLut[b], (std::size_t)r->slotsPerPass * 4 * sizeof(float))) return fail();
+        if (!dev((void**)&r->dLut[b], (std::size_t)r->slotsPerPass * 4 * sizeof(double))) return fail();
         if (!dev(&r->dG[b],           (std::size_t)r->slotsPerPass * t_N * r->esz)) return fail();
     }
     r->devBytes = db;
@@ -284,7 +298,7 @@ void destroy(Reducer* r)
 }
 
 unsigned char* packed(Reducer* r)             { return r ? r->hPacked : nullptr; }
-float*         lut(Reducer* r)                { return r ? r->hLut : nullptr; }
+double*        lut(Reducer* r)                { return r ? r->hLut : nullptr; }
 std::size_t    bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
 bool           isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
 const float*   outCf(const Reducer* r)        { return (r && !r->fp64) ? (const float*)r->hC : nullptr; }
@@ -326,7 +340,7 @@ bool reduce(Reducer* r, int t_nSlots)
         CKR(cudaMemcpyAsync(r->dPk[b], r->hPacked + (std::size_t)s0 * r->bpv,
                             (std::size_t)sc * r->bpv, cudaMemcpyHostToDevice, s));
         CKR(cudaMemcpyAsync(r->dLut[b], r->hLut + (std::size_t)s0 * 4,
-                            (std::size_t)sc * 4 * sizeof(float),
+                            (std::size_t)sc * 4 * sizeof(double),
                             cudaMemcpyHostToDevice, s));
         CKR(cudaEventRecord(r->ev[b][1], s));
 

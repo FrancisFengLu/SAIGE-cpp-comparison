@@ -90,9 +90,16 @@ void     destroy(Reducer* t_r);
 // Pinned staging buffers owned by the reducer. The caller writes marker data
 // straight into them, so no copy stands between the decode and the H2D.
 //   packed()  t_maxSlots * bpv bytes, bpv = (N+3)/4; slot j at offset j*bpv
-//   lut()     t_maxSlots * 4 floats;  slot j's code->dosage table at 4*j
+//   lut()     t_maxSlots * 4 doubles; slot j's code->dosage table at 4*j.
+//             DOUBLE, not float, in both precision modes: three of its entries
+//             are exact small integers but the fourth is the imputed mean
+//             2*altFreq, and narrowing that on the host would put a 6e-8
+//             relative error into every missing cell before the reduction even
+//             starts -- which is a difference from the CPU's INPUT, not from
+//             its arithmetic. In fp32 mode the kernel narrows it itself, so
+//             the two modes still see the same table.
 unsigned char* packed(Reducer* t_r);
-float*         lut(Reducer* t_r);
+double*        lut(Reducer* t_r);
 std::size_t    bytesPerSlot(const Reducer* t_r);
 
 // Reduce slots [0, t_nSlots). Returns false on any CUDA error, in which case

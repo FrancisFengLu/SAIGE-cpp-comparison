@@ -23,7 +23,7 @@ Reducer* create(int, int, int, const double*, int, bool) { return nullptr; }
 void     destroy(Reducer*) {}
 
 unsigned char* packed(Reducer*)            { return nullptr; }
-float*         lut(Reducer*)               { return nullptr; }
+double*        lut(Reducer*)               { return nullptr; }
 std::size_t    bytesPerSlot(const Reducer*) { return 0; }
 bool           reduce(Reducer*, int)       { return false; }
 bool           isFp64(const Reducer*)       { return false; }

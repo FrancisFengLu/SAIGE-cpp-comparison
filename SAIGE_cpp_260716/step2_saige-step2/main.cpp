@@ -2295,6 +2295,12 @@ bool mainMarkerMTGpu(
     // three memcpy-shaped copies and the result columns split back the same way.
     const int sumP = ctx.sumP;
     const int K = 2 * sumP + P;
+    if ((int)ctx.Astack.n_rows != n || (int)ctx.Xstack.n_rows != n ||
+        (int)ctx.RES.n_rows != n) {
+        std::cout << "  useGPU: refused, running on the CPU "
+                     "(stacked constants are not n rows)" << std::endl;
+        return false;
+    }
     int Bblk = g_mtBlockSize;
     if (Bblk <= 0) {
         const double budget = g_mtMemBudgetGB * 1024.0 * 1024.0 * 1024.0;
@@ -2326,7 +2332,7 @@ bool mainMarkerMTGpu(
     }
     const std::size_t bpv = saige::gpu2::bytesPerSlot(R);
     unsigned char* hPk = saige::gpu2::packed(R);
-    float*         hLu = saige::gpu2::lut(R);
+    double*        hLu = saige::gpu2::lut(R);
 
     std::cout << "  useGPU: " << saige::gpu2::describe(g_gpuDevice)
               << "; " << (g_gpuFp64 ? "fp64" : "fp32")
@@ -2458,7 +2464,7 @@ bool mainMarkerMTGpu(
                     double ss = 0.0;
                     for (int k = 0; k < 4; k++) {
                         S.fdc[(std::size_t)c * 4 + k] = fs.fd[k];
-                        hLu[(slotBase + c) * 4 + k]   = (float)fs.fd[k];
+                        hLu[(slotBase + c) * 4 + k]   = fs.fd[k];
                         ss += fs.fd[k] * fs.fd[k] * (double)fs.counts[k];
                     }
                     (void)kMissCode;
@@ -2483,7 +2489,7 @@ bool mainMarkerMTGpu(
                 // zeros and cannot produce a NaN that would poison a GEMM tile.
                 for (int c = S.nUsed; c < Bblk; c++) {
                     std::memset(hPk + (slotBase + c) * bpv, 0, bpv);
-                    for (int k = 0; k < 4; k++) hLu[(slotBase + c) * 4 + k] = 0.f;
+                    for (int k = 0; k < 4; k++) hLu[(slotBase + c) * 4 + k] = 0.0;
                 }
             }
             tRead += omp_get_wtime() - t0;
