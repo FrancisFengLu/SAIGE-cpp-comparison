@@ -252,6 +252,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("vr_max_mac")) c.vr_max_mac = get("vr_max_mac").as<int>();
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
+  if (get("selective_geno_load")) c.selective_geno_load = get("selective_geno_load").as<bool>();
   if (get("multi_lockstep")) c.multi_lockstep = get("multi_lockstep").as<bool>();
   if (get("mask_missing")) c.mask_missing = get("mask_missing").as<bool>();
   if (get("mask_min_coverage")) c.mask_min_coverage = get("mask_min_coverage").as<double>();
@@ -1934,6 +1935,57 @@ int main(int argc, char** argv) {
            std::chrono::duration<double>(t - T0).count());
   }
 
+  // -------- Selective (variance-ratio-only) genotype load --------
+  // fit.selective_geno_load. In the sparse-GRM fitting path the genotype matrix
+  // has exactly one numerical consumer left — the variance-ratio marker loop —
+  // and one diagnostic consumer, output_grm_diagonal. The GLMM fit itself never
+  // touches it: psi*u goes through the sparse Psi (getCrossprodMatAndKin's
+  // sparse branch) and Sigma^-1 through gen_spsolve_v4. So the load can be
+  // restricted to the ~1000 markers the VR draw can claim, which is 2-3% of the
+  // BED. Decided once, here, for every group.
+  //
+  // Every condition below names a consumer that WOULD need the full matrix; if
+  // any holds the flag is ignored and the reason is printed, never silently.
+  bool selective_geno = false;
+  if (cfg.selective_geno_load) {
+    std::string why;
+    if (!cfg.use_sparse_grm_to_fit)
+      why = "fit.use_sparse_grm_to_fit is off — the GLMM fit reads the genotype "
+            "matrix on every psi*u";
+    else if (!sparse_have_files)
+      why = "no sparse GRM files are given, so build_sparse_grm_in_place() has to "
+            "compute the GRM from the genotypes";
+    else if (cfg.make_sparse_grm_only)
+      why = "fit.make_sparse_grm_only builds the GRM from the genotypes";
+    else if (cfg.loco)
+      why = "fit.loco needs the per-chromosome marker blocks";
+    else if (cfg.use_pcg_with_sparse_grm && !cfg.isDiagofKinSetAsOne)
+      why = "fit.use_pcg_with_sparse_grm with diag_one=false needs the GRM diagonal "
+            "for the Jacobi preconditioner (getDiagOfSigma)";
+    else if (std::any_of(unit_mask.begin(), unit_mask.end(),
+                         [](const MaskInfo& m) { return m.on; }))
+      // Unreachable while masking itself refuses use_sparse_grm_to_fit (§7
+      // above), but the two features are decided independently, so check the
+      // state rather than rely on that staying true.
+      why = "scheme-C masking is on for at least one group — it rebuilds per-trait "
+            "stats out of a union decode of the whole matrix";
+    else if (cfg.num_markers_for_vr <= 0)
+      // Nothing would be decoded at all, which is fine, but then the only thing
+      // this flag buys is dropping .grm_diag.txt. Refuse rather than surprise.
+      why = "fit.num_markers_for_vr is 0 — there is no variance-ratio pool to load, "
+            "so the only effect would be to drop .grm_diag.txt";
+    if (!why.empty()) {
+      std::cout << "[selective] fit.selective_geno_load requested but NOT used: "
+                << why << ". Loading the full genotype matrix.\n";
+    } else {
+      selective_geno = true;
+      std::cout << "[selective] fit.selective_geno_load ON: decoding only the "
+                   "variance-ratio markers; the GRM genotype matrix is not built and "
+                   "<out_prefix>.grm_diag.txt is NOT written (diagnostic only; step 2 "
+                   "does not read it).\n";
+    }
+  }
+
   // The sparse GRM file is the same for every group; parse it once (lazily, on
   // the first group) and subset it per group below.
   bool sparse_parsed = false;
@@ -1966,6 +2018,11 @@ int main(int argc, char** argv) {
   if (cfg.num_markers_for_vr > 0) {
     setminMAC_VarianceRatio(20.0f, -1.0f, true);
   }
+
+  // Selective load is a property of the genotype object, which
+  // reset_step1_state_for_new_sample_set() replaces between groups — so set it
+  // per group, right before init_global_geno().
+  set_vr_only_geno_load(selective_geno);
 
   // Initialize genotype data BEFORE sparse GRM section (needed for build_sparse_grm_in_place)
   auto T1 = std::chrono::steady_clock::now();
@@ -2242,7 +2299,19 @@ int main(int argc, char** argv) {
                                      : saige::fit_null(cfg, mpaths, designs[mi]);
 
     // ------------------ Output GRM diagonal (after fit_null, same as R version) ------------------
-    output_grm_diagonal(mpaths.out_prefix + ".grm_diag.txt");
+    // The GRM diagonal is sum_m stdGeno(m,i)^2 / M — it needs EVERY marker, so
+    // there is no cheap way to keep it under a selective load. It is a
+    // diagnostic (step 2 never reads .grm_diag.txt), so under
+    // fit.selective_geno_load it is skipped rather than approximated from the
+    // sparse GRM's diagonal, which is a different (thresholded, file-supplied)
+    // quantity and would silently change the file's meaning.
+    if (selective_geno) {
+      std::cout << "[selective] skipping " << mpaths.out_prefix
+                << ".grm_diag.txt (needs every marker; fit.selective_geno_load "
+                   "decoded only the variance-ratio markers)\n";
+    } else {
+      output_grm_diagonal(mpaths.out_prefix + ".grm_diag.txt");
+    }
 
     // ------------------ Report artifacts ------------------
     std::cout << "== SAIGE Null Fit Completed ==\n";

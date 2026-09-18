@@ -90,6 +90,15 @@ public:
         // Return the j-th packed byte of the snp-th pass-QC marker, routing
         // between the option-3 flat buffer and the legacy vector-of-pointers.
         inline unsigned char packed_byte(std::size_t snp_idx, std::size_t byte_idx) const {
+          if (vrOnlyLoad_) {
+            // Selective load: the GRM matrix was never decoded, so there is no
+            // byte to return. Anything that reaches here wants the full load.
+            throw std::runtime_error(
+                "genoClass::packed_byte: the GRM genotype matrix is not in memory "
+                "because fit.selective_geno_load loaded only the variance-ratio "
+                "markers. This configuration needs the full matrix — turn "
+                "fit.selective_geno_load off.");
+          }
           if (packed_flat_released_) {
             // G4: we freed the host copy when GPU took ownership of the data.
             // Any caller reaching this point wants a host-side byte, which we
@@ -238,6 +247,16 @@ public:
 	float g_minMACVarRatio;
 	float g_maxMACVarRatio;
 	bool isVarRatio = false;
+	// Selective genotype load (fit.selective_geno_load, sparse-fit path only).
+	// When true, setGenoObj decodes ONLY the markers the variance-ratio draw
+	// can claim and builds NO GRM store: numberofMarkerswithMAFge_minMAFto-
+	// ConstructGRM stays 0, genoVecofPointers stays empty, packed_flat_ is
+	// never filled. Every reader of the main store throws (packed_byte,
+	// Get_Diagof_StdGeno) rather than returning zeros, so a configuration that
+	// does need the matrix fails loudly instead of quietly producing garbage.
+	// Reset for free between sample-set groups: reset_step1_state_for_new_
+	// sample_set() replaces the whole object.
+	bool vrOnlyLoad_ = false;
 	int numberofMarkers_varRatio = 0;
 	int numberofMarkers_varRatio_common = 0;
 	arma::ivec g_randMarkerIndforVR;
@@ -1155,6 +1174,11 @@ public:
 	}
 
 	arma::fvec * Get_Diagof_StdGeno(){
+		if(vrOnlyLoad_)
+			throw std::runtime_error(
+			    "genoClass::Get_Diagof_StdGeno: the GRM diagonal needs every marker, "
+			    "but fit.selective_geno_load decoded only the variance-ratio markers. "
+			    "Turn fit.selective_geno_load off for this configuration.");
 		if(maskMode_) return Get_Diagof_StdGeno_masked();
 
 		arma::fvec * temp = &m_OneSNP_StdGeno;
@@ -1663,6 +1687,11 @@ public:
 
 		numMarkersofEachArray = 1;
                         numofGenoArray = M;
+                        // Selective load: no GRM store, so no per-marker stubs either.
+                        // Leaving genoVecofPointers EMPTY (rather than M null pointers)
+                        // is what makes packed_rows_contiguous() / packed_n_markers()
+                        // report "nothing here" instead of dereferencing nulls.
+                        if (!vrOnlyLoad_) {
 			genoVecofPointers.resize(numofGenoArray);
 			genoVecofPointers_forVarRatio.resize(numofGenoArray);
                         // In the parallel path we populate packed_flat_ (and, for VR runs,
@@ -1677,6 +1706,7 @@ public:
                                         genoVecofPointers[i]->reserve(numMarkersofEachArray*ceil(float(Nnomissing)/4));
                                 }
                         }
+                        }  // end of !vrOnlyLoad_
 
 		// Pre-build lookup: BED byte -> 4 genotype values (0=hom_A1=2alleles, 1=het, 2=hom_A2=0alleles, 3=missing)
 		// PLINK BED 2-bit encoding per sample: 00=hom_A1(2), 01=missing(3), 10=het(1), 11=hom_A2(0)
@@ -1796,7 +1826,107 @@ public:
 		// bed_pipeline_test.cpp, benchmark_results/ukb_ldl/cpp_covT/stdout.log)
 		// still match byte-for-byte.
 		// =====================================================================
-		if (use_parallel_bed) {
+		if (vrOnlyLoad_) {
+		// =====================================================================
+		// Selective (variance-ratio-only) load — fit.selective_geno_load.
+		//
+		// Who can claim a marker for the VR pool (marker_decoder.hpp,
+		// VarRatioRule)? With g_maxMACVarRatio == -1, which is the only value
+		// main.cpp ever sets:
+		//     passVR  <=>  mac >= g_minMACVarRatio  AND  the marker was DRAWN
+		// The draw (g_randMarkerIndforVR, ≤1000 indices) happens above, before
+		// any BED byte is read, from a fixed seed or the bypass file, and
+		// depends on nothing but M. So the VR pool is a subset of the drawn
+		// markers and every other marker's bytes only ever reach the GRM store
+		// — which the sparse fit does not use. Decoding just the drawn markers
+		// therefore reproduces the VR pool EXACTLY: same members, same
+		// ascending-marker order (the full loop walks i upward and so does
+		// this one), same MAC/freq/invstd, same packed bytes, hence the same
+		// numAvailMarkers and the same mt19937(200) shuffle downstream.
+		//
+		// What is NOT built: alleleFreqVec / invstdvVec / MACVec / origPlinkIdx,
+		// MarkerswithMAFge_minMAFtoConstructGRM_indVec, packed_flat_, and the
+		// "Marker i: freq=..." lines for i<20. numberofMarkerswithMAFge_-
+		// minMAFtoConstructGRM stays 0. main.cpp gates the flag on the
+		// configurations where none of that is read; packed_byte() and
+		// Get_Diagof_StdGeno() throw if anything asks anyway.
+		// =====================================================================
+			test_bedfile.close();  // BedReaderPool opens its own fd
+			std::vector<std::size_t> want;   // drawn markers, ascending, unique
+			if (isVarRatio) {
+				std::vector<unsigned char> drawn((std::size_t)M, 0);
+				for (arma::uword k = 0; k < g_randMarkerIndforVR.n_elem; ++k) {
+					const int idx = g_randMarkerIndforVR(k);
+					if (idx >= 0 && idx < static_cast<int>(M))
+						drawn[static_cast<std::size_t>(idx)] = 1;
+				}
+				for (std::size_t i = 0; i < (std::size_t)M; ++i)
+					if (drawn[i]) want.push_back(i);
+			}
+			saige::VarRatioRule vr_rule;
+			if (isVarRatio) {
+				// The whole argument rests on "only a drawn marker can enter the
+				// VR pool", which is the max_mac == -1 branch of VarRatioRule.
+				// The other branch claims every marker in a MAC bin, drawn or
+				// not, and would need the full scan. Nothing sets it today
+				// (main.cpp's setminMAC_VarianceRatio(20, -1, true) is the only
+				// caller), so refuse loudly if that ever changes rather than
+				// silently returning a short pool.
+				if (g_maxMACVarRatio != -1.0f)
+					throw std::runtime_error(
+					    "selective genotype load: the variance-ratio rule has "
+					    "max_mac=" + std::to_string(g_maxMACVarRatio) +
+					    " (a categorical MAC bin), which claims markers that were "
+					    "never drawn — those cannot be found without scanning every "
+					    "marker. Turn fit.selective_geno_load off.");
+				vr_rule.enabled = true;
+				vr_rule.min_mac = g_minMACVarRatio;
+				vr_rule.max_mac = g_maxMACVarRatio;
+			}
+			const std::size_t nbyte_vr =
+			    (std::size_t)((Nnomissing + 3) / 4);
+			packed_flat_vr_.init(want.size(), nbyte_vr);
+			if (!want.empty()) {
+				saige::BedReaderPool reader(bedfile,
+				                            static_cast<std::size_t>(N), 1);
+				std::vector<unsigned char> raw(reader.n_bytes_per_marker());
+				std::vector<unsigned char> packed(nbyte_vr, 0);
+				for (std::size_t mi : want) {
+					reader.read_marker(0, mi, raw.data());
+					saige::MarkerStats s;
+					bool passVR = false;
+					saige::decode_marker(raw.data(),
+					                     static_cast<std::size_t>(N),
+					                     ptrsubSampleInGeno.data(),
+					                     static_cast<std::size_t>(Nnomissing),
+					                     minMAFtoConstructGRM, maxMissingRate,
+					                     bed_lookup, vr_rule, /*vr_drawn=*/true,
+					                     s, passVR, packed.data());
+					if (!passVR) continue;
+					const float Std_i = std::sqrt(2.0f * s.altFreq * (1.0f - s.altFreq));
+					invstdvVec0_forVarRatio.push_back(Std_i == 0.0f ? 0.0f : 1.0f / Std_i);
+					alleleFreqVec0_forVarRatio.push_back(s.altFreq);
+					MACVec0_forVarRatio.push_back(s.mac);
+					markerIndexVec0_forVarRatio.push_back(static_cast<int>(mi));
+					packed_flat_vr_.append(packed.data());
+					numberofMarkers_varRatio++;
+				}
+			}
+			use_packed_flat_vr_ = true;
+			use_packed_flat_    = false;
+			std::cout << "[selective] VR-only genotype load: drawn=" << want.size()
+			          << " of " << M << " markers decoded, VR pool n_stored="
+			          << packed_flat_vr_.n_stored()
+			          << " (" << (packed_flat_vr_.n_stored() * nbyte_vr)
+			          << " bytes); GRM store not built" << std::endl;
+			if (static_cast<int>(packed_flat_vr_.n_stored()) != numberofMarkers_varRatio)
+				throw std::runtime_error(
+				    "selective loader: VR store holds " +
+				    std::to_string(packed_flat_vr_.n_stored()) +
+				    " markers but bookkeeping counted " +
+				    std::to_string(numberofMarkers_varRatio));
+			elapsed("BED selective VR decode");
+		} else if (use_parallel_bed) {
 			test_bedfile.close();  // BedReaderPool opens its own fds
 
 			// Translate g_randMarkerIndforVR (a sorted list of drawn marker
@@ -1994,12 +2124,17 @@ public:
 		// =====================================================================
 
 		if( minMAFtoConstructGRM > 0 | maxMissingRate < 1){
+			if (vrOnlyLoad_)
+				cout << "GRM marker count not computed (fit.selective_geno_load: only the "
+				     << "variance-ratio markers were decoded)" << endl;
+			else
 			cout << numberofMarkerswithMAFge_minMAFtoConstructGRM << " markers with MAF >= " << minMAFtoConstructGRM << " and missing rate <= " << maxMissingRate  << endl;
 		}
 		//else{
 		//	cout << M << " markers with MAF >= " << minMAFtoConstructGRM << endl;
 		//}
 
+		if (!vrOnlyLoad_) {
 		int numofGenoArray_old = numofGenoArray;
 		if(numberofMarkerswithMAFge_minMAFtoConstructGRM % numMarkersofEachArray == 0){
                         numofGenoArray = numberofMarkerswithMAFge_minMAFtoConstructGRM / numMarkersofEachArray;
@@ -2038,6 +2173,7 @@ public:
 			MACVec[i] = MACVec0.at(i);
 
 		}
+		}  // end of !vrOnlyLoad_ (no main GRM array to compact)
 	if(isVarRatio){
 		invstdvVec_forVarRatio.clear();
                 invstdvVec_forVarRatio.set_size(numberofMarkers_varRatio);
@@ -2266,6 +2402,13 @@ void init_global_geno_masked(const std::string& bed, const std::string& bim,
                              const std::vector<std::string>& names) {
   if (excl.size() != scatter.size() || excl.size() != names.size())
     throw std::runtime_error("init_global_geno_masked: excl/scatter/names size mismatch");
+  // Scheme C rebuilds every trait's stats out of ONE decode of the whole
+  // matrix; a selective load has no matrix to rebuild them from. main.cpp
+  // refuses the combination, so this only fires if that gate is ever loosened.
+  if (geno.vrOnlyLoad_)
+    throw std::runtime_error(
+        "init_global_geno_masked: scheme-C masking needs a full union decode, but "
+        "the selective (variance-ratio-only) genotype load is on.");
   geno.maskExclIn_    = &excl;
   geno.maskScatterIn_ = &scatter;
   geno.maskNamesIn_   = &names;
@@ -2283,6 +2426,12 @@ void init_global_geno_masked(const std::string& bed, const std::string& bim,
 }
 
 bool mask_mode_active() { return geno.maskMode_; }
+
+// Selective (VR-only) genotype load. Must be called BEFORE the group's
+// init_global_geno(); reset_step1_state_for_new_sample_set() clears it along
+// with the rest of the object, so main.cpp sets it once per group.
+void set_vr_only_geno_load(bool on) { geno.vrOnlyLoad_ = on; }
+bool vr_only_geno_load_active()     { return geno.vrOnlyLoad_; }
 
 void set_scheme_c_break(const std::string& which) { g_scheme_c_break = which; }
 

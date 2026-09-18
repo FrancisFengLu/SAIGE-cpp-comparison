@@ -45,6 +45,20 @@ void activate_trait_for_fit(int t);
 // True once init_global_geno_masked() has built a mask group.
 bool mask_mode_active();
 
+// Selective genotype load (fit.selective_geno_load). When on, the NEXT
+// init_global_geno() decodes only the markers the variance-ratio draw can claim
+// and builds no GRM store at all: the sparse-GRM fit never reads the matrix, so
+// the other ~97% of the BED is never touched. Call before init_global_geno();
+// it is cleared by reset_step1_state_for_new_sample_set() with the rest of the
+// genotype object, so set it once per sample-set group.
+//
+// It is the caller's job to only turn this on where the GRM matrix is unused:
+// use_sparse_grm_to_fit with a sparse GRM read from file, LOCO off, and
+// .grm_diag.txt not wanted. Everything that reads the main store throws a
+// clear error under this mode rather than returning zeros.
+void set_vr_only_geno_load(bool on);
+bool vr_only_geno_load_active();
+
 // Acceptance C2 (SCHEME_C_DESIGN.md §5): "" | "freq" | "qc" | "corr". Anything
 // but "" removes one of §1's steps from the per-trait rebuild so the gate can
 // be shown to catch it, and says so on stdout. Never set in a real run.

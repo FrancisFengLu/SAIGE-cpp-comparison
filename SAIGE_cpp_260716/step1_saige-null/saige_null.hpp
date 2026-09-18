@@ -38,6 +38,23 @@ struct FitNullConfig {
   bool make_sparse_grm_only{false};  // NEW
   bool use_pcg_with_sparse_grm{false};  // false = direct solve (R default), true = PCG
 
+  // Selective genotype load for the sparse-GRM fitting path.
+  //
+  // With use_sparse_grm_to_fit the GLMM fit never touches the genotype matrix
+  // (psi*u goes through the sparse Psi, Sigma^-1 through the sparse solve), so
+  // the only numerical consumer left is the variance-ratio marker loop, which
+  // reads ~1000 drawn markers out of every QC-passing marker in the BED. When
+  // this is on, step 1 decodes ONLY those drawn markers.
+  //
+  // OFF by default because it changes one output: .grm_diag.txt needs every
+  // marker and is therefore NOT written under it (step 2 never reads that file;
+  // it is a diagnostic). Everything else — the variance ratio, the VR marker
+  // list, tau, the model artifacts — is bit-for-bit what the full load gives,
+  // because the VR draw happens before any BED byte is read and a marker's VR
+  // eligibility depends on that marker alone. Ignored (with a printed reason)
+  // for any configuration that does need the matrix; see main.cpp.
+  bool selective_geno_load{false};
+
   // Tier-2 multi-phenotype: advance the P AI-REML loops in lockstep so the
   // fixed-effect PCG solves of all still-active traits go through one batched
   // multi-Sigma solve. OFF by default because it is not bit-identical to
