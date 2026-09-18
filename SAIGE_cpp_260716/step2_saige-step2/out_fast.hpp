@@ -51,6 +51,10 @@
 //   output bytes       text -> sgs:  94 -> 72 MB, 752 -> 352 MB,
 //                      3.01 -> 1.31 GB, 12.03 -> 5.15 GB (2.33x at P=128)
 //
+// sgsPrecision: fp32 (default fp64) halves the floating-point columns again, and
+// is off for a reason: it costs the byte-identical round trip. Numbers pending
+// (logs/gpu_step2/writer/f32/).
+//
 // Round trip verified by tools/sgs2txt + cmp at every P: 128 traits x 1,000,000
 // markers = 128,000,000 rows byte-identical at P=128, and on a file with 2%
 // missing calls plus 50 markers over maxMissRate so the QC-dropped rows are
@@ -140,9 +144,12 @@ class SgsSink {
 public:
     ~SgsSink();
     // metas[t].outFile + ".sgs" per trait; metas[0].outFile + ".markers.sgs"
-    // for the shared marker block. Returns false and fills err on any failure.
+    // for the shared marker block. storeF32 narrows every floating-point column
+    // to float (sgsPrecision: fp32), which halves the file and gives up the
+    // byte-identical round trip -- see sgs_format.hpp for the measured cost.
+    // Returns false and fills err on any failure.
     bool open(const std::vector<TraitMeta>& metas, bool isImputation,
-              std::string& err);
+              bool storeF32, std::string& err);
     bool isOpen() const { return m_open; }
     const std::string& markerPath() const { return m_markerPath; }
 

@@ -167,6 +167,26 @@ static void put_col_pod(std::string& b, const T* v, std::size_t n) {
     else     { put_u8(b, E_RAW);   put_bytes(b, v, n * sizeof(T)); }
 }
 
+// The columns the program computed as double. Under fp32 the constant check is
+// made on the narrowed values, so a column that is constant only after
+// narrowing still costs one value.
+static void put_col_f64(std::string& b, const double* v, std::size_t n, bool f32) {
+    if (!f32) { put_col_pod(b, v, n); return; }
+    bool cst = (n > 0);
+    const float f0 = (float)v[0];
+    for (std::size_t i = 1; i < n; i++) {
+        const float fi = (float)v[i];
+        if (std::memcmp(&fi, &f0, sizeof(float)) != 0) { cst = false; break; }
+    }
+    if (cst) { put_u8(b, E_CONST32); put_f32(b, f0); }
+    else {
+        put_u8(b, E_RAW32);
+        std::vector<float> f(n);
+        for (std::size_t i = 0; i < n; i++) f[i] = (float)v[i];
+        put_bytes(b, f.data(), n * sizeof(float));
+    }
+}
+
 static void put_col_str(std::string& b, const std::vector<std::string>& v, std::size_t n) {
     bool cst = (n > 0);
     for (std::size_t i = 1; i < n; i++) if (v[i] != v[0]) { cst = false; break; }
@@ -200,8 +220,9 @@ static bool canonical_6E(const std::string& s, double& out) {
     return true;
 }
 
-static void put_col_pval(std::string& b, const std::vector<std::string>& v, std::size_t n) {
-    put_u8(b, E_PVAL);
+static void put_col_pval(std::string& b, const std::vector<std::string>& v,
+                         std::size_t n, bool f32) {
+    put_u8(b, f32 ? E_PVAL32 : E_PVAL);
     std::vector<double> d(n);
     std::string exc;
     uint32_t nexc = 0;
@@ -215,7 +236,15 @@ static void put_col_pval(std::string& b, const std::vector<std::string>& v, std:
             nexc++;
         }
     }
-    put_bytes(b, d.data(), n * sizeof(double));
+    if (!f32) put_bytes(b, d.data(), n * sizeof(double));
+    else {
+        // The exception list still holds the string verbatim, so the NaN
+        // placeholders stay placeholders; only the 7th printed digit of a
+        // canonical p-value is at risk here.
+        std::vector<float> f(n);
+        for (std::size_t i = 0; i < n; i++) f[i] = (float)d[i];
+        put_bytes(b, f.data(), n * sizeof(float));
+    }
     put_u32(b, nexc);
     b.append(exc);
 }
@@ -249,6 +278,7 @@ struct SgsSink::Impl {
     std::vector<TraitMeta> metas;
     std::vector<std::vector<uint8_t> > cols;
     bool isImputation = false;
+    bool storeF32 = false;
     uint64_t nMarkers = 0;
     std::vector<uint64_t> nEmitted;
     std::vector<std::string> bufs;       // one scratch buffer per trait
@@ -258,15 +288,19 @@ struct SgsSink::Impl {
 SgsSink::~SgsSink() { delete m_impl; }
 
 bool SgsSink::open(const std::vector<TraitMeta>& metas, bool isImputation,
-                   std::string& err)
+                   bool storeF32, std::string& err)
 {
     if (metas.empty()) { err = "no traits"; return false; }
     m_impl = new Impl();
     m_impl->metas = metas;
     m_impl->isImputation = isImputation;
+    m_impl->storeF32 = storeF32;
     m_impl->nEmitted.assign(metas.size(), 0);
     m_impl->bufs.resize(metas.size());
     m_markerPath = metas[0].outFile + ".markers.sgs";
+    const uint32_t hdrFlags = (isImputation ? H_IMPUTATION : 0u)
+                            | (storeF32     ? H_F32        : 0u);
+
 
     m_impl->markerFd = ::open(m_markerPath.c_str(),
                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -278,7 +312,7 @@ bool SgsSink::open(const std::vector<TraitMeta>& metas, bool isImputation,
         std::string h;
         put_bytes(h, MAGIC_MARKER, 8);
         put_u32(h, VERSION);
-        put_u32(h, isImputation ? 1u : 0u);
+        put_u32(h, hdrFlags);
         if (!write_all(m_impl->markerFd, h.data(), h.size(), err)) return false;
         m_bytes += h.size();
     }
@@ -295,7 +329,7 @@ bool SgsSink::open(const std::vector<TraitMeta>& metas, bool isImputation,
         std::string h;
         put_bytes(h, MAGIC_TRAIT, 8);
         put_u32(h, VERSION);
-        put_u32(h, isImputation ? 1u : 0u);
+        put_u32(h, hdrFlags);
         put_str(h, header_line(metas[t], isImputation));
         put_str(h, metas[t].name);
         put_str(h, metas[t].traitType);
@@ -324,6 +358,8 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
     numtest.assign(P, 0);
     if (nRows == 0) return true;
 
+    const bool f32 = I.storeF32;
+
     // ---- marker block: written once, not P times ----
     const std::vector<double>& mInfo =
         I.isImputation ? *cols[0].imputeInfo : *cols[0].missingRate;
@@ -337,9 +373,9 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
         put_col_str(b, *M.mid, nRows);
         put_col_str(b, *M.ref, nRows);
         put_col_str(b, *M.alt, nRows);
-        put_col_pod(b, cols[0].altCounts->data(), nRows);
-        put_col_pod(b, cols[0].altFreq->data(), nRows);
-        put_col_pod(b, mInfo.data(), nRows);
+        put_col_f64(b, cols[0].altCounts->data(), nRows, f32);
+        put_col_f64(b, cols[0].altFreq->data(), nRows, f32);
+        put_col_f64(b, mInfo.data(), nRows, f32);
         if (!write_all(I.markerFd, b.data(), b.size(), err)) return false;
         m_bytes += b.size();
         I.nMarkers += nRows;
@@ -384,33 +420,33 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
         put_u32(b, (uint32_t)nRows);
         put_u32(b, flags);
         if (flags & F_HAS_PRESENT) put_bytes(b, present.data(), nRows);
-        if (flags & F_OVERRIDE_AC)   put_col_pod(b, C.altCounts->data(), nRows);
-        if (flags & F_OVERRIDE_AF)   put_col_pod(b, C.altFreq->data(), nRows);
-        if (flags & F_OVERRIDE_MISS) put_col_pod(b, tInfo.data(), nRows);
+        if (flags & F_OVERRIDE_AC)   put_col_f64(b, C.altCounts->data(), nRows, f32);
+        if (flags & F_OVERRIDE_AF)   put_col_f64(b, C.altFreq->data(), nRows, f32);
+        if (flags & F_OVERRIDE_MISS) put_col_f64(b, tInfo.data(), nRows, f32);
 
         for (std::size_t i = 0; i < I.cols[t].size(); i++) {
             switch (I.cols[t][i]) {
-                case C_BETA:   put_col_pod (b, C.Beta->data(), nRows); break;
-                case C_SE:     put_col_pod (b, C.seBeta->data(), nRows); break;
-                case C_TSTAT:  put_col_pod (b, C.Tstat->data(), nRows); break;
-                case C_VAR:    put_col_pod (b, C.varT->data(), nRows); break;
-                case C_PVAL:   put_col_pval(b, *C.pval, nRows); break;
-                case C_PVALNA: put_col_pval(b, *C.pvalNA, nRows); break;
+                case C_BETA:   put_col_f64 (b, C.Beta->data(), nRows, f32); break;
+                case C_SE:     put_col_f64 (b, C.seBeta->data(), nRows, f32); break;
+                case C_TSTAT:  put_col_f64 (b, C.Tstat->data(), nRows, f32); break;
+                case C_VAR:    put_col_f64 (b, C.varT->data(), nRows, f32); break;
+                case C_PVAL:   put_col_pval(b, *C.pval, nRows, f32); break;
+                case C_PVALNA: put_col_pval(b, *C.pvalNA, nRows, f32); break;
                 case C_ISSPA:  put_col_pod (b, C.isSPAConverge->data(), nRows); break;
-                case C_BETA_C: put_col_pod (b, C.Beta_c->data(), nRows); break;
-                case C_SE_C:   put_col_pod (b, C.seBeta_c->data(), nRows); break;
-                case C_TSTAT_C:put_col_pod (b, C.Tstat_c->data(), nRows); break;
-                case C_VAR_C:  put_col_pod (b, C.varT_c->data(), nRows); break;
-                case C_PVAL_C: put_col_pval(b, *C.pval_c, nRows); break;
-                case C_PVALNA_C: put_col_pval(b, *C.pvalNA_c, nRows); break;
-                case C_AFCASE: put_col_pod (b, C.AF_case->data(), nRows); break;
-                case C_AFCTRL: put_col_pod (b, C.AF_ctrl->data(), nRows); break;
+                case C_BETA_C: put_col_f64 (b, C.Beta_c->data(), nRows, f32); break;
+                case C_SE_C:   put_col_f64 (b, C.seBeta_c->data(), nRows, f32); break;
+                case C_TSTAT_C:put_col_f64 (b, C.Tstat_c->data(), nRows, f32); break;
+                case C_VAR_C:  put_col_f64 (b, C.varT_c->data(), nRows, f32); break;
+                case C_PVAL_C: put_col_pval(b, *C.pval_c, nRows, f32); break;
+                case C_PVALNA_C: put_col_pval(b, *C.pvalNA_c, nRows, f32); break;
+                case C_AFCASE: put_col_f64 (b, C.AF_case->data(), nRows, f32); break;
+                case C_AFCTRL: put_col_f64 (b, C.AF_ctrl->data(), nRows, f32); break;
                 case C_NCASE:  put_col_pod (b, C.N_case->data(), nRows); break;
                 case C_NCTRL:  put_col_pod (b, C.N_ctrl->data(), nRows); break;
-                case C_NCASEHOM: put_col_pod(b, C.N_case_hom->data(), nRows); break;
-                case C_NCASEHET: put_col_pod(b, C.N_case_het->data(), nRows); break;
-                case C_NCTRLHOM: put_col_pod(b, C.N_ctrl_hom->data(), nRows); break;
-                case C_NCTRLHET: put_col_pod(b, C.N_ctrl_het->data(), nRows); break;
+                case C_NCASEHOM: put_col_f64(b, C.N_case_hom->data(), nRows, f32); break;
+                case C_NCASEHET: put_col_f64(b, C.N_case_het->data(), nRows, f32); break;
+                case C_NCTRLHOM: put_col_f64(b, C.N_ctrl_hom->data(), nRows, f32); break;
+                case C_NCTRLHET: put_col_f64(b, C.N_ctrl_het->data(), nRows, f32); break;
                 case C_N:      put_col_pod (b, C.N->data(), nRows); break;
                 default: perr[t] = "unknown column code"; break;
             }

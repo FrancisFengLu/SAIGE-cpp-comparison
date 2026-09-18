@@ -207,6 +207,14 @@ bool g_gpuStep2   = false;
 // only for that path, and a run that asks for it and does not get that path
 // stops with an error rather than quietly writing something else.
 bool g_outputFormatSgs = false;
+// Config key sgsPrecision: "fp64" (default) or "fp32", the on-disk width of the
+// .sgs floating-point columns. fp64 is what the program computed, so sgs2txt
+// reproduces the text byte for byte. fp32 halves those columns and gives that
+// up: the text prints 6-7 significant digits and a float carries ~7.2, so some
+// fields land on the other side of the last printed digit (out_fast.hpp has the
+// measured rates). Only touches the file, never the numbers the run computed or
+// the text a text run writes.
+bool g_sgsF32 = false;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2345,13 +2353,17 @@ bool mainMarkerMTGpu(
     SAIGE::outfast::SgsSink sgs;
     if (g_outputFormatSgs) {
         std::string err;
-        if (!sgs.open(g_traitMeta, t_isImputation, err)) {
+        if (!sgs.open(g_traitMeta, t_isImputation, g_sgsF32, err)) {
             saige::gpu2::destroy(R);
             throw std::runtime_error("outputFormat: sgs: " + err);
         }
-        std::cout << "  outputFormat: sgs -> " << sgs.markerPath()
+        std::cout << "  outputFormat: sgs (" << (g_sgsF32 ? "fp32" : "fp64") << ") -> "
+                  << sgs.markerPath()
                   << " + one <outputFile>.sgs per trait; convert with tools/sgs2txt"
                   << std::endl;
+        if (g_sgsF32)
+            std::cout << "  sgsPrecision: fp32 -- sgs2txt output is close to, not "
+                         "identical to, a text run" << std::endl;
     }
 
     const int nThreadsHere = std::max(1, omp_get_max_threads());
@@ -5850,6 +5862,11 @@ int main(int argc, char* argv[])
             std::cerr << "                     plus one shared <first outputFile>.markers.sgs;" << std::endl;
             std::cerr << "                     tools/sgs2txt converts them back to the exact text." << std::endl;
             std::cerr << "                     GPU multi-trait path only." << std::endl;
+            std::cerr << "  sgsPrecision:      fp64 (default) or fp32, the width of the .sgs" << std::endl;
+            std::cerr << "                     floating-point columns. fp64 round-trips to the" << std::endl;
+            std::cerr << "                     exact text; fp32 halves those columns and does" << std::endl;
+            std::cerr << "                     not (a small fraction of fields change their last" << std::endl;
+            std::cerr << "                     printed digit). outputFormat: sgs only." << std::endl;
             std::cerr << std::endl;
             std::cerr << "LD matrix generation (requires groupFile):" << std::endl;
             std::cerr << "  isLDMatrix:        true/false (default: false)" << std::endl;
@@ -6021,6 +6038,17 @@ int main(int argc, char* argv[])
             else if (of == "sgs")  g_outputFormatSgs = true;
             else throw std::runtime_error(
                 "outputFormat must be text or sgs, not '" + of + "'");
+        }
+        if (config["sgsPrecision"]) {
+            const std::string sp = config["sgsPrecision"].as<std::string>();
+            if      (sp == "fp64") g_sgsF32 = false;
+            else if (sp == "fp32") g_sgsF32 = true;
+            else throw std::runtime_error(
+                "sgsPrecision must be fp64 or fp32, not '" + sp + "'");
+            if (g_sgsF32 && !g_outputFormatSgs)
+                throw std::runtime_error(
+                    "sgsPrecision: fp32 needs outputFormat: sgs; the text writer always "
+                    "formats the doubles the run computed");
         }
         if (config["gpuDevice"]) g_gpuDevice = config["gpuDevice"].as<int>();
         if (config["gpuBlockSize"]) {

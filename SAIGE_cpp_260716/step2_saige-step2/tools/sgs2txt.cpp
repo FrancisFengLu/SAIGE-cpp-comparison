@@ -12,6 +12,11 @@
 // coincidence: the only question the round-trip test answers is whether the
 // values survived the trip, and they do (sgs_format.hpp explains the one place
 // that needed an argument, the p-value strings).
+//
+// A file written under sgsPrecision: fp32 is read by the same code -- the
+// encoding byte carries the width -- but its values did NOT survive the trip
+// intact, so its text is close to, not identical to, the original. The
+// converter says so on stderr rather than leaving it to be discovered.
 
 #include <cerrno>
 #include <cstdio>
@@ -65,6 +70,31 @@ static void get_col_pod(Reader& r, std::vector<T>& v, size_t n) {
     } else { r.bad = true; }
 }
 
+// A column the writer held as double, stored at either width.
+static void get_col_f64(Reader& r, std::vector<double>& v, size_t n) {
+    v.assign(n, 0.0);
+    uint8_t e = r.u8();
+    if (e == E_CONST) {
+        const uint8_t* q = r.take(sizeof(double));
+        if (!q) return;
+        double x; memcpy(&x, q, sizeof(double));
+        for (size_t i = 0; i < n; i++) v[i] = x;
+    } else if (e == E_RAW) {
+        const uint8_t* q = r.take(n * sizeof(double));
+        if (q) memcpy(v.data(), q, n * sizeof(double));
+    } else if (e == E_CONST32) {
+        const uint8_t* q = r.take(sizeof(float));
+        if (!q) return;
+        float x; memcpy(&x, q, sizeof(float));
+        for (size_t i = 0; i < n; i++) v[i] = (double)x;
+    } else if (e == E_RAW32) {
+        const uint8_t* q = r.take(n * sizeof(float));
+        if (!q) return;
+        const float* f = (const float*)(const void*)q;
+        for (size_t i = 0; i < n; i++) v[i] = (double)f[i];
+    } else { r.bad = true; }
+}
+
 static void get_col_str(Reader& r, std::vector<std::string>& v, size_t n) {
     v.assign(n, std::string());
     uint8_t e = r.u8();
@@ -79,14 +109,16 @@ static void get_col_str(Reader& r, std::vector<std::string>& v, size_t n) {
 static void get_col_pval(Reader& r, std::vector<std::string>& v, size_t n) {
     v.assign(n, std::string());
     uint8_t e = r.u8();
-    if (e != E_PVAL) { r.bad = true; return; }
-    const uint8_t* q = r.take(n * sizeof(double));
+    if (e != E_PVAL && e != E_PVAL32) { r.bad = true; return; }
+    const size_t w = (e == E_PVAL) ? sizeof(double) : sizeof(float);
+    const uint8_t* q = r.take(n * w);
     if (!q) return;
-    const double* d = (const double*)(const void*)q;
+    const double* d = (e == E_PVAL) ? (const double*)(const void*)q : nullptr;
+    const float*  f = (e == E_PVAL) ? nullptr : (const float*)(const void*)q;
     char b[64];
     for (size_t i = 0; i < n; i++) {
         // The very sprintf that produced the string in score_format.hpp.
-        snprintf(b, sizeof(b), "%.6E", d[i]);
+        snprintf(b, sizeof(b), "%.6E", d ? d[i] : (double)f[i]);
         v[i].assign(b);
     }
     uint32_t nexc = r.u32();
@@ -110,7 +142,7 @@ static bool read_marker_block(Reader& r, MarkerBlock& B) {
     const size_t n = B.nRows;
     get_col_str(r, B.chr, n); get_col_str(r, B.pos, n); get_col_str(r, B.mid, n);
     get_col_str(r, B.ref, n); get_col_str(r, B.alt, n);
-    get_col_pod(r, B.ac, n);  get_col_pod(r, B.af, n);  get_col_pod(r, B.info, n);
+    get_col_f64(r, B.ac, n);  get_col_f64(r, B.af, n);  get_col_f64(r, B.info, n);
     return !r.bad;
 }
 
@@ -180,8 +212,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         uint32_t ver = r.u32();
-        isImputation = (r.u32() & 1u) != 0;
+        const uint32_t hf = r.u32();
+        isImputation = (hf & H_IMPUTATION) != 0;
         if (ver != VERSION) { fprintf(stderr, "marker file version %u, expected %u\n", ver, VERSION); return 1; }
+        if (hf & H_F32)
+            fprintf(stderr, "note: %s was written with sgsPrecision: fp32; the text this "
+                            "produces is NOT byte-identical to a text run\n", markerPath.c_str());
         while (!r.bad && (size_t)(r.end - r.p) > 4) {
             uint32_t peek; memcpy(&peek, r.p, 4);
             if (peek == END_MAGIC) break;
@@ -258,33 +294,33 @@ int main(int argc, char** argv) {
                 if (q) memcpy(present.data(), q, n);
             }
             ac = MB.ac; af = MB.af; info = MB.info;
-            if (flags & F_OVERRIDE_AC)   get_col_pod(r, ac, n);
-            if (flags & F_OVERRIDE_AF)   get_col_pod(r, af, n);
-            if (flags & F_OVERRIDE_MISS) get_col_pod(r, info, n);
+            if (flags & F_OVERRIDE_AC)   get_col_f64(r, ac, n);
+            if (flags & F_OVERRIDE_AF)   get_col_f64(r, af, n);
+            if (flags & F_OVERRIDE_MISS) get_col_f64(r, info, n);
 
             for (uint32_t i = 0; i < nc; i++) {
                 switch (cols[i]) {
-                    case C_BETA:   get_col_pod (r, Beta, n); break;
-                    case C_SE:     get_col_pod (r, seBeta, n); break;
-                    case C_TSTAT:  get_col_pod (r, Tstat, n); break;
-                    case C_VAR:    get_col_pod (r, varT, n); break;
+                    case C_BETA:   get_col_f64 (r, Beta, n); break;
+                    case C_SE:     get_col_f64 (r, seBeta, n); break;
+                    case C_TSTAT:  get_col_f64 (r, Tstat, n); break;
+                    case C_VAR:    get_col_f64 (r, varT, n); break;
                     case C_PVAL:   get_col_pval(r, pval, n); break;
                     case C_PVALNA: get_col_pval(r, pvalNA, n); break;
                     case C_ISSPA:  get_col_pod (r, isSPA, n); break;
-                    case C_BETA_C: get_col_pod (r, Beta_c, n); break;
-                    case C_SE_C:   get_col_pod (r, seBeta_c, n); break;
-                    case C_TSTAT_C:get_col_pod (r, Tstat_c, n); break;
-                    case C_VAR_C:  get_col_pod (r, varT_c, n); break;
+                    case C_BETA_C: get_col_f64 (r, Beta_c, n); break;
+                    case C_SE_C:   get_col_f64 (r, seBeta_c, n); break;
+                    case C_TSTAT_C:get_col_f64 (r, Tstat_c, n); break;
+                    case C_VAR_C:  get_col_f64 (r, varT_c, n); break;
                     case C_PVAL_C: get_col_pval(r, pval_c, n); break;
                     case C_PVALNA_C: get_col_pval(r, pvalNA_c, n); break;
-                    case C_AFCASE: get_col_pod (r, AF_case, n); break;
-                    case C_AFCTRL: get_col_pod (r, AF_ctrl, n); break;
+                    case C_AFCASE: get_col_f64 (r, AF_case, n); break;
+                    case C_AFCTRL: get_col_f64 (r, AF_ctrl, n); break;
                     case C_NCASE:  get_col_pod (r, N_case, n); break;
                     case C_NCTRL:  get_col_pod (r, N_ctrl, n); break;
-                    case C_NCASEHOM: get_col_pod(r, Nch, n); break;
-                    case C_NCASEHET: get_col_pod(r, Nche, n); break;
-                    case C_NCTRLHOM: get_col_pod(r, Ncth, n); break;
-                    case C_NCTRLHET: get_col_pod(r, Nctt, n); break;
+                    case C_NCASEHOM: get_col_f64(r, Nch, n); break;
+                    case C_NCASEHET: get_col_f64(r, Nche, n); break;
+                    case C_NCTRLHOM: get_col_f64(r, Ncth, n); break;
+                    case C_NCTRLHET: get_col_f64(r, Nctt, n); break;
                     case C_N:      get_col_pod (r, N, n); break;
                     default: fprintf(stderr, "%s: unknown column code %u\n", in.c_str(), cols[i]); ok = false;
                 }

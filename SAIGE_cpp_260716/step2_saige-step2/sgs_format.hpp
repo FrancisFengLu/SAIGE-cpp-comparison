@@ -23,6 +23,15 @@
 // verbatim in a per-block exception list. So the text is reproducible byte for
 // byte, which tools/sgs2txt verifies with cmp.
 //
+// sgsPrecision: fp32 halves every floating-point column instead (E_RAW32 /
+// E_CONST32 / E_PVAL32) and GIVES THAT GUARANTEE UP. A float carries ~7.2
+// decimal digits, the text prints 6 ("%.6g") or 7 ("%.6E"), and the narrowing
+// moves a value across the last printed digit's rounding boundary often enough
+// to matter -- the measured rates are in out_fast.hpp. The integer and flag
+// columns (N, N_case, N_ctrl, Is.SPA) are untouched either way. The
+// encoding byte says which width a column is, so one reader handles both and
+// files written before the option existed still read. Default is fp64.
+//
 // Little-endian, and the reader checks that. No attempt at cross-endian
 // portability: this is a scratch format for one machine's pipeline.
 
@@ -53,11 +62,22 @@ enum ColCode : uint8_t {
     C_N
 };
 
-// Column encodings.
+// Column encodings. The 32-bit forms appear only under sgsPrecision: fp32, and
+// only for columns the program computed as double; uint32 and flag columns keep
+// their own width.
 enum Enc : uint8_t {
-    E_RAW   = 0,   // nRows values back to back
-    E_CONST = 1,   // one value, repeated
-    E_PVAL  = 2    // f64[nRows] + exception list (see above)
+    E_RAW     = 0,   // nRows values back to back
+    E_CONST   = 1,   // one value, repeated
+    E_PVAL    = 2,   // f64[nRows] + exception list (see above)
+    E_RAW32   = 3,   // nRows floats
+    E_CONST32 = 4,   // one float, repeated
+    E_PVAL32  = 5    // f32[nRows] + exception list
+};
+
+// Header flag bits (the u32 after VERSION in both file kinds).
+enum HdrFlag : uint32_t {
+    H_IMPUTATION = 1u << 0,   // the info column is imputationInfo, not MissingRate
+    H_F32        = 1u << 1    // floating-point columns stored as float
 };
 
 // Block flag bits.
@@ -76,6 +96,7 @@ inline void put_u8 (std::string& b, uint8_t  v) { b.push_back((char)v); }
 inline void put_u32(std::string& b, uint32_t v) { put_bytes(b, &v, 4); }
 inline void put_u64(std::string& b, uint64_t v) { put_bytes(b, &v, 8); }
 inline void put_f64(std::string& b, double   v) { put_bytes(b, &v, 8); }
+inline void put_f32(std::string& b, float    v) { put_bytes(b, &v, 4); }
 inline void put_str(std::string& b, const std::string& s) {
     put_u32(b, (uint32_t)s.size());
     b.append(s);
@@ -108,6 +129,7 @@ struct Reader {
     uint32_t u32() { const uint8_t* q = take(4); uint32_t v = 0; if (q) std::memcpy(&v, q, 4); return v; }
     uint64_t u64() { const uint8_t* q = take(8); uint64_t v = 0; if (q) std::memcpy(&v, q, 8); return v; }
     double   f64() { const uint8_t* q = take(8); double   v = 0; if (q) std::memcpy(&v, q, 8); return v; }
+    float    f32() { const uint8_t* q = take(4); float    v = 0; if (q) std::memcpy(&v, q, 4); return v; }
     std::string str() {
         uint32_t n = u32(); const uint8_t* q = take(n);
         return q ? std::string((const char*)q, n) : std::string();
