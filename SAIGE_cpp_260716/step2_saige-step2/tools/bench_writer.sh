@@ -2,13 +2,13 @@
 # Writer re-measure: the same P sweep as bench2.sh (10^6 markers x 50,000
 # samples, quantitative, GPU path) with the new writer.
 #   gtxt_P*  GPU, text output, fast formatter + per-trait parallel write
-# (copy of logs/gpu_step2/writer/bench3.sh; the run it produced is recorded in
-# out_fast.hpp. bench_writer_walltimes.sh pulls the real wall times out of the
-# /usr/bin/time -v files, because this script prints min_wall=0s -- its awk
-# splits the "Elapsed (wall clock) time (h:mm:ss or m:ss): M:SS" line on the
-# wrong separator. bench2.sh had the same bug.)
 #   gsgs_P*  GPU, outputFormat: sgs, then sgs2txt and cmp against gtxt
 # One timed job at a time; page cache dropped before every run.
+#
+# The run this produced is recorded in out_fast.hpp. Read the wall times with
+# bench_writer_walltimes.sh, not from this script's own RESULT lines: the awk
+# below splits the "Elapsed (wall clock) time (h:mm:ss or m:ss): M:SS" line on
+# the wrong separator and always prints min_wall=0s. bench2.sh had the same bug.
 set -u
 BIN=/opt/saige/SAIGE-cpp-comparison/SAIGE_cpp_260716/step2_saige-step2/saige-step2.cuda
 CVT=/opt/saige/SAIGE-cpp-comparison/SAIGE_cpp_260716/step2_saige-step2/tools/sgs2txt
