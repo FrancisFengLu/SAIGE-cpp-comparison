@@ -56,6 +56,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "genotype_reader.hpp"
 #include "saige_test.hpp"
 #include "saige_mt.hpp"
+#include "out_fast.hpp"
 #include "gpu_step2.hpp"
 #include "UTIL.hpp"
 #include "cct.hpp"
@@ -197,6 +198,15 @@ double g_mtMemBudgetGB = 1.5;
 // dispatch below is unchanged. A build without USE_CUDA=1 links the stub, so
 // even useGPU: true then prints a refusal and runs on the CPU.
 bool g_gpuStep2   = false;
+
+// Config key outputFormat: "text" (default) or "sgs". OFF means every byte of
+// every output file is what it always was. ON switches the GPU multi-trait
+// path to the binary columnar format described in sgs_format.hpp, which stores
+// the per-marker columns once instead of once per trait and never formats a
+// number; tools/sgs2txt converts it back to the exact text. It is implemented
+// only for that path, and a run that asks for it and does not get that path
+// stops with an error rather than quietly writing something else.
+bool g_outputFormatSgs = false;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -612,6 +622,9 @@ bool openOutfile_single(std::ofstream& OutFile_single,
     const std::string& t_traitType   = t_meta.traitType;
     const bool         t_isMoreOutput = t_meta.isMoreOutput;
     bool isopen;
+    // outputFormat: sgs writes <outFile>.sgs instead; creating a header-only
+    // text file next to it would look like a finished empty result.
+    if (g_outputFormatSgs) return true;
     if (!isappend) {
         OutFile_single.open(t_meta.outFile.c_str());
         isopen = OutFile_single.is_open();
@@ -712,91 +725,47 @@ void writeOutfile_single(std::ofstream& OutFile_single,
     const bool         t_isMoreOutput = t_meta.isMoreOutput;
     const bool         t_isCondition  = t_meta.isCondition;
     const std::string& t_traitType    = t_meta.traitType;
-    int numtest = 0;
-    for (unsigned int k = 0; k < pvalVec.size(); k++) {
-        if (pvalVec.at(k) != "NA") {
-            numtest = numtest + 1;
-            OutFile_single << chrVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << posVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << markerVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << refVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << altVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << altCountsVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << altFreqVec.at(k);
-            OutFile_single << "\t";
-
-            if (t_isImputation) {
-                OutFile_single << imputationInfoVec.at(k);
-                OutFile_single << "\t";
-            } else {
-                OutFile_single << missingRateVec.at(k);
-                OutFile_single << "\t";
-            }
-            OutFile_single << BetaVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << seBetaVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << TstatVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << varTVec.at(k);
-            OutFile_single << "\t";
-            OutFile_single << pvalVec.at(k);
-            OutFile_single << "\t";
-
-            if (t_traitType == "binary" || t_traitType == "survival") {
-                OutFile_single << pvalNAVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << std::boolalpha << isSPAConvergeVec.at(k);
-                OutFile_single << "\t";
-            }
-            if (t_isCondition) {
-                OutFile_single << Beta_cVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << seBeta_cVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << Tstat_cVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << varT_cVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << pval_cVec.at(k);
-                OutFile_single << "\t";
-                if (t_traitType == "binary" || t_traitType == "survival") {
-                    OutFile_single << pvalNA_cVec.at(k);
-                    OutFile_single << "\t";
-                }
-            }
-            if (t_traitType == "binary" || t_traitType == "survival") {
-                OutFile_single << AF_caseVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << AF_ctrlVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << N_caseVec.at(k);
-                OutFile_single << "\t";
-                OutFile_single << N_ctrlVec.at(k);
-
-                if (t_isMoreOutput) {
-                    OutFile_single << "\t";
-                    OutFile_single << N_case_homVec.at(k);
-                    OutFile_single << "\t";
-                    OutFile_single << N_case_hetVec.at(k);
-                    OutFile_single << "\t";
-                    OutFile_single << N_ctrl_homVec.at(k);
-                    OutFile_single << "\t";
-                    OutFile_single << N_ctrl_hetVec.at(k);
-                }
-                OutFile_single << "\n";
-            } else if (t_traitType == "quantitative") {
-                OutFile_single << N_Vec.at(k);
-                OutFile_single << "\n";
-            }
-        }
+    // Fast path (2026-09-18). The rows below used to go out as ~14
+    // operator<< per row, which a microbenchmark on one real 1M-row output
+    // file put at 3.905 s of which only 0.13 s was disk -- 96% was
+    // number-to-string formatting inside the stream. They are now formatted
+    // into one buffer and handed to the stream as a single write(). Not one
+    // output byte changes: libstdc++'s num_put for double is vsnprintf with
+    // "%.*g" in the C locale, so snprintf("%.6g") reproduces `stream <<
+    // double` exactly (out_fast.hpp).
+    SAIGE::outfast::MarkerCols OM;
+    OM.chr = &chrVec; OM.pos = &posVec; OM.mid = &markerVec;
+    OM.ref = &refVec; OM.alt = &altVec;
+    SAIGE::outfast::TraitCols OT;
+    OT.altCounts = &altCountsVec;   OT.altFreq  = &altFreqVec;
+    OT.imputeInfo = &imputationInfoVec; OT.missingRate = &missingRateVec;
+    OT.Beta = &BetaVec; OT.seBeta = &seBetaVec; OT.Tstat = &TstatVec; OT.varT = &varTVec;
+    OT.pval = &pvalVec; OT.pvalNA = &pvalNAVec;
+    OT.Beta_c = &Beta_cVec; OT.seBeta_c = &seBeta_cVec;
+    OT.Tstat_c = &Tstat_cVec; OT.varT_c = &varT_cVec;
+    OT.pval_c = &pval_cVec; OT.pvalNA_c = &pvalNA_cVec;
+    OT.AF_case = &AF_caseVec; OT.AF_ctrl = &AF_ctrlVec;
+    OT.N_case = &N_caseVec;   OT.N_ctrl = &N_ctrlVec;
+    OT.N_case_hom = &N_case_homVec; OT.N_ctrl_het = &N_ctrl_hetVec;
+    OT.N_case_het = &N_case_hetVec; OT.N_ctrl_hom = &N_ctrl_homVec;
+    OT.N = &N_Vec;
+    std::vector<char> spaChar;
+    if (t_traitType == "binary" || t_traitType == "survival") {
+        spaChar.resize(isSPAConvergeVec.size());
+        for (std::size_t i = 0; i < isSPAConvergeVec.size(); i++)
+            spaChar[i] = isSPAConvergeVec[i] ? 1 : 0;
+        OT.isSPAConverge = &spaChar;
     }
+    // thread_local: the multi-trait call sites write the P traits in parallel.
+    thread_local std::string rowbuf;
+    rowbuf.clear();
+    if (rowbuf.capacity() < (std::size_t)(4u << 20)) rowbuf.reserve((std::size_t)(4u << 20));
+    int numtest = SAIGE::outfast::format_text(rowbuf, t_meta, t_isImputation,
+                                              OM, OT, pvalVec.size());
+    if (!rowbuf.empty())
+        OutFile_single.write(rowbuf.data(), (std::streamsize)rowbuf.size());
+    (void)t_isMoreOutput; (void)t_isCondition;
+
     if (t_numtestOut) *t_numtestOut = numtest;
     if (!t_printSummary) return;
     std::cout << numtest << " markers were tested." << std::endl;
@@ -2283,6 +2252,11 @@ bool mainMarkerMTGpu(
         { /* why already set by available() */ }
 
     if (!why.empty()) {
+        if (g_outputFormatSgs)
+            throw std::runtime_error(
+                "outputFormat: sgs is implemented only for the GPU multi-trait path, and "
+                "this run does not take it (" + why + "). Re-run with outputFormat: text, "
+                "or fix the reason the GPU path refused.");
         std::cout << "  useGPU: refused, running on the CPU (" << why << ")" << std::endl;
         return false;
     }
@@ -2362,6 +2336,23 @@ bool mainMarkerMTGpu(
     // -- phases 1 and 3 are measured around their parallel regions, so they
     // include the barriers.
     double tRead = 0, tGpu = 0, tFin = 0, tWrite = 0;
+
+    // The P per-trait files are independent, so they are written in parallel.
+    // Bounded by P: more threads than traits only adds barriers.
+    const int nWriteThreads = std::max(1, std::min(P, omp_get_max_threads()));
+
+    // outputFormat: sgs. Opened here so a bad path fails before any compute.
+    SAIGE::outfast::SgsSink sgs;
+    if (g_outputFormatSgs) {
+        std::string err;
+        if (!sgs.open(g_traitMeta, t_isImputation, err)) {
+            saige::gpu2::destroy(R);
+            throw std::runtime_error("outputFormat: sgs: " + err);
+        }
+        std::cout << "  outputFormat: sgs -> " << sgs.markerPath()
+                  << " + one <outputFile>.sgs per trait; convert with tools/sgs2txt"
+                  << std::endl;
+    }
 
     const int nThreadsHere = std::max(1, omp_get_max_threads());
     std::vector<MTBlockWork> work(nThreadsHere);
@@ -2720,8 +2711,42 @@ bool mainMarkerMTGpu(
             tFin += omp_get_wtime() - t0;
         }  // superblock
 
-        // ---- write this chunk's rows, one file per trait (serial) ----
+        // ---- write this chunk's rows, one file per trait ----
+        // The traits are independent files, so they go out in parallel; at
+        // P=128 this stage used to be 84% of the whole run (out_fast.hpp).
         const double tw = omp_get_wtime();
+        if (g_outputFormatSgs) {
+            SAIGE::outfast::MarkerCols MC;
+            MC.chr = &chrVec; MC.pos = &posVec; MC.mid = &markerVec;
+            MC.ref = &refVec; MC.alt = &altVec;
+            std::vector<SAIGE::outfast::TraitCols> TC(P);
+            for (int t = 0; t < P; t++) {
+                MTTraitChunk& O = out[t];
+                SAIGE::outfast::TraitCols& C = TC[t];
+                C.altCounts = &O.altCounts; C.altFreq = &O.altFreq;
+                C.imputeInfo = &O.imputeInfo; C.missingRate = &O.missingRate;
+                C.Beta = &O.Beta; C.seBeta = &O.seBeta;
+                C.Tstat = &O.Tstat; C.varT = &O.varT;
+                C.pval = &O.pval; C.pvalNA = &O.pvalNA;
+                C.isSPAConverge = &O.isSPAConverge;
+                C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
+                C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
+                C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
+                C.AF_case = &O.AF_case; C.AF_ctrl = &O.AF_ctrl;
+                C.N_case = &O.N_case; C.N_ctrl = &O.N_ctrl;
+                C.N_case_hom = &O.N_case_hom; C.N_ctrl_het = &O.N_ctrl_het;
+                C.N_case_het = &O.N_case_het; C.N_ctrl_hom = &O.N_ctrl_hom;
+                C.N = &O.N;
+            }
+            std::vector<int> ntSgs;
+            std::string err;
+            if (!sgs.writeChunk(MC, TC, out[0].pval.size(), nWriteThreads,
+                                ntSgs, err))
+                throw std::runtime_error("outputFormat: sgs: " + err);
+            for (int t = 0; t < P; t++) numtestTotal[t] += ntSgs[t];
+        } else {
+        std::vector<int> ntChunk(P, 0);
+#pragma omp parallel for schedule(dynamic) num_threads(nWriteThreads)
         for (int t = 0; t < P; t++) {
             MTTraitChunk& O = out[t];
             std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
@@ -2745,9 +2770,11 @@ bool mainMarkerMTGpu(
                                 O.N,
                                 /*printSummary*/ false,
                                 &numtestChunk);
-            numtestTotal[t] += numtestChunk;
+            ntChunk[t] = numtestChunk;
         }
+        for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
         for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+        }
         tWrite += omp_get_wtime() - tw;
     }  // chunk
 
@@ -2773,6 +2800,15 @@ bool mainMarkerMTGpu(
                   << " carried a marker ("
                   << (100.0 * (double)nSlotsUsed / (double)nSlotsTotal)
                   << "%; the rest are QC failures and block tails)" << std::endl;
+    }
+    if (g_outputFormatSgs) {
+        std::string err;
+        const double tc = omp_get_wtime();
+        if (!sgs.close(err)) throw std::runtime_error("outputFormat: sgs: " + err);
+        tWrite += omp_get_wtime() - tc;
+        std::cout << "  outputFormat: sgs wrote " << sgs.bytesWritten()
+                  << " bytes (" << (double)sgs.bytesWritten() / 1e9 << " GB)"
+                  << std::endl;
     }
     std::cout << "  [gpu breakdown] read+QC+stage " << tRead << " s, device call "
               << tGpu << " s, tail+finalize " << tFin << " s, output write "
@@ -5807,6 +5843,13 @@ int main(int argc, char* argv[])
             std::cerr << "  gpuDevice:         CUDA device index (default: 0)" << std::endl;
             std::cerr << "  gpuBlockSize:      markers per device batch (default: 16384)" << std::endl;
             std::cerr << "  gpuPrecision:      fp64 (default) or fp32" << std::endl;
+            std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
+            std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
+            std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
+            std::cerr << "                     no number formatting at all. Writes <outputFile>.sgs" << std::endl;
+            std::cerr << "                     plus one shared <first outputFile>.markers.sgs;" << std::endl;
+            std::cerr << "                     tools/sgs2txt converts them back to the exact text." << std::endl;
+            std::cerr << "                     GPU multi-trait path only." << std::endl;
             std::cerr << std::endl;
             std::cerr << "LD matrix generation (requires groupFile):" << std::endl;
             std::cerr << "  isLDMatrix:        true/false (default: false)" << std::endl;
@@ -5972,6 +6015,13 @@ int main(int argc, char* argv[])
         // why, unless every trait is quantitative and batchable, the input is
         // PLINK, the models share one sample list, and a device is present.
         g_gpuStep2 = config["useGPU"] ? config["useGPU"].as<bool>() : false;
+        if (config["outputFormat"]) {
+            const std::string of = config["outputFormat"].as<std::string>();
+            if      (of == "text") g_outputFormatSgs = false;
+            else if (of == "sgs")  g_outputFormatSgs = true;
+            else throw std::runtime_error(
+                "outputFormat must be text or sgs, not '" + of + "'");
+        }
         if (config["gpuDevice"]) g_gpuDevice = config["gpuDevice"].as<int>();
         if (config["gpuBlockSize"]) {
             g_gpuBlockSize = config["gpuBlockSize"].as<int>();

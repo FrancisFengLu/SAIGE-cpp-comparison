@@ -143,7 +143,13 @@ DEPS    := $(OBJECTS:.o=.d)
 
 TARGET  ?= saige-step2
 
-all: $(TARGET)
+all: $(TARGET) tools/sgs2txt
+
+# sgs2txt converts `outputFormat: sgs` output back to the exact text file.
+# It links the very out_fast.o the step-2 binary uses, so the rows it emits
+# come out of the same format_text().
+tools/sgs2txt: tools/sgs2txt.cpp out_fast.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/sgs2txt.cpp out_fast.o $(LIBS) -o $@
 
 $(TARGET): $(OBJECTS) $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
@@ -155,7 +161,7 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET)
+	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml
