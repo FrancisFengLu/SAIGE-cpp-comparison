@@ -64,6 +64,12 @@ CASES = {
     # reset_step1_state_for_new_sample_set()
     "fu_qt_mt":    dict(pheno=QT_PHENO, ys=["sq1", "sq2"], trait="quantitative",
                         fit=SPARSE, fused=dict(fused_vr_markers=10), expect="on"),
+    # forces the "keep delta" branch (z = 0 makes any |delta-1| > 0 significant),
+    # which the data itself never triggers: the written ratio must then be the
+    # sampled bin mean, not the anchor.
+    "fu_qt_keep":  dict(pheno=QT_PHENO, y="sq1", trait="quantitative",
+                        fit=SPARSE, fused=dict(fused_vr_markers=10, fused_vr_delta_z=0.0),
+                        expect="on", needs=["keep delta (bin differs from the anchor)"]),
     # combined with the other new flag
     "fu_qt_sel":   dict(pheno=QT_PHENO, y="sq1", trait="quantitative",
                         fit=dict(SPARSE, selective_geno_load=True),

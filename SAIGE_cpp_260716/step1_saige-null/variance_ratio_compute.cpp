@@ -699,6 +699,11 @@ void compute_variance_ratio(const Paths& paths,
         // mirror to legacy single-bin ratioCV for log compatibility
         ratioCV = 0.0f;
         for (int b = 0; b < numBins; ++b) ratioCV = std::max(ratioCV, ratioCV_per_bin[b]);
+        // In fused mode ratioCV_per_bin holds se(delta)/delta, which is on a
+        // different scale from ratioCVcutoff; drive the outer loop off
+        // all_converged alone so a small fused_vr_delta_se cannot make the
+        // while condition exit behind a bin that still wants markers.
+        if (fused_on) ratioCV = all_converged ? 0.0f : 1.0f;
 
         if (all_converged) {
             std::cout << "[VR] All " << numBins << " bin(s) converged.\n";
@@ -754,13 +759,19 @@ void compute_variance_ratio(const Paths& paths,
                 bin_noXadj[b] = fused.anchor_noXadj;
             }
             const std::streamsize oldprec2 = std::cout.precision(10);
-            std::cout << "[fusedVR] Bin " << (b+1) << ": n=" << v.n_elem
-                      << " sampled=" << sampled << " +- " << se
-                      << "  anchor=" << fused.anchor
-                      << "  delta=" << delta << " +- " << dse
-                      << "  -> " << (keep ? "keep delta (bin differs from the anchor)"
-                                          : "delta set to 1 (anchor stands)")
-                      << ", null=" << bin_null[b] << "\n";
+            if (v.n_elem < 2) {
+                std::cout << "[fusedVR] Bin " << (b+1) << ": n=" << v.n_elem
+                          << " -- too few markers to test delta; the anchor stands, null="
+                          << bin_null[b] << "\n";
+            } else {
+                std::cout << "[fusedVR] Bin " << (b+1) << ": n=" << v.n_elem
+                          << " sampled=" << sampled << " +- " << se
+                          << "  anchor=" << fused.anchor
+                          << "  delta=" << delta << " +- " << dse
+                          << "  -> " << (keep ? "keep delta (bin differs from the anchor)"
+                                              : "delta set to 1 (anchor stands)")
+                          << ", null=" << bin_null[b] << "\n";
+            }
             std::cout.precision(oldprec2);
             if (cfg.use_sparse_grm_for_vr && varRatio_sparse_vec_per_bin[b].n_elem == 0)
                 std::cout << "[fusedVR] Bin " << (b+1) << ": WARNING no marker for the "
