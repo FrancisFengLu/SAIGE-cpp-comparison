@@ -76,10 +76,18 @@ int format_text(std::string& buf, const TraitMeta& meta, bool isImputation,
         if (pv == "NA") continue;
         numtest++;
 
-        std::size_t want = 800 + (*M.mid)[k].size() + (*M.ref)[k].size()
-                         + (*M.alt)[k].size() + (*M.chr)[k].size()
-                         + (*M.pos)[k].size() + pv.size();
-        if (cond) want += 64;
+        // Room for every field this row can hold: 21 numeric fields at <= 24
+        // characters plus their tabs fits in 1024, and the variable-length
+        // ones -- the five marker strings and up to four p-value strings --
+        // are added explicitly rather than assumed to be short.
+        std::size_t want = 1024 + (*M.chr)[k].size() + (*M.pos)[k].size()
+                         + (*M.mid)[k].size() + (*M.ref)[k].size()
+                         + (*M.alt)[k].size() + pv.size();
+        if (isBinOrSurv) want += (*T.pvalNA)[k].size();
+        if (cond) {
+            want += (*T.pval_c)[k].size();
+            if (isBinOrSurv) want += (*T.pvalNA_c)[k].size();
+        }
         if (row.size() < want) row.resize(want);
         char* p = row.data();
 

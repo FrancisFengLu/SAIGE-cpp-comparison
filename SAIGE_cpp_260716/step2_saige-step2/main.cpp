@@ -2745,35 +2745,35 @@ bool mainMarkerMTGpu(
                 throw std::runtime_error("outputFormat: sgs: " + err);
             for (int t = 0; t < P; t++) numtestTotal[t] += ntSgs[t];
         } else {
-        std::vector<int> ntChunk(P, 0);
+            std::vector<int> ntChunk(P, 0);
 #pragma omp parallel for schedule(dynamic) num_threads(nWriteThreads)
-        for (int t = 0; t < P; t++) {
-            MTTraitChunk& O = out[t];
-            std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
-            int numtestChunk = 0;
-            writeOutfile_single(g_OutFiles_single[t],
-                                g_traitMeta[t],
-                                t_isImputation,
-                                t_isFirth,
-                                mFirth[t],
-                                mFirthConverge[t],
-                                chrVec, posVec, markerVec, refVec, altVec,
-                                O.altCounts, O.altFreq,
-                                O.imputeInfo, O.missingRate,
-                                O.Beta, O.seBeta, O.Tstat, O.varT,
-                                O.pval, O.pvalNA, spa,
-                                O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
-                                O.pval_c, O.pvalNA_c,
-                                O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
-                                O.N_case_hom, O.N_ctrl_het,
-                                O.N_case_het, O.N_ctrl_hom,
-                                O.N,
-                                /*printSummary*/ false,
-                                &numtestChunk);
-            ntChunk[t] = numtestChunk;
-        }
-        for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
-        for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+            for (int t = 0; t < P; t++) {
+                MTTraitChunk& O = out[t];
+                std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
+                int numtestChunk = 0;
+                writeOutfile_single(g_OutFiles_single[t],
+                                    g_traitMeta[t],
+                                    t_isImputation,
+                                    t_isFirth,
+                                    mFirth[t],
+                                    mFirthConverge[t],
+                                    chrVec, posVec, markerVec, refVec, altVec,
+                                    O.altCounts, O.altFreq,
+                                    O.imputeInfo, O.missingRate,
+                                    O.Beta, O.seBeta, O.Tstat, O.varT,
+                                    O.pval, O.pvalNA, spa,
+                                    O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
+                                    O.pval_c, O.pvalNA_c,
+                                    O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
+                                    O.N_case_hom, O.N_ctrl_het,
+                                    O.N_case_het, O.N_ctrl_hom,
+                                    O.N,
+                                    /*printSummary*/ false,
+                                    &numtestChunk);
+                ntChunk[t] = numtestChunk;
+            }
+            for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
+            for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
         }
         tWrite += omp_get_wtime() - tw;
     }  // chunk
