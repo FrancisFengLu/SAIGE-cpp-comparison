@@ -77,6 +77,27 @@ C++ now supports both solver paths matching R's `getPCG1ofSigmaAndVector`:
 
 Both R and C++ now default to the direct sparse solve. The R test script uses `usePCGwithSparseGRM = FALSE`.
 
+### `selective_geno_load` (step 1, sparse-GRM fit only, default `false`)
+
+With `use_sparse_grm_to_fit: true` the GLMM fit never reads the genotype matrix
+(psi*u goes through the sparse Psi, Sigma^-1 through `gen_spsolve_v4`), so the
+only numerical consumer left is the variance-ratio marker loop — ~1000 drawn
+markers out of every QC-passing marker in the BED. `fit.selective_geno_load:
+true` decodes only those markers.
+
+- The VR draw happens before any BED byte is read and a marker's VR eligibility
+  depends on that marker alone, so the VR pool, the variance ratio, tau and
+  every model artifact are **byte-identical** to the full load.
+- **The one difference: `<out_prefix>.grm_diag.txt` is not written.** It needs
+  every marker and step 2 never reads it. The log says so on every run.
+- Refused, with the reason printed, for any configuration that really needs the
+  matrix (dense fit, no sparse GRM file, `make_sparse_grm_only`, LOCO,
+  `use_pcg_with_sparse_grm` without `diag_one`, scheme-C masking,
+  `num_markers_for_vr: 0`). Anything that reads the main store under the flag
+  throws rather than returning zeros.
+- Gate: `tests/selective_geno/run_ab_gate.sh <saige-null>`.
+  Write-up: `SAIGE-work/optimization/SELECTIVE_GENO_LOAD.md`.
+
 ## Current Status: VALUES MATCH (random vector bypass only)
 
 | Metric | R | C++ (rand bypass) | C++ (both bypass) | C++ (no bypass) |
