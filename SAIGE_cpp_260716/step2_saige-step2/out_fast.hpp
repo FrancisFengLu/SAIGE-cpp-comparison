@@ -33,6 +33,35 @@
 //      back to the text output by tools/sgs2txt, which re-uses format_text()
 //      below, so the round trip is byte-identical by construction.
 //
+// Measured after the change, same sweep as before (10^6 markers x 50,000
+// samples, V100, fp64, page cache dropped before every run, machine otherwise
+// idle; logs/gpu_step2/writer/bench3.out):
+//
+//   output write (s)     P=1    P=8    P=32   P=128
+//     before             4.7   36.5   159.3   614.2
+//     text, this file    3.6    6.4    26.5   106.4
+//     sgs                0.4    0.6     2.8     6.9
+//
+//   end to end (s)       P=1    P=8    P=32   P=128
+//     before            66.5  100.9   238.0   737.0
+//     text              66.6   71.2   109.1   265.6
+//     sgs               66.4   68.1    84.1   165.1
+//     TorchGWAS2 GPU    96.6   99.1   107.6   139.9
+//
+//   output bytes       text -> sgs:  94 -> 72 MB, 752 -> 352 MB,
+//                      3.01 -> 1.31 GB, 12.03 -> 5.15 GB (2.33x at P=128)
+//
+// Round trip verified by tools/sgs2txt + cmp at every P: 128 traits x 1,000,000
+// markers = 128,000,000 rows byte-identical at P=128, and on a file with 2%
+// missing calls plus 50 markers over maxMissRate so the QC-dropped rows are
+// exercised too.
+//
+// What is left at P=128 with sgs: 33.9 s before the main loop (28.7 s of it
+// reading the 128 null models), 50.9 s read+QC+stage (the 12.5 GB .bed at the
+// disk's ~207 MB/s), 40.5 s tail+finalize (the per-pair p-value formatting and
+// chi-square tail), 20.0 s on the device, 6.9 s writing. The writer is no
+// longer the thing to fix.
+//
 // Rejected after measuring: zstd on the f64 columns (1.17x, 1.29x with a byte
 // shuffle -- not worth the CPU), and a hand-rolled %g (the text path is disk
 // bound once the traits are written in parallel, so a faster formatter buys
