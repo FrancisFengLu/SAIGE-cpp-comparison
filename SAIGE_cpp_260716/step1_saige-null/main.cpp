@@ -253,6 +253,12 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("diag_one")) c.isDiagofKinSetAsOne = get("diag_one").as<bool>();
   if (get("use_pcg_with_sparse_grm")) c.use_pcg_with_sparse_grm = get("use_pcg_with_sparse_grm").as<bool>();
   if (get("selective_geno_load")) c.selective_geno_load = get("selective_geno_load").as<bool>();
+  if (get("fused_variance_ratio")) c.fused_variance_ratio = get("fused_variance_ratio").as<bool>();
+  if (get("fused_vr_markers"))     c.fused_vr_markers     = get("fused_vr_markers").as<int>();
+  if (get("fused_vr_max_markers")) c.fused_vr_max_markers = get("fused_vr_max_markers").as<int>();
+  if (get("fused_vr_delta_se"))    c.fused_vr_delta_se    = get("fused_vr_delta_se").as<double>();
+  if (get("fused_vr_delta_z"))     c.fused_vr_delta_z     = get("fused_vr_delta_z").as<double>();
+  if (get("fused_vr_max_block"))   c.fused_vr_max_block   = get("fused_vr_max_block").as<int>();
   if (get("multi_lockstep")) c.multi_lockstep = get("multi_lockstep").as<bool>();
   if (get("mask_missing")) c.mask_missing = get("mask_missing").as<bool>();
   if (get("mask_min_coverage")) c.mask_min_coverage = get("mask_min_coverage").as<double>();

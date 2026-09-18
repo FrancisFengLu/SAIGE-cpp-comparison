@@ -23,6 +23,7 @@
 #include "variance_ratio_compute.hpp"
 #include "SAIGE_step1_fast.hpp"
 #include "score.hpp"
+#include "fused_variance_ratio.hpp"
 #include <fstream>
 #include <cstdlib>
 #include <iostream>
@@ -85,7 +86,7 @@ void compute_variance_ratio(const Paths& paths,
 
     const int n = design.n;
     const int p = design.p;
-    const int numMarkers_default = cfg.num_markers_for_vr;  // default 30
+    int numMarkers_default = cfg.num_markers_for_vr;  // default 30 (lowered below when the fused anchor is on)
     const float tolPCG = static_cast<float>(cfg.tolPCG);
     const int maxiterPCG = cfg.maxiterPCG;
     const double ratioCVcutoff = cfg.ratio_cv_cutoff;
@@ -163,6 +164,73 @@ void compute_variance_ratio(const Paths& paths,
     std::cout << "[VR] W[0:5]: ";
     for (int i = 0; i < std::min(5, n); ++i) std::cout << W(i) << " ";
     std::cout << "\n";
+
+    // ---------------- fused variance ratio: the closed-form anchor ------------
+    // fit.fused_variance_ratio. The per-bin ratio is anchored on the EXACT
+    // closed form anchor = tr(P Psi)/tr((I-H) Psi) and markers are spent only on
+    // testing the per-bin correction delta = mean(ratio)/anchor against 1.
+    // Every gate below names a reason the closed form would not describe what
+    // the sampled ratio measures; when one fires the flag is ignored out loud
+    // and the ordinary sampled path runs unchanged.
+    FusedVrAnchor fused;
+    bool fused_on = false;
+    if (cfg.fused_variance_ratio) {
+        std::string why;
+        if (is_binary)
+            why = "the trait is binary -- var2 carries the working weights "
+                  "mu(1-mu), so the closed-form denominator is neither tr(Psi) "
+                  "nor tr(I); that case has not been derived or measured";
+        else if (cfg.trait != "quantitative")
+            why = "fit.trait is '" + cfg.trait + "'; only quantitative is derived";
+        else if (!cfg.use_sparse_grm_to_fit)
+            why = "fit.use_sparse_grm_to_fit is off -- with a dense GRM tr(P Psi) "
+                  "is O(N^2) and Sigma is not block diagonal, so no trace here is exact";
+        else if (!get_isUseSparseSigmaforModelFitting())
+            why = "the sparse Sigma was not installed for the model fit";
+        else if (cfg.use_sparse_grm_for_vr && cfg.fused_vr_markers <= 0)
+            why = "fit.use_sparse_grm_for_vr needs the per-marker sparse row, which "
+                  "has no closed form here, but fit.fused_vr_markers is 0";
+        if (why.empty()) {
+            arma::vec Wd(n), taud(2);
+            for (int i = 0; i < n; ++i) Wd(i) = static_cast<double>(W(i));
+            taud(0) = fit.theta.size() > 0 ? fit.theta[0] : 0.0;
+            taud(1) = fit.theta.size() > 1 ? fit.theta[1] : 0.0;
+            // The SAME X the var1/var2 loop below uses -- on the default
+            // covariate_offset path that is the collapsed intercept-only design
+            // (design.p == 1, the covariates having moved into the offset), and
+            // the anchor has to describe what the sampled ratio measures, not
+            // what step 2 later projects with. Measured cost of the difference
+            // on the fair simulation: 1.2e-6 relative, both on the anchor and
+            // on the per-marker mean.
+            arma::mat Xd = arma::conv_to<arma::mat>::from(X);
+            fused = compute_fused_vr_anchor(Wd, taud, Xd, cfg.fused_vr_max_block);
+            if (!fused.ok) why = fused.why;
+        }
+        if (!why.empty()) {
+            std::cout << "[fusedVR] fit.fused_variance_ratio requested but NOT used: "
+                      << why << ". Falling back to the sampled variance ratio.\n";
+        } else {
+            fused_on = true;
+            numMarkers_default = std::max(0, cfg.fused_vr_markers);
+            const std::streamsize oldprec = std::cout.precision(10);
+            std::cout << "[fusedVR] ON  blocks=" << fused.nblocks
+                      << " (max " << fused.maxblock << ")  diag floor hits="
+                      << fused.floor_hits << "  " << fused.seconds << "s\n"
+                      << "[fusedVR]   tr(Psi)=" << fused.trPsi
+                      << "  tr((I-H)Psi)=" << fused.trPsi_proj
+                      << "  tr(P Psi)=" << fused.trPPsi
+                      << "  tr(P)=" << fused.trP << "\n"
+                      << "[fusedVR]   anchor = tr(P Psi)/tr((I-H)Psi) = " << fused.anchor
+                      << "   (raw tr(P Psi)/tr(Psi) = " << fused.anchor_raw
+                      << ", tr(P)/N = " << fused.trP_over_N << ")\n"
+                      << "[fusedVR]   noXadj anchor = " << fused.anchor_noXadj
+                      << "   delta budget = " << numMarkers_default
+                      << " marker(s)/bin, ceiling " << cfg.fused_vr_max_markers
+                      << ", se target " << cfg.fused_vr_delta_se
+                      << ", keep delta at |delta-1| > " << cfg.fused_vr_delta_z << " se\n";
+            std::cout.precision(oldprec);
+        }
+    }
 
     // --- Compute Sigma_iX (global, no LOCO) ---
     // getSigma_X solves Σ^{-1} X column by column via PCG
@@ -356,7 +424,14 @@ void compute_variance_ratio(const Paths& paths,
         arma::fvec G0f;   // raw genotype (minor-allele coded), float
     };
 
-    while (ratioCV > ratioCVcutoff) {
+    // With the fused anchor and a zero marker budget there is nothing to
+    // sample: the closed form IS the answer and no genotype is touched.
+    const bool skip_marker_loop = (fused_on && numMarkers_default <= 0);
+    if (skip_marker_loop)
+        std::cout << "[fusedVR] marker budget 0 -- no PCG solve, no genotype read; "
+                     "every bin takes the closed-form anchor.\n";
+
+    while (!skip_marker_loop && ratioCV > ratioCVcutoff) {
         // ---- Phase A: select this wave's markers (no PCG) ----
         std::vector<VrCand> wave;
         while (numTestedMarker + (int)wave.size() < numMarkers0
@@ -571,6 +646,39 @@ void compute_variance_ratio(const Paths& paths,
                               && b < static_cast<int>(cfg.cateVarRatioIndexVec.size())
                               && cfg.cateVarRatioIndexVec[b] == 0);
             if (skip_bin) { binConverged[b] = true; continue; }
+            if (fused_on) {
+                // The stopping rule has to change with the estimand. delta is the
+                // bin mean divided by a CONSTANT, so sd/mean -- the CV rule used
+                // below -- is numerically identical for delta and for the ratio and
+                // would buy nothing. What the anchor buys is a looser accuracy
+                // target, so the rule is on the relative standard error of delta,
+                // which does fall as 1/sqrt(n).
+                const arma::fvec& v = varRatio_NULL_vec_per_bin[b];
+                if (numTestedMarker_per_bin[b] >= numTarget_per_bin[b] && v.n_elem > 0) {
+                    const double m  = arma::mean(v);
+                    const double sd = (v.n_elem > 1) ? arma::stddev(v) : 0.0;
+                    const double rse = (m != 0.0 && v.n_elem > 1)
+                                         ? sd / std::sqrt((double)v.n_elem) / std::abs(m) : 0.0;
+                    ratioCV_per_bin[b] = static_cast<float>(rse);
+                    if (rse <= cfg.fused_vr_delta_se
+                        || numTestedMarker_per_bin[b] >= cfg.fused_vr_max_markers) {
+                        binConverged[b] = true;
+                        std::cout << "[fusedVR] Bin " << (b+1) << ": se(delta)/delta=" << rse
+                                  << (rse <= cfg.fused_vr_delta_se ? " <= " : " > ")
+                                  << cfg.fused_vr_delta_se << " using "
+                                  << numTestedMarker_per_bin[b] << " markers"
+                                  << (rse <= cfg.fused_vr_delta_se ? " (converged)\n"
+                                                                   : " (ceiling reached)\n");
+                    } else {
+                        numTarget_per_bin[b] += 10;
+                        std::cout << "[fusedVR] Bin " << (b+1) << ": se(delta)/delta=" << rse
+                                  << " > " << cfg.fused_vr_delta_se << "; trying "
+                                  << numTarget_per_bin[b] << " markers in this bin\n";
+                    }
+                }
+                if (!binConverged[b]) all_converged = false;
+                continue;
+            }
             if (numTestedMarker_per_bin[b] >= numTarget_per_bin[b] && varRatio_NULL_vec_per_bin[b].n_elem > 0) {
                 ratioCV_per_bin[b] = calCV(varRatio_NULL_vec_per_bin[b]);
                 if (ratioCV_per_bin[b] <= ratioCVcutoff) {
@@ -620,6 +728,43 @@ void compute_variance_ratio(const Paths& paths,
             if (varRatio_NULL_vec_per_bin[b].n_elem        > 0) bin_null  [b] = arma::mean(varRatio_NULL_vec_per_bin[b]);
             if (varRatio_NULL_noXadj_vec_per_bin[b].n_elem > 0) bin_noXadj[b] = arma::mean(varRatio_NULL_noXadj_vec_per_bin[b]);
             if (varRatio_sparse_vec_per_bin[b].n_elem      > 0) bin_sparse[b] = arma::mean(varRatio_sparse_vec_per_bin[b]);
+        }
+        if (fused_on && !skip_bin) {
+            // anchor + tested correction. delta is kept only when the markers
+            // actually resolve it away from 1; otherwise the exact closed form
+            // stands, which is both cheaper and (on the fair simulation) a
+            // factor of 3 more accurate than a 30-marker sampled mean.
+            const arma::fvec& v = varRatio_NULL_vec_per_bin[b];
+            double sampled = bin_null[b], se = 0.0, delta = 1.0, dse = 0.0;
+            if (v.n_elem > 0) {
+                sampled = arma::mean(v);
+                se = (v.n_elem > 1) ? arma::stddev(v) / std::sqrt((double)v.n_elem) : 0.0;
+                delta = sampled / fused.anchor;
+                dse   = se / fused.anchor;
+            }
+            const bool keep = (v.n_elem > 1) && (std::abs(delta - 1.0) > cfg.fused_vr_delta_z * dse);
+            bin_null[b] = keep ? sampled : fused.anchor;
+            if (varRatio_NULL_noXadj_vec_per_bin[b].n_elem > 1) {
+                const arma::fvec& vn = varRatio_NULL_noXadj_vec_per_bin[b];
+                const double sn = arma::mean(vn);
+                const double sen = arma::stddev(vn) / std::sqrt((double)vn.n_elem);
+                bin_noXadj[b] = (std::abs(sn - fused.anchor_noXadj) > cfg.fused_vr_delta_z * sen)
+                                  ? sn : fused.anchor_noXadj;
+            } else {
+                bin_noXadj[b] = fused.anchor_noXadj;
+            }
+            const std::streamsize oldprec2 = std::cout.precision(10);
+            std::cout << "[fusedVR] Bin " << (b+1) << ": n=" << v.n_elem
+                      << " sampled=" << sampled << " +- " << se
+                      << "  anchor=" << fused.anchor
+                      << "  delta=" << delta << " +- " << dse
+                      << "  -> " << (keep ? "keep delta (bin differs from the anchor)"
+                                          : "delta set to 1 (anchor stands)")
+                      << ", null=" << bin_null[b] << "\n";
+            std::cout.precision(oldprec2);
+            if (cfg.use_sparse_grm_for_vr && varRatio_sparse_vec_per_bin[b].n_elem == 0)
+                std::cout << "[fusedVR] Bin " << (b+1) << ": WARNING no marker for the "
+                             "'sparse' row; it stays at the 1.0 default.\n";
         }
         std::cout << "[VR] Bin " << (b+1) << ": null=" << bin_null[b]
                   << " null_noXadj=" << bin_noXadj[b];

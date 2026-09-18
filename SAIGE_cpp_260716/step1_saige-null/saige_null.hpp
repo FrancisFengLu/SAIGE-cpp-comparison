@@ -150,6 +150,20 @@ struct FitNullConfig {
   std::vector<double> cateVarRatioMaxMACVecInclude{20.5};        // R default (length = numCate - 1)
   std::vector<int>    cateVarRatioIndexVec{};                    // optional: 0 => default 1.0; 1 => estimate (per bin)
 
+  // ---- Fused variance ratio (quantitative + sparse-GRM fit only) ----------
+  // fit.fused_variance_ratio. Anchors the per-bin variance ratio on the exact
+  // closed form tr(P Psi)/tr((I-H) Psi) -- every trace computed exactly by
+  // connected components of the sparse Psi, no Hutchinson probes -- and spends
+  // markers only on testing the per-bin correction delta = ratio / anchor
+  // against 1.  See optimization/FUSED_VARIANCE_RATIO.md.  Off by default;
+  // with it off nothing below is read and the output is byte-identical.
+  bool   fused_variance_ratio{false};
+  int    fused_vr_markers{10};      // markers per bin for the delta test (0 = pure closed form)
+  int    fused_vr_max_markers{30};  // ceiling when the se rule keeps asking for more
+  double fused_vr_delta_se{0.002};  // stop when se(delta)/delta <= this
+  double fused_vr_delta_z{2.0};     // keep delta only when |delta-1| > z*se(delta)
+  int    fused_vr_max_block{1024};  // refuse if a connected component is larger
+
   // VR min MAC
   double memory_chunk_gb;
   int vr_min_mac;
