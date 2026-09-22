@@ -6449,6 +6449,23 @@ int main(int argc, char* argv[])
         std::vector<SAIGE::TraitMeta>   metaCfgOrder(numTraits);
         for (int ti = 0; ti < numTraits; ti++) {
             NullModelData& nm = nms[ti];
+            // Step 1 writes the variance-ratio file's "sparse" rows only when it
+            // was run with use_sparse_grm_for_vr. When they are absent the loader
+            // leaves -1.0 in varRatio_sparse (null_model_loader.cpp, label-format
+            // branch) -- a value no real variance ratio can take. If a sparse GRM
+            // is in use here, assignVarianceRatio would hand that -1.0 out as the
+            // ratio and every marker whose MAC lands in that category gets a
+            // negative variance and a meaningless p-value. Refuse up front.
+            if (nm.flagSparseGRM) {
+                for (arma::uword vi = 0; vi < nm.varRatio_sparse.n_elem; vi++) {
+                    if (nm.varRatio_sparse(vi) < 0.0)
+                        throw std::runtime_error(
+                            "trait '" + modelSpecs[ti].traitName + "': a sparse GRM is in use, "
+                            "but the variance-ratio file has no 'sparse' row for MAC category "
+                            + std::to_string(vi) + ". Re-run step 1 with "
+                            "use_sparse_grm_for_vr: true, or run step 2 without the sparse GRM.");
+                }
+            }
             // setSAIGEobjInCPP writes the new instance into ptr_gSAIGEobj; grab
             // it right after the call. ptr_gSAIGEobj is re-pointed at the first
             // internal-order trait once the loop is done.
