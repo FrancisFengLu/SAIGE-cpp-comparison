@@ -292,3 +292,23 @@ arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& w,
 //     const arma::fvec& vc = v;
 //     return getPCG1ofSigmaAndVector_LOCO_mother(wc, tc, vc, maxiterPCG, tolPCG);
 // }
+// ---------------------------------------------------------------------------
+// Sparse direct-solve profiler (stage 0 of the block-Sigma work). Measures the
+// cost and the call sites of Sigma^-1 v on the sparse-GRM path, plus the
+// connected-component structure of the sparse GRM. Enabled by fit.profile_spsolve;
+// when off, every entry point is a no-op and no arithmetic changes.
+namespace spsolve_prof {
+enum Tag { TAG_OTHER = 0, TAG_FIT = 1, TAG_TRACE = 2, TAG_VARRATIO = 3, TAG_N = 4 };
+void enable(bool on);
+bool enabled();
+void reset();
+void report(const char* what);
+void set_tag(int t);
+int  get_tag();
+double now_s();
+struct Scope {
+    int prev;
+    explicit Scope(int t) : prev(get_tag()) { set_tag(t); }
+    ~Scope() { set_tag(prev); }
+};
+}  // namespace spsolve_prof

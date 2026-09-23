@@ -511,6 +511,7 @@ void compute_variance_ratio(const Paths& paths,
 
         // ---- Phase B: Σ⁻¹G for the whole wave ----
         const int nw = (int)wave.size();
+        spsolve_prof::Scope _sc_vr(spsolve_prof::TAG_VARRATIO);
         arma::fmat Sigma_iG_mat(n, std::max(nw, 1));
         if (nw > 0) {
             if (!isBlockPCGdisabled()) {

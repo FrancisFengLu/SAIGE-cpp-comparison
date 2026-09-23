@@ -205,6 +205,7 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("covariate_qr")) c.covariate_qr = get("covariate_qr").as<bool>();
   if (get("covariate_offset")) c.covariate_offset = get("covariate_offset").as<bool>();
   if (get("inv_normalize")) c.inv_normalize = get("inv_normalize").as<bool>();
+  if (get("profile_spsolve")) c.profile_spsolve = get("profile_spsolve").as<bool>();
   if (get("include_nonauto_for_vr")) c.include_nonauto_for_vr = get("include_nonauto_for_vr").as<bool>();
 
   if (get("tol")) c.tol = get("tol").as<double>();
@@ -1932,6 +1933,7 @@ int main(int argc, char** argv) {
   // Propagate the AI-REML trace-estimator seed override (fit.trace_seed) to the
   // GetTrace / GetTrace_q RNG. -1 keeps the builtin per-trait defaults (10/200).
   setTraceSeed(cfg.trace_seed);
+  spsolve_prof::enable(cfg.profile_spsolve);
   if (cfg.trace_seed >= 0)
     std::cout << "[config] trace_seed override = " << cfg.trace_seed << "\n";
 
@@ -2344,6 +2346,11 @@ int main(int argc, char** argv) {
       printf("[TIMER-MAIN] phenotype %-28s %8.2fs%s\n", m.y_col.c_str(),
              std::chrono::duration<double>(t - T_ph).count(),
              use_lockstep ? "  (post-fit only; fit is in fit_null_multi)" : "");
+    }
+
+    if (spsolve_prof::enabled()) {
+      spsolve_prof::report(m.y_col.c_str());
+      spsolve_prof::reset();
     }
 
     // Free this trait's design as soon as it is fitted: at P=32 on a big cohort

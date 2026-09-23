@@ -9,6 +9,10 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <functional>
+#include <unordered_map>
+#include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <cmath>
 #include <ctime>// include this header for calculating execution time
@@ -6311,6 +6315,119 @@ arma::sp_mat gen_sp_Sigma(arma::fvec& wVec,  arma::fvec& tauVec){
 
 // R CONNECTION: Sparse linear system solver version 3 to R functions
 // Solves sparse matrix systems using optimized algorithms for computational efficiency
+// ---------------------------------------------------------------------------
+// Instrumentation for the sparse direct-solve path (stage 0 of the block-Sigma
+// plan). Measures only; changes no arithmetic. Two questions it answers:
+//   1. How many times per run is Sigma^-1 v solved, and from where?
+//   2. Of that time, how much is rebuilding the sp_mat vs the SuperLU solve?
+// Both are needed before deciding whether a block-diagonal explicit Sigma^-1
+// is worth building: if the cost is dominated by re-factorising a matrix whose
+// structure never changes, reusing a factorisation is the cheaper fix.
+//
+// The block report additionally prints the connected-component sizes of the
+// sparse GRM. Sigma = tau0*W^-1 + tau1*Psi has exactly Psi's sparsity pattern
+// (W^-1 is diagonal), so those components are the blocks a block-wise inverse
+// would work on, for binary traits as well as quantitative. The largest one
+// decides whether dense per-block inversion is viable at all.
+namespace spsolve_prof {
+
+static const char* kTagName[TAG_N] = {"other", "fit", "trace", "varratio"};
+
+struct Acc { long long calls = 0; double t_build = 0.0; double t_solve = 0.0; };
+static Acc   g_acc[TAG_N];
+static int   g_tag = TAG_FIT;
+static bool  g_enabled = false;          // set by fit.profile_spsolve
+
+void enable(bool on) { g_enabled = on; }
+bool enabled()       { return g_enabled; }
+
+void set_tag(int t) { g_tag = (t >= 0 && t < TAG_N) ? t : TAG_OTHER; }
+int  get_tag()      { return g_tag; }
+
+double now_s() {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void add(double t_build, double t_solve) {
+    Acc& a = g_acc[(g_tag >= 0 && g_tag < TAG_N) ? g_tag : TAG_OTHER];
+    a.calls++; a.t_build += t_build; a.t_solve += t_solve;
+}
+
+void reset() { for (int i = 0; i < TAG_N; i++) g_acc[i] = Acc(); }
+
+void report(const char* what) {
+    if (!g_enabled) return;
+    long long tot_calls = 0; double tot_b = 0, tot_s = 0;
+    for (int i = 0; i < TAG_N; i++) {
+        tot_calls += g_acc[i].calls; tot_b += g_acc[i].t_build; tot_s += g_acc[i].t_solve;
+    }
+    if (tot_calls == 0) return;
+    printf("[spsolve] %s: %lld calls, build %.3fs, solve %.3fs, total %.3fs "
+           "(%.2f ms/call: %.2f build + %.2f solve)\n",
+           what, tot_calls, tot_b, tot_s, tot_b + tot_s,
+           1000.0 * (tot_b + tot_s) / (double)tot_calls,
+           1000.0 * tot_b / (double)tot_calls, 1000.0 * tot_s / (double)tot_calls);
+    for (int i = 0; i < TAG_N; i++) {
+        if (g_acc[i].calls == 0) continue;
+        printf("[spsolve]   %-9s %8lld calls  build %7.3fs  solve %7.3fs  "
+               "%6.2f ms/call\n",
+               kTagName[i], g_acc[i].calls, g_acc[i].t_build, g_acc[i].t_solve,
+               1000.0 * (g_acc[i].t_build + g_acc[i].t_solve) / (double)g_acc[i].calls);
+    }
+    fflush(stdout);
+}
+
+// Connected components of the sparse GRM, by union-find over its off-diagonal
+// entries. Printed once per run; costs O(nnz alpha(n)).
+static bool g_blocks_done = false;
+
+void report_blocks(const arma::umat& loc, int n) {
+    if (!g_enabled || g_blocks_done || n <= 0 || loc.n_cols == 0) return;
+    g_blocks_done = true;
+    std::vector<int> parent((size_t)n);
+    for (int i = 0; i < n; i++) parent[(size_t)i] = i;
+    std::function<int(int)> find = [&](int x) {
+        while (parent[(size_t)x] != x) { parent[(size_t)x] = parent[(size_t)parent[(size_t)x]];
+                                         x = parent[(size_t)x]; }
+        return x;
+    };
+    for (arma::uword k = 0; k < loc.n_cols; k++) {
+        const int a = (int)loc(0, k), b = (int)loc(1, k);
+        if (a == b || a < 0 || b < 0 || a >= n || b >= n) continue;
+        const int ra = find(a), rb = find(b);
+        if (ra != rb) parent[(size_t)ra] = rb;
+    }
+    std::unordered_map<int, int> size_of;
+    for (int i = 0; i < n; i++) size_of[find(i)]++;
+    std::vector<int> sizes; sizes.reserve(size_of.size());
+    for (const auto& kv : size_of) sizes.push_back(kv.second);
+    std::sort(sizes.begin(), sizes.end());
+    const size_t nb = sizes.size();
+    long long cube = 0, sq = 0;
+    for (int b : sizes) { cube += (long long)b * b * b; sq += (long long)b * b; }
+    // Histogram over the sizes that actually matter for a dense per-block inverse.
+    const int edges[] = {1, 2, 3, 4, 8, 16, 64, 256, 1024, 1 << 30};
+    printf("[blocks] sparse GRM: n=%d, nnz=%llu, %zu connected components; "
+           "max %d, median %d, mean %.2f\n",
+           n, (unsigned long long)loc.n_cols, nb, sizes.back(),
+           sizes[nb / 2], (double)n / (double)nb);
+    printf("[blocks] size histogram:");
+    size_t idx = 0;
+    for (int e = 0; e < (int)(sizeof(edges) / sizeof(edges[0])) && idx < nb; e++) {
+        size_t c = 0;
+        while (idx < nb && sizes[idx] <= edges[e]) { c++; idx++; }
+        if (c) printf("  <=%d:%zu", edges[e], c);
+    }
+    printf("\n");
+    printf("[blocks] dense per-block inverse would cost sum(b^3) = %lld flops, "
+           "store sum(b^2) = %lld doubles (%.1f MB)\n",
+           cube, sq, (double)sq * 8.0 / 1048576.0);
+    fflush(stdout);
+}
+
+}  // namespace spsolve_prof
+
 arma::vec gen_spsolve_v3(arma::vec & yvec){
     // sparse x sparse -> sparse
     //arma::sp_mat result(locationMat, valueVec, dimNum, dimNum);
@@ -6332,12 +6449,21 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
 
     arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
 
+    // Stage-0 instrumentation (fit.profile_spsolve, off by default): split the
+    // cost into "rebuild the sp_mat" and "factorise + solve". Both happen on
+    // every call today -- the sparsity pattern never changes, only the values.
+    const bool _prof = spsolve_prof::enabled();
+    const double _t0 = _prof ? spsolve_prof::now_s() : 0.0;
+    if (_prof) spsolve_prof::report_blocks(locationMat, dimNum);
+
     arma::sp_mat result = gen_sp_Sigma(wVec, tauVec);
 #ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG3] gen_sp_Sigma done nnz=%llu\n", (unsigned long long)result.n_nonzero); fflush(stderr);
 #endif
+    const double _t1 = _prof ? spsolve_prof::now_s() : 0.0;
 
     arma::vec x = arma::spsolve(result, yvec2);
+    if (_prof) spsolve_prof::add(_t1 - _t0, spsolve_prof::now_s() - _t1);
 #ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG4] spsolve done\n"); fflush(stderr);
 #endif
@@ -8247,6 +8373,7 @@ float GetTrace(const arma::fmat& Sigma_iX,
       for (int i = 0; i < nb_cols; ++i)
         Umat.col(i) = rademacher_vec(n);
 
+      spsolve_prof::Scope _sc(spsolve_prof::TAG_TRACE);
       arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
                                                    maxiterPCG, tolPCG);
       arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));
@@ -9118,6 +9245,7 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
       for (int i = 0; i < nb_cols; ++i)
         Umat.col(i) = rademacher_vec(n);
 
+      spsolve_prof::Scope _sc(spsolve_prof::TAG_TRACE);
       arma::fmat Sigma_iU = getPCGofSigmaAndMatrix(wVec, tauVec, Umat,
                                                    maxiterPCG, tolPCG);
       arma::fmat PU = Sigma_iU - Sigma_iX * (cov1 * (Sigma_iXt * Umat));

@@ -33,6 +33,9 @@ struct FitNullConfig {
   bool covariate_qr{true};
   bool covariate_offset{true};   // Docker step1_fitNULLGLMM.R CLI default is TRUE (function default is FALSE; CLI overrides)
   bool inv_normalize{false};
+  // Stage-0 profiler for the sparse direct solve (see spsolve_prof). Off by
+  // default; when off nothing is timed and no arithmetic changes.
+  bool profile_spsolve{false};
   bool include_nonauto_for_vr{false};
   bool isDiagofKinSetAsOne{false};  // R default is FALSE; TRUE forces GRM diagonal to 1.0
   bool make_sparse_grm_only{false};  // NEW
