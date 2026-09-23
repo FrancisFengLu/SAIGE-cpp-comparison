@@ -4402,6 +4402,12 @@ void activate_trait_for_fit(int t)
 
 void reset_step1_state_for_new_sample_set()
 {
+    // The block partition indexes samples by position within the sample set it
+    // was built for, so it cannot survive a change of sample set. refresh() has
+    // no dimension guard (solve() does), so a stale partition indexes past the
+    // end of w and aborts rather than quietly producing wrong numbers.
+    blocksigma::instance().reset();
+
 	// 1. GPU
 	if (g_gpu_handle) saige::gpu::destroy(g_gpu_handle);
 	g_gpu_handle    = nullptr;
@@ -8367,6 +8373,19 @@ float GetTrace(const arma::fmat& Sigma_iX,
                float tolPCG,
                float traceCVcutoff)
 {
+  // Before anything else, including set_seed()/GetRNGstate(): with exact traces
+  // there are no probes, so there is no reason to touch R's RNG. Placing this
+  // lower still called into the embedded R interpreter once per AI-REML round
+  // (six times on a binary fit) for probes that were then skipped -- and the R
+  // evaluator is what keeps this binary linked against libR at all.
+  if (exactTraceAvailable(wVec, tauVec)) {
+    const double tr = exactTraceMPsi(Sigma_iX, cov1, nullptr);
+    std::cout << "GetTrace: exact tr(M*Psi) = " << tr
+              << "  (fit.exact_trace; " << nrun << " Hutchinson probes skipped)"
+              << std::endl;
+    return (float)tr;
+  }
+
   std::cout << "=== Entering saige::GetTrace ===" << std::endl << std::flush;
 
   // Load precomputed vectors from R if file exists
@@ -8420,14 +8439,6 @@ float GetTrace(const arma::fmat& Sigma_iX,
   if (!Sigma_iX.is_finite() || !Xmat.is_finite() || !wVec.is_finite() ||
       !tauVec.is_finite() || !cov1.is_finite()) {
     throw std::runtime_error("GetTrace: non-finite entries in inputs");
-  }
-
-  if (exactTraceAvailable(wVec, tauVec)) {
-    const double tr = exactTraceMPsi(Sigma_iX, cov1, nullptr);
-    std::cout << "GetTrace: exact tr(M*Psi) = " << tr
-              << "  (fit.exact_trace; " << nrun << " Hutchinson probes skipped)"
-              << std::endl;
-    return (float)tr;
   }
 
   arma::fmat Sigma_iXt = Sigma_iX.t();   // p×n

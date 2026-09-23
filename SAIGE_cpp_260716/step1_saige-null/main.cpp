@@ -601,7 +601,10 @@ struct CategoricalPlan {
 };
 
 // two-pass plan: detect & choose reference (most frequent; tie → lexicographically smallest)
+// `remap` maps a full header index to the row's compacted slot (see
+// DesignFileCache); rows carry only the columns the run asked for.
 static CategoricalPlan plan_categoricals(const std::vector<std::vector<std::string>>& rows,
+                                         const std::vector<int>& remap,
                                          const std::vector<int>& x_idx,
                                          const std::vector<std::string>& header,
                                          bool drop_reference=true)
@@ -618,7 +621,7 @@ static CategoricalPlan plan_categoricals(const std::vector<std::vector<std::stri
   for (size_t i=0;i<n;++i){
     const auto& r = rows[i];
     for (size_t j=0;j<p;++j){
-      const std::string &s = r[x_idx[j]];
+      const std::string &s = r[remap[x_idx[j]]];
       if (plan.is_num[j] && !looks_numeric(s)) plan.is_num[j]=false;
       if (!plan.is_num[j] && !is_missing(s)) ++counts[j][s];
     }
@@ -709,6 +712,60 @@ static bool sex_code_matches(const std::string& v, const std::string& code) {
 // same point, before categorical levels, min_covariate_count and the intercept
 // check are worked out, so a sex-specific run sees exactly what a design file
 // pre-filtered to that sex would give.
+// Tokenised design file, parsed once per run and shared by every trait.
+//
+// The loader used to re-read the whole phenotype file for each y_col and to
+// split and trim every column of every row before using four of them. On the
+// 258-column, 71 MB benchmark file that was 1.17 s per trait -- 9.36 s of an
+// 11.65 s P=8 run, 80% of the wall clock, for work that is identical across
+// traits. Measured: P=1 "Design + preprocessing" 1.55 s, P=8 9.36 s.
+//
+// The cache keeps only the columns some trait will actually ask for, so the
+// row vectors are ~11 entries instead of 258, and it keeps them unfiltered:
+// the missing-value filter is y-dependent and must not be baked in.
+// `remap` maps a full header index (what find_col returns) to its slot in the
+// compacted row, or -1 when the column was not kept.
+namespace {
+struct DesignFileCache {
+    std::string              path;
+    char                     delim = '\t';
+    std::vector<std::string> cols;      // full header, so find_col is unchanged
+    std::vector<int>         remap;     // full index -> compact index, -1 if dropped
+    std::vector<std::vector<std::string>> rows;   // compacted, unfiltered
+    bool                     valid = false;
+};
+DesignFileCache g_design_cache;
+
+// Split a line, materialising only the fields we kept. Skipping a field costs
+// a scan to the next delimiter instead of an allocation plus a trim.
+void split_keep(const std::string& line, char delim,
+                const std::vector<int>& remap, int ncompact,
+                std::vector<std::string>& out) {
+    out.assign((size_t)ncompact, std::string());
+    size_t pos = 0;
+    const size_t len = line.size();
+    int col = 0;
+    while (pos <= len && col < (int)remap.size()) {
+        size_t next = line.find(delim, pos);
+        if (next == std::string::npos) next = len;
+        const int slot = remap[(size_t)col];
+        if (slot >= 0) {
+            size_t b = pos, e = next;
+            while (b < e && (line[b]==' '||line[b]=='\t'||line[b]=='\r'||line[b]=='\n')) ++b;
+            while (e > b && (line[e-1]==' '||line[e-1]=='\t'||line[e-1]=='\r'||line[e-1]=='\n')) --e;
+            out[(size_t)slot].assign(line, b, e - b);
+        }
+        pos = next + 1;
+        ++col;
+    }
+}
+}  // namespace
+
+// Columns any trait in this run will need. Set once from the config so the
+// cache knows what to keep; empty means "keep everything".
+static std::vector<std::string> g_design_keep_cols;
+void set_design_keep_cols(std::vector<std::string> v) { g_design_keep_cols = std::move(v); }
+
 static Design load_design_csv(const std::string& path,
                               int min_covariate_count,
                               bool categorical_drop_reference,
@@ -777,18 +834,44 @@ static Design load_design_csv(const std::string& path,
     std::cout << "[design] covar_cols is empty -> using NO covariates\n";
   }
 
-  // Read all rows as strings
-  std::vector<std::vector<std::string>> rows;
-  rows.reserve(1024);
-  std::string line;
-  while (std::getline(in, line)){
-    if (line.empty()) continue;
-    auto toks = split_simple(line, delim);
-    // pad short rows
-    if ((int)toks.size() < (int)cols.size()) toks.resize(cols.size(), "");
-    for (auto& t: toks) t = trim(t);
-    rows.push_back(std::move(toks));
+  // Rows, from the shared cache (see DesignFileCache). Parsed once per run.
+  DesignFileCache& DC = g_design_cache;
+  const bool cache_hit =
+      DC.valid && DC.path == path && DC.cols.size() == cols.size() &&
+      idx_iid >= 0 && DC.remap[(size_t)idx_iid] >= 0 &&
+      idx_y   >= 0 && DC.remap[(size_t)idx_y]   >= 0 &&
+      (idx_sex    < 0 || DC.remap[(size_t)idx_sex]    >= 0) &&
+      (idx_offset < 0 || DC.remap[(size_t)idx_offset] >= 0) &&
+      (idx_time   < 0 || DC.remap[(size_t)idx_time]   >= 0) &&
+      std::all_of(x_idx.begin(), x_idx.end(),
+                  [&](int k){ return k < 0 || DC.remap[(size_t)k] >= 0; });
+
+  if (!cache_hit) {
+    DC = DesignFileCache();
+    DC.path = path; DC.delim = delim; DC.cols = cols;
+    DC.remap.assign(cols.size(), -1);
+    // Keep what this call needs plus whatever the run declared up front, so one
+    // parse serves every trait.
+    auto keep = [&](int k){ if (k >= 0 && k < (int)cols.size()) DC.remap[(size_t)k] = 0; };
+    keep(idx_iid); keep(idx_y); keep(idx_offset); keep(idx_time); keep(idx_sex);
+    for (int k : x_idx) keep(k);
+    for (const auto& nm : g_design_keep_cols)
+      for (int i = 0; i < (int)cols.size(); ++i) if (ieq(cols[i], nm)) DC.remap[(size_t)i] = 0;
+    int ncompact = 0;
+    for (auto& r : DC.remap) if (r == 0) r = ncompact++;
+    std::string line;
+    std::vector<std::string> tmp;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      split_keep(line, delim, DC.remap, ncompact, tmp);
+      DC.rows.push_back(tmp);
+    }
+    DC.valid = true;
+    std::cout << "[design] parsed " << path << ": " << DC.rows.size() << " rows, keeping "
+              << ncompact << " of " << cols.size() << " columns (cached for this run)\n";
   }
+  const std::vector<int>& RM = DC.remap;
+  std::vector<std::vector<std::string>> rows = DC.rows;   // y-dependent filtering below
 
   // ===== Step 12: Drop rows with any missing value (R line 1430: complete.cases) =====
   // R: data = data[complete.cases(data),,drop=F]
@@ -800,14 +883,14 @@ static Design load_design_csv(const std::string& path,
     for (auto& row : rows) {
       bool any_missing = false;
       // Check phenotype
-      const std::string& yval = row[idx_y];
+      const std::string& yval = row[RM[idx_y]];
       if (yval.empty() || ieq(yval, "NA") || ieq(yval, "NaN")) {
         any_missing = true;
       }
       // Check all covariate columns
       if (!any_missing) {
         for (int j : x_idx) {
-          const std::string& cv = row[j];
+          const std::string& cv = row[RM[j]];
           if (cv.empty() || ieq(cv, "NA") || ieq(cv, "NaN")) {
             any_missing = true;
             break;
@@ -833,7 +916,7 @@ static Design load_design_csv(const std::string& path,
     int n_other = 0, n_miss = 0;
     const int before = (int)rows.size();
     for (auto& row : rows) {
-      const std::string& v = row[idx_sex];
+      const std::string& v = row[RM[idx_sex]];
       if (sex_code_matches(v, sex->code)) kept.push_back(std::move(row));
       else if (is_missing(v))             ++n_miss;
       else                                ++n_other;
@@ -857,19 +940,19 @@ static Design load_design_csv(const std::string& path,
   if (idx_time>=0)   d.event_time.assign(n, 0.0);
 
   for (int i=0;i<n;++i){
-    d.iid[i] = rows[i][idx_iid];
-    d.y[i]   = std::stod(rows[i][idx_y]);
-    if (idx_offset>=0 && !rows[i][idx_offset].empty())
-      d.offset[i] = std::stod(rows[i][idx_offset]);
-    if (idx_time>=0 && !rows[i][idx_time].empty())
-      d.event_time[i] = std::stod(rows[i][idx_time]);
+    d.iid[i] = rows[i][RM[idx_iid]];
+    d.y[i]   = std::stod(rows[i][RM[idx_y]]);
+    if (idx_offset>=0 && !rows[i][RM[idx_offset]].empty())
+      d.offset[i] = std::stod(rows[i][RM[idx_offset]]);
+    if (idx_time>=0 && !rows[i][RM[idx_time]].empty())
+      d.event_time[i] = std::stod(rows[i][RM[idx_time]]);
   }
 
   // If no covariates:
   if (x_idx.empty()) { d.p=0; d.X.clear(); return d; }
 
   // Plan categorical encoding for X columns
-  auto plan = plan_categoricals(rows, x_idx, cols, /*drop_reference=*/categorical_drop_reference);
+  auto plan = plan_categoricals(rows, RM, x_idx, cols, /*drop_reference=*/categorical_drop_reference);
 
   // Allocate numeric X and fill
   d.p = plan.out_p;
@@ -879,7 +962,7 @@ static Design load_design_csv(const std::string& path,
   for (size_t j=0;j<x_idx.size();++j){
     if (plan.is_num[j]){
       for (int i=0;i<n;++i){
-        const std::string& s = rows[i][x_idx[j]];
+        const std::string& s = rows[i][RM[x_idx[j]]];
         double v = s.empty() ? std::numeric_limits<double>::quiet_NaN() : std::strtod(s.c_str(), nullptr);
         d.X[(size_t)i*(size_t)d.p + col_out] = v;
       }
@@ -889,7 +972,7 @@ static Design load_design_csv(const std::string& path,
       const auto& kept = plan.kept_levels[j];
       for (const auto& lvl : kept){
         for (int i=0;i<n;++i){
-          const std::string& s = rows[i][x_idx[j]];
+          const std::string& s = rows[i][RM[x_idx[j]]];
           double v = (!s.empty() && s==lvl) ? 1.0 : 0.0; // missing -> 0 (acts like reference)
           d.X[(size_t)i*(size_t)d.p + col_out] = v;
         }
@@ -1288,6 +1371,16 @@ int main(int argc, char** argv) {
       std::cout << "[config] sex_col=" << cfg.sex_col
                 << " is set but neither female_only nor male_only is true -> no sex filter\n";
     }
+  }
+
+  // Tell the design cache which columns this run will ask for, so one parse of
+  // the phenotype file serves every trait instead of one parse per trait.
+  {
+    std::vector<std::string> keep;
+    keep.push_back(iid_col_name);
+    for (const auto& m : models) keep.push_back(m.y_col);
+    for (const auto& c : covar_col_names) keep.push_back(c);
+    set_design_keep_cols(std::move(keep));
   }
 
   // Parse design (with categoricals) - using configurable column names

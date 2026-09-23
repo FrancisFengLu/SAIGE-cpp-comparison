@@ -75,6 +75,12 @@ public:
     // every subsequent solve re-ran the union-find over all nnz and reprinted
     // the refusal -- 200+ times in a single fit.
     bool buildRefused() const { return buildFailed_; }
+
+    // Drop the partition and the cached inverse. Must be called whenever the
+    // sample set changes: the partition indexes samples by position in THAT
+    // sample set, so reusing it across a sample-set group is a crash waiting to
+    // happen (refresh() has no dimension guard, unlike solve()).
+    void reset() { *this = BlockSigma(); }
     void setBudget(double flopBudget, double byteBudget);
     double lastFlops() const { return flops_; }
     double lastBytes() const { return bytes_; }
