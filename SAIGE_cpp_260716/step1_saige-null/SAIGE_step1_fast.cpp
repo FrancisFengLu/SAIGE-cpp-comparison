@@ -3081,6 +3081,13 @@ void set_seed(unsigned int seed) {
 // use the builtin per-trait defaults (10 binary / 200 quant) to match R SAIGE.
 // Set via setTraceSeed() from the config (fit.trace_seed) to sweep seeds.
 static int g_trace_seed = -1;
+// fit.exact_trace: replace the Hutchinson probes with the exact traces the
+// block-diagonal Sigma^-1 makes available. Changes results (an exact value in
+// place of a 30-probe estimate), so it is a separate switch from
+// fit.block_sparse_sigma, which must not.
+static bool g_exact_trace = false;
+void setExactTrace(bool on) { g_exact_trace = on; }
+bool isExactTraceEnabled()  { return g_exact_trace; }
 void setTraceSeed(int s) { g_trace_seed = s; }
 int  getTraceSeedOr(int builtin_default) {
 	return (g_trace_seed >= 0) ? g_trace_seed : builtin_default;
@@ -8307,6 +8314,48 @@ static inline arma::fvec rademacher_vec(int n) {
   return u;
 }
 
+// ---------------------------------------------------------------------------
+// Exact AI-REML traces (fit.exact_trace). Replaces the 30 Hutchinson probes.
+//
+// Both GetTrace and GetTrace_q estimate traces of
+//     M = Sigma(wVec)^-1 - Sigma_iX * cov1 * Sigma_iX'
+// where Sigma_iX and cov1 arrive as ARGUMENTS. That matters: the outer loop
+// rebuilds W after the inner IRLS converges but leaves Sigma_iX and cov1 on the
+// previous W, so M is a mixed operator, not the textbook projection P. Using
+// textbook P here moves the binary AI from 598 to 522 from round 2 on and the
+// whole tau trajectory drifts. Computing from the passed arguments reproduces
+// the upstream behaviour by construction.
+//
+//   tr(M Psi) = tr(Sigma^-1 Psi) - tr(cov1 * Sigma_iX' * (Psi * Sigma_iX))
+//   tr(M)     = tr(Sigma^-1)     - tr(cov1 * Sigma_iX' * Sigma_iX)
+//
+// Sigma^-1 is needed only where Psi is non-zero, which for a block-diagonal
+// Sigma is exactly the within-block entries blocksigma already holds.
+static bool exactTraceAvailable(const arma::fvec& wVec, const arma::fvec& tauVec) {
+    if (!isExactTraceEnabled() || !blocksigma::enabled()) return false;
+    blocksigma::BlockSigma& BS = blocksigma::instance();
+    if (!BS.partition().built && !BS.build(locationMat, valueVec, dimNum)) return false;
+    BS.refresh(wVec, tauVec);
+    return BS.ready();
+}
+
+// Returns tr(M*Psi); writes tr(M) to trM when non-null.
+static double exactTraceMPsi(const arma::fmat& Sigma_iX, const arma::fmat& cov1,
+                             double* trM) {
+    blocksigma::BlockSigma& BS = blocksigma::instance();
+    double trSiPsi = 0.0, trSi = 0.0;
+    BS.traces(&trSiPsi, &trSi);
+
+    const arma::fmat PsiX = BS.psiMultiply(Sigma_iX);         // n x p
+    const arma::mat  SXd  = arma::conv_to<arma::mat>::from(Sigma_iX);
+    const arma::mat  Cd   = arma::conv_to<arma::mat>::from(cov1);
+    const arma::mat  A    = SXd.t() * arma::conv_to<arma::mat>::from(PsiX);  // p x p
+    const arma::mat  B    = SXd.t() * SXd;                                   // p x p
+    const double corrPsi  = arma::trace(Cd * A);
+    if (trM) *trM = trSi - arma::trace(Cd * B);
+    return trSiPsi - corrPsi;
+}
+
 namespace saige {
 float GetTrace(const arma::fmat& Sigma_iX,
                const arma::fmat& Xmat,
@@ -8371,6 +8420,14 @@ float GetTrace(const arma::fmat& Sigma_iX,
   if (!Sigma_iX.is_finite() || !Xmat.is_finite() || !wVec.is_finite() ||
       !tauVec.is_finite() || !cov1.is_finite()) {
     throw std::runtime_error("GetTrace: non-finite entries in inputs");
+  }
+
+  if (exactTraceAvailable(wVec, tauVec)) {
+    const double tr = exactTraceMPsi(Sigma_iX, cov1, nullptr);
+    std::cout << "GetTrace: exact tr(M*Psi) = " << tr
+              << "  (fit.exact_trace; " << nrun << " Hutchinson probes skipped)"
+              << std::endl;
+    return (float)tr;
   }
 
   arma::fmat Sigma_iXt = Sigma_iX.t();   // p×n
@@ -9203,8 +9260,22 @@ arma::fvec  getSigma_G_Surv_new_LOCO(arma::fvec& wVec, arma::fvec& tauVec,arma::
 
 //This function needs the function getPCG1ofSigmaAndVector and function getCrossprodMatAndKin
 
+
 arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, arma::fvec& tauVec, arma::fmat& cov1, int nrun, int maxiterPCG, float tolPCG, float traceCVcutoff){
   std::cout << "=== Entering GetTrace_q ===" << std::endl << std::flush;
+
+  if (exactTraceAvailable(wVec, tauVec)) {
+    double trM = 0.0;
+    const double trMPsi = exactTraceMPsi(Sigma_iX, cov1, &trM);
+    arma::fvec traVecX(2);
+    traVecX(0) = (float)trM;      // identity component, tau[0]
+    traVecX(1) = (float)trMPsi;   // kinship component, tau[1]
+    std::cout << "GetTrace_q: exact Trace[0] (identity) = " << traVecX(0)
+              << ", Trace[1] (kinship) = " << traVecX(1)
+              << "  (fit.exact_trace; " << nrun << " Hutchinson probes skipped)"
+              << std::endl;
+    return traVecX;
+  }
 
   // Load precomputed vectors from R if file exists (quantitative trait version)
   static bool load_attempted_q = false;

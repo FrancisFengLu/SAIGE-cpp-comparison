@@ -43,6 +43,13 @@ struct FitNullConfig {
   // fit.block_sparse_sigma_verify: run both paths on every call and report the
   // difference. This is the correctness gate, not a mode to benchmark.
   bool block_sparse_sigma_verify{false};
+  // fit.block_sparse_sigma_flop_budget: refuse the block inverse when
+  // sum(block^3) exceeds this. A connected component is not a clique, so a
+  // large component is better served by a sparse factorisation.
+  double block_sparse_sigma_flop_budget{1e9};
+  // fit.exact_trace: exact AI-REML traces instead of 30 Hutchinson probes.
+  // Requires block_sparse_sigma. This one DOES change results.
+  bool exact_trace{false};
   bool include_nonauto_for_vr{false};
   bool isDiagofKinSetAsOne{false};  // R default is FALSE; TRUE forces GRM diagonal to 1.0
   bool make_sparse_grm_only{false};  // NEW

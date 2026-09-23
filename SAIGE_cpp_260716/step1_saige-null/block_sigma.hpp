@@ -64,7 +64,16 @@ public:
     // Build the partition from SAIGE's sparse-GRM globals. Returns false (and
     // leaves the object unusable) if the input is empty or inconsistent, in
     // which case the caller must fall back to gen_spsolve_v4.
+    // A connected component is not a clique: on a stress GRM with components of
+    // 1,000 members only 0.90% of the within-block entries are non-zero, so a
+    // dense inverse of such a block spends 2e10 flops on a matrix that is 99%
+    // zeros. The right gate is therefore the total sum(b^3), not the largest
+    // block. build() refuses when that budget (or the sum(b^2) storage budget)
+    // is exceeded, and the caller falls back to gen_spsolve_v4.
     bool build(const arma::umat& loc, const arma::vec& val, int n);
+    void setBudget(double flopBudget, double byteBudget);
+    double lastFlops() const { return flops_; }
+    double lastBytes() const { return bytes_; }
 
     // Form Sigma for this (w, tau) and invert it block by block. Mirrors
     // gen_sp_Sigma's arithmetic exactly, including the 1e-4 floor that is
@@ -79,6 +88,16 @@ public:
     // probes are 30 solves against one unchanged Sigma, so skipping the
     // re-inversion there is most of what makes this cheap.
     bool upToDate(const arma::fvec& w, const arma::fvec& tau) const;
+
+    // Exact traces from the block inverse. tr(Sigma^-1 Psi) needs Sigma^-1
+    // only where Psi is non-zero, which for a block-diagonal Sigma is exactly
+    // the within-block entries we already hold -- no selected inverse needed.
+    // Accumulated in fp64 over ~10^5 terms.
+    void traces(double* trSigmaInvPsi, double* trSigmaInv) const;
+
+    // Psi * X, from the same per-block storage, so the trace correction term
+    // does not depend on getCrossprodMatAndKin's scaling conventions.
+    arma::fmat psiMultiply(const arma::fmat& X) const;
 
     bool ready() const { return part_.built && refreshed_; }
     const Partition& partition() const { return part_; }
@@ -102,6 +121,9 @@ private:
     long long nFloored_ = 0;
     arma::fvec lastW_, lastTau_;
     long long nRefresh_ = 0, nReuse_ = 0;
+    double flopBudget_ = 1e9;        // ~0.3 s per refresh on this machine
+    double byteBudget_ = 2e9;        // 2 GB of block inverses
+    double flops_ = 0.0, bytes_ = 0.0;
 
 public:
     long long refreshCount() const { return nRefresh_; }

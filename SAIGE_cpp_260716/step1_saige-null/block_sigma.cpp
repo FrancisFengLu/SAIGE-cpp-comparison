@@ -132,9 +132,36 @@ bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
         part_.psiV[(size_t)at] = val(k);
     }
 
+    // Cost gate, on totals rather than the largest block (see the header).
+    flops_ = 0.0; bytes_ = 0.0;
+    for (int b = 0; b < nb; b++) {
+        const double sz = (double)part_.size[(size_t)b];
+        flops_ += sz * sz * sz;
+        bytes_ += sz * sz * 8.0;
+    }
+    if (flops_ > flopBudget_ || bytes_ > byteBudget_) {
+        printf("[blocksigma] refusing: %d blocks, max %d, sum(b^3) = %.3g flops, "
+               "sum(b^2) = %.3g MB -- over the budget (%.3g flops, %.3g MB). "
+               "Falling back to spsolve; a component is not a clique, so large "
+               "blocks want a sparse factorisation, not a dense inverse.\n",
+               nb, part_.maxBlock, flops_, bytes_ / 1048576.0,
+               flopBudget_, byteBudget_ / 1048576.0);
+        fflush(stdout);
+        part_ = Partition();
+        return false;
+    }
+
     inv_.assign((size_t)ioff, 0.0);
     part_.built = true;
+    printf("[blocksigma] partition: %d blocks, max %d, sum(b^3) = %.3g flops, "
+           "block inverses %.2f MB\n", nb, part_.maxBlock, flops_, bytes_ / 1048576.0);
+    fflush(stdout);
     return true;
+}
+
+void BlockSigma::setBudget(double flopBudget, double byteBudget) {
+    if (flopBudget > 0) flopBudget_ = flopBudget;
+    if (byteBudget > 0) byteBudget_ = byteBudget;
 }
 
 bool BlockSigma::upToDate(const arma::fvec& w, const arma::fvec& tau) const {
@@ -199,6 +226,52 @@ void BlockSigma::refresh(const arma::fvec& w, const arma::fvec& tau) {
     nFloored_ = floored;
     lastW_ = w; lastTau_ = tau;
     refreshed_ = true;
+}
+
+void BlockSigma::traces(double* trSigmaInvPsi, double* trSigmaInv) const {
+    double tp = 0.0, ti = 0.0;
+    if (!ready()) { if (trSigmaInvPsi) *trSigmaInvPsi = 0.0;
+                    if (trSigmaInv)    *trSigmaInv    = 0.0; return; }
+    const int nb = part_.nblocks;
+
+    // tr(AB) = sum_ij A_ij B_ji. Psi is symmetric and both triangles are
+    // stored, so every non-zero (i,j) appears once and B_ji = B_ij = v.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(+:tp,ti)
+#endif
+    for (int b = 0; b < nb; b++) {
+        const int s = part_.size[(size_t)b];
+        const double* A = &inv_[(size_t)part_.invStart[(size_t)b]];
+        for (int k = part_.psiStart[(size_t)b]; k < part_.psiStart[(size_t)b + 1]; k++)
+            tp += A[(size_t)part_.psiC[(size_t)k] * s + part_.psiR[(size_t)k]]
+                  * part_.psiV[(size_t)k];
+        for (int r = 0; r < s; r++) ti += A[(size_t)r * s + r];
+    }
+    if (trSigmaInvPsi) *trSigmaInvPsi = tp;
+    if (trSigmaInv)    *trSigmaInv    = ti;
+}
+
+arma::fmat BlockSigma::psiMultiply(const arma::fmat& X) const {
+    arma::fmat out(X.n_rows, X.n_cols, arma::fill::zeros);
+    if (!part_.built || (int)X.n_rows != part_.n) return out;
+    const int nb = part_.nblocks;
+    const int p  = (int)X.n_cols;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int b = 0; b < nb; b++) {
+        const int mo = part_.start[(size_t)b];
+        for (int k = part_.psiStart[(size_t)b]; k < part_.psiStart[(size_t)b + 1]; k++) {
+            const int gi = part_.member[(size_t)(mo + part_.psiR[(size_t)k])];
+            const int gj = part_.member[(size_t)(mo + part_.psiC[(size_t)k])];
+            const double v = part_.psiV[(size_t)k];
+            for (int c = 0; c < p; c++)
+                out((arma::uword)gi, (arma::uword)c) +=
+                    (float)(v * (double)X((arma::uword)gj, (arma::uword)c));
+        }
+    }
+    return out;
 }
 
 arma::fvec BlockSigma::solve(const arma::fvec& b) const {

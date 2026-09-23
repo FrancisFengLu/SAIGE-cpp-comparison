@@ -297,6 +297,9 @@ arma::fvec getPCG1ofSigmaAndVector_LOCO(const arma::fvec& w,
 // cost and the call sites of Sigma^-1 v on the sparse-GRM path, plus the
 // connected-component structure of the sparse GRM. Enabled by fit.profile_spsolve;
 // when off, every entry point is a no-op and no arithmetic changes.
+void setExactTrace(bool on);
+bool isExactTraceEnabled();
+
 namespace spsolve_prof {
 enum Tag { TAG_OTHER = 0, TAG_FIT = 1, TAG_TRACE = 2, TAG_VARRATIO = 3, TAG_N = 4 };
 void enable(bool on);

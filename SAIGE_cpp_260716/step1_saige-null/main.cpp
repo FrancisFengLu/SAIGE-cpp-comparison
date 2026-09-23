@@ -210,6 +210,9 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("block_sparse_sigma")) c.block_sparse_sigma = get("block_sparse_sigma").as<bool>();
   if (get("block_sparse_sigma_verify"))
     c.block_sparse_sigma_verify = get("block_sparse_sigma_verify").as<bool>();
+  if (get("block_sparse_sigma_flop_budget"))
+    c.block_sparse_sigma_flop_budget = get("block_sparse_sigma_flop_budget").as<double>();
+  if (get("exact_trace")) c.exact_trace = get("exact_trace").as<bool>();
   if (get("include_nonauto_for_vr")) c.include_nonauto_for_vr = get("include_nonauto_for_vr").as<bool>();
 
   if (get("tol")) c.tol = get("tol").as<double>();
@@ -1939,6 +1942,11 @@ int main(int argc, char** argv) {
   setTraceSeed(cfg.trace_seed);
   spsolve_prof::enable(cfg.profile_spsolve);
   blocksigma::enable(cfg.block_sparse_sigma);
+  blocksigma::instance().setBudget(cfg.block_sparse_sigma_flop_budget, 0.0);
+  setExactTrace(cfg.exact_trace);
+  if (cfg.exact_trace && !cfg.block_sparse_sigma)
+    std::cout << "[exact_trace] needs fit.block_sparse_sigma; staying on the "
+                 "Hutchinson probes" << std::endl;
   blocksigma::enableVerify(cfg.block_sparse_sigma_verify);
   if (cfg.block_sparse_sigma_verify && !cfg.block_sparse_sigma)
     std::cout << "[blocksigma] block_sparse_sigma_verify has no effect unless "
