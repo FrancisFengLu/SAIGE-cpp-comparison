@@ -6721,10 +6721,17 @@ int main(int argc, char* argv[])
                           << " quantitative traits folded onto trait "
                           << (g_mtctx.foldRef >= 0
                                   ? g_mtctx.meta[g_mtctx.foldRef].name : std::string("-"))
-                          << "'s covariate block (max fit residual "
-                          << std::scientific << std::setprecision(2) << maxResid
-                          << std::defaultfloat << ", tol "
-                          << SAIGE::MT_FOLD_RESID_TOL << ")" << std::endl;
+                          << "'s covariate block (max fit residual ";
+                {
+                    // Format into its own stream: setprecision on std::cout
+                    // sticks, and std::defaultfloat does not undo it -- that
+                    // would silently truncate every later number, the batch
+                    // coverage percentage included.
+                    std::ostringstream os;
+                    os << std::scientific << std::setprecision(2) << maxResid;
+                    std::cout << os.str();
+                }
+                std::cout << ", tol " << SAIGE::MT_FOLD_RESID_TOL << ")" << std::endl;
             }
             std::cout << std::endl;
         }
