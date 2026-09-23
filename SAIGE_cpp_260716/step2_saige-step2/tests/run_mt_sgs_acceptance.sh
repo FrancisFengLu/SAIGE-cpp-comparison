@@ -38,7 +38,7 @@ DATA="/opt/saige/logs/tg2_step2"
 SUBNULL="${MS_NULL:-/opt/saige/logs/missing_mt/step2/null}"
 MID2K="/opt/saige/data/mid2k"
 RARE="/opt/saige/data/rare"
-CASES="q8 q32 qnobatch qmiss b8 bmiss mixed differ_block differ_indep rare_er"
+CASES="q8 q32 qnobatch qmiss b8 bmiss mixed cond bcond differ_block differ_indep rare_er"
 G1=1; G2=1
 while getopts "n:b:w:c:12" o; do case $o in
   n) NEW=$OPTARG;; b) BASE=$OPTARG;; w) WORK=$OPTARG;; c) CASES=$OPTARG;;
@@ -116,6 +116,9 @@ seq_models() {
   done
 }
 
+# Two markers to condition on, for the cond / bcond cases.
+COND=$(awk 'NR<=2{print $2}' "$DATA/data/g5k.bim" | paste -sd,)
+
 # cfg_for <case> <outdir>  -> prints the whole yaml
 cfg_for() {
   local C=$1 OD=$2
@@ -128,6 +131,13 @@ cfg_for() {
                         "is_Firth_beta: true" "pCutoffforFirth: 0.05"
               seq_models 8 "$BINMODELS" y "$OD" ;;
     bmiss)    head_yaml "$MISS" "isMoreOutput: true";        seq_models 8  "$BINMODELS" y "$OD" ;;
+    cond)     # conditional analysis: BETA_c / SE_c / Tstat_c / var_c / p.value_c.
+              # It also makes every trait non-batchable, so every pair is scalar.
+              head_yaml "$DATA/data/g5k" "condition: $COND"
+              seq_models 8 "$MODELS" y "$OD" ;;
+    bcond)    # the same on binary traits, which adds p.value.NA_c
+              head_yaml "$DATA/data/g5k" "condition: $COND" "isMoreOutput: true"
+              seq_models 8 "$BINMODELS" y "$OD" ;;
     mixed)    # 4 binary + 4 quantitative in one run, interleaved in the config
               head_yaml "$DATA/data/g5k" "isMoreOutput: true"
               local k
