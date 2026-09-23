@@ -39,6 +39,18 @@ struct FusedVrAnchor {
     double trP{0};              // tr(P)                  (diagnostic only)
     double trSigmaInv{0};       // tr(Sigma^-1)           (diagnostic only)
 
+    // Binary denominator. var2 for a binary trait is g~' W g~ with the
+    // W-weighted covariate projection M = I - X(X'WX)^-1 X'W, and because
+    // X'WM = 0 the expansion of tr(W M Psi M') collapses:
+    //     M'WM = WM = W - W X (X'WX)^-1 X' W
+    // so two of the three covariate terms cancel and one is left.
+    //     tr(W Psi) - tr((X'WX)^-1 X'W Psi W X)
+    // With W == 1 this is literally tr((I-H) Psi), i.e. the quantitative
+    // denominator above -- one formula, not two.
+    double trWPsi{0};           // tr(W Psi)
+    double trPsi_Wproj{0};      // tr(W Psi) - tr((X'WX)^-1 X'W Psi W X)
+    double anchor_binary{0};    // tr(P Psi) / tr(W Psi - ...)
+
     double trPsi_mean{0};       // tr((I - 11'/n) Psi)    denominator of the noXadj row
     double anchor{0};           // tr(P Psi) / tr((I-H) Psi)     <- what we use
     double anchor_noXadj{0};    // tr(P Psi) / tr((I - 11'/n) Psi)

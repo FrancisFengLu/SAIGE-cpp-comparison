@@ -6472,10 +6472,10 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
     // which is what the 30 trace probes do.
     if (blocksigma::enabled()) {
         blocksigma::BlockSigma& BS = blocksigma::instance();
-        if (!BS.partition().built) {
+        if (!BS.partition().built && !BS.buildRefused()) {
             if (!BS.build(locationMat, valueVec, dimNum))
-                std::cout << "[blocksigma] partition failed; falling back to spsolve"
-                          << std::endl;
+                std::cout << "[blocksigma] partition not usable; falling back to spsolve "
+                             "for the rest of this run" << std::endl;
         }
         if (BS.partition().built) {
             BS.refresh(wVec, tauVec);

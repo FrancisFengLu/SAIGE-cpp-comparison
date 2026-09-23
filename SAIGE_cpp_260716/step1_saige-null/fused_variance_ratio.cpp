@@ -158,6 +158,22 @@ FusedVrAnchor compute_fused_vr_anchor(const arma::vec& W,
     double sumPsi = 0.0;
     for (arma::uword k2 = 0; k2 < nnz; ++k2) sumPsi += val(k2);
 
+    // ---- binary denominator (see the header for why only one term survives)
+    // W == 1 reduces every line below to its quantitative counterpart, which is
+    // the self-check: trPsi_Wproj must then equal trPsi_proj.
+    arma::mat WX(n, p);
+    for (int i = 0; i < n; ++i) WX.row(i) = W(i) * X.row(i);
+    arma::mat PsiWX(n, p, arma::fill::zeros);
+    for (arma::uword k2 = 0; k2 < nnz; ++k2)
+        PsiWX.row(loc(0, k2)) += val(k2) * WX.row(loc(1, k2));
+    double trWPsi = 0.0;
+    for (arma::uword k2 = 0; k2 < nnz; ++k2)
+        if (loc(0, k2) == loc(1, k2)) trWPsi += W(loc(0, k2)) * val(k2);
+    arma::mat XtWX_inv;
+    double trPsi_Wproj = std::numeric_limits<double>::quiet_NaN();
+    if (arma::inv_sympd(XtWX_inv, arma::symmatu(X.t() * WX)))
+        trPsi_Wproj = trWPsi - arma::accu(XtWX_inv % (WX.t() * PsiWX).t());
+
     R.trPsi         = trPsi;
     R.trPsi_mean    = trPsi - sumPsi / n;
     R.trPsi_proj    = trPsi - trHPsi;
@@ -165,6 +181,9 @@ FusedVrAnchor compute_fused_vr_anchor(const arma::vec& W,
     R.trPPsi        = trSiPsi - arma::accu(XtSiX_inv % (SiX.t() * PsiSiX).t());
     R.trSigmaInv    = trSi;
     R.trP           = trSi - arma::accu(XtSiX_inv % (SiX.t() * SiX).t());
+    R.trWPsi        = trWPsi;
+    R.trPsi_Wproj   = trPsi_Wproj;
+    R.anchor_binary = R.trPPsi / trPsi_Wproj;
     R.anchor        = R.trPPsi / R.trPsi_proj;
     R.anchor_noXadj = R.trPPsi / R.trPsi_mean;
     R.anchor_raw    = R.trPPsi / R.trPsi;

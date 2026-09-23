@@ -176,11 +176,7 @@ void compute_variance_ratio(const Paths& paths,
     bool fused_on = false;
     if (cfg.fused_variance_ratio) {
         std::string why;
-        if (is_binary)
-            why = "the trait is binary -- var2 carries the working weights "
-                  "mu(1-mu), so the closed-form denominator is neither tr(Psi) "
-                  "nor tr(I); that case has not been derived or measured";
-        else if (cfg.trait != "quantitative")
+        if (cfg.trait != "quantitative" && !is_binary)
             why = "fit.trait is '" + cfg.trait + "'; only quantitative is derived";
         else if (!cfg.use_sparse_grm_to_fit)
             why = "fit.use_sparse_grm_to_fit is off -- with a dense GRM tr(P Psi) "
@@ -210,7 +206,36 @@ void compute_variance_ratio(const Paths& paths,
             std::cout << "[fusedVR] fit.fused_variance_ratio requested but NOT used: "
                       << why << ". Falling back to the sampled variance ratio.\n";
         } else {
-            fused_on = true;
+            if (is_binary) {
+                // var2 for a binary trait carries the working weights, so the
+                // denominator is the W-weighted one. Two of the three covariate
+                // terms cancel (X'WM = 0 makes M'WM = WM), leaving
+                //     tr(W Psi) - tr((X'WX)^-1 X'W Psi W X)
+                // which reduces to tr((I-H)Psi) at W == 1 -- the same formula,
+                // not a second one. Derivation and the N=2000 dense check:
+                // optimization/blocksigma/BINARY_VR_CLOSED_FORM.md.
+                if (!(std::isfinite(fused.anchor_binary) && fused.anchor_binary > 0.0)) {
+                    why = "the binary anchor came out non-finite or non-positive";
+                    std::cout << "[fusedVR] " << why << "; falling back to the "
+                                 "sampled variance ratio.\n";
+                    fused.ok = false;
+                } else {
+                    fused.anchor = fused.anchor_binary;
+                    // isnoadjCov mean-centres WITHOUT the weights, so C'WC is not
+                    // WC and the cancellation above does not happen for that row.
+                    // Left on the sampled estimate rather than guessed at.
+                    fused.anchor_noXadj = std::numeric_limits<double>::quiet_NaN();
+                    std::cout << "[fusedVR] binary anchor = tr(P Psi)/[tr(W Psi) "
+                                 "- tr((X'WX)^-1 X'W Psi W X)] = "
+                              << fused.anchor_binary
+                              << "  (tr(W Psi) = " << fused.trWPsi
+                              << ", denominator = " << fused.trPsi_Wproj
+                              << "); the null_noXadj row stays on the sampled "
+                                 "estimate\n";
+                }
+            }
+            if (!fused.ok) { fused_on = false; }
+            else fused_on = true;
             numMarkers_default = std::max(0, cfg.fused_vr_markers);
             const std::streamsize oldprec = std::cout.precision(10);
             std::cout << "[fusedVR] ON  blocks=" << fused.nblocks
@@ -220,7 +245,15 @@ void compute_variance_ratio(const Paths& paths,
                       << "  tr((I-H)Psi)=" << fused.trPsi_proj
                       << "  tr(P Psi)=" << fused.trPPsi
                       << "  tr(P)=" << fused.trP << "\n"
-                      << "[fusedVR]   anchor = tr(P Psi)/tr((I-H)Psi) = " << fused.anchor
+                      << "[fusedVR]   tr(W Psi)=" << fused.trWPsi
+                      << "  denominator tr(W Psi)-tr((X'WX)^-1 X'W Psi W X)="
+                      << fused.trPsi_Wproj
+                      << (is_binary ? "" :
+                          "   (W==1, so it must equal tr((I-H)Psi) above)")
+                      << "\n"
+                      << (is_binary ? "[fusedVR]   anchor = tr(P Psi)/[tr(W Psi)-...] = "
+                                    : "[fusedVR]   anchor = tr(P Psi)/tr((I-H)Psi) = ")
+                      << fused.anchor
                       << "   (raw tr(P Psi)/tr(Psi) = " << fused.anchor_raw
                       << ", tr(P)/N = " << fused.trP_over_N << ")\n"
                       << "[fusedVR]   noXadj anchor = " << fused.anchor_noXadj
@@ -754,9 +787,11 @@ void compute_variance_ratio(const Paths& paths,
                 const arma::fvec& vn = varRatio_NULL_noXadj_vec_per_bin[b];
                 const double sn = arma::mean(vn);
                 const double sen = arma::stddev(vn) / std::sqrt((double)vn.n_elem);
-                bin_noXadj[b] = (std::abs(sn - fused.anchor_noXadj) > cfg.fused_vr_delta_z * sen)
-                                  ? sn : fused.anchor_noXadj;
-            } else {
+                bin_noXadj[b] =
+                    (!std::isfinite(fused.anchor_noXadj) ||
+                     std::abs(sn - fused.anchor_noXadj) > cfg.fused_vr_delta_z * sen)
+                      ? sn : fused.anchor_noXadj;
+            } else if (std::isfinite(fused.anchor_noXadj)) {
                 bin_noXadj[b] = fused.anchor_noXadj;
             }
             const std::streamsize oldprec2 = std::cout.precision(10);

@@ -71,6 +71,10 @@ public:
     // block. build() refuses when that budget (or the sum(b^2) storage budget)
     // is exceeded, and the caller falls back to gen_spsolve_v4.
     bool build(const arma::umat& loc, const arma::vec& val, int n);
+    // True once build() has refused; the caller must not retry. Without this
+    // every subsequent solve re-ran the union-find over all nnz and reprinted
+    // the refusal -- 200+ times in a single fit.
+    bool buildRefused() const { return buildFailed_; }
     void setBudget(double flopBudget, double byteBudget);
     double lastFlops() const { return flops_; }
     double lastBytes() const { return bytes_; }
@@ -121,9 +125,19 @@ private:
     long long nFloored_ = 0;
     arma::fvec lastW_, lastTau_;
     long long nRefresh_ = 0, nReuse_ = 0;
-    double flopBudget_ = 1e9;        // ~0.3 s per refresh on this machine
+    // Measured scaling of the whole sparse-solve stage, same data, same call
+    // count, block inverse off vs on (N=50,000, P=1, quantitative):
+    //   max block  10  sum(b^3) 7.5e5   56x
+    //   max block  49  sum(b^3) 3.1e7   9.6x   (1.757 -> 0.184 s)
+    //   max block 199  sum(b^3) 4.6e8   1.6x   (1.786 -> 1.126 s)
+    //   max block 999  sum(b^3) 1.2e10  a loss: ~4 s per refresh against 1.8 s
+    //                                   of SuperLU for the whole stage
+    // The gain decays smoothly and turns negative somewhere above 1e9, so the
+    // default sits below that with the last measured win (1.6x) still inside.
+    double flopBudget_ = 5e8;
     double byteBudget_ = 2e9;        // 2 GB of block inverses
     double flops_ = 0.0, bytes_ = 0.0;
+    bool buildFailed_ = false;
 
 public:
     long long refreshCount() const { return nRefresh_; }

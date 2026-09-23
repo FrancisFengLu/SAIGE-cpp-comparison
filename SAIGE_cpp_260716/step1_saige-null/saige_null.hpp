@@ -46,7 +46,7 @@ struct FitNullConfig {
   // fit.block_sparse_sigma_flop_budget: refuse the block inverse when
   // sum(block^3) exceeds this. A connected component is not a clique, so a
   // large component is better served by a sparse factorisation.
-  double block_sparse_sigma_flop_budget{1e9};
+  double block_sparse_sigma_flop_budget{5e8};
   // fit.exact_trace: exact AI-REML traces instead of 30 Hutchinson probes.
   // Requires block_sparse_sigma. This one DOES change results.
   bool exact_trace{false};

@@ -71,10 +71,13 @@ void reportVerify(const char* what) {
 }
 
 bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
+    if (buildFailed_) return false;          // decided once, not per call
     part_ = Partition();
     inv_.clear(); scratch_.clear(); refreshed_ = false; nFloored_ = 0;
-    if (n <= 0 || loc.n_cols == 0 || loc.n_rows < 2 || val.n_elem != loc.n_cols)
+    if (n <= 0 || loc.n_cols == 0 || loc.n_rows < 2 || val.n_elem != loc.n_cols) {
+        buildFailed_ = true;
         return false;
+    }
 
     // --- components over the off-diagonal entries -----------------------
     UnionFind uf(n);
@@ -125,7 +128,7 @@ bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
     for (arma::uword k = 0; k < loc.n_cols; k++) {
         const int r = (int)loc(0, k), c = (int)loc(1, k);
         const int b = part_.blockOf[(size_t)r];
-        if (part_.blockOf[(size_t)c] != b) return false;   // pattern is not block diagonal
+        if (part_.blockOf[(size_t)c] != b) { buildFailed_ = true; return false; }  // not block diagonal
         const int at = fill[(size_t)b]++;
         part_.psiR[(size_t)at] = part_.localOf[(size_t)r];
         part_.psiC[(size_t)at] = part_.localOf[(size_t)c];
@@ -148,6 +151,7 @@ bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
                flopBudget_, byteBudget_ / 1048576.0);
         fflush(stdout);
         part_ = Partition();
+        buildFailed_ = true;
         return false;
     }
 
