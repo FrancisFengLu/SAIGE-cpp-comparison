@@ -2851,6 +2851,9 @@ void mainMarkerMT(
 
     const SAIGE::MTContext& ctx = g_mtctx;
     const int P = static_cast<int>(g_saigeObjs.size());
+    // Writing the P per-trait files is bounded by P: more threads than traits
+    // only adds barriers. Same rule mainMarkerMTGpu uses.
+    const int nWriteThreadsMT = std::max(1, std::min(P, omp_get_max_threads()));
     const bool differ = ctx.sampleSetsDiffer;
     // Union sample count when the sample sets differ; otherwise every model's n.
     const int n = differ ? ctx.N : g_saigeObjs[0]->m_n;
@@ -3768,7 +3771,15 @@ void mainMarkerMT(
             }  // for jj (finalize)
         }  // for blk (omp)
 
-        // ---- write this chunk's rows, one file per trait (serial) ----
+        // ---- write this chunk's rows, one file per trait ----
+        // The P files are independent, so they go out in parallel, exactly as
+        // mainMarkerMTGpu already does. This stage was measured at 45.6% of the
+        // per-trait marginal cost, and 98.5% of that is turning doubles into
+        // decimal strings, not the filesystem: at P=128 the output rate is
+        // 12 MB/s against a disk that does 186 MB/s.
+        {
+        std::vector<int> ntChunk(P, 0);
+#pragma omp parallel for schedule(dynamic) num_threads(nWriteThreadsMT)
         for (int t = 0; t < P; t++) {
             MTTraitChunk& O = out[t];
             std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
@@ -3792,9 +3803,11 @@ void mainMarkerMT(
                                 O.N,
                                 /*printSummary*/ false,
                                 &numtestChunk);
-            numtestTotal[t] += numtestChunk;
+            ntChunk[t] = numtestChunk;
         }
+        for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
         for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+        }
     }  // for chunkStart
 
     // One summary per trait, after every chunk (design section 7.2).
