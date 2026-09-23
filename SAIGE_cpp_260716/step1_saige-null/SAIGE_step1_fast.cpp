@@ -6407,7 +6407,7 @@ void report_blocks(const arma::umat& loc, int n) {
     long long cube = 0, sq = 0;
     for (int b : sizes) { cube += (long long)b * b * b; sq += (long long)b * b; }
     // Histogram over the sizes that actually matter for a dense per-block inverse.
-    const int edges[] = {1, 2, 3, 4, 8, 16, 64, 256, 1024, 1 << 30};
+    const int edges[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 64, 256, 1024, 1 << 30};
     printf("[blocks] sparse GRM: n=%d, nnz=%llu, %zu connected components; "
            "max %d, median %d, mean %.2f\n",
            n, (unsigned long long)loc.n_cols, nb, sizes.back(),
