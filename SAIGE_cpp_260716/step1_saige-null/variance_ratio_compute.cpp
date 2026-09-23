@@ -245,6 +245,9 @@ void compute_variance_ratio(const Paths& paths,
                       << "  tr((I-H)Psi)=" << fused.trPsi_proj
                       << "  tr(P Psi)=" << fused.trPPsi
                       << "  tr(P)=" << fused.trP << "\n"
+                      << "[fusedVR]   tr(Sigma^-1 Psi)=" << fused.trSigmaInvPsi
+                      << "  candidate sparse-row anchor tr(P Psi)/tr(Sigma^-1 Psi)="
+                      << (fused.trPPsi / fused.trSigmaInvPsi) << "\n"
                       << "[fusedVR]   tr(W Psi)=" << fused.trWPsi
                       << "  denominator tr(W Psi)-tr((X'WX)^-1 X'W Psi W X)="
                       << fused.trPsi_Wproj
@@ -793,6 +796,15 @@ void compute_variance_ratio(const Paths& paths,
                       ? sn : fused.anchor_noXadj;
             } else if (std::isfinite(fused.anchor_noXadj)) {
                 bin_noXadj[b] = fused.anchor_noXadj;
+            }
+            if (varRatio_sparse_vec_per_bin.size() > (size_t)b &&
+                varRatio_sparse_vec_per_bin[b].n_elem > 0) {
+                const arma::fvec& vs = varRatio_sparse_vec_per_bin[b];
+                const std::streamsize op = std::cout.precision(12);
+                std::cout << "[fusedVR] Bin " << (b + 1) << ": sampled sparse row n="
+                          << vs.n_elem << " mean=" << arma::mean(vs)
+                          << " sd=" << (vs.n_elem > 1 ? arma::stddev(vs) : 0.0) << "\n";
+                std::cout.precision(op);
             }
             const std::streamsize oldprec2 = std::cout.precision(10);
             if (v.n_elem < 2) {
