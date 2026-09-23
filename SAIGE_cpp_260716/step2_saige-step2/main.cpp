@@ -200,12 +200,14 @@ double g_mtMemBudgetGB = 1.5;
 bool g_gpuStep2   = false;
 
 // Config key outputFormat: "text" (default) or "sgs". OFF means every byte of
-// every output file is what it always was. ON switches the GPU multi-trait
-// path to the binary columnar format described in sgs_format.hpp, which stores
-// the per-marker columns once instead of once per trait and never formats a
-// number; tools/sgs2txt converts it back to the exact text. It is implemented
-// only for that path, and a run that asks for it and does not get that path
-// stops with an error rather than quietly writing something else.
+// every output file is what it always was. ON switches the two multi-trait
+// single-variant loops -- mainMarkerMT (CPU) and mainMarkerMTGpu -- to the
+// binary columnar format described in sgs_format.hpp, which stores the
+// per-marker columns once instead of once per trait and never formats a
+// number; tools/sgs2txt converts it back to the exact text. mainMarkerInCPP
+// (P == 1 with useGPU off) and the region / group loops do not write it, and a
+// run that would take one of those stops with an error at config time rather
+// than quietly writing something else.
 bool g_outputFormatSgs = false;
 // Config key sgsPrecision: "fp64" (default) or "fp32", the on-disk width of the
 // .sgs floating-point columns. fp64 is what the program computed, so sgs2txt
@@ -2261,11 +2263,10 @@ bool mainMarkerMTGpu(
         { /* why already set by available() */ }
 
     if (!why.empty()) {
-        if (g_outputFormatSgs)
-            throw std::runtime_error(
-                "outputFormat: sgs is implemented only for the GPU multi-trait path, and "
-                "this run does not take it (" + why + "). Re-run with outputFormat: text, "
-                "or fix the reason the GPU path refused.");
+        // outputFormat: sgs used to be refused here, because only this path
+        // could write it. mainMarkerMT writes it too now, so a refusal is just
+        // a fallback to the CPU multi-trait loop, which produces the same
+        // .sgs files.
         std::cout << "  useGPU: refused, running on the CPU (" << why << ")" << std::endl;
         return false;
     }
@@ -2854,6 +2855,10 @@ void mainMarkerMT(
     // Writing the P per-trait files is bounded by P: more threads than traits
     // only adds barriers. Same rule mainMarkerMTGpu uses.
     const int nWriteThreadsMT = std::max(1, std::min(P, omp_get_max_threads()));
+    // Wall clock inside the write stage, summed over the chunks. It is the one
+    // stage of this loop whose cost is a choice (outputFormat) rather than the
+    // statistic, so it is worth being able to read off a run.
+    double tWriteMT = 0;
     const bool differ = ctx.sampleSetsDiffer;
     // Union sample count when the sample sets differ; otherwise every model's n.
     const int n = differ ? ctx.N : g_saigeObjs[0]->m_n;
@@ -2943,6 +2948,25 @@ void mainMarkerMT(
     } else {
         std::cout << "  MT batch kernel disabled; every pair takes the scalar path"
                   << std::endl;
+    }
+
+    // outputFormat: sgs. Opened here so a bad path fails before any compute.
+    // Same sink, same files and same block order as mainMarkerMTGpu: the two
+    // loops fill the identical MTTraitChunk arrays, so the writer cannot tell
+    // which one produced them.
+    SAIGE::outfast::SgsSink sgs;
+    if (g_outputFormatSgs) {
+        std::string err;
+        if (!sgs.open(g_traitMeta, t_isImputation, g_sgsF32, err))
+            throw std::runtime_error("outputFormat: sgs: " + err);
+        std::cout << "  outputFormat: sgs (" << (g_sgsF32 ? "fp32" : "fp64") << ") -> "
+                  << sgs.markerPath()
+                  << " + one <outputFile>.sgs per trait; convert with tools/sgs2txt"
+                  << std::endl;
+        if (g_sgsF32)
+            std::cout << "  sgsPrecision: fp32 -- sgs2txt output is close to, not "
+                         "identical to, a text run, and any p-value below 1.2e-38 "
+                         "is lost (a float cannot hold it)" << std::endl;
     }
 
     // BGEN streamer spans the whole run (design section 7.3): it is indexed by
@@ -3777,7 +3801,39 @@ void mainMarkerMT(
         // per-trait marginal cost, and 98.5% of that is turning doubles into
         // decimal strings, not the filesystem: at P=128 the output rate is
         // 12 MB/s against a disk that does 186 MB/s.
-        {
+        const double twMT = omp_get_wtime();
+        if (g_outputFormatSgs) {
+            // outputFormat: sgs -- no number is formatted at all, and the
+            // per-marker columns go out once instead of P times.
+            SAIGE::outfast::MarkerCols MC;
+            MC.chr = &chrVec; MC.pos = &posVec; MC.mid = &markerVec;
+            MC.ref = &refVec; MC.alt = &altVec;
+            std::vector<SAIGE::outfast::TraitCols> TC(P);
+            for (int t = 0; t < P; t++) {
+                MTTraitChunk& O = out[t];
+                SAIGE::outfast::TraitCols& C = TC[t];
+                C.altCounts = &O.altCounts; C.altFreq = &O.altFreq;
+                C.imputeInfo = &O.imputeInfo; C.missingRate = &O.missingRate;
+                C.Beta = &O.Beta; C.seBeta = &O.seBeta;
+                C.Tstat = &O.Tstat; C.varT = &O.varT;
+                C.pval = &O.pval; C.pvalNA = &O.pvalNA;
+                C.isSPAConverge = &O.isSPAConverge;
+                C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
+                C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
+                C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
+                C.AF_case = &O.AF_case; C.AF_ctrl = &O.AF_ctrl;
+                C.N_case = &O.N_case; C.N_ctrl = &O.N_ctrl;
+                C.N_case_hom = &O.N_case_hom; C.N_ctrl_het = &O.N_ctrl_het;
+                C.N_case_het = &O.N_case_het; C.N_ctrl_hom = &O.N_ctrl_hom;
+                C.N = &O.N;
+            }
+            std::vector<int> ntSgs;
+            std::string err;
+            if (!sgs.writeChunk(MC, TC, out[0].pval.size(), nWriteThreadsMT,
+                                ntSgs, err))
+                throw std::runtime_error("outputFormat: sgs: " + err);
+            for (int t = 0; t < P; t++) numtestTotal[t] += ntSgs[t];
+        } else {
         std::vector<int> ntChunk(P, 0);
 #pragma omp parallel for schedule(dynamic) num_threads(nWriteThreadsMT)
         for (int t = 0; t < P; t++) {
@@ -3808,7 +3864,19 @@ void mainMarkerMT(
         for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
         for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
         }
+        tWriteMT += omp_get_wtime() - twMT;
     }  // for chunkStart
+
+    if (g_outputFormatSgs) {
+        std::string err;
+        const double tc = omp_get_wtime();
+        if (!sgs.close(err)) throw std::runtime_error("outputFormat: sgs: " + err);
+        tWriteMT += omp_get_wtime() - tc;
+        std::cout << "  outputFormat: sgs wrote " << sgs.bytesWritten()
+                  << " bytes (" << (double)sgs.bytesWritten() / 1e9 << " GB)"
+                  << std::endl;
+    }
+    std::cout << "  [mt breakdown] output write " << tWriteMT << " s" << std::endl;
 
     // One summary per trait, after every chunk (design section 7.2).
     long totBatch = 0, totFall = 0;
@@ -5876,7 +5944,8 @@ int main(int argc, char* argv[])
             std::cerr << "                     no number formatting at all. Writes <outputFile>.sgs" << std::endl;
             std::cerr << "                     plus one shared <first outputFile>.markers.sgs;" << std::endl;
             std::cerr << "                     tools/sgs2txt converts them back to the exact text." << std::endl;
-            std::cerr << "                     GPU multi-trait path only." << std::endl;
+            std::cerr << "                     Multi-trait single-variant paths only (CPU or" << std::endl;
+            std::cerr << "                     GPU); not the P=1 path or region testing." << std::endl;
             std::cerr << "  sgsPrecision:      fp64 (default) or fp32, the width of the .sgs" << std::endl;
             std::cerr << "                     floating-point columns. fp64 round-trips to the" << std::endl;
             std::cerr << "                     exact text; fp32 halves those columns and does" << std::endl;
@@ -6128,6 +6197,24 @@ int main(int argc, char* argv[])
                 "multi-trait region testing is not supported: the config lists " +
                 std::to_string(numTraits) + " models together with groupFile '" +
                 groupFile + "'. Run the region test one model per config.");
+        }
+        // outputFormat: sgs is written by the two multi-trait single-variant
+        // loops, mainMarkerMT and mainMarkerMTGpu. The other two consumers of
+        // openOutfile_single -- mainMarkerInCPP, which is where a P == 1 run
+        // goes when useGPU is off, and the region / group loops -- still write
+        // text only. openOutfile_single deliberately creates no text file under
+        // sgs, so a run that took one of those would write nothing at all;
+        // refuse here instead, before any model is loaded.
+        if (g_outputFormatSgs && (isRegionTest || (numTraits == 1 && !g_gpuStep2))) {
+            const std::string what =
+                isRegionTest ? "region / group testing (groupFile is set)"
+                             : "the single-trait path (one model and useGPU is off)";
+            throw std::runtime_error(
+                "outputFormat: sgs is implemented on the multi-trait single-variant "
+                "paths, and this run takes " + what + ". Re-run with outputFormat: "
+                "text, or, for one trait, list it under `models:` with useGPU: true "
+                "-- that routes it through the multi-trait loop, which writes sgs "
+                "whether or not a device is found.");
         }
 
         // Annotation list (e.g., ["lof", "lof;missense", "lof;missense;synonymous"])
