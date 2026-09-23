@@ -36,6 +36,13 @@ struct FitNullConfig {
   // Stage-0 profiler for the sparse direct solve (see spsolve_prof). Off by
   // default; when off nothing is timed and no arithmetic changes.
   bool profile_spsolve{false};
+  // fit.block_sparse_sigma: on the sparse-GRM path, solve Sigma^-1 v with an
+  // explicit block-diagonal inverse instead of a fresh SuperLU factorisation
+  // per call. Pure speed: it must not change results.
+  bool block_sparse_sigma{false};
+  // fit.block_sparse_sigma_verify: run both paths on every call and report the
+  // difference. This is the correctness gate, not a mode to benchmark.
+  bool block_sparse_sigma_verify{false};
   bool include_nonauto_for_vr{false};
   bool isDiagofKinSetAsOne{false};  // R default is FALSE; TRUE forces GRM diagonal to 1.0
   bool make_sparse_grm_only{false};  // NEW

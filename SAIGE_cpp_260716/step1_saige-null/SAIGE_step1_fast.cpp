@@ -21,7 +21,8 @@
 #include <boost/date_time.hpp> // for gettimeofday and timeval
 #include "getMem.hpp"
 #include "UTIL.hpp"  // Substituted from src/UTIL.hpp for utility functions
-#include "SAIGE_step1_fast.hpp"  // Included from src/Main.hpp for function declarations
+#include "SAIGE_step1_fast.hpp"
+#include "block_sigma.hpp"  // Included from src/Main.hpp for function declarations
 #include "bed_reader.hpp"      // PR-5: parallel pread-backed BED reader
 #include "marker_decoder.hpp"  // PR-5: decode + QC + repack
 #include "parallel_decode.hpp" // PR-5: parallel_decode_bed()
@@ -6455,6 +6456,32 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
     const bool _prof = spsolve_prof::enabled();
     const double _t0 = _prof ? spsolve_prof::now_s() : 0.0;
     if (_prof) spsolve_prof::report_blocks(locationMat, dimNum);
+
+    // fit.block_sparse_sigma: Sigma has Psi's sparsity pattern, so after
+    // permuting by Psi's connected components it is block diagonal. Invert
+    // each block densely once per (w, tau) and the solve becomes a block
+    // matrix-vector product. The partition is built on first use and outlives
+    // every change of w and tau; the inverse is reused when (w, tau) repeat,
+    // which is what the 30 trace probes do.
+    if (blocksigma::enabled()) {
+        blocksigma::BlockSigma& BS = blocksigma::instance();
+        if (!BS.partition().built) {
+            if (!BS.build(locationMat, valueVec, dimNum))
+                std::cout << "[blocksigma] partition failed; falling back to spsolve"
+                          << std::endl;
+        }
+        if (BS.partition().built) {
+            BS.refresh(wVec, tauVec);
+            arma::fvec got = BS.solve(yvec);
+            if (blocksigma::verifyEnabled()) {
+                arma::sp_mat ref = gen_sp_Sigma(wVec, tauVec);
+                arma::vec  refy  = arma::spsolve(ref, yvec2);
+                blocksigma::recordVerify(arma::conv_to<arma::fvec>::from(refy), got);
+            }
+            if (_prof) spsolve_prof::add(spsolve_prof::now_s() - _t0, 0.0);
+            return got;
+        }
+    }
 
     arma::sp_mat result = gen_sp_Sigma(wVec, tauVec);
 #ifdef SAIGE_DEBUG_IO

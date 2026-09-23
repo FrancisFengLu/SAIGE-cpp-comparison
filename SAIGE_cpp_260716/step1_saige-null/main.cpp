@@ -24,7 +24,8 @@
 #ifdef _OPENMP
 #  include <omp.h>
 #endif
-#include "SAIGE_step1_fast.hpp"   // (optional) genoClass decl — comment out if not available
+#include "SAIGE_step1_fast.hpp"
+#include "block_sigma.hpp"   // (optional) genoClass decl — comment out if not available
 #include "preprocess_engine.hpp"
 
 #include <yaml-cpp/yaml.h>
@@ -206,6 +207,9 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
   if (get("covariate_offset")) c.covariate_offset = get("covariate_offset").as<bool>();
   if (get("inv_normalize")) c.inv_normalize = get("inv_normalize").as<bool>();
   if (get("profile_spsolve")) c.profile_spsolve = get("profile_spsolve").as<bool>();
+  if (get("block_sparse_sigma")) c.block_sparse_sigma = get("block_sparse_sigma").as<bool>();
+  if (get("block_sparse_sigma_verify"))
+    c.block_sparse_sigma_verify = get("block_sparse_sigma_verify").as<bool>();
   if (get("include_nonauto_for_vr")) c.include_nonauto_for_vr = get("include_nonauto_for_vr").as<bool>();
 
   if (get("tol")) c.tol = get("tol").as<double>();
@@ -1934,6 +1938,11 @@ int main(int argc, char** argv) {
   // GetTrace / GetTrace_q RNG. -1 keeps the builtin per-trait defaults (10/200).
   setTraceSeed(cfg.trace_seed);
   spsolve_prof::enable(cfg.profile_spsolve);
+  blocksigma::enable(cfg.block_sparse_sigma);
+  blocksigma::enableVerify(cfg.block_sparse_sigma_verify);
+  if (cfg.block_sparse_sigma_verify && !cfg.block_sparse_sigma)
+    std::cout << "[blocksigma] block_sparse_sigma_verify has no effect unless "
+                 "block_sparse_sigma is also on" << std::endl;
   if (cfg.trace_seed >= 0)
     std::cout << "[config] trace_seed override = " << cfg.trace_seed << "\n";
 
@@ -2351,6 +2360,17 @@ int main(int argc, char** argv) {
     if (spsolve_prof::enabled()) {
       spsolve_prof::report(m.y_col.c_str());
       spsolve_prof::reset();
+    }
+    if (blocksigma::enabled() && blocksigma::instance().partition().built) {
+      const blocksigma::Partition& P = blocksigma::instance().partition();
+      printf("[blocksigma] %s: %d blocks, max %d; %lld inversions, %lld reuses, "
+             "%lld floored diagonals\n",
+             m.y_col.c_str(), P.nblocks, P.maxBlock,
+             blocksigma::instance().refreshCount(),
+             blocksigma::instance().reuseCount(),
+             blocksigma::instance().flooredDiagonals());
+      blocksigma::reportVerify(m.y_col.c_str());
+      blocksigma::resetVerify();
     }
 
     // Free this trait's design as soon as it is fitted: at P=32 on a big cohort
