@@ -182,7 +182,36 @@ struct MTContext {
     std::vector<int> batchTraits;       // batchable, binary first
     std::vector<int> batchQuantTraits;  // batchable and quantitative
     std::vector<int> scalarTraits;      // not batchable
+
+    // ---- folded covariate projection for quantitative traits ----
+    // Config key mtFoldQuantProj. For a quantitative trait V_t = (1/tau0_t)*I,
+    // so XVX_inv_XV_t = V_t X (X'V_t X)^{-1} lies in the column space of X --
+    // and every trait in a run shares the same covariate matrix. Both wide
+    // (sum_t p_t)-column GEMMs of scoreTestBatchMT therefore collapse into one
+    // p-column GEMM Z0 = Xref' G, with
+    //     A_t' G = K_t' Z0      K_t the p x p matrix with A_t = Xref K_t
+    //     X_t' G = Z0           (X_t is Xref bit for bit)
+    // K_t is FITTED to the stored A_t (least squares against Xref) rather than
+    // rebuilt from tau0 and XVX_inv: step 1 computes XVX_inv_XV in fp32 and
+    // nullmodel.json rounds tau0 to 6 significant digits, so the analytic form
+    // is 5-10x further from the number the wide path actually contracts.
+    // foldResid records how far the fit is from the stored matrix; a trait
+    // whose residual is above mtFoldResidTol keeps the wide path.
+    bool foldQuant = false;             // at least one trait takes the fold
+    int  foldRef   = -1;                // internal index of the trait whose X block is Xref
+    int  foldRefCol0 = 0;               // Xref's first column inside Xstack
+    int  foldRefP    = 0;               // Xref's column count
+    std::vector<char>      foldable;    // [P] 1 = this trait takes the fold
+    std::vector<arma::mat> foldK;       // [P] p x p, only for foldable traits
+    std::vector<double>    foldResid;   // [P] max|A_t - Xref K_t| / max|A_t|, -1 when not tried
+    std::vector<int>       foldTraits;  // internal indices that took the fold
 };
+
+// Largest relative fit residual a trait may have and still take the fold.
+// The floor is step 1's fp32 rounding of XVX_inv_XV, ~6e-8 relative; anything
+// that is not a scalar-V model misses the column space of X outright and
+// lands near 1.0, so this threshold separates the two cases by four orders.
+constexpr double MT_FOLD_RESID_TOL = 1e-5;
 
 // The batch kernel's intermediates: one per thread, reused across blocks
 // (grow-only, never reallocated per block). The block's genotype matrix itself
@@ -204,6 +233,9 @@ struct MTScratch {
     arma::mat MissR, MissMu2, MissMask;    // B x (P | nBin | nMask), same
     arma::mat Zc, Wc;                      // p x B   one trait's corrected Z / GW
     arma::vec Rc, Qc;                      // B
+    // Folded quantitative projection only (MTContext::foldQuant).
+    arma::mat Z0;      // p x B   Xref' G, shared by every folded trait
+    arma::mat Zf;      // p x B   one folded trait's K_t' Z0
 };
 
 // Per-(block column, trait) description of how the trait's own genotype vector
@@ -280,7 +312,8 @@ void buildMTContext(MTContext& t_ctx,
                     std::vector<TraitMeta>& t_meta,
                     bool t_locoEnabled,
                     const std::string& t_locoChrom,
-                    const std::vector<std::string>& t_unionIDs);
+                    const std::vector<std::string>& t_unionIDs,
+                    bool t_foldQuantProj = false);
 
 // One marker block's normal-approximation results, B x P. Only the columns of
 // the trait set passed to scoreTestBatchMT are written.
@@ -346,6 +379,12 @@ void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               MTScratch& t_scr,
                               MTBlockResult& t_out);
 
+
+#ifdef MTFOLD_PROF
+// Defined in saige_mt.cpp; see the MTF_TIC/MTF_TOC block there. cpu-seconds
+// summed across threads, not wall clock.
+extern double g_mtfProfZall, g_mtfProfGW, g_mtfProfZ0, g_mtfProfGR;
+#endif
 
 }  // namespace SAIGE
 

@@ -4,6 +4,7 @@
 #include "saige_mt.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -15,6 +16,22 @@
 #include <stdexcept>
 
 #include "score_format.hpp"
+
+// Opt-in stage timers for the sample-space GEMMs. Not compiled into the
+// shipped binary; build a throwaway copy with -DMTFOLD_PROF to split the
+// marker-loop cost between Zall / GWqnt / the folded Z0 / GR.
+#ifdef MTFOLD_PROF
+#include <omp.h>
+namespace SAIGE {
+double g_mtfProfZall = 0.0, g_mtfProfGW = 0.0, g_mtfProfZ0 = 0.0, g_mtfProfGR = 0.0;
+}
+#define MTF_TIC()      const double mtfT0 = omp_get_wtime()
+#define MTF_TOC(v)     do { const double mtfD = omp_get_wtime() - mtfT0; \
+                            _Pragma("omp atomic") v += mtfD; } while (0)
+#else
+#define MTF_TIC()      do {} while (0)
+#define MTF_TOC(v)     do {} while (0)
+#endif
 
 namespace SAIGE {
 
@@ -365,7 +382,8 @@ void buildMTContext(MTContext& t_ctx,
                     std::vector<TraitMeta>& t_meta,
                     bool t_locoEnabled,
                     const std::string& t_locoChrom,
-                    const std::vector<std::string>& t_unionIDs)
+                    const std::vector<std::string>& t_unionIDs,
+                    bool t_foldQuantProj)
 {
     const int P = static_cast<int>(t_meta.size());
     if (P == 0 || static_cast<int>(t_order.size()) != P)
@@ -550,6 +568,61 @@ void buildMTContext(MTContext& t_ctx,
         if (t_meta[t].kind != TraitKind::Binary) t_ctx.batchQuantTraits.push_back(t);
     }
     t_ctx.meta = t_meta;
+
+    // ---- folded covariate projection (config mtFoldQuantProj) ----
+    // See the block comment on MTContext::foldQuant. Everything here is a
+    // one-off O(N p^2) per trait; the marker loop only ever reads foldable /
+    // foldK / foldRefCol0.
+    t_ctx.foldQuant   = false;
+    t_ctx.foldRef     = -1;
+    t_ctx.foldRefCol0 = 0;
+    t_ctx.foldRefP    = 0;
+    t_ctx.foldable.assign(P, 0);
+    t_ctx.foldK.assign(P, arma::mat());
+    t_ctx.foldResid.assign(P, -1.0);
+    t_ctx.foldTraits.clear();
+    if (t_foldQuantProj) {
+        for (int t : t_ctx.batchQuantTraits) {
+            if (!t_ctx.samp[t].sameAsUnion) continue;   // its stack block is padded with zeros
+            t_ctx.foldRef = t;
+            break;
+        }
+        if (t_ctx.foldRef >= 0) {
+            const TraitMeta& R  = t_ctx.meta[t_ctx.foldRef];
+            const arma::uword pr = static_cast<arma::uword>(R.p);
+            const arma::uword ar = static_cast<arma::uword>(R.colOff);
+            t_ctx.foldRefCol0 = R.colOff;
+            t_ctx.foldRefP    = R.p;
+            const arma::mat Xr  = t_ctx.Xstack.cols(ar, ar + pr - 1);   // N x p
+            const arma::mat XtX = Xr.t() * Xr;
+            for (int t : t_ctx.batchQuantTraits) {
+                const TraitMeta& M = t_ctx.meta[t];
+                if (!t_ctx.samp[t].sameAsUnion) continue;
+                if (static_cast<arma::uword>(M.p) != pr) continue;
+                const arma::uword a = static_cast<arma::uword>(M.colOff);
+                // X_t' G is only Xref' G if the two blocks are the same bits.
+                bool sameX = true;
+                for (arma::uword c = 0; c < pr && sameX; ++c) {
+                    const double* u = t_ctx.Xstack.colptr(a + c);
+                    const double* v = t_ctx.Xstack.colptr(ar + c);
+                    if (u != v && std::memcmp(u, v, N * sizeof(double)) != 0) sameX = false;
+                }
+                if (!sameX) continue;
+                const arma::mat At = t_ctx.Astack.cols(a, a + pr - 1);
+                arma::mat K;
+                if (!arma::solve(K, XtX, Xr.t() * At, arma::solve_opts::no_approx)) continue;
+                const double scale = arma::abs(At).max();
+                const double resid = arma::abs(At - Xr * K).max();
+                const double rel   = (scale > 0.0) ? resid / scale : resid;
+                t_ctx.foldResid[t] = rel;
+                if (!(rel <= MT_FOLD_RESID_TOL)) continue;
+                t_ctx.foldable[t] = 1;
+                t_ctx.foldK[t]    = K;
+                t_ctx.foldTraits.push_back(t);
+            }
+            t_ctx.foldQuant = !t_ctx.foldTraits.empty();
+        }
+    }
 }
 
 void MTBlockAdj::resize(int t_B, int t_P)
@@ -667,19 +740,28 @@ void scoreTestBatchMT(const MTContext& t_ctx,
     // between two that are gets computed and ignored; that is cheaper than
     // splitting the GEMM.
     const int INTMAX = std::numeric_limits<int>::max();
+    const bool foldOn = t_ctx.foldQuant;
     bool anyBin = false, anyQnt = false;
+    bool anyFold = false, anyWideA = false;
     bool anyAdj = false, anyAdjBin = false, anyAdjQnt = false;
     int c0 = INTMAX, c1 = 0, b0 = INTMAX, b1 = 0, q0 = INTMAX, q1 = 0;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        // A folded trait reads neither Astack nor Xstack in the marker loop --
+        // its whole sample-space contribution is the shared Z0 -- so it must
+        // not widen either GEMM's column range. buildMTContext only ever marks
+        // a quantitative, batchable, same-sample-set trait foldable, so `adj`
+        // is false here by construction.
+        const bool fold = foldOn && t_ctx.foldable[t];
+        if (M.kind == TraitKind::Binary) anyBin = true; else anyQnt = true;
+        if (fold) { anyFold = true; continue; }
+        anyWideA = true;
         c0 = std::min(c0, M.colOff); c1 = std::max(c1, M.colOff + M.p);
         if (M.kind == TraitKind::Binary) {
-            anyBin = true;
             b0 = std::min(b0, M.binOff); b1 = std::max(b1, M.binOff + M.p);
             anyAdjBin = anyAdjBin || adj;
         } else {
-            anyQnt = true;
             q0 = std::min(q0, M.colOff); q1 = std::max(q1, M.colOff + M.p);
             anyAdjQnt = anyAdjQnt || adj;
         }
@@ -689,7 +771,11 @@ void scoreTestBatchMT(const MTContext& t_ctx,
         throw std::runtime_error("scoreTestBatchMT: traits with their own sample list need t_adj");
 
     // Z = A^T G, one GEMM for every trait in the set (design section 2.3).
-    t_scr.Zall = colView(t_ctx.Astack, c0, c1).t() * Gv;            // (c1-c0) x B
+    if (anyWideA) {
+        MTF_TIC();
+        t_scr.Zall = colView(t_ctx.Astack, c0, c1).t() * Gv;        // (c1-c0) x B
+        MTF_TOC(SAIGE::g_mtfProfZall);
+    }
 
     // g^2 feeds both the binary sum_i mu2_i g_i^2 and the quantitative g'g.
     t_scr.Gb2 = Gv % Gv;                                            // N x B
@@ -699,10 +785,26 @@ void scoreTestBatchMT(const MTContext& t_ctx,
         t_scr.G2Mu2  = t_scr.Gb2.t() * t_ctx.MU2bin;                // B x nBin
     }
     if (anyQnt) {
-        t_scr.GWqnt  = colView(t_ctx.Xstack, q0, q1).t() * Gv;      // (q1-q0) x B
+        if (q0 != INTMAX) {
+            MTF_TIC();
+            t_scr.GWqnt = colView(t_ctx.Xstack, q0, q1).t() * Gv;   // (q1-q0) x B
+            MTF_TOC(SAIGE::g_mtfProfGW);
+        }
         t_scr.Gsq    = arma::sum(t_scr.Gb2, 0).t();                 // B
     }
-    t_scr.GR = Gv.t() * t_ctx.RES;                                  // B x P
+    // The one shared covariate GEMM: p columns, not sum_t p_t, and it stands in
+    // for the folded traits' Astack block AND their Xstack block at once.
+    if (anyFold) {
+        MTF_TIC();
+        t_scr.Z0 = colView(t_ctx.Xstack, t_ctx.foldRefCol0,
+                           t_ctx.foldRefCol0 + t_ctx.foldRefP).t() * Gv;   // p x B
+        MTF_TOC(SAIGE::g_mtfProfZ0);
+    }
+    {
+        MTF_TIC();
+        t_scr.GR = Gv.t() * t_ctx.RES;                              // B x P
+        MTF_TOC(SAIGE::g_mtfProfGR);
+    }
 
     // ---- different sample sets (design 4.7) ----
     // Only traits whose sample list differs from the union's read any of this.
@@ -752,6 +854,20 @@ void scoreTestBatchMT(const MTContext& t_ctx,
 
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
+        if (foldOn && t_ctx.foldable[t]) {
+            // Same three contractions as the !adj branch below, with
+            //   A_t' G  ->  K_t' Z0        (Astack block == Xref K_t)
+            //   X_t' G  ->  Z0             (Xstack block == Xref, bit for bit)
+            t_scr.Zf = t_ctx.foldK[t].t() * t_scr.Z0;                // p x B
+            const arma::mat& Z_t = t_scr.Zf;
+            arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+            arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+            arma::rowvec gwz = arma::sum(t_scr.Z0 % Z_t, 0);
+            arma::vec S    = (t_scr.GR.col(t) - saz.t()) / M.tau0;
+            arma::vec var2 = zxz.t() * M.tau0 + t_scr.Gsq - 2.0 * gwz.t();
+            emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
+            continue;
+        }
         const arma::uword r0 = static_cast<arma::uword>(M.colOff - c0);
         const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
         const arma::uword w0 = (M.kind == TraitKind::Binary)

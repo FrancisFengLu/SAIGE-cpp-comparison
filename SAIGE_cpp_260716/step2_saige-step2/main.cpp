@@ -191,6 +191,11 @@ bool g_mtBatch = true;
 // Config key mtMemBudgetGB: total marker-block scratch across all threads,
 // used to pick a block width when mtBlockSize is absent.
 double g_mtMemBudgetGB = 1.5;
+// Config key mtFoldQuantProj: collapse the per-trait covariate projection of
+// the quantitative traits into one shared p-column GEMM (see MTContext::
+// foldQuant). Default off -- it changes the last digits of the quantitative
+// output, so it has to be asked for. Binary traits keep the wide path.
+bool g_mtFoldQuantProj = false;
 
 // ---- GPU path for single-variant, quantitative-only runs (gpu/gpu_step2.hpp)
 // Config key useGPU (default false). OFF means the binary behaves exactly as it
@@ -3877,6 +3882,12 @@ void mainMarkerMT(
                   << std::endl;
     }
     std::cout << "  [mt breakdown] output write " << tWriteMT << " s" << std::endl;
+#ifdef MTFOLD_PROF
+    std::cout << "  [mtfold prof] cpu-s  Zall " << SAIGE::g_mtfProfZall
+              << "  GWqnt " << SAIGE::g_mtfProfGW
+              << "  Z0(fold) " << SAIGE::g_mtfProfZ0
+              << "  GR " << SAIGE::g_mtfProfGR << std::endl;
+#endif
 
     // One summary per trait, after every chunk (design section 7.2).
     long totBatch = 0, totFall = 0;
@@ -6674,6 +6685,15 @@ int main(int argc, char* argv[])
             // needs the loaded models, which are still alive here; nothing
             // reads nms after this point.
             g_mtBatch     = config["mtBatch"] ? config["mtBatch"].as<bool>() : true;
+            g_mtFoldQuantProj = config["mtFoldQuantProj"]
+                                    ? config["mtFoldQuantProj"].as<bool>() : false;
+            if (g_mtFoldQuantProj && g_gpuStep2) {
+                // The GPU path prefills Zall / GWqnt itself (scoreTestBatchMTQuantPre);
+                // nothing there consults the fold, so say so instead of pretending.
+                std::cout << "  mtFoldQuantProj: ignored, the GPU multi-trait path "
+                             "computes its own covariate projection" << std::endl;
+                g_mtFoldQuantProj = false;
+            }
             g_mtBlockSize = config["mtBlockSize"] ? config["mtBlockSize"].as<int>() : 0;
             if (config["mtMemBudgetGB"]) {
                 g_mtMemBudgetGB = config["mtMemBudgetGB"].as<double>();
@@ -6683,7 +6703,8 @@ int main(int argc, char* argv[])
             {
                 std::vector<int> order = SAIGE::mtInternalOrder(nms);
                 SAIGE::buildMTContext(g_mtctx, nms, order, g_traitMeta,
-                                      useLOCO, locoChrom, readerSampleIDs);
+                                      useLOCO, locoChrom, readerSampleIDs,
+                                      g_mtFoldQuantProj);
                 if (g_mtctx.sampleSetsDiffer != mtSampleSetsDiffer)
                     throw std::runtime_error("internal: sample-set bookkeeping disagrees");
             }
@@ -6692,6 +6713,19 @@ int main(int argc, char* argv[])
                       << " / quantitative " << g_mtctx.sumPqnt << ")"
                       << ", batch kernel " << (g_mtBatch ? "on" : "OFF (mtBatch: false)")
                       << std::endl;
+            if (g_mtFoldQuantProj) {
+                double maxResid = 0.0;
+                for (double r : g_mtctx.foldResid) if (r > maxResid) maxResid = r;
+                std::cout << "  mtFoldQuantProj: " << g_mtctx.foldTraits.size()
+                          << " / " << g_mtctx.batchQuantTraits.size()
+                          << " quantitative traits folded onto trait "
+                          << (g_mtctx.foldRef >= 0
+                                  ? g_mtctx.meta[g_mtctx.foldRef].name : std::string("-"))
+                          << "'s covariate block (max fit residual "
+                          << std::scientific << std::setprecision(2) << maxResid
+                          << std::defaultfloat << ", tol "
+                          << SAIGE::MT_FOLD_RESID_TOL << ")" << std::endl;
+            }
             std::cout << std::endl;
         }
 
