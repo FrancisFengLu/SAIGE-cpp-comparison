@@ -205,6 +205,18 @@ struct MTContext {
     std::vector<arma::mat> foldK;       // [P] p x p, only for foldable traits
     std::vector<double>    foldResid;   // [P] max|A_t - Xref K_t| / max|A_t|, -1 when not tried
     std::vector<int>       foldTraits;  // internal indices that took the fold
+
+    // ---- block-at-a-time (marker, trait) statistics ----
+    // Config key mtVecQuantStats. When set, a quantitative trait's block tail
+    // runs emitBlockResultsVecQuant instead of the per-pair
+    // format_score_result: one branch-free pass over the block's B columns for
+    // Beta / seBeta / Tstat / var / StdStat, one vectorised erfc for the
+    // chi-square(1) upper tail, and one std::to_chars pass for the "%.6E"
+    // string. Pairs whose p-value would fall below MT_VEC_EXACT_BELOW_P, and
+    // every degenerate pair, still go through format_score_result itself, so
+    // the tail is bit-identical. Binary traits are never touched: their tail
+    // gates SPA / ER / Firth on each pair's own statistic. See score_vec.hpp.
+    bool vecQuantStats = false;
 };
 
 // Largest relative fit residual a trait may have and still take the fold.
@@ -236,6 +248,8 @@ struct MTScratch {
     // Folded quantitative projection only (MTContext::foldQuant).
     arma::mat Z0;      // p x B   Xref' G, shared by every folded trait
     arma::mat Zf;      // p x B   one folded trait's K_t' Z0
+    // Block tail only (MTContext::vecQuantStats). Length B, grow-only.
+    std::vector<double> evVar1, evStat, evZ, evP;
 };
 
 // Per-(block column, trait) description of how the trait's own genotype vector
@@ -384,6 +398,21 @@ void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
 // Defined in saige_mt.cpp; see the MTF_TIC/MTF_TOC block there. cpu-seconds
 // summed across threads, not wall clock.
 extern double g_mtfProfZall, g_mtfProfGW, g_mtfProfZ0, g_mtfProfGR;
+#endif
+
+#ifdef MTVEC_PROF
+// Defined in saige_mt.cpp. cpu-seconds summed across threads.
+//   g_mtvProfEmit   the whole per-(block, trait) tail, either path
+//   g_mtvProfStat   block path: variance ratio, Beta/seBeta/Tstat/var/StdStat,
+//                   the vectorised erfc, and the stores
+//   g_mtvProfFmt    block path: the "%.6E" pass (plus the rare boost fallback)
+//   g_mtvProfPairs  pairs that took the block path
+//   g_mtvProfFall   pairs handed back to format_score_result
+// Set MTVEC_PROF_NOFMT=1 in the environment to skip the string pass entirely;
+// the output is then garbage, but the difference is the formatting cost.
+extern double g_mtvProfEmit, g_mtvProfStat, g_mtvProfFmt;
+extern long   g_mtvProfPairs, g_mtvProfFall;
+extern bool   g_mtvProfNoFmt;
 #endif
 
 }  // namespace SAIGE

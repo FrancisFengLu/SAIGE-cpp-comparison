@@ -16,6 +16,7 @@
 #include <stdexcept>
 
 #include "score_format.hpp"
+#include "score_vec.hpp"
 
 // Opt-in stage timers for the sample-space GEMMs. Not compiled into the
 // shipped binary; build a throwaway copy with -DMTFOLD_PROF to split the
@@ -31,6 +32,28 @@ double g_mtfProfZall = 0.0, g_mtfProfGW = 0.0, g_mtfProfZ0 = 0.0, g_mtfProfGR = 
 #else
 #define MTF_TIC()      do {} while (0)
 #define MTF_TOC(v)     do {} while (0)
+#endif
+
+// Same idea for the per-(marker, trait) tail (mtVecQuantStats). Throwaway
+// builds only; without -DMTVEC_PROF every macro below is empty.
+#ifdef MTVEC_PROF
+#include <cstdlib>
+#include <omp.h>
+namespace SAIGE {
+double g_mtvProfEmit = 0.0, g_mtvProfStat = 0.0, g_mtvProfFmt = 0.0;
+long   g_mtvProfPairs = 0, g_mtvProfFall = 0;
+bool   g_mtvProfNoFmt = (std::getenv("MTVEC_PROF_NOFMT") != nullptr);
+}
+#define MTV_TIC(v)     const double v = omp_get_wtime()
+#define MTV_TOC(v, a)  do { const double mtvD = omp_get_wtime() - v; \
+                            _Pragma("omp atomic") a += mtvD; } while (0)
+#define MTV_ADD(a, n)  do { _Pragma("omp atomic") a += (n); } while (0)
+#define MTV_NOFMT      (SAIGE::g_mtvProfNoFmt)
+#else
+#define MTV_TIC(v)     do {} while (0)
+#define MTV_TOC(v, a)  do {} while (0)
+#define MTV_ADD(a, n)  do {} while (0)
+#define MTV_NOFMT      false
 #endif
 
 namespace SAIGE {
@@ -723,6 +746,145 @@ static void emitBlockResults(int t_t, int t_j0,
     }
 }
 
+// Same tail, one block at a time, for a QUANTITATIVE trait only
+// (MTContext::vecQuantStats, config key mtVecQuantStats). Three passes:
+//
+//   1  var1 / stat / z = sqrt(stat/2)           branch free, auto-vectorises
+//      + one mtVecErfc over the block           4 wide where libmvec is there
+//   2  Beta / seBeta / Tstat / var1 / var2 / StdStat / pvalRaw
+//      written unconditionally                  branch free, auto-vectorises
+//   3  the "%.6E" string, and the fallback
+//
+// Every expression in passes 1 and 2 is character for character the one
+// format_score_result evaluates, in the same order, so for a pair that stays
+// on this path only the p-value can differ -- and pass 3 sends every pair
+// whose stat reaches mtVecStatCutoff() (p < 1e-5), and every degenerate pair,
+// straight to format_score_result, which overwrites all seven outputs and the
+// string. So the ONLY pairs this function decides are the ones with
+// p >= 1e-5, where erfc(sqrt(stat/2)) and boost's cdf agree to 4.2e-15
+// relative (score_vec.hpp).
+//
+// NOT used for binary traits: the caller reads StdStat / pvalRaw / pvalStr of
+// each binary pair to decide SPA, ER and Firth, and those decisions must keep
+// coming from the same numbers as the scalar path.
+// NOTE on the two passes below: they are written branch free so they can be
+// vectorised, but under the default -fmath-errno GCC still wraps every
+// std::sqrt in a branch that calls libm for a negative argument, and that
+// control flow blocks the vectoriser ("not vectorized: control flow in loop").
+// Measured cost of leaving them scalar is ~10 ns of a ~1000 ns pair, so no
+// -fno-math-errno is forced on the build for it; see MT_VEC_STATS.md.
+static void emitBlockResultsVecQuant(int t_t, int t_j0,
+                                     const arma::vec& t_S, const arma::vec& t_var2,
+                                     const arma::mat& t_VR,
+                                     MTScratch& t_scr, MTBlockResult& t_out)
+{
+    const int B = static_cast<int>(t_S.n_elem);
+    if (B <= 0) return;
+    if (static_cast<int>(t_scr.evVar1.size()) < B) {
+        t_scr.evVar1.resize(B); t_scr.evStat.resize(B);
+        t_scr.evZ.resize(B);    t_scr.evP.resize(B);
+    }
+    double* __restrict v1 = t_scr.evVar1.data();
+    double* __restrict st = t_scr.evStat.data();
+    double* __restrict zz = t_scr.evZ.data();
+    double* __restrict pp = t_scr.evP.data();
+
+    const double* __restrict S  = t_S.memptr();
+    const double* __restrict v2 = t_var2.memptr();
+    const arma::uword t  = static_cast<arma::uword>(t_t);
+    const arma::uword j0 = static_cast<arma::uword>(t_j0);
+    const double* __restrict vr = t_VR.colptr(t) + j0;
+
+    MTV_TIC(mtvT0);
+    // ---- pass 1 ----
+    for (int j = 0; j < B; ++j) {
+        const double var1 = v2[j] * vr[j];
+        const double stat = S[j] * S[j] / var1;
+        v1[j] = var1;
+        st[j] = stat;
+        // fabs keeps a degenerate negative stat from raising FE_INVALID here;
+        // such a pair is rejected in pass 3 and never reads pp[j].
+        zz[j] = std::sqrt(std::fabs(stat) * 0.5);
+    }
+    mtVecErfc(zz, pp, B);
+
+    // ---- pass 2 ----
+    double* __restrict oBeta = t_out.Beta.colptr(t)    + j0;
+    double* __restrict oSe   = t_out.seBeta.colptr(t)  + j0;
+    double* __restrict oTs   = t_out.Tstat.colptr(t)   + j0;
+    double* __restrict oV1   = t_out.var1.colptr(t)    + j0;
+    double* __restrict oV2   = t_out.var2.colptr(t)    + j0;
+    double* __restrict oSd   = t_out.StdStat.colptr(t) + j0;
+    double* __restrict oPr   = t_out.pvalRaw.colptr(t) + j0;
+    for (int j = 0; j < B; ++j) {
+        const double Beta = S[j] / v1[j];
+        oBeta[j] = Beta;
+        oSe[j]   = std::fabs(Beta) / std::sqrt(std::fabs(st[j]));
+        oTs[j]   = S[j];
+        oV1[j]   = v1[j];
+        oV2[j]   = v2[j];
+        oSd[j]   = std::fabs(S[j]) / std::sqrt(v1[j]);
+        oPr[j]   = pp[j];
+    }
+    MTV_TOC(mtvT0, SAIGE::g_mtvProfStat);
+
+    // ---- pass 3 ----
+    MTV_TIC(mtvT1);
+    std::vector<std::string>& pstr = t_out.pvalStr[t_t];
+    std::vector<char>&        plog = t_out.pvalIsLog[t_t];
+    const double cutoff = mtVecStatCutoff();
+    const double tiny   = std::numeric_limits<double>::min();
+    char buf[40];
+    long nFall = 0;
+    for (int j = 0; j < B; ++j) {
+        const double stat = st[j];
+        if (!(v1[j] > tiny) || !(stat >= 0.0) || !(stat < cutoff)) {
+            // Includes NaN stat (every comparison false) and +inf.
+            const arma::uword jo = j0 + static_cast<arma::uword>(j);
+            double Beta, seBeta, pval, TstatOut, var1Out, var2Out;
+            bool islogp = false;
+            std::string pvalStr;
+            format_score_result(S[j], v1[j], v2[j], Beta, seBeta, pvalStr, pval,
+                                islogp, TstatOut, var1Out, var2Out);
+            t_out.Beta(jo, t)    = Beta;
+            t_out.seBeta(jo, t)  = seBeta;
+            t_out.Tstat(jo, t)   = TstatOut;
+            t_out.var1(jo, t)    = var1Out;
+            t_out.var2(jo, t)    = var2Out;
+            t_out.StdStat(jo, t) = std::fabs(S[j]) / std::sqrt(v1[j]);
+            t_out.pvalRaw(jo, t) = pval;
+            pstr[jo] = pvalStr;
+            plog[jo] = islogp ? 1 : 0;
+            nFall++;
+            continue;
+        }
+        plog[j0 + j] = 0;
+        if (!MTV_NOFMT) {
+            const int len = mtVecFormatE6(pp[j], buf);
+            pstr[j0 + j].assign(buf, static_cast<size_t>(len));
+        }
+    }
+    MTV_TOC(mtvT1, SAIGE::g_mtvProfFmt);
+    MTV_ADD(SAIGE::g_mtvProfPairs, (long)B);
+    MTV_ADD(SAIGE::g_mtvProfFall, nFall);
+    (void)nFall;
+}
+
+// The one place that decides which tail a (block, trait) takes.
+static inline void emitBlock(const MTContext& t_ctx, const TraitMeta& t_M,
+                             int t_t, int t_j0,
+                             const arma::vec& t_S, const arma::vec& t_var2,
+                             const arma::mat& t_VR,
+                             MTScratch& t_scr, MTBlockResult& t_out)
+{
+    MTV_TIC(mtvE0);
+    if (t_ctx.vecQuantStats && t_M.kind == TraitKind::Quantitative)
+        emitBlockResultsVecQuant(t_t, t_j0, t_S, t_var2, t_VR, t_scr, t_out);
+    else
+        emitBlockResults(t_t, t_j0, t_S, t_var2, t_VR, t_out);
+    MTV_TOC(mtvE0, SAIGE::g_mtvProfEmit);
+}
+
 void scoreTestBatchMT(const MTContext& t_ctx,
                       const std::vector<int>& t_traitSet,
                       const arma::mat& t_Gb,
@@ -865,7 +1027,7 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             arma::rowvec gwz = arma::sum(t_scr.Z0 % Z_t, 0);
             arma::vec S    = (t_scr.GR.col(t) - saz.t()) / M.tau0;
             arma::vec var2 = zxz.t() * M.tau0 + t_scr.Gsq - 2.0 * gwz.t();
-            emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
+            emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
             continue;
         }
         const arma::uword r0 = static_cast<arma::uword>(M.colOff - c0);
@@ -955,7 +1117,7 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             }
         }
 
-        emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
+        emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
     }
 }
 
@@ -1016,7 +1178,7 @@ void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
         if (S.n_elem != B || var2.n_elem != B)
             throw std::runtime_error("scoreTestBatchMTQuantPre: prefilled scratch has the wrong width");
 
-        emitBlockResults(t, t_j0, S, var2, t_VR, t_out);
+        emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
     }
 }
 

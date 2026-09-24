@@ -110,6 +110,22 @@ ifneq ($(strip $(ZSTD_LIBS)),)
   LIBS += $(ZSTD_LIBS)
 endif
 
+# ---- optional: glibc libmvec's 4-wide double erfc (score_vec.hpp) ---------
+# Used by the mtVecQuantStats block path for the chi-square(1) upper tail.
+# Probe-gated so the build stays portable: on anything that is not glibc 2.35+
+# on x86-64 with AVX2 the probe fails, SAIGE_HAVE_MVEC_ERFC stays undefined and
+# score_vec.hpp uses the scalar libm erfc instead (18.4 ns vs 5.1 ns, i.e. 13 ns
+# out of a ~1500 ns per-pair tail). Set USE_MVEC=0 to skip the probe.
+USE_MVEC ?= 1
+ifeq ($(USE_MVEC),1)
+  MVEC_OK := $(shell $(CXX) -O0 -std=c++17 -march=native tools/mvec_probe.cpp \
+                     -o /dev/null -lmvec > /dev/null 2>&1 && echo yes)
+  ifeq ($(MVEC_OK),yes)
+    override CXXFLAGS += -DSAIGE_HAVE_MVEC_ERFC=1
+    LIBS += -lmvec
+  endif
+endif
+
 # ---- optional GPU path for step 2 (gpu/gpu_step2.hpp) ----------------------
 # DEFAULT OFF. Without USE_CUDA=1 the stub translation unit is linked, so
 # saige::gpu2::available() always says no, main()'s GPU gate can never be
@@ -166,6 +182,10 @@ tools/sgs_fidelity: tools/sgs_fidelity.cpp sgs_format.hpp
 tools/out_fieldcmp: tools/out_fieldcmp.cpp
 	$(CXX) $(CXXFLAGS) tools/out_fieldcmp.cpp -o $@
 
+# Accuracy + cost of score_vec.hpp's chi-square(1) tail against boost's.
+tools/mtvec_tail_accuracy: tools/mtvec_tail_accuracy.cpp score_vec.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/mtvec_tail_accuracy.cpp $(filter -lmvec,$(LIBS)) -o $@
+
 $(TARGET): $(OBJECTS) $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJECTS) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
 
@@ -177,7 +197,7 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 
 clean:
 	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt \
-	      tools/sgs_fidelity tools/out_fieldcmp
+	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml

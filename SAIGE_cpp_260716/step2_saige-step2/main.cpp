@@ -56,6 +56,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "genotype_reader.hpp"
 #include "saige_test.hpp"
 #include "saige_mt.hpp"
+#include "score_vec.hpp"
 #include "out_fast.hpp"
 #include "gpu_step2.hpp"
 #include "UTIL.hpp"
@@ -196,6 +197,13 @@ double g_mtMemBudgetGB = 1.5;
 // foldQuant). Default off -- it changes the last digits of the quantitative
 // output, so it has to be asked for. Binary traits keep the wide path.
 bool g_mtFoldQuantProj = false;
+// Config key mtVecQuantStats: run a quantitative trait's per-(marker, trait)
+// tail one marker block at a time -- a vectorised chi-square(1) upper tail and
+// std::to_chars instead of boost's cdf and sprintf (see score_vec.hpp).
+// Default off. Pairs with p < 1e-5 and every degenerate pair still go through
+// format_score_result itself, so the tail is bit-identical; above 1e-5 the two
+// p-values agree to 4.2e-15 relative. Binary traits are never touched.
+bool g_mtVecQuantStats = false;
 
 // ---- GPU path for single-variant, quantitative-only runs (gpu/gpu_step2.hpp)
 // Config key useGPU (default false). OFF means the binary behaves exactly as it
@@ -3888,6 +3896,15 @@ void mainMarkerMT(
               << "  Z0(fold) " << SAIGE::g_mtfProfZ0
               << "  GR " << SAIGE::g_mtfProfGR << std::endl;
 #endif
+#ifdef MTVEC_PROF
+    std::cout << "  [mtvec prof] cpu-s  emit " << SAIGE::g_mtvProfEmit
+              << "  vec:stat " << SAIGE::g_mtvProfStat
+              << "  vec:fmt " << SAIGE::g_mtvProfFmt
+              << "  vec:pairs " << SAIGE::g_mtvProfPairs
+              << "  vec:boostFallback " << SAIGE::g_mtvProfFall
+              << (SAIGE::g_mtvProfNoFmt ? "  [MTVEC_PROF_NOFMT: strings skipped]" : "")
+              << std::endl;
+#endif
 
     // One summary per trait, after every chunk (design section 7.2).
     long totBatch = 0, totFall = 0;
@@ -6732,6 +6749,21 @@ int main(int argc, char* argv[])
                     std::cout << os.str();
                 }
                 std::cout << ", tol " << SAIGE::MT_FOLD_RESID_TOL << ")" << std::endl;
+            }
+            g_mtVecQuantStats = config["mtVecQuantStats"]
+                                    ? config["mtVecQuantStats"].as<bool>() : false;
+            g_mtctx.vecQuantStats = g_mtVecQuantStats;
+            if (g_mtVecQuantStats) {
+                std::ostringstream os;
+                os << std::scientific << std::setprecision(0) << SAIGE::MT_VEC_EXACT_BELOW_P;
+                std::cout << "  mtVecQuantStats: on for "
+                          << g_mtctx.batchQuantTraits.size() << " / "
+                          << g_mtctx.meta.size() << " traits (quantitative only); "
+                          << "pairs with p < " << os.str()
+                          << " keep boost's chi-square tail";
+                std::ostringstream oc;
+                oc << std::fixed << std::setprecision(4) << SAIGE::mtVecStatCutoff();
+                std::cout << " (stat >= " << oc.str() << ")" << std::endl;
             }
             std::cout << std::endl;
         }
