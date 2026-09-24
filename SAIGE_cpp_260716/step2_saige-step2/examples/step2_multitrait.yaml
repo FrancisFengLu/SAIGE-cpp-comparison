@@ -52,6 +52,14 @@ nThreads: 16
 mtBatch: true
 # mtBlockSize: 0        # 0 / absent = pick from mtMemBudgetGB
 mtMemBudgetGB: 1.5
+# mtVecQuantStats: true
+#   QUANTITATIVE traits only, default off. Runs the per-(marker, trait) tail --
+#   Beta / seBeta / the chi-square(1) upper tail / the "%.6E" string -- one
+#   marker block at a time instead of one pair at a time (score_vec.hpp).
+#   Every pair with p < 1e-5, and every degenerate pair, still goes through the
+#   same format_score_result the scalar path calls, so the tail is bit
+#   identical; above 1e-5 the two p-values agree to 1.5e-15 relative. Binary
+#   traits are untouched (their tail feeds the SPA / ER / Firth gates).
 # mtRequireSameSamples: true   # the only accepted value; false is refused
 #                              # rather than silently ignored
 

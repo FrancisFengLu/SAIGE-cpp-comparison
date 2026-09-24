@@ -30,6 +30,7 @@
 #   C8  mixed p (1 / 2 / 3) in one run -- the tl_X1 / tl_A1 grow test
 #   C9  C8 at nThreads=8, where a wrong grow test corrupts the heap
 #   CA  mtBatch: false -- every pair down the scalar path (the A/B reference)
+#   CV  mtVecQuantStats: true -- the block-at-a-time quantitative tail
 #   CB  mtBlockSize 32      CC  mtBlockSize 512      CD  mtBlockSize 7 + 8 threads
 #   CE  a quantitative trait whose p-values all underflow, so the batch kernel's
 #       fixed-point "%.1fE%d" branch is exercised on non-fallback pairs
@@ -185,6 +186,12 @@ if [ -n "$XTRAITS" ]; then
     # p == 0 on a quantitative trait: the fixed-point "%.1fE%d" branch, reached
     # through the batch kernel (quantitative pairs never fall back).
     mt_cfg CE_extreme 1 false false 10000 plain $BTRAITS $QTRAITS $XTRAITS
+    # The same extreme traits with mtVecQuantStats on: every pair below p=1e-5
+    # must come back through format_score_result, so the log-scale branch and
+    # the whole tail have to stay byte-identical.
+    MT_EXTRA="mtVecQuantStats: true"
+    mt_cfg CV_extreme 1 false false 10000 plain $BTRAITS $QTRAITS $XTRAITS
+    MT_EXTRA=""
     n0=$(awk -F'\t' 'NR>1 && $13 ~ /^[0-9][.][0-9]E-/ {c++} END{print c+0}' \
              "$WORK/out/CE_extreme.q2x.txt" 2>/dev/null || echo 0)
     if [ "${n0:-0}" -gt 0 ]; then
@@ -208,6 +215,15 @@ MT_EXTRA="mtBlockSize: 512"
 mt_cfg CC_blk512 1 false false 10000 plain $BTRAITS $QTRAITS
 MT_EXTRA="mtBlockSize: 7"
 mt_cfg CD_blk7   8 true  true  1000  more  $BTRAITS $QTRAITS
+# mtVecQuantStats: the quantitative tail computed one marker block at a time.
+# Same judgement as everything else here -- byte-identical to the single-trait
+# goldens -- which is the only acceptable answer for a switch that only changes
+# HOW the chi-square tail and the "%.6E" are evaluated. Run once single-threaded
+# and once at 8 threads with isMoreOutput + Firth on, so the binary traits in
+# the same batch (which must not touch the new path at all) are exercised too.
+MT_EXTRA="mtVecQuantStats: true"
+mt_cfg CV_vec1   1 false false 10000 plain $BTRAITS $QTRAITS
+mt_cfg CV_vec8   8 true  true  10000 more  $BTRAITS $QTRAITS
 MT_EXTRA=""
 
 # C5: per-model override -- q1 gets isnoadjCov, everyone else does not.
