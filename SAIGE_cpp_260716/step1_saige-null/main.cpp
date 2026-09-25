@@ -212,6 +212,10 @@ static FitNullConfig load_cfg(const YAML::Node& y) {
     c.block_sparse_sigma_verify = get("block_sparse_sigma_verify").as<bool>();
   if (get("block_sparse_sigma_flop_budget"))
     c.block_sparse_sigma_flop_budget = get("block_sparse_sigma_flop_budget").as<double>();
+  if (get("block_sparse_sigma_refresh_budget_s"))
+    c.block_sparse_sigma_refresh_budget_s =
+        get("block_sparse_sigma_refresh_budget_s").as<double>();
+  if (get("cache_sparse_solve")) c.cache_sparse_solve = get("cache_sparse_solve").as<bool>();
   if (get("exact_trace")) c.exact_trace = get("exact_trace").as<bool>();
   if (get("include_nonauto_for_vr")) c.include_nonauto_for_vr = get("include_nonauto_for_vr").as<bool>();
 
@@ -2036,6 +2040,8 @@ int main(int argc, char** argv) {
   spsolve_prof::enable(cfg.profile_spsolve);
   blocksigma::enable(cfg.block_sparse_sigma);
   blocksigma::instance().setBudget(cfg.block_sparse_sigma_flop_budget, 0.0);
+  blocksigma::instance().setRefreshBudget(cfg.block_sparse_sigma_refresh_budget_s);
+  spsolve_cache::enable(cfg.cache_sparse_solve);
   setExactTrace(cfg.exact_trace);
   if (cfg.exact_trace && !cfg.block_sparse_sigma)
     std::cout << "[exact_trace] needs fit.block_sparse_sigma; staying on the "
@@ -2461,15 +2467,20 @@ int main(int argc, char** argv) {
     if (spsolve_prof::enabled()) {
       spsolve_prof::report(m.y_col.c_str());
       spsolve_prof::reset();
+      spsolve_cache::report(m.y_col.c_str());
+      spsolve_cache::reset_stats();
     }
     if (blocksigma::enabled() && blocksigma::instance().partition().built) {
       const blocksigma::Partition& P = blocksigma::instance().partition();
       printf("[blocksigma] %s: %d blocks, max %d; %lld inversions, %lld reuses, "
-             "%lld floored diagonals\n",
+             "%lld floored diagonals; refresh %.4f s total (estimate was %.4f s "
+             "each)\n",
              m.y_col.c_str(), P.nblocks, P.maxBlock,
              blocksigma::instance().refreshCount(),
              blocksigma::instance().reuseCount(),
-             blocksigma::instance().flooredDiagonals());
+             blocksigma::instance().flooredDiagonals(),
+             blocksigma::instance().refreshSeconds(),
+             blocksigma::instance().estRefreshSeconds());
       blocksigma::reportVerify(m.y_col.c_str());
       blocksigma::resetVerify();
     }

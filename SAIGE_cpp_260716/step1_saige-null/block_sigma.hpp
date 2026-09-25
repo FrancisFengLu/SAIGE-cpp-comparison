@@ -56,6 +56,17 @@ struct Partition {
     std::vector<int>    psiR, psiC;  // local row/col inside the block
     std::vector<double> psiV;
     std::vector<int>    invStart;    // block -> offset into the dense inverse
+    // Size-1 fast lane. 86% of the blocks on the benchmark GRM hold a single
+    // sample, and for those the whole "form the block and invert it" reduces to
+    // one reciprocal. Precomputing (sample, Psi_ii, slot) lets refresh() walk a
+    // flat array instead of re-reading size/start/psiStart per block. Only
+    // size-1 blocks whose Psi contribution is exactly one diagonal entry are
+    // listed here; anything odd (no entry, or a duplicate) stays on the general
+    // path so the arithmetic cannot drift.
+    std::vector<int>    one_sample;  // sample index
+    std::vector<double> one_psi;     // Psi_ii
+    std::vector<int>    one_slot;    // offset into inv_
+    std::vector<int>    genBlock;    // block ids NOT on the fast lane
     bool built = false;
 };
 
@@ -64,12 +75,16 @@ public:
     // Build the partition from SAIGE's sparse-GRM globals. Returns false (and
     // leaves the object unusable) if the input is empty or inconsistent, in
     // which case the caller must fall back to gen_spsolve_v4.
-    // A connected component is not a clique: on a stress GRM with components of
-    // 1,000 members only 0.90% of the within-block entries are non-zero, so a
-    // dense inverse of such a block spends 2e10 flops on a matrix that is 99%
-    // zeros. The right gate is therefore the total sum(b^3), not the largest
-    // block. build() refuses when that budget (or the sum(b^2) storage budget)
-    // is exceeded, and the caller falls back to gen_spsolve_v4.
+    // Cost gate. The old gate compared sum(b^3) against a bare flop budget whose
+    // default (5e8) refused a single 800-sample block -- a number with no
+    // operational meaning, and wrong besides: FastSparseGRM's blocks are dense
+    // cliques (BLOCK_INVERSE_ALGOS.md S1), so a large block is a genuinely dense
+    // inverse, not a sparse matrix being mishandled. The gate is now a WALL-CLOCK
+    // budget for one refresh: build() times a real inverse at the largest block
+    // size with the same dispatch refresh() will use, extrapolates by sum(b^3),
+    // divides by the threads refresh() can actually use, and refuses when the
+    // estimate exceeds fit.block_sparse_sigma_refresh_budget_s. The storage
+    // budget (sum(b^2) bytes) still applies.
     bool build(const arma::umat& loc, const arma::vec& val, int n);
     // True once build() has refused; the caller must not retry. Without this
     // every subsequent solve re-ran the union-find over all nnz and reprinted
@@ -82,8 +97,15 @@ public:
     // happen (refresh() has no dimension guard, unlike solve()).
     void reset() { *this = BlockSigma(); }
     void setBudget(double flopBudget, double byteBudget);
+    // Seconds allowed for ONE refresh (fit.block_sparse_sigma_refresh_budget_s).
+    void setRefreshBudget(double seconds);
     double lastFlops() const { return flops_; }
     double lastBytes() const { return bytes_; }
+    // Estimated and measured cost of one refresh, in seconds. The estimate is
+    // what the gate used; the measurement is what it actually cost. Both are
+    // printed so a bad estimate is visible rather than silent.
+    double estRefreshSeconds() const { return estSecs_; }
+    double refreshSeconds() const { return refreshSecs_; }
 
     // Form Sigma for this (w, tau) and invert it block by block. Mirrors
     // gen_sp_Sigma's arithmetic exactly, including the 1e-4 floor that is
@@ -136,13 +158,21 @@ private:
     //   max block  10  sum(b^3) 7.5e5   56x
     //   max block  49  sum(b^3) 3.1e7   9.6x   (1.757 -> 0.184 s)
     //   max block 199  sum(b^3) 4.6e8   1.6x   (1.786 -> 1.126 s)
-    //   max block 999  sum(b^3) 1.2e10  a loss: ~4 s per refresh against 1.8 s
-    //                                   of SuperLU for the whole stage
-    // The gain decays smoothly and turns negative somewhere above 1e9, so the
-    // default sits below that with the last measured win (1.6x) still inside.
-    double flopBudget_ = 5e8;
+    //   max block 999  sum(b^3) 1.2e10  a loss
+    // The gain decays smoothly and turns negative between the last two, which is
+    // what the seconds budget is calibrated against.
+    // flopBudget_ <= 0 means "no raw flop gate"; the seconds gate below is the
+    // real one. Kept as an escape hatch for reproducing the old behaviour.
+    double flopBudget_ = 0.0;
     double byteBudget_ = 2e9;        // 2 GB of block inverses
+    // Seconds per refresh. Calibrated against the measured cost of the four test
+    // GRMs; see SMALL_BLOCK_INVERSE.md S4.
+    double refreshBudget_ = 0.25;
     double flops_ = 0.0, bytes_ = 0.0;
+    // Times one real inverse at the largest block size and scales by sum(b^3).
+    double estimateRefreshSeconds() const;
+    double estSecs_ = 0.0;           // gate's estimate for one refresh
+    double refreshSecs_ = 0.0;       // measured, summed over all refreshes
     bool buildFailed_ = false;
 
 public:

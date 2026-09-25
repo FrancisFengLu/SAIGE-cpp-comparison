@@ -3996,6 +3996,9 @@ void setupSparseGRM(int r, arma::umat & locationMatinR, arma::vec & valueVecinR)
     valueVec = valueVecinR;
     dimNum = r;
 
+    // Any cached LU factors belong to the previous GRM.
+    spsolve_cache::reset();
+
     std::cout << locationMat.n_rows << " locationMat.n_rows " << std::endl;
     std::cout << locationMat.n_cols << " locationMat.n_cols " << std::endl;
     std::cout << valueVec.n_elem << " valueVec.n_elem " << std::endl;
@@ -4407,6 +4410,9 @@ void reset_step1_state_for_new_sample_set()
     // no dimension guard (solve() does), so a stale partition indexes past the
     // end of w and aborts rather than quietly producing wrong numbers.
     blocksigma::instance().reset();
+    // The LU factors are keyed on (w, tau) plus the GRM's dimension and nnz,
+    // not on its contents, so a new sample set must drop them explicitly.
+    spsolve_cache::reset();
 
 	// 1. GPU
 	if (g_gpu_handle) saige::gpu::destroy(g_gpu_handle);
@@ -6459,6 +6465,119 @@ arma::vec gen_spsolve_v3(arma::vec & yvec){
 }
 
 
+// ---------------------------------------------------------------------------
+// (w, tau) cache for the SuperLU fallback of gen_spsolve_v4.
+//
+// The fallback is a fresh arma::spsolve per call: rebuild the whole n x n
+// sp_mat from every nnz (7.5-8.1 ms at N=50,000) and run a full SuperLU
+// symbolic + numeric factorisation (23-26 ms). Nothing about the matrix
+// changes between most of those calls -- a single-trait quantitative fit makes
+// 199 of them with 5 distinct (w, tau), a binary fit 261 with 13, because the
+// 30 Hutchinson trace probes all solve against one unchanged Sigma.
+//
+// arma::spsolve_factoriser (Armadillo >= 12.4) holds exactly the pieces
+// arma::spsolve throws away. Its factorise() runs get_permutation_c +
+// sp_preorder_mat + gstrf and its solve() runs gstrs -- which is what
+// dgssv does internally, with the same default superlu_opts -- so the answer is
+// the same bits, not merely the same to rounding. The one behavioural
+// difference is that factorise() rejects a factorisation whose rcond is below
+// eps unless allow_ugly is set; allow_ugly is set here so the acceptance test
+// matches spsolve_simple's (gstrf's info code), and any failure falls straight
+// back to arma::spsolve so the old error behaviour (including the throw on a
+// singular system) is preserved.
+//
+// The key is (w, tau) plus the GRM's dimension and nnz. That is not a content
+// hash: reset() must be called whenever the sample set or the sparse GRM is
+// replaced, which is what reset_step1_state_for_new_sample_set does, exactly as
+// the block partition already relies on.
+namespace spsolve_cache {
+
+static bool  g_enabled = true;
+static arma::spsolve_factoriser g_fact;
+static bool  g_valid = false;
+static arma::fvec g_w, g_tau;
+static int   g_dim = -1;
+static arma::uword g_nnz = 0;
+static long long g_fact_calls = 0, g_hits = 0, g_fallbacks = 0;
+static double g_t_build = 0.0, g_t_fact = 0.0, g_t_solve = 0.0;
+
+void enable(bool on) { g_enabled = on; }
+bool enabled()       { return g_enabled; }
+
+void reset() {
+    g_fact.reset();
+    g_valid = false;
+    g_w.reset(); g_tau.reset();
+    g_dim = -1; g_nnz = 0;
+}
+
+void reset_stats() {
+    g_fact_calls = 0; g_hits = 0; g_fallbacks = 0;
+    g_t_build = g_t_fact = g_t_solve = 0.0;
+}
+
+void report(const char* what) {
+    const long long calls = g_fact_calls + g_hits + g_fallbacks;
+    if (calls == 0) return;
+    printf("[spsolve-cache] %s: %lld calls, %lld factorisations, %lld reuses "
+           "(%.1f%% hit), %lld uncached fallbacks; build %.3fs, factorise %.3fs, "
+           "solve %.3fs\n",
+           what, calls, g_fact_calls, g_hits,
+           100.0 * (double)g_hits / (double)calls, g_fallbacks,
+           g_t_build, g_t_fact, g_t_solve);
+    fflush(stdout);
+}
+
+static bool upToDate(const arma::fvec& w, const arma::fvec& tau,
+                     int dim, arma::uword nnz) {
+    if (!g_valid || g_dim != dim || g_nnz != nnz) return false;
+    if (g_w.n_elem != w.n_elem || g_tau.n_elem != tau.n_elem) return false;
+    for (arma::uword i = 0; i < tau.n_elem; i++) if (g_tau(i) != tau(i)) return false;
+    for (arma::uword i = 0; i < w.n_elem;   i++) if (g_w(i)   != w(i))   return false;
+    return true;
+}
+
+// Returns true and fills x when the cached factors could be used (or freshly
+// built); false means the caller must run the old uncached path.
+static bool solve(arma::fvec& wVec, arma::fvec& tauVec, const arma::vec& b,
+                  arma::vec& x, bool prof, double t_entry) {
+    if (!g_enabled) return false;
+    const double t0 = spsolve_prof::now_s();
+    if (upToDate(wVec, tauVec, dimNum, valueVec.n_elem)) {
+        g_hits++;
+        arma::mat X;
+        const double t1 = spsolve_prof::now_s();
+        const bool ok = g_fact.solve(X, b);
+        g_t_solve += spsolve_prof::now_s() - t1;
+        if (!ok || X.n_rows != b.n_elem) { reset(); g_hits--; g_fallbacks++; return false; }
+        x = arma::vec(X.memptr(), X.n_rows);
+        if (prof) spsolve_prof::add(t1 - t_entry, spsolve_prof::now_s() - t1);
+        return true;
+    }
+    reset();
+    arma::sp_mat A = gen_sp_Sigma(wVec, tauVec);
+    const double t1 = spsolve_prof::now_s();
+    g_t_build += t1 - t0;
+    arma::superlu_opts opts;
+    opts.allow_ugly = true;     // match spsolve_simple: accept on gstrf's info
+    const bool fok = g_fact.factorise(A, opts);
+    g_t_fact += spsolve_prof::now_s() - t1;
+    if (!fok) { reset(); g_fallbacks++; return false; }
+    g_fact_calls++;
+    const double t2 = spsolve_prof::now_s();
+    arma::mat X;
+    const bool sok = g_fact.solve(X, b);
+    g_t_solve += spsolve_prof::now_s() - t2;
+    if (!sok || X.n_rows != b.n_elem) { reset(); g_fact_calls--; g_fallbacks++; return false; }
+    x = arma::vec(X.memptr(), X.n_rows);
+    g_w = wVec; g_tau = tauVec; g_dim = dimNum; g_nnz = valueVec.n_elem;
+    g_valid = true;
+    if (prof) spsolve_prof::add(t1 - t_entry, spsolve_prof::now_s() - t1);
+    return true;
+}
+
+}  // namespace spsolve_cache
+
 arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yvec){
 
     arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
@@ -6496,13 +6615,23 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
         }
     }
 
+    // fit.cache_sparse_solve: reuse the LU factors when (w, tau) repeat. Same
+    // matrix, same factorisation, same triangular solves -- just not redone.
+    arma::vec x;
+    if (spsolve_cache::solve(wVec, tauVec, yvec2, x, _prof, _t0)) {
+#ifdef SAIGE_DEBUG_IO
+        fprintf(stderr, "[DBG4] cached spsolve done\n"); fflush(stderr);
+#endif
+        return arma::conv_to<arma::fvec>::from(x);
+    }
+
     arma::sp_mat result = gen_sp_Sigma(wVec, tauVec);
 #ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG3] gen_sp_Sigma done nnz=%llu\n", (unsigned long long)result.n_nonzero); fflush(stderr);
 #endif
     const double _t1 = _prof ? spsolve_prof::now_s() : 0.0;
 
-    arma::vec x = arma::spsolve(result, yvec2);
+    x = arma::spsolve(result, yvec2);
     if (_prof) spsolve_prof::add(_t1 - _t0, spsolve_prof::now_s() - _t1);
 #ifdef SAIGE_DEBUG_IO
     fprintf(stderr, "[DBG4] spsolve done\n"); fflush(stderr);

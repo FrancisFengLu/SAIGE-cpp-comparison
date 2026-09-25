@@ -315,3 +315,27 @@ struct Scope {
     ~Scope() { set_tag(prev); }
 };
 }  // namespace spsolve_prof
+
+// ---------------------------------------------------------------------------
+// (w, tau) cache for the SuperLU fallback of gen_spsolve_v4.
+//
+// The fallback rebuilds the whole n x n sp_mat from every nnz and runs a fresh
+// SuperLU symbolic + numeric factorisation on EVERY call -- 30-34 ms measured
+// at N=50,000. But (w, tau) repeats constantly: a single-trait quantitative fit
+// makes 199 such calls with only 5 distinct (w, tau), a binary fit 261 with 13.
+// (The 30 Hutchinson trace probes are 30 solves against one unchanged Sigma.)
+// Holding the LU factors across calls and re-running only the triangular solves
+// is bit-identical -- same matrix, same factorisation, same back-substitution --
+// and it also covers the case the block path cannot help with at all: one giant
+// connected component, where there are no blocks to invert.
+//
+// Enabled by fit.cache_sparse_solve (default on). reset() MUST be called
+// whenever the sample set or the sparse GRM changes; the factors are keyed on
+// (w, tau) plus the GRM's dimension and nnz, not on its contents.
+namespace spsolve_cache {
+void enable(bool on);
+bool enabled();
+void reset();          // drop the factors (sample set / GRM changed)
+void reset_stats();
+void report(const char* what);
+}  // namespace spsolve_cache

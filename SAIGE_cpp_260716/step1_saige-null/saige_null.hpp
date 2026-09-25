@@ -43,10 +43,24 @@ struct FitNullConfig {
   // fit.block_sparse_sigma_verify: run both paths on every call and report the
   // difference. This is the correctness gate, not a mode to benchmark.
   bool block_sparse_sigma_verify{false};
-  // fit.block_sparse_sigma_flop_budget: refuse the block inverse when
-  // sum(block^3) exceeds this. A connected component is not a clique, so a
-  // large component is better served by a sparse factorisation.
-  double block_sparse_sigma_flop_budget{5e8};
+  // fit.block_sparse_sigma_flop_budget: raw sum(block^3) gate. OFF by default
+  // (0) -- it was never an operational number; the seconds budget below
+  // replaced it. Set it > 0 to reproduce the old behaviour.
+  double block_sparse_sigma_flop_budget{0.0};
+  // fit.block_sparse_sigma_refresh_budget_s: refuse the block inverse when ONE
+  // refresh is estimated to cost more than this many seconds on a single
+  // thread. build() gets the estimate by timing a real inverse at the largest
+  // block size and scaling by sum(b^3), so it is a measurement on this machine,
+  // not a flop count. Default 0.25 s: the four stress GRMs measure 1.6x faster
+  // than SuperLU at max block 199 and slower at max block 999, and the estimate
+  // separates them (see SMALL_BLOCK_INVERSE.md).
+  double block_sparse_sigma_refresh_budget_s{0.25};
+  // fit.cache_sparse_solve: on the SuperLU fallback path, keep the LU factors
+  // and reuse them when (w, tau) repeat. Bit-identical by construction -- the
+  // same matrix, the same factorisation, the same triangular solves, just not
+  // redone. ON by default; set false to go back to a fresh arma::spsolve per
+  // call.
+  bool cache_sparse_solve{true};
   // fit.exact_trace: exact AI-REML traces instead of 30 Hutchinson probes.
   // Requires block_sparse_sigma. This one DOES change results.
   bool exact_trace{false};
