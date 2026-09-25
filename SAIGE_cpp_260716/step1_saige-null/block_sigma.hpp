@@ -148,6 +148,11 @@ public:
 private:
     Partition part_;
     std::vector<double> inv_;        // dense inverse of each block, concatenated
+    // The size-1 blocks' reciprocals again, contiguous and in one_sample order,
+    // so solve() reads them sequentially instead of gathering them out of inv_
+    // (where they sit interleaved with the real blocks). 8 bytes per size-1
+    // block -- 240 KB on the benchmark GRM.
+    std::vector<double> oneInv_;
     std::vector<double> scratch_;    // per-block dense Sigma during refresh
     bool refreshed_ = false;
     long long nFloored_ = 0;
@@ -169,6 +174,10 @@ private:
     // GRMs; see SMALL_BLOCK_INVERSE.md S4.
     double refreshBudget_ = 0.25;
     double flops_ = 0.0, bytes_ = 0.0;
+    // sum(b^2) over the blocks that are NOT on the size-1 lane: the work the
+    // general pass of solve() does, and what decides whether it is worth a
+    // parallel region.
+    double genFlops_ = 0.0;
     // Times one real inverse at the largest block size and scales by sum(b^3).
     double estimateRefreshSeconds() const;
     double estSecs_ = 0.0;           // gate's estimate for one refresh

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -118,6 +119,15 @@ static inline bool sym4_inv(double* A) {
     return true;
 }
 
+// Below these thresholds solve() runs the pass serially. Entering an OpenMP
+// parallel region costs a thread wake-up on every call; on the benchmark GRM
+// (n=50,000, 34,687 blocks of which 30,000 hold one sample) the whole solve is
+// ~0.2 ms of work single-threaded, so the region has to earn its keep. Measured
+// in production, not in a loop that keeps the pool hot -- see
+// SMALL_BLOCK_INVERSE.md S3.
+static const int    kParN     = 32768;   // size-1 elements
+static const double kParFlops = 2.0e6;   // sum(b^2) over the general blocks
+
 // Largest block still sent to chol_inv. Above this arma::inv_sympd (LAPACK's
 // blocked dpotrf/dpotri) wins; see the comment on chol_inv.
 static const int kCholMax = 32;
@@ -228,12 +238,10 @@ bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
         part_.localOf[(size_t)i] = part_.size[(size_t)b]++;
     }
     part_.start.assign((size_t)nb, 0);
-    part_.invStart.assign((size_t)nb, 0);
     long long off = 0, ioff = 0;
     for (int b = 0; b < nb; b++) {
-        part_.start[(size_t)b]    = (int)off;   off  += part_.size[(size_t)b];
-        part_.invStart[(size_t)b] = (int)ioff;  ioff += (long long)part_.size[(size_t)b]
-                                                        * part_.size[(size_t)b];
+        part_.start[(size_t)b] = (int)off;   off += part_.size[(size_t)b];
+        ioff += (long long)part_.size[(size_t)b] * part_.size[(size_t)b];
         part_.maxBlock = std::max(part_.maxBlock, part_.size[(size_t)b]);
     }
     part_.member.assign((size_t)n, -1);
@@ -261,31 +269,54 @@ bool BlockSigma::build(const arma::umat& loc, const arma::vec& val, int n) {
         part_.psiV[(size_t)at] = val(k);
     }
 
-    // --- size-1 fast lane -----------------------------------------------
+    // --- size-1 fast lane, and the layout of inv_ -------------------------
     // A size-1 block whose Psi contribution is exactly one diagonal entry is
     // one reciprocal; nothing about size/start/psiStart needs re-reading.
     // Anything else (no entry at all, or a duplicate) stays on the general
     // path, so the arithmetic is bit-for-bit what it was.
+    //
+    // invStart is assigned AFTER this split, general blocks first: solve()'s
+    // general pass then walks one contiguous region instead of one interleaved
+    // with 30,000 single doubles it does not read (it reads those from
+    // oneInv_). At s=3 a block is 72 bytes, so without the compaction every
+    // block straddles a cache line it shares with lane entries.
     part_.one_sample.clear(); part_.one_psi.clear(); part_.one_slot.clear();
     part_.genBlock.clear();
+    std::vector<int> laneBlock;
     for (int b = 0; b < nb; b++) {
         const int k0 = part_.psiStart[(size_t)b], k1 = part_.psiStart[(size_t)b + 1];
         if (part_.size[(size_t)b] == 1 && k1 - k0 == 1 &&
             part_.psiR[(size_t)k0] == 0 && part_.psiC[(size_t)k0] == 0) {
+            laneBlock.push_back(b);
             part_.one_sample.push_back(part_.member[(size_t)part_.start[(size_t)b]]);
             part_.one_psi.push_back(part_.psiV[(size_t)k0]);
-            part_.one_slot.push_back(part_.invStart[(size_t)b]);
         } else {
             part_.genBlock.push_back(b);
         }
     }
+    part_.invStart.assign((size_t)nb, 0);
+    {
+        long long at = 0;
+        for (size_t j = 0; j < part_.genBlock.size(); j++) {
+            const int b = part_.genBlock[j];
+            part_.invStart[(size_t)b] = (int)at;
+            at += (long long)part_.size[(size_t)b] * part_.size[(size_t)b];
+        }
+        for (size_t j = 0; j < laneBlock.size(); j++) {
+            const int b = laneBlock[j];
+            part_.invStart[(size_t)b] = (int)at;
+            part_.one_slot.push_back((int)at);
+            at += 1;
+        }
+    }
 
     // --- cost gate --------------------------------------------------------
-    flops_ = 0.0; bytes_ = 0.0;
+    flops_ = 0.0; bytes_ = 0.0; genFlops_ = 0.0;
     for (int b = 0; b < nb; b++) {
         const double sz = (double)part_.size[(size_t)b];
         flops_ += sz * sz * sz;
         bytes_ += sz * sz * 8.0;
+        if (sz > 1.0) genFlops_ += sz * sz;
     }
     // Estimate the seconds one refresh costs by timing a real inverse at the
     // largest block size, with the dispatch refresh() will use, and scaling by
@@ -368,9 +399,15 @@ void BlockSigma::setRefreshBudget(double seconds) {
 bool BlockSigma::upToDate(const arma::fvec& w, const arma::fvec& tau) const {
     if (!refreshed_ || lastW_.n_elem != w.n_elem || lastTau_.n_elem != tau.n_elem)
         return false;
-    for (arma::uword i = 0; i < tau.n_elem; i++) if (lastTau_(i) != tau(i)) return false;
-    for (arma::uword i = 0; i < w.n_elem;   i++) if (lastW_(i)   != w(i))   return false;
-    return true;
+    // memcmp, not an element-wise float compare: it is called on every solve
+    // (199-261 times a fit) over the full n-length weight vector. Bitwise
+    // equality is strictly stronger than floating-point equality here -- the
+    // only pairs it separates are +0/-0 (which then simply costs a refresh that
+    // would have produced the same matrix) and NaN (where identical bits do
+    // mean an identical Sigma, so reusing is right).
+    if (std::memcmp(lastTau_.memptr(), tau.memptr(), tau.n_elem * sizeof(float)) != 0)
+        return false;
+    return std::memcmp(lastW_.memptr(), w.memptr(), w.n_elem * sizeof(float)) == 0;
 }
 
 void BlockSigma::refresh(const arma::fvec& w, const arma::fvec& tau) {
@@ -387,7 +424,11 @@ void BlockSigma::refresh(const arma::fvec& w, const arma::fvec& tau) {
     long long floored = 0;
 
     // Fast lane: one reciprocal per single-sample block, over flat arrays.
+    // The reciprocal is stored twice -- into inv_ where traces() and
+    // blockInverse() expect it, and into the contiguous oneInv_ that solve()
+    // streams.
     const int n1 = (int)part_.one_slot.size();
+    if ((int)oneInv_.size() != n1) oneInv_.assign((size_t)n1, 0.0);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) reduction(+:floored)
 #endif
@@ -396,7 +437,9 @@ void BlockSigma::refresh(const arma::fvec& w, const arma::fvec& tau) {
         const float dt = (1.0f / w((arma::uword)part_.one_sample[(size_t)k])) * tau0;
         v += (double)dt;
         if (v < 1e-4) { v = 1e-4; floored++; }
-        inv_[(size_t)part_.one_slot[(size_t)k]] = 1.0 / v;
+        const double r = 1.0 / v;
+        inv_[(size_t)part_.one_slot[(size_t)k]] = r;
+        oneInv_[(size_t)k] = r;
     }
 
     const int ng = (int)part_.genBlock.size();
@@ -479,30 +522,57 @@ arma::fmat BlockSigma::psiMultiply(const arma::fmat& X) const {
     return out;
 }
 
+// Sigma^-1 b. This is the hot function on the block path: refresh() runs 5
+// (quantitative) or 13 (binary) times per fit, solve() 199 or 261 times.
+//
+// Two things used to dominate it and neither was arithmetic:
+//   * arma::fvec(n, fill::zeros) memset the whole output every call. It was
+//     dead work: the blocks partition ALL n samples and every block stores
+//     every one of its members, so each element is written exactly once.
+//   * one `#pragma omp parallel for` over all 34,687 blocks, 86% of which hold
+//     a single sample. Entering a parallel region to hand a thread one multiply
+//     costs more than the multiply. The size-1 blocks are now a separate flat
+//     pass over contiguous arrays, and whether either pass is worth
+//     parallelising is decided by size (kParN / kParFlops), measured below.
 arma::fvec BlockSigma::solve(const arma::fvec& b) const {
-    arma::fvec out(b.n_elem, arma::fill::zeros);
-    if (!ready() || (int)b.n_elem != part_.n) return out;
-    const int nb = part_.nblocks;
+    if (!ready() || (int)b.n_elem != part_.n)
+        return arma::fvec(b.n_elem, arma::fill::zeros);
 
+    arma::fvec out(b.n_elem);                 // every element is written below
+    const float*  __restrict bp = b.memptr();
+    float*        __restrict op = out.memptr();
+
+    // --- size-1 blocks: a pure elementwise product ------------------------
+    const int n1 = (int)part_.one_sample.size();
+    const int*    __restrict os = part_.one_sample.data();
+    const double* __restrict oi = oneInv_.data();
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) if (n1 >= kParN)
 #endif
-    for (int blk = 0; blk < nb; blk++) {
-        const int s  = part_.size[(size_t)blk];
-        const int mo = part_.start[(size_t)blk];
-        const double* A = &inv_[(size_t)part_.invStart[(size_t)blk]];
-        if (s == 1) {
-            const int i = part_.member[(size_t)mo];
-            out((arma::uword)i) = (float)(A[0] * (double)b((arma::uword)i));
-            continue;
-        }
-        // Accumulate in fp64, round once on store, matching gen_spsolve_v4,
-        // which solves in fp64 and converts the result to fp32 at the end.
+    for (int k = 0; k < n1; k++) {
+        const int i = os[k];
+        op[i] = (float)(oi[k] * (double)bp[i]);
+    }
+
+    // --- everything else -------------------------------------------------
+    // Accumulate in fp64, round once on store, matching gen_spsolve_v4, which
+    // solves in fp64 and converts the result to fp32 at the end. The order of
+    // the inner sum is unchanged, so this is bit-for-bit the old result.
+    const int ng = (int)part_.genBlock.size();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (genFlops_ >= kParFlops)
+#endif
+    for (int j = 0; j < ng; j++) {
+        const int blk = part_.genBlock[(size_t)j];
+        const int s   = part_.size[(size_t)blk];
+        const int mo  = part_.start[(size_t)blk];
+        const double* __restrict A = &inv_[(size_t)part_.invStart[(size_t)blk]];
+        const int*    __restrict mem = part_.member.data() + mo;
         for (int r = 0; r < s; r++) {
             double acc = 0.0;
             for (int c = 0; c < s; c++)
-                acc += A[(size_t)c * s + r] * (double)b((arma::uword)part_.member[(size_t)(mo + c)]);
-            out((arma::uword)part_.member[(size_t)(mo + r)]) = (float)acc;
+                acc += A[(size_t)c * s + r] * (double)bp[mem[c]];
+            op[mem[r]] = (float)acc;
         }
     }
     return out;

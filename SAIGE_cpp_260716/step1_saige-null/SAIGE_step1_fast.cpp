@@ -6580,8 +6580,6 @@ static bool solve(arma::fvec& wVec, arma::fvec& tauVec, const arma::vec& b,
 
 arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yvec){
 
-    arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
-
     // Stage-0 instrumentation (fit.profile_spsolve, off by default): split the
     // cost into "rebuild the sp_mat" and "factorise + solve". Both happen on
     // every call today -- the sparsity pattern never changes, only the values.
@@ -6607,6 +6605,7 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
             arma::fvec got = BS.solve(yvec);
             if (blocksigma::verifyEnabled()) {
                 arma::sp_mat ref = gen_sp_Sigma(wVec, tauVec);
+                arma::vec  yvec2 = arma::conv_to<arma::vec>::from(yvec);
                 arma::vec  refy  = arma::spsolve(ref, yvec2);
                 blocksigma::recordVerify(arma::conv_to<arma::fvec>::from(refy), got);
             }
@@ -6614,6 +6613,11 @@ arma::fvec gen_spsolve_v4(arma::fvec& wVec,  arma::fvec& tauVec, arma::fvec & yv
             return got;
         }
     }
+
+    // Only the SuperLU path needs the fp64 copy of the right-hand side. It used
+    // to be built at function entry, so the block path paid an n-element
+    // allocation and conversion on every one of its 199-261 calls for nothing.
+    arma::vec yvec2 = arma::conv_to<arma::vec>::from(yvec);
 
     // fit.cache_sparse_solve: reuse the LU factors when (w, tau) repeat. Same
     // matrix, same factorisation, same triangular solves -- just not redone.
