@@ -99,6 +99,8 @@ Args parse(int argc, char** argv) {
     if (a.trace != "exact" && a.trace != "hutchinson") {
         std::fprintf(stderr, "step1bench: --trace must be exact or hutchinson\n"); std::exit(2);
     }
+    if (a.probes < 1)  { std::fprintf(stderr, "step1bench: --probes must be >= 1\n");  std::exit(2); }
+    if (a.maxiter < 1) { std::fprintf(stderr, "step1bench: --maxiter must be >= 1\n"); std::exit(2); }
     return a;
 }
 
