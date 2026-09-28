@@ -24,6 +24,7 @@ std::atomic<std::uint64_t> g_firthFitCalls{0};
 #include <boost/math/distributions/chi_squared.hpp>
 #include <boost/math/special_functions/erf.hpp>
 #include <boost/math/constants/constants.hpp>
+#include "phase_timing.hpp"
 
 namespace SAIGE {
 
@@ -860,6 +861,7 @@ void SAIGEClass::getMarkerPval(arma::vec & t_GVec,
 
 
 
+  PT_T0(tScSG);
   t_isFirth = false;
   std::string t_pval_str;
   double t_var2, t_SPApval;
@@ -936,6 +938,7 @@ if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
 }
 
 
+  PT_ADD(S_SCORE, tScSG);
   double StdStat = std::abs(t_Tstat) / sqrt(t_var1);
 
   t_isSPAConverge = false;
@@ -1019,6 +1022,7 @@ if(!t_isER){
 
 
   if(!std::isnan(StdStat) && (StdStat > m_SPA_Cutoff) && m_traitType != "quantitative"){
+    PT_SCOPE(S_SPA);
 
         // gtilde, p_iIndexComVecSize, m1, gNA/gNB/muNA/muNB, NAmu, NAsigma,
         // tol1 -- one definition, shared with the conditional SPA block below.
@@ -1138,6 +1142,7 @@ if(!t_isER){
    }
 
 }else{ //if(!t_isER){
+    PT_SCOPE(S_ER);
 
     arma::mat Z_er(t_GVec.n_elem, 1);
     Z_er.col(0) = t_GVec;
@@ -1188,6 +1193,7 @@ if(!t_isER){
     }
 }
    if(t_isFirth && !g_firthDefer){
+	PT_SCOPE(S_FIRTH);
 	if(!is_gtilde){
                 getadjGFast(t_GVec, t_gtilde, iIndex);
                 is_gtilde = true;

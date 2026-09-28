@@ -27,6 +27,7 @@
 #include <chrono>
 #include <atomic>
 #include <omp.h>
+#include "phase_timing.hpp"
 
 // OpenBLAS thread-count knob (no public header in some installs); declared here
 // so we can clamp BLAS to 1 thread per OMP worker and avoid nested oversubscription.
@@ -3035,6 +3036,7 @@ void mainMarkerMT(
             const int jj1 = std::min(jj0 + Bblk, qc);
             int nHi = 0, nLo = 0;
 
+            PT_T0(tRdMT);
             // ---- read + QC + impute every marker in the block ----
             for (int jj = jj0; jj < jj1; jj++) {
                 const int i = chunkStart + jj;
@@ -3415,6 +3417,8 @@ void mainMarkerMT(
                 }
             }
 
+            PT_ADD(S_READ, tRdMT);
+            PT_T0(tGeMT);
             // ---- batch pass ----
             const SAIGE::MTBlockAdj* adjPtr = differ ? &W.adj : nullptr;
             if (batchOn) {
@@ -3430,6 +3434,8 @@ void mainMarkerMT(
                                             Bblk - nLo, Bblk, W.VR, adjPtr, W.scr, W.res);
             }
 
+            PT_ADD(S_GEMM, tGeMT);
+            PT_T0(tFiMT);
             // ---- finalize every (marker, trait) pair in the block ----
             for (int jj = jj0; jj < jj1; jj++) {
                 const int c = W.colOf[jj - jj0];
@@ -3477,6 +3483,8 @@ void mainMarkerMT(
                         O.imputeInfo[jj]  = imputationInfoVec[jj];
                     }
                     const bool hi = (MAC > g_MACCutoffforER);
+                    PT_CNTIF(C_PAIR_BIN, isBin);
+                    PT_CNTIF(C_ER_LOWMAC, isBin && !hi);
                     // The trait's genotype values: the block column, or the
                     // trait's own table looked up through the union codes.
                     const SAIGE::MTTraitSamples& S = ctx.samp[t];
@@ -3493,6 +3501,7 @@ void mainMarkerMT(
                     // and model constants, so it is known before the first
                     // pass. When it matches, the recompute is a bit-identical
                     // repeat and is skipped -- and Firth must run inline.
+                    PT_T0(tGtMT);
                     bool fastRecomputeSameCtx = false;
                     const bool fastEligible =
                         obj->m_isFastTest &&
@@ -3550,7 +3559,12 @@ void mainMarkerMT(
                             needFast = (pnum < obj->m_pval_cutoff_for_fastTest);
                         }
                         useBatch = !needSPA && !needFirth && !needFast;
+                        PT_CNT(C_GATED);
+                        PT_CNTIF(C_NEEDSPA, needSPA);
+                        PT_CNTIF(C_NEEDFIRTH, needFirth);
+                        PT_CNTIF(C_NEEDFAST, needFast);
                     }
+                    PT_ADD(S_GATE, tGtMT);
 
                     if (ownSamples) {
                         if (W.adj.a(c, t) < 0.0) {
@@ -3578,6 +3592,7 @@ void mainMarkerMT(
                         #pragma omp atomic
                         nBatched[t]++;
                     } else {
+                        PT_SCOPE(S_FALL);
                         // The genotype vector getMarkerPval sees: the block
                         // column itself, or -- for a trait with its own sample
                         // list -- that trait's vector, rebuilt from the codes
@@ -3806,6 +3821,7 @@ void mainMarkerMT(
                     }
                 }  // for t
             }  // for jj (finalize)
+            PT_ADD(S_FINAL, tFiMT);
         }  // for blk (omp)
 
         // ---- write this chunk's rows, one file per trait ----
@@ -3890,6 +3906,7 @@ void mainMarkerMT(
                   << std::endl;
     }
     std::cout << "  [mt breakdown] output write " << tWriteMT << " s" << std::endl;
+    PT_REPORT(tWriteMT, nThreadsHere);
 #ifdef MTFOLD_PROF
     std::cout << "  [mtfold prof] cpu-s  Zall " << SAIGE::g_mtfProfZall
               << "  GWqnt " << SAIGE::g_mtfProfGW

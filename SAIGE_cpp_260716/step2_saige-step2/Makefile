@@ -126,6 +126,20 @@ ifeq ($(USE_MVEC),1)
   endif
 endif
 
+# ---- optional stage timers for the multi-trait loop (phase_timing.hpp) ----
+# DEFAULT OFF. Without PHASE_TIMING=1 every PT_* macro expands to ((void)0),
+# phase_timing.cpp compiles to an empty translation unit, and the binary is
+# byte-for-byte the production one. Used to measure how the multi-trait
+# single-variant loop splits into the dense fast-path scan and the scalar
+# slow-path corrections (SPA / ER / Firth).
+#   make clean && make PHASE_TIMING=1 TARGET=saige-step2.phase
+# The object files are shared between the two configurations, so a `make clean`
+# between builds is required.
+PHASE_TIMING ?= 0
+ifeq ($(PHASE_TIMING),1)
+  override CXXFLAGS += -DMT_PHASE_TIMING
+endif
+
 # ---- optional GPU path for step 2 (gpu/gpu_step2.hpp) ----------------------
 # DEFAULT OFF. Without USE_CUDA=1 the stub translation unit is linked, so
 # saige::gpu2::available() always says no, main()'s GPU gate can never be
