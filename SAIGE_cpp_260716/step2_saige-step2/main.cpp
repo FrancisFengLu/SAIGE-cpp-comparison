@@ -5976,6 +5976,23 @@ int main(int argc, char* argv[])
             std::cerr << "  LOCO:              true/false (default: false)" << std::endl;
             std::cerr << "  chrom:             chromosome being tested, e.g. \"1\" (required when LOCO=true)" << std::endl;
             std::cerr << std::endl;
+            std::cerr << "Sparse-GRM variance solve (only reached with a sparse GRM in the model):" << std::endl;
+            std::cerr << "  blockSparseSigma:  true/false (default: false). Solve Sigma^-1 gtilde" << std::endl;
+            std::cerr << "                     with an explicit block-diagonal inverse (one dense" << std::endl;
+            std::cerr << "                     inverse per connected component of the GRM) instead" << std::endl;
+            std::cerr << "                     of the per-marker PCG. Direct, so more accurate than" << std::endl;
+            std::cerr << "                     the PCG's 0.02 tolerance; not bitwise the same." << std::endl;
+            std::cerr << "                     Falls back to PCG, printing why, when a component" << std::endl;
+            std::cerr << "                     is too large to invert within the budget." << std::endl;
+            std::cerr << "  blockSparseSigmaVerify: true/false (default: false). Run PCG too on" << std::endl;
+            std::cerr << "                     every solve and report residuals against a tight" << std::endl;
+            std::cerr << "                     reference at the end. Slow by design." << std::endl;
+            std::cerr << "  blockSparseSigmaRefreshBudget_s: seconds one inversion may take" << std::endl;
+            std::cerr << "                     before the block inverse is refused (default: 0.25)" << std::endl;
+            std::cerr << "  blockSparseSigmaSolveMargin: the block solve must be this many times" << std::endl;
+            std::cerr << "                     faster than one PCG on a probe, timed at start-up," << std::endl;
+            std::cerr << "                     or PCG is kept (default: 2; 0 disables the check)" << std::endl;
+            std::cerr << std::endl;
             std::cerr << "GPU (single-variant, quantitative traits only):" << std::endl;
             std::cerr << "  useGPU:            true/false (default: false). Puts the sample-space" << std::endl;
             std::cerr << "                     reductions on a CUDA device. Falls back to the CPU," << std::endl;
@@ -6210,6 +6227,27 @@ int main(int argc, char* argv[])
         // R step 2 --relatednessCutoff (default 0): sparse GRM entries below it
         // are dropped before Sigma is built (null_model_loader.cpp).
         double relatednessCutoff = config["relatednessCutoff"] ? config["relatednessCutoff"].as<double>() : 0.0;
+        // blockSparseSigma (default off): on the sparse-GRM variance path,
+        // solve Sigma^-1 gtilde with the explicit block-diagonal inverse of
+        // s2_block_solve.hpp instead of the per-marker PCG. Read before the
+        // SAIGEClass instances are built, which is where the inverse is formed.
+        {
+            s2blk::Config blk;
+            blk.enabled = config["blockSparseSigma"] ? config["blockSparseSigma"].as<bool>() : false;
+            blk.verify  = config["blockSparseSigmaVerify"] ? config["blockSparseSigmaVerify"].as<bool>() : false;
+            blk.refreshBudgetS = config["blockSparseSigmaRefreshBudget_s"]
+                                     ? config["blockSparseSigmaRefreshBudget_s"].as<double>() : 0.25;
+            blk.solveMargin = config["blockSparseSigmaSolveMargin"]
+                                  ? config["blockSparseSigmaSolveMargin"].as<double>() : 2.0;
+            s2blk::configure(blk);
+            if (blk.verify && !blk.enabled)
+                std::cout << "blockSparseSigmaVerify has no effect unless blockSparseSigma is also on"
+                          << std::endl;
+            if (blk.enabled)
+                std::cout << "  blockSparseSigma:  true (verify=" << (blk.verify ? "true" : "false")
+                          << ", refresh budget " << blk.refreshBudgetS << " s, solve margin "
+                          << blk.solveMargin << ")" << std::endl;
+        }
         bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
 
         // Weights beta parameters (default Beta(1,25))
@@ -7669,6 +7707,10 @@ int main(int argc, char* argv[])
             }
         }
         std::cout << std::endl;
+
+        // Sparse-Sigma solve accounting (PCG vs block inverse); silent unless
+        // some marker took that path.
+        s2blk::reportAll();
 
         timing_mark("99_main_end");  // TIMING_INSTRUMENT_REMOVE_ME
         return 0;

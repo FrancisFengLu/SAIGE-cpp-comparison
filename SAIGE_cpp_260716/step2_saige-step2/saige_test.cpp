@@ -154,6 +154,28 @@ SAIGEClass::SAIGEClass(
     if(t_dimNum != 0){
         m_spSigmaMat = arma::sp_mat(t_locationMat, t_valueVec, t_dimNum, t_dimNum);
 	m_diagSigma = arma::vec(m_spSigmaMat.diag());
+        // blockSparseSigma: build the block-diagonal inverse of this very
+        // Sigma. One instance per SAIGEClass, because Sigma is per trait
+        // (tau1, and mu2 for binary) even though the partition is not; the
+        // union-find is milliseconds and is not worth sharing. init() prints
+        // what it built or why it refused, and a refusal leaves m_blockSolver
+        // null so the PCG runs exactly as before.
+        if (s2blk::config().enabled) {
+            static std::atomic<int> s_objIndex{0};
+            const int idx = s_objIndex.fetch_add(1);
+            auto solver = std::make_shared<s2blk::Solver>();
+            // The production PCG (100 iterations, tol 0.02, as both call
+            // sites use it) for the solve gate's timing probe.
+            auto pcgProbe = [this](const arma::vec& b) {
+                return pcgSigma(b, 100, 0.02, nullptr, true);
+            };
+            if (solver->init(t_locationMat, t_valueVec, t_dimNum,
+                             "trait #" + std::to_string(idx) + " (" + t_traitType + ")",
+                             pcgProbe)) {
+                m_blockSolver = solver;
+                s2blk::registerSolver(solver);
+            }
+        }
     }
 }
 
@@ -1739,7 +1761,42 @@ void SAIGEClass::set_isnoadjCov_cur(bool t_isnoadjCov_cur){
         m_isnoadjCov_cur = t_isnoadjCov_cur;
 }
 
+// Sigma^-1 bVec for the sparse-GRM variance. With blockSparseSigma on and the
+// block inverse built (m_blockSolver non-null) this is a direct solve; otherwise
+// it is the Jacobi PCG below, unchanged. The two are not expected to agree
+// bitwise -- PCG stops at ||r||^2 < tolPCG (0.02 at both call sites) while the
+// block inverse is exact to rounding -- which is what blockSparseSigmaVerify
+// measures: it runs both plus a tight-tolerance PCG reference on every call and
+// reports residuals and distances at the end of the run (s2blk::reportAll).
 arma::vec SAIGEClass::getPCG1ofSigmaAndGtilde(arma::vec& bVec, int maxiterPCG, double tolPCG) {
+    if (m_blockSolver) {
+        const auto t0 = std::chrono::steady_clock::now();
+        arma::vec xBlk = m_blockSolver->solve(bVec);
+        s2blk::noteSolve(true, std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - t0).count());
+        if (s2blk::config().verify) {
+            const auto t1 = std::chrono::steady_clock::now();
+            bool conv = true;
+            arma::vec xPcg = pcgSigma(bVec, maxiterPCG, tolPCG, &conv, false);
+            s2blk::noteVerifyPcg(std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() - t1).count());
+            // Reference: the same PCG driven to ||r||^2 < 1e-18, i.e. ||r|| < 1e-9
+            // absolute, 10^8 times tighter than the production stop. Independent
+            // of the block inverse.
+            arma::vec xRef = pcgSigma(bVec, 20000, 1e-18, nullptr, true);
+            m_blockSolver->recordVerify(m_spSigmaMat, bVec, xPcg, xBlk, xRef, conv);
+        }
+        return xBlk;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    arma::vec x = pcgSigma(bVec, maxiterPCG, tolPCG, nullptr, false);
+    s2blk::noteSolve(false, std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0).count());
+    return x;
+}
+
+arma::vec SAIGEClass::pcgSigma(const arma::vec& bVec, int maxiterPCG, double tolPCG,
+                               bool* converged, bool quiet) const {
     int Nnomissing = m_spSigmaMat.n_rows;
     arma::vec xVec(Nnomissing, arma::fill::zeros); // Initialize xVec to zeros
     arma::vec rVec = bVec; // Residual vector
@@ -1767,7 +1824,8 @@ arma::vec SAIGEClass::getPCG1ofSigmaAndGtilde(arma::vec& bVec, int maxiterPCG, d
         sumr2 = arma::dot(rVec, rVec); // Update residual norm
     }
 
-    if (iter >= maxiterPCG) {
+    if (converged) *converged = (iter < maxiterPCG);
+    if (iter >= maxiterPCG && !quiet) {
         std::cout << "PCG in getPCG1ofSigmaAndGtilde did not converge. You may increase maxiter number." << std::endl;
     }
 

@@ -8,6 +8,9 @@
 #include <random>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+
+#include "s2_block_solve.hpp"
 
 // A3 (2026-07-15): two-stage-lite Firth. g_firthDefer (thread_local) makes the
 // first getMarkerPval pass record the Firth candidate (sets t_isFirth) but skip
@@ -125,6 +128,11 @@ class SAIGEClass
       bool m_islog10p;
 	arma::sp_mat m_spSigmaMat; // Declare the sparse matrix attribute
 	arma::vec m_diagSigma;    // Precompute diagonal
+	// blockSparseSigma: the explicit block-diagonal inverse of m_spSigmaMat
+	// (s2_block_solve.hpp). Null when the switch is off, when there is no
+	// sparse GRM, or when the cost gate refused; getPCG1ofSigmaAndGtilde
+	// then runs the PCG exactly as before.
+	std::shared_ptr<s2blk::Solver> m_blockSolver;
 
 
   ////////////////////// -------------------- functions ----------------
@@ -449,6 +457,12 @@ void scoreTestFast_block(const arma::mat& G,
      double computeSingleVarianceRatio(bool issparseforVR, bool isnoXadj) const;
 
      arma::vec getPCG1ofSigmaAndGtilde(arma::vec& bVec, int maxiterPCG, double tolPCG);
+     // The PCG itself, unchanged from before blockSparseSigma existed.
+     // getPCG1ofSigmaAndGtilde dispatches here unless the block inverse is
+     // ready. `converged` (optional) reports iter < maxiterPCG; `quiet`
+     // suppresses the non-convergence message (used for the verify reference).
+     arma::vec pcgSigma(const arma::vec& bVec, int maxiterPCG, double tolPCG,
+                        bool* converged, bool quiet) const;
 
 };
 }
