@@ -206,6 +206,21 @@ struct MTContext {
     std::vector<double>    foldResid;   // [P] max|A_t - Xref K_t| / max|A_t|, -1 when not tried
     std::vector<int>       foldTraits;  // internal indices that took the fold
 
+    // ---- fused sample-dimension GEMM (config mtFuseGemm) ----
+    // Requires the fold. With it, the quantitative traits' whole sample-space
+    // work per marker block is two GEMMs against G: Z0 = Xref' G (p columns)
+    // and GR = G' RES (P columns). Both are bandwidth-bound on this machine --
+    // MT_FOLD_QUANT.md 5.1 measured the 24-column GEMM at 1.5x the 3-column
+    // one, not 8x -- so the cost is streaming the N x B block, and streaming
+    // it once against the stacked
+    //     H = [ Xref | RES ]        N x (p + P)
+    // then slicing the result replaces two passes over G with one. H is built
+    // once here: Xref and RES are per-run constants, nothing in it changes
+    // between blocks. It duplicates RES (N x P doubles); RES itself stays
+    // because the different-sample-set corrections index it by row.
+    bool      fuseGemm = false;         // Hfold is built and the kernel uses it
+    arma::mat Hfold;                    // N x (foldRefP + P), only when fuseGemm
+
     // ---- block-at-a-time (marker, trait) statistics ----
     // Config key mtVecQuantStats. When set, a quantitative trait's block tail
     // runs emitBlockResultsVecQuant instead of the per-pair
@@ -248,6 +263,8 @@ struct MTScratch {
     // Folded quantitative projection only (MTContext::foldQuant).
     arma::mat Z0;      // p x B   Xref' G, shared by every folded trait
     arma::mat Zf;      // p x B   one folded trait's K_t' Z0
+    // Fused sample-dimension GEMM only (MTContext::fuseGemm).
+    arma::mat GH;      // B x (p+P)   G' [Xref | RES], sliced into Z0 and GR
     // Block tail only (MTContext::vecQuantStats). Length B, grow-only.
     std::vector<double> evVar1, evStat, evZ, evP;
 };
@@ -327,7 +344,8 @@ void buildMTContext(MTContext& t_ctx,
                     bool t_locoEnabled,
                     const std::string& t_locoChrom,
                     const std::vector<std::string>& t_unionIDs,
-                    bool t_foldQuantProj = false);
+                    bool t_foldQuantProj = false,
+                    bool t_fuseGemm = false);
 
 // One marker block's normal-approximation results, B x P. Only the columns of
 // the trait set passed to scoreTestBatchMT are written.
@@ -398,6 +416,9 @@ void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
 // Defined in saige_mt.cpp; see the MTF_TIC/MTF_TOC block there. cpu-seconds
 // summed across threads, not wall clock.
 extern double g_mtfProfZall, g_mtfProfGW, g_mtfProfZ0, g_mtfProfGR;
+// The fused G' [Xref | RES] GEMM (mtFuseGemm), and the g^2 / colsum pass that
+// every quantitative block also pays.
+extern double g_mtfProfGH, g_mtfProfGsq;
 #endif
 
 #ifdef MTVEC_PROF

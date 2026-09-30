@@ -25,6 +25,7 @@
 #include <omp.h>
 namespace SAIGE {
 double g_mtfProfZall = 0.0, g_mtfProfGW = 0.0, g_mtfProfZ0 = 0.0, g_mtfProfGR = 0.0;
+double g_mtfProfGH = 0.0, g_mtfProfGsq = 0.0;
 }
 #define MTF_TIC()      const double mtfT0 = omp_get_wtime()
 #define MTF_TOC(v)     do { const double mtfD = omp_get_wtime() - mtfT0; \
@@ -406,7 +407,8 @@ void buildMTContext(MTContext& t_ctx,
                     bool t_locoEnabled,
                     const std::string& t_locoChrom,
                     const std::vector<std::string>& t_unionIDs,
-                    bool t_foldQuantProj)
+                    bool t_foldQuantProj,
+                    bool t_fuseGemm)
 {
     const int P = static_cast<int>(t_meta.size());
     if (P == 0 || static_cast<int>(t_order.size()) != P)
@@ -645,6 +647,21 @@ void buildMTContext(MTContext& t_ctx,
             }
             t_ctx.foldQuant = !t_ctx.foldTraits.empty();
         }
+    }
+
+    // ---- fused sample-dimension GEMM (config mtFuseGemm) ----
+    // See the block comment on MTContext::fuseGemm. Only meaningful once the
+    // fold has reduced the covariate side to Xref's p columns; without a
+    // folded trait there is nothing p-wide to stack next to RES.
+    t_ctx.fuseGemm = false;
+    t_ctx.Hfold.reset();
+    if (t_fuseGemm && t_ctx.foldQuant) {
+        const arma::uword pr = static_cast<arma::uword>(t_ctx.foldRefP);
+        const arma::uword ar = static_cast<arma::uword>(t_ctx.foldRefCol0);
+        t_ctx.Hfold.set_size(N, pr + static_cast<arma::uword>(P));
+        t_ctx.Hfold.cols(0, pr - 1) = t_ctx.Xstack.cols(ar, ar + pr - 1);
+        t_ctx.Hfold.cols(pr, pr + P - 1) = t_ctx.RES;
+        t_ctx.fuseGemm = true;
     }
 }
 
@@ -952,20 +969,36 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             t_scr.GWqnt = colView(t_ctx.Xstack, q0, q1).t() * Gv;   // (q1-q0) x B
             MTF_TOC(SAIGE::g_mtfProfGW);
         }
+        MTF_TIC();
         t_scr.Gsq    = arma::sum(t_scr.Gb2, 0).t();                 // B
+        MTF_TOC(SAIGE::g_mtfProfGsq);
     }
-    // The one shared covariate GEMM: p columns, not sum_t p_t, and it stands in
-    // for the folded traits' Astack block AND their Xstack block at once.
-    if (anyFold) {
+    if (t_ctx.fuseGemm && anyFold) {
+        // One pass over G for both: GH = G' [Xref | RES]. The leading p
+        // columns are Z0 transposed, the trailing P are GR. Each element is
+        // the same length-N dot product the two separate GEMMs compute; only
+        // BLAS's tiling of the wider result can move a last bit.
         MTF_TIC();
-        t_scr.Z0 = colView(t_ctx.Xstack, t_ctx.foldRefCol0,
-                           t_ctx.foldRefCol0 + t_ctx.foldRefP).t() * Gv;   // p x B
-        MTF_TOC(SAIGE::g_mtfProfZ0);
-    }
-    {
-        MTF_TIC();
-        t_scr.GR = Gv.t() * t_ctx.RES;                              // B x P
-        MTF_TOC(SAIGE::g_mtfProfGR);
+        const arma::uword pr = static_cast<arma::uword>(t_ctx.foldRefP);
+        t_scr.GH = Gv.t() * t_ctx.Hfold;                            // B x (p+P)
+        t_scr.Z0 = t_scr.GH.cols(0, pr - 1).t();                    // p x B
+        t_scr.GR = t_scr.GH.cols(pr, pr + t_ctx.RES.n_cols - 1);    // B x P
+        MTF_TOC(SAIGE::g_mtfProfGH);
+    } else {
+        // The one shared covariate GEMM: p columns, not sum_t p_t, and it
+        // stands in for the folded traits' Astack block AND their Xstack
+        // block at once.
+        if (anyFold) {
+            MTF_TIC();
+            t_scr.Z0 = colView(t_ctx.Xstack, t_ctx.foldRefCol0,
+                               t_ctx.foldRefCol0 + t_ctx.foldRefP).t() * Gv;   // p x B
+            MTF_TOC(SAIGE::g_mtfProfZ0);
+        }
+        {
+            MTF_TIC();
+            t_scr.GR = Gv.t() * t_ctx.RES;                          // B x P
+            MTF_TOC(SAIGE::g_mtfProfGR);
+        }
     }
 
     // ---- different sample sets (design 4.7) ----

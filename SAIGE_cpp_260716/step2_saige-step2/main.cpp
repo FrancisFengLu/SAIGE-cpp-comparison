@@ -57,6 +57,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "genotype_reader.hpp"
 #include "saige_test.hpp"
 #include "saige_mt.hpp"
+#include "popcount_af.hpp"
 #include "score_vec.hpp"
 #include "out_fast.hpp"
 #include "gpu_step2.hpp"
@@ -198,6 +199,21 @@ double g_mtMemBudgetGB = 1.5;
 // foldQuant). Default off -- it changes the last digits of the quantitative
 // output, so it has to be asked for. Binary traits keep the wide path.
 bool g_mtFoldQuantProj = false;
+// Config key mtFuseGemm: with the fold on, stream each marker block through
+// memory once against [Xref | RES] instead of once for Z0 = Xref' G and again
+// for GR = G' RES (see MTContext::fuseGemm). Default off. Needs mtFoldQuantProj;
+// without it there is no p-column covariate GEMM to stack. Every element it
+// produces is the same dot product; only BLAS's tiling of the wider result can
+// move a last bit, so it is asked for rather than assumed.
+bool g_mtFuseGemm = false;
+// Config key mtPopcountAF: in the CPU multi-trait loop, take the per-(marker,
+// binary trait) case / control allele sums from popcounts over the marker's
+// 2-bit column ANDed with a per-trait mask instead of two index gathers over
+// the dosage vector (popcount_af.hpp). Exact: integer counts where the sum is
+// an integer, an exact replay of the sequential floating-point sum where a
+// mean-imputed missing genotype makes it not one. Default off. PLINK input
+// with the fused decode only; any other column keeps the gather.
+bool g_mtPopcountAF = false;
 // Config key mtVecQuantStats: run a quantitative trait's per-(marker, trait)
 // tail one marker block at a time -- a vectorised chi-square(1) upper tail and
 // std::to_chars instead of boost's cdf and sprintf (see score_vec.hpp).
@@ -2111,10 +2127,26 @@ struct MTBlockWork {
     arma::vec gT;                     // a trait's own genotype vector (fallback)
     arma::uvec idxZt, idxNZt;
 
-    void ensure(int t_n, int t_B, int t_P, bool t_differ) {
+    // ---- mtPopcountAF only ----
+    // The marker's 2-bit codes as the .bed row holds them, in analysis order,
+    // one row of nWords 64-bit words per Gb column; and the column's 4-entry
+    // code -> dosage table, so the finalize can put a code back into the
+    // number the dense column holds. hasPacked is 0 for a column that came
+    // from a reader without the fused PLINK decode: that column gathers.
+    std::vector<uint64_t> packed;     // B x nWords
+    std::vector<double>   fdc;        // B x 4
+    std::vector<char>     hasPacked;  // B
+
+    void ensure(int t_n, int t_B, int t_P, bool t_differ, int t_nWords = 0) {
         const arma::uword N = static_cast<arma::uword>(t_n);
         const arma::uword B = static_cast<arma::uword>(t_B);
         if (Gb.n_rows != N || Gb.n_cols != B) Gb.set_size(N, B);
+        if (t_nWords > 0) {
+            const std::size_t PW = (std::size_t)t_B * (std::size_t)t_nWords;
+            if (packed.size() != PW) packed.resize(PW);
+            if (fdc.size() != (std::size_t)t_B * 4) fdc.resize((std::size_t)t_B * 4);
+            hasPacked.assign(t_B, 0);
+        }
         if (VR.n_rows != B || VR.n_cols != (arma::uword)t_P) VR.set_size(B, t_P);
         if (tmpG.n_elem != N) { tmpG.set_size(N); gtilde.set_size(N); }
         colOf.assign(t_B, -1);
@@ -2927,6 +2959,37 @@ void mainMarkerMT(
     const int imputeCase = string_to_case.at(g_impute_method);
     static const uint8_t kMiss = 0x1;   // PLINK 2-bit code 01 = missing genotype
 
+    // mtPopcountAF: one 2-bit case mask and one control mask per trait that
+    // reports AF_case / AF_ctrl, over the analysis (union) sample positions
+    // the packed column is in; and whether that trait's case and control
+    // positions ascend, which the exact replay of a mean-imputed sum needs
+    // (popcount_af.hpp). Only PLINK input with the fused decode puts the
+    // 2-bit codes in the block; otherwise pcOn stays false and nothing here
+    // is built or read.
+    const bool pcOn = g_mtPopcountAF && t_genoType == "plink" && ptr_gPLINKobj != nullptr &&
+                      (differ || g_fusedPlinkDecode);
+    const int pcWordsN = pcOn ? SAIGE::pcWords(n) : 0;
+    std::vector<std::vector<uint64_t>> pcCase(P), pcCtrl(P);
+    std::vector<char> pcAsc(P, 0), pcHas(P, 0);
+    if (pcOn) {
+        for (int t = 0; t < P; t++) {
+            const std::string& tt = ctx.meta[t].traitType;
+            if (tt != "binary" && tt != "survival") continue;
+            const bool own = differ && !ctx.samp[t].sameAsUnion;
+            const arma::uvec& cu = own ? caseU[t] : g_saigeObjs[t]->m_case_indices;
+            const arma::uvec& ou = own ? ctrlU[t] : g_saigeObjs[t]->m_ctrl_indices;
+            pcCase[t].assign((std::size_t)pcWordsN, 0);
+            pcCtrl[t].assign((std::size_t)pcWordsN, 0);
+            SAIGE::pcBuildMask(cu.memptr(), cu.n_elem, pcCase[t].data());
+            SAIGE::pcBuildMask(ou.memptr(), ou.n_elem, pcCtrl[t].data());
+            pcAsc[t] = (SAIGE::pcAscending(cu.memptr(), cu.n_elem) &&
+                        SAIGE::pcAscending(ou.memptr(), ou.n_elem)) ? 1 : 0;
+            pcHas[t] = 1;
+        }
+    }
+    // pairs by path: counts formula / exact replay / gather (the fallback)
+    std::vector<long> nPcCounts(P, 0), nPcReplay(P, 0), nPcGather(P, 0);
+
     std::vector<int> mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
     std::vector<long> nBatched(P, 0), nFallback(P, 0);
     // Different sample sets, coverage diagnostics only: pairs whose flip is the
@@ -3031,7 +3094,7 @@ void mainMarkerMT(
         #pragma omp parallel for schedule(dynamic, 1)
         for (int blk = 0; blk < nBlocks; blk++) {
             MTBlockWork& W = work[omp_get_thread_num()];
-            W.ensure(n, Bblk, P, differ);
+            W.ensure(n, Bblk, P, differ, pcWordsN);
             const int jj0 = blk * Bblk;
             const int jj1 = std::min(jj0 + Bblk, qc);
             int nHi = 0, nLo = 0;
@@ -3196,6 +3259,13 @@ void mainMarkerMT(
                         for (int u = 0; u < n; u++) g[u] = fu.fd[codes[u]];
                     }
                     std::memcpy(W.codes.data() + (std::size_t)c * (std::size_t)n, codes, (size_t)n);
+                    if (pcOn) {
+                        uint64_t* pk = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
+                        pk[pcWordsN - 1] = 0;   // bytes past (n+3)/4 stay zero
+                        ptr_gPLINKobj->copyFusedPacked_ts(fsU, reinterpret_cast<uint8_t*>(pk));
+                        for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fu.fd[c4];
+                        W.hasPacked[c] = 1;
+                    }
                     std::vector<arma::uword>& mv = W.adj.miss[c];
                     mv.clear();
                     if (fu.counts[kMiss] > 0) {
@@ -3402,6 +3472,16 @@ void mainMarkerMT(
                 W.MACc[c] = MAC;
                 W.altFreqc[c] = altFreq;
                 W.flipc[c] = flip ? 1 : 0;
+                if (pcOn && usedFusedDecode) {
+                    // Stage A's thread-local cache still holds this marker's
+                    // .bed row; nothing between here and the next marker's
+                    // Stage A call replaces it.
+                    uint64_t* pk = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
+                    pk[pcWordsN - 1] = 0;
+                    ptr_gPLINKobj->copyFusedPacked_ts(fsFused, reinterpret_cast<uint8_t*>(pk));
+                    for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fsFused.fd[c4];
+                    W.hasPacked[c] = 1;
+                }
 
                 // The variance ratio is a pure function of MAC and per-trait
                 // constants, so it is computed once here and read by both the
@@ -3758,7 +3838,35 @@ void mainMarkerMT(
                         double sum_case = 0.0, sum_ctrl = 0.0;
                         uint32_t case_hom_cnt = 0, case_het_cnt = 0;
                         uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
-                        if (!ownSamples) {
+                        int pcPath = 0;
+                        if (pcOn && pcHas[t] && W.hasPacked[c]) {
+                            // mtPopcountAF: the same two sums from the code
+                            // counts of the packed column, or -- when a
+                            // mean-imputed missing call makes the gather's
+                            // sum round -- from an exact replay of it. 0 means
+                            // the replay is not available for this trait and
+                            // the gather below runs as before.
+                            const double* fdUse = ownSamples ? fdt : &W.fdc[(std::size_t)c * 4];
+                            const uint64_t* col = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
+                            pcPath = SAIGE::pcSumPair(col, pcCase[t].data(), pcCtrl[t].data(), pcWordsN,
+                                                      N_case, N_ctrl, fdUse, pcAsc[t] != 0,
+                                                      sum_case, sum_ctrl, t_isMoreOutput,
+                                                      case_hom_cnt, case_het_cnt,
+                                                      ctrl_hom_cnt, ctrl_het_cnt);
+                            if (pcPath == 1) {
+                                #pragma omp atomic
+                                nPcCounts[t]++;
+                            } else if (pcPath == 2) {
+                                #pragma omp atomic
+                                nPcReplay[t]++;
+                            } else {
+                                #pragma omp atomic
+                                nPcGather[t]++;
+                            }
+                        }
+                        if (pcPath != 0) {
+                            // sums and counts are in
+                        } else if (!ownSamples) {
                             for (arma::uword k = 0; k < N_case; ++k) {
                                 double d = gp[case_idx[k]];
                                 sum_case += d;
@@ -3911,7 +4019,9 @@ void mainMarkerMT(
     std::cout << "  [mtfold prof] cpu-s  Zall " << SAIGE::g_mtfProfZall
               << "  GWqnt " << SAIGE::g_mtfProfGW
               << "  Z0(fold) " << SAIGE::g_mtfProfZ0
-              << "  GR " << SAIGE::g_mtfProfGR << std::endl;
+              << "  GR " << SAIGE::g_mtfProfGR
+              << "  GH(fused) " << SAIGE::g_mtfProfGH
+              << "  Gsq " << SAIGE::g_mtfProfGsq << std::endl;
 #endif
 #ifdef MTVEC_PROF
     std::cout << "  [mtvec prof] cpu-s  emit " << SAIGE::g_mtvProfEmit
@@ -3957,6 +4067,13 @@ void mainMarkerMT(
                   << (totBatch + totFall) << " pairs ("
                   << (100.0 * (double)totBatch / (double)(totBatch + totFall))
                   << "%)" << std::endl;
+    }
+    if (pcOn) {
+        long a = 0, b = 0, g = 0;
+        for (int t = 0; t < P; t++) { a += nPcCounts[t]; b += nPcReplay[t]; g += nPcGather[t]; }
+        std::cout << "  mtPopcountAF: " << (a + b + g) << " case/control pairs -- counts formula "
+                  << a << ", exact replay " << b << ", gather (no replay for the trait) " << g
+                  << std::endl;
     }
     if (t_isFirth) {
         std::cout << "[A3] Firth fit calls: " << g_firthFitCalls.load()
@@ -6766,6 +6883,14 @@ int main(int argc, char* argv[])
                              "computes its own covariate projection" << std::endl;
                 g_mtFoldQuantProj = false;
             }
+            g_mtFuseGemm = config["mtFuseGemm"] ? config["mtFuseGemm"].as<bool>() : false;
+            if (g_mtFuseGemm && !g_mtFoldQuantProj) {
+                std::cout << "  mtFuseGemm: ignored, it needs mtFoldQuantProj: true "
+                             "(the fold is what makes the covariate side p columns wide)"
+                          << std::endl;
+                g_mtFuseGemm = false;
+            }
+            g_mtPopcountAF = config["mtPopcountAF"] ? config["mtPopcountAF"].as<bool>() : false;
             g_mtBlockSize = config["mtBlockSize"] ? config["mtBlockSize"].as<int>() : 0;
             if (config["mtMemBudgetGB"]) {
                 g_mtMemBudgetGB = config["mtMemBudgetGB"].as<double>();
@@ -6776,7 +6901,7 @@ int main(int argc, char* argv[])
                 std::vector<int> order = SAIGE::mtInternalOrder(nms);
                 SAIGE::buildMTContext(g_mtctx, nms, order, g_traitMeta,
                                       useLOCO, locoChrom, readerSampleIDs,
-                                      g_mtFoldQuantProj);
+                                      g_mtFoldQuantProj, g_mtFuseGemm);
                 if (g_mtctx.sampleSetsDiffer != mtSampleSetsDiffer)
                     throw std::runtime_error("internal: sample-set bookkeeping disagrees");
             }
@@ -6804,6 +6929,29 @@ int main(int argc, char* argv[])
                     std::cout << os.str();
                 }
                 std::cout << ", tol " << SAIGE::MT_FOLD_RESID_TOL << ")" << std::endl;
+            }
+            if (g_mtFuseGemm) {
+                if (g_mtctx.fuseGemm) {
+                    std::cout << "  mtFuseGemm: on -- one G' [Xref | RES] GEMM of width "
+                              << g_mtctx.Hfold.n_cols << " (p = " << g_mtctx.foldRefP
+                              << " + P = " << g_mtctx.P << ") per block instead of two"
+                              << std::endl;
+                } else {
+                    std::cout << "  mtFuseGemm: off, no trait took the fold" << std::endl;
+                    g_mtFuseGemm = false;
+                }
+            }
+            if (g_mtPopcountAF) {
+                int nCC = 0;
+                for (const auto& M : g_mtctx.meta)
+                    if (M.traitType == "binary" || M.traitType == "survival") nCC++;
+                std::cout << "  mtPopcountAF: on for " << nCC << " / " << g_mtctx.meta.size()
+                          << " traits (the ones with case / control columns)";
+                if (genoType != "plink" || !g_fusedPlinkDecode)
+                    std::cout << " -- but the genotype input is not PLINK with the fused "
+                                 "decode, so no column carries its 2-bit codes and every "
+                                 "pair keeps the gather";
+                std::cout << std::endl;
             }
             g_mtVecQuantStats = config["mtVecQuantStats"]
                                     ? config["mtVecQuantStats"].as<bool>() : false;
