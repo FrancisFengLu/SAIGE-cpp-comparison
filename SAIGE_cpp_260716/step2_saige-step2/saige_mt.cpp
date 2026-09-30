@@ -980,9 +980,9 @@ void scoreTestBatchMT(const MTContext& t_ctx,
         // BLAS's tiling of the wider result can move a last bit.
         MTF_TIC();
         const arma::uword pr = static_cast<arma::uword>(t_ctx.foldRefP);
-        t_scr.GH = Gv.t() * t_ctx.Hfold;                            // B x (p+P)
-        t_scr.Z0 = t_scr.GH.cols(0, pr - 1).t();                    // p x B
-        t_scr.GR = t_scr.GH.cols(pr, pr + t_ctx.RES.n_cols - 1);    // B x P
+        t_scr.GH = t_ctx.Hfold.t() * Gv;                            // (p+P) x B
+        t_scr.Z0 = t_scr.GH.rows(0, pr - 1);                        // p x B
+        t_scr.GR = t_scr.GH.rows(pr, pr + t_ctx.RES.n_cols - 1).t();    // B x P
         MTF_TOC(SAIGE::g_mtfProfGH);
     } else {
         // The one shared covariate GEMM: p columns, not sum_t p_t, and it
