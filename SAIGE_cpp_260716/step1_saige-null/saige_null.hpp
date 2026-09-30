@@ -84,7 +84,15 @@ struct FitNullConfig {
   // because the VR draw happens before any BED byte is read and a marker's VR
   // eligibility depends on that marker alone. Ignored (with a printed reason)
   // for any configuration that does need the matrix; see main.cpp.
-  bool selective_geno_load{false};
+  // Default ON since 2026-09-30. In the sparse-fit path the 39,000 markers this
+  // skips have no consumer at all: the GLMM fit reaches Psi through the sparse
+  // branch and Sigma^-1 through the direct solve, so decoding them is pure waste
+  // (measured 13.23 s -> 0.32 s at N=50,000, M=40,000). Every configuration that
+  // WOULD need the full matrix is enumerated in main.cpp and turns this back off
+  // with a printed reason, so the model output is unchanged. One documented
+  // consequence: .grm_diag.txt is not written, because it needs every marker.
+  // Nothing downstream reads it -- step 2 does not.
+  bool selective_geno_load{true};
 
   // Tier-2 multi-phenotype: advance the P AI-REML loops in lockstep so the
   // fixed-effect PCG solves of all still-active traits go through one batched
