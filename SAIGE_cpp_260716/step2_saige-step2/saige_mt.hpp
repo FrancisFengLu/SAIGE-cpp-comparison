@@ -218,6 +218,11 @@ struct MTContext {
     // once here: Xref and RES are per-run constants, nothing in it changes
     // between blocks. It duplicates RES (N x P doubles); RES itself stays
     // because the different-sample-set corrections index it by row.
+    // Orientation matters for the bits: the kernel computes H' G ((p+P) x B),
+    // which keeps p on BLAS's M side exactly as the separate Z0 = Xref' G had
+    // it, and that reproduces both Z0 and GR to the last bit. G' H (B x
+    // (p+P)) moved the last bits of 9.6% of the pairs' Tstat (fp64 output,
+    // mid q:8) while the printed text stayed identical. S2_FUSE_AND_POPCOUNT.md.
     bool      fuseGemm = false;         // Hfold is built and the kernel uses it
     arma::mat Hfold;                    // N x (foldRefP + P), only when fuseGemm
 
@@ -264,7 +269,7 @@ struct MTScratch {
     arma::mat Z0;      // p x B   Xref' G, shared by every folded trait
     arma::mat Zf;      // p x B   one folded trait's K_t' Z0
     // Fused sample-dimension GEMM only (MTContext::fuseGemm).
-    arma::mat GH;      // B x (p+P)   G' [Xref | RES], sliced into Z0 and GR
+    arma::mat GH;      // (p+P) x B   [Xref | RES]' G, sliced into Z0 and GR
     // Block tail only (MTContext::vecQuantStats). Length B, grow-only.
     std::vector<double> evVar1, evStat, evZ, evP;
 };

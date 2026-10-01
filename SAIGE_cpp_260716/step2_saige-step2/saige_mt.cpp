@@ -974,10 +974,11 @@ void scoreTestBatchMT(const MTContext& t_ctx,
         MTF_TOC(SAIGE::g_mtfProfGsq);
     }
     if (t_ctx.fuseGemm && anyFold) {
-        // One pass over G for both: GH = G' [Xref | RES]. The leading p
-        // columns are Z0 transposed, the trailing P are GR. Each element is
-        // the same length-N dot product the two separate GEMMs compute; only
-        // BLAS's tiling of the wider result can move a last bit.
+        // One pass over G for both: GH = [Xref | RES]' G. The leading p
+        // rows are Z0, the trailing P rows are GR transposed. Each element is
+        // the same length-N dot product the two separate GEMMs compute, and
+        // in THIS orientation (p on the M side, as Z0 = Xref' G had it) the
+        // result is bit-identical to them; G' H was not (see the hpp).
         MTF_TIC();
         const arma::uword pr = static_cast<arma::uword>(t_ctx.foldRefP);
         t_scr.GH = t_ctx.Hfold.t() * Gv;                            // (p+P) x B

@@ -6932,7 +6932,7 @@ int main(int argc, char* argv[])
             }
             if (g_mtFuseGemm) {
                 if (g_mtctx.fuseGemm) {
-                    std::cout << "  mtFuseGemm: on -- one G' [Xref | RES] GEMM of width "
+                    std::cout << "  mtFuseGemm: on -- one [Xref | RES]' G GEMM of width "
                               << g_mtctx.Hfold.n_cols << " (p = " << g_mtctx.foldRefP
                               << " + P = " << g_mtctx.P << ") per block instead of two"
                               << std::endl;
