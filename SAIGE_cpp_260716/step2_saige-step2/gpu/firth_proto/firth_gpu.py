@@ -252,8 +252,10 @@ def validate(a):
         m = np.isfinite(seC) & conv_both
         print(f'  reported SE = |beta|/qnorm(p/2) (p unchanged by Firth): max |d| {np.abs(seG-seC)[m].max():.2e}  max rel {(np.abs(seG-seC)/seC)[m].max():.2e}')
         if 'beta_out' in P and np.isfinite(P['beta_out'][:npairs0]).any():
+            # the fit sees the flipped genotype; main.cpp writes Beta * (1 - 2*flip)
+            sgn = 1.0 - 2.0 * P['flip'][:npairs0]
             bo = P['beta_out'][:npairs0]; mo = np.isfinite(bo) & (bo != 0)
-            print(f'  vs production BETA (6 printed digits): max rel {(np.abs(gb-bo)/np.abs(bo))[mo].max():.2e} over {int(mo.sum())} pairs')
+            print(f'  vs production BETA (6 printed digits, flip sign applied): max rel {(np.abs(gb*sgn-bo)/np.abs(bo))[mo].max():.2e} over {int(mo.sum())} pairs')
     if a.dump:
         with open(a.dump, 'w') as f:
             f.write('pair\tbeta_gpu\tse_gpu\tflag_gpu\tstrict_gpu\titer_gpu\tsing_gpu\talpha_gpu\n')
