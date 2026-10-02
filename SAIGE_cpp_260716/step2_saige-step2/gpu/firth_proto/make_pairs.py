@@ -14,6 +14,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--bed', required=True); ap.add_argument('--bim', required=True)
 ap.add_argument('--N', type=int, required=True); ap.add_argument('--out', required=True)
 ap.add_argument('--cut', type=float, default=0.05)
+ap.add_argument('--routes', default=None, help='route-dump dir: keep rows whose route byte has bit 5 (Firth was run) instead of p <= cut')
 ap.add_argument('--zerod_cutoff', type=float, default=0.2); ap.add_argument('--zerod_mac', type=float, default=10.0)
 ap.add_argument('specs', nargs='+')
 a = ap.parse_args()
@@ -28,12 +29,17 @@ rows = []; traits = []
 for ti, spec in enumerate(a.specs):
     name, mdir, outf = spec.split('=')
     traits.append((ti, name, mdir))
+    route = None
+    if a.routes:
+        rr = np.fromfile(os.path.join(a.routes, name + '.route'), dtype=np.dtype([('r', 'u1'), ('g', '<f8')]))
+        assert len(rr) == M, (len(rr), M); route = rr['r']
     with open(outf) as f:
         h = f.readline().rstrip('\n').split('\t'); c = {k: i for i, k in enumerate(h)}
         for l in f:
             t = l.rstrip('\n').split('\t')
             p = float(t[c['p.value']])
-            if p <= a.cut:
+            keep = (p <= a.cut) if route is None else bool(route[pos[t[c['MarkerID']]]] & 0x20)
+            if keep:
                 rows.append((ti, pos[t[c['MarkerID']]], p, float(t[c['BETA']]), float(t[c['SE']]), float(t[c['Tstat']]), t[c['Is.SPA']], float(t[c['AF_Allele2']])))
 rows.sort()
 mk = np.array(sorted(set(r[1] for r in rows)), dtype=np.int32)
