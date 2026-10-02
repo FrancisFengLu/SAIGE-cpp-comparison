@@ -176,17 +176,29 @@ inline bool pcIsHet(double t_d) { return t_d >= 0.5 && t_d < 1.5; }
 //   2  at least one sum by the exact replay
 // t_nCase / t_nCtrl are the mask populations. The four hom / het counts are
 // written only when t_moreOutput.
+// t_total (config key mtPopcountCtrlFromTotal; nullptr otherwise) is the
+// column's code count over ALL of the trait's samples. When the case and
+// control masks partition those samples the control counts are the total
+// minus the case counts -- integers, no rounding -- and the second popcount
+// pass is skipped. The caller asserts the partition (N_case + N_ctrl == n and
+// the trait's sample list is the column's); the replay path, which needs the
+// control mask itself, is unchanged.
 inline int pcSumPair(const uint64_t* t_col,
                      const uint64_t* t_caseMask, const uint64_t* t_ctrlMask, int t_nWords,
                      uint64_t t_nCase, uint64_t t_nCtrl, const double* t_fd, bool t_ascending,
                      double& t_sumCase, double& t_sumCtrl,
                      bool t_moreOutput,
                      uint32_t& t_caseHom, uint32_t& t_caseHet,
-                     uint32_t& t_ctrlHom, uint32_t& t_ctrlHet)
+                     uint32_t& t_ctrlHom, uint32_t& t_ctrlHet,
+                     const uint64_t* t_total = nullptr)
 {
     uint64_t nc[4], no[4];
     pcCountCodes(t_col, t_caseMask, t_nWords, t_nCase, nc);
-    pcCountCodes(t_col, t_ctrlMask, t_nWords, t_nCtrl, no);
+    if (t_total) {
+        for (unsigned c = 0; c < 4; ++c) no[c] = t_total[c] - nc[c];
+    } else {
+        pcCountCodes(t_col, t_ctrlMask, t_nWords, t_nCtrl, no);
+    }
     const bool missInt  = pcIsInteger(t_fd[PC_MISSING]);
     const bool caseInt  = missInt || nc[PC_MISSING] == 0;
     const bool ctrlInt  = missInt || no[PC_MISSING] == 0;

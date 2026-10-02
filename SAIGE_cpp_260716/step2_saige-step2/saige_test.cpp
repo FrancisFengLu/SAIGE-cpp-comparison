@@ -8,6 +8,7 @@
 #include "saige_test.hpp"
 #include "score_format.hpp"
 #include "spa.hpp"
+#include "spa_binary.hpp"   // g_spaScratch
 #include "er_binary.hpp"
 #include "UTIL.hpp"
 #include "getMem.hpp"
@@ -787,7 +788,16 @@ void SAIGEClass::getadjGFast(arma::vec & t_GVec, arma::vec & g, arma::uvec & iIn
   for(unsigned int i = 0; i < iIndex.n_elem; i++){
       m_XVG += m_XV.col(iIndex(i)) * t_GVec(iIndex(i));
   }
-  g = t_GVec - m_XXVX_inv * m_XVG;
+  if (g_spaScratch) {
+      // spaScratch: the N-vector product lands in a thread_local buffer that
+      // grows once instead of in a fresh temporary (an mmap under the 64 KB
+      // mallopt threshold) per call. Same gemv, same elementwise subtraction.
+      thread_local arma::vec tl_XXb;
+      tl_XXb = m_XXVX_inv * m_XVG;
+      g = t_GVec - tl_XXb;
+  } else {
+      g = t_GVec - m_XXVX_inv * m_XVG;
+  }
 }
 
 
@@ -1002,10 +1012,22 @@ if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
   unsigned int iIndexComVecSize = iIndexComVec.n_elem;
   unsigned int iIndexSize = iIndex.n_elem;
   PT_T0(tAlSG);
-  arma::vec gNB(iIndexSize, arma::fill::none);
-  arma::vec gNA(iIndexComVecSize, arma::fill::none);
-  arma::vec muNB(iIndexSize, arma::fill::none);
-  arma::vec muNA(iIndexComVecSize, arma::fill::none);
+  // spaScratch: the four subset vectors are thread_local and grow-only; the
+  // assignments in prepare_spa_inputs size them (armadillo reuses the buffer
+  // whenever the new length fits), and they are not cleared at the end.
+  // Otherwise they are the per-call locals they always were.
+  thread_local arma::vec tl_gNB, tl_gNA, tl_muNB, tl_muNA;
+  arma::vec gNB_l, gNA_l, muNB_l, muNA_l;
+  if (!g_spaScratch) {
+      gNB_l.set_size(iIndexSize);
+      gNA_l.set_size(iIndexComVecSize);
+      muNB_l.set_size(iIndexSize);
+      muNA_l.set_size(iIndexComVecSize);
+  }
+  arma::vec& gNB  = g_spaScratch ? tl_gNB  : gNB_l;
+  arma::vec& gNA  = g_spaScratch ? tl_gNA  : gNA_l;
+  arma::vec& muNB = g_spaScratch ? tl_muNB : muNB_l;
+  arma::vec& muNA = g_spaScratch ? tl_muNA : muNA_l;
   PT_ADD(S_FB_ALLOC, tAlSG);
 
   bool spa_inputs_ready = false;
@@ -1393,10 +1415,12 @@ if(!t_isER){
  }
 
 
+    if (!g_spaScratch) {
     gNA.clear();
     gNB.clear();
     muNA.clear();
     gNB.clear();
+    }
 
 
     if(is_region && !is_gtilde){

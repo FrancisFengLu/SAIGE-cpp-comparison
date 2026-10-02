@@ -24,6 +24,24 @@
 // each call under the mallopt fix was triggering 1–4 mmap/munmap syscalls +
 // ~750 pf each. Bit-identical results.
 
+bool g_spaScratch = false;
+
+void spaGposGneg(const arma::vec& g, double& gpos, double& gneg)
+{
+	// accu(compacted) = (sum of compacted[0], [2], [4], ...) + (sum of [1], [3], ...)
+	double p1 = 0.0, p2 = 0.0, n1 = 0.0, n2 = 0.0;
+	arma::uword kp = 0, kn = 0;
+	const double* x = g.memptr();
+	const arma::uword N = g.n_elem;
+	for (arma::uword i = 0; i < N; ++i) {
+		const double v = x[i];
+		if (v > 0) { if ((kp & 1u) == 0) p1 += v; else p2 += v; ++kp; }
+		else if (v < 0) { if ((kn & 1u) == 0) n1 += v; else n2 += v; ++kn; }
+	}
+	gpos = p1 + p2;
+	gneg = n1 + n2;
+}
+
 double Korg_Binom(double t1, arma::vec & mu, arma::vec & g)
 {
 	thread_local arma::vec _kb_temp;
@@ -62,15 +80,19 @@ double K2_Binom(double t1, arma::vec & mu, arma::vec & g)
 
 
 RootResult getroot_K1_Binom(double init, arma::vec & mu, arma::vec & g, double q, double tol, int maxiter){
+	PT_T0(tGpSB);
+	double gpos = arma::accu( g.elem( find(g > 0) ) );
+	double gneg = arma::accu( g.elem( find(g < 0) ) );
+	PT_ADD(S_SPA_GPOS, tGpSB);
+	return getroot_K1_Binom(init, mu, g, q, tol, maxiter, gpos, gneg);
+}
+
+RootResult getroot_K1_Binom(double init, arma::vec & mu, arma::vec & g, double q, double tol, int maxiter, double gpos, double gneg){
 	double root;
 	int niter;
 	bool Isconverge;
 	double K1_eval, K2_eval, t, tnew, newK1;
 	double prevJump;
-	PT_T0(tGpSB);
-	double gpos = arma::accu( g.elem( find(g > 0) ) );
-	double gneg = arma::accu( g.elem( find(g < 0) ) );
-	PT_ADD(S_SPA_GPOS, tGpSB);
 	if(q >= gpos || q <= gneg){
 		root = std::numeric_limits<double>::infinity();
 		niter = 0;
@@ -285,15 +307,19 @@ double K2_fast_Binom(double t1, arma::vec & mu, arma::vec & g, arma::vec & gNA, 
 
 
 RootResult getroot_K1_fast_Binom(double init, arma::vec & mu, arma::vec & g, double q, arma::vec & gNA, arma::vec & gNB, arma::vec & muNA, arma::vec & muNB, double NAmu, double NAsigma, double tol, int maxiter){
+	PT_T0(tGpSB);
+	double gpos = arma::accu( g.elem( find(g > 0) ) );
+	double gneg = arma::accu( g.elem( find(g < 0) ) );
+	PT_ADD(S_SPA_GPOS, tGpSB);
+	return getroot_K1_fast_Binom(init, mu, g, q, gNA, gNB, muNA, muNB, NAmu, NAsigma, tol, maxiter, gpos, gneg);
+}
+
+RootResult getroot_K1_fast_Binom(double init, arma::vec & mu, arma::vec & g, double q, arma::vec & gNA, arma::vec & gNB, arma::vec & muNA, arma::vec & muNB, double NAmu, double NAsigma, double tol, int maxiter, double gpos, double gneg){
 	double root;
 	int niter;
 	bool Isconverge;
 	double K1_eval, K2_eval, t, tnew, newK1;
 	double prevJump;
-	PT_T0(tGpSB);
-	double gpos = arma::accu( g.elem( find(g > 0) ) );
-	double gneg = arma::accu( g.elem( find(g < 0) ) );
-	PT_ADD(S_SPA_GPOS, tGpSB);
 	if(q >= gpos || q <= gneg){
 		root = std::numeric_limits<double>::infinity();
 		niter = 0;

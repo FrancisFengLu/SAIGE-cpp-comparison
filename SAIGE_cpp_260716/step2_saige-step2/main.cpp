@@ -64,6 +64,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
+#include "spa_binary.hpp"   // g_spaScratch
 #include "getMem.hpp"
 #include "group_file.hpp"
 #include "skat.hpp"
@@ -214,6 +215,12 @@ bool g_mtFuseGemm = false;
 // mean-imputed missing genotype makes it not one. Default off. PLINK input
 // with the fused decode only; any other column keeps the gather.
 bool g_mtPopcountAF = false;
+// Config key mtPopcountCtrlFromTotal (needs mtPopcountAF): the control-group
+// code counts are the marker's total counts minus the case counts instead of
+// a second popcount pass over the column -- integers either way, so the same
+// sums. Only for a trait whose cases and controls partition the column's
+// samples; otherwise that pair keeps the two-pass form. Default off.
+bool g_mtPopcountCtrlFromTotal = false;
 // Config key mtVecQuantStats: run a quantitative trait's per-(marker, trait)
 // tail one marker block at a time -- a vectorised chi-square(1) upper tail and
 // std::to_chars instead of boost's cdf and sprintf (see score_vec.hpp).
@@ -2135,6 +2142,7 @@ struct MTBlockWork {
     // from a reader without the fused PLINK decode: that column gathers.
     std::vector<uint64_t> packed;     // B x nWords
     std::vector<double>   fdc;        // B x 4
+    std::vector<uint64_t> cntc;       // B x 4   the column's code counts (mtPopcountCtrlFromTotal)
     std::vector<char>     hasPacked;  // B
 
     void ensure(int t_n, int t_B, int t_P, bool t_differ, int t_nWords = 0) {
@@ -2145,6 +2153,7 @@ struct MTBlockWork {
             const std::size_t PW = (std::size_t)t_B * (std::size_t)t_nWords;
             if (packed.size() != PW) packed.resize(PW);
             if (fdc.size() != (std::size_t)t_B * 4) fdc.resize((std::size_t)t_B * 4);
+            if (cntc.size() != (std::size_t)t_B * 4) cntc.resize((std::size_t)t_B * 4);
             hasPacked.assign(t_B, 0);
         }
         if (VR.n_rows != B || VR.n_cols != (arma::uword)t_P) VR.set_size(B, t_P);
@@ -3265,6 +3274,7 @@ void mainMarkerMT(
                         pk[pcWordsN - 1] = 0;   // bytes past (n+3)/4 stay zero
                         ptr_gPLINKobj->copyFusedPacked_ts(fsU, reinterpret_cast<uint8_t*>(pk));
                         for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fu.fd[c4];
+                        for (int c4 = 0; c4 < 4; c4++) W.cntc[(std::size_t)c * 4 + c4] = fsU.counts[c4];
                         W.hasPacked[c] = 1;
                     }
                     std::vector<arma::uword>& mv = W.adj.miss[c];
@@ -3481,6 +3491,7 @@ void mainMarkerMT(
                     pk[pcWordsN - 1] = 0;
                     ptr_gPLINKobj->copyFusedPacked_ts(fsFused, reinterpret_cast<uint8_t*>(pk));
                     for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fsFused.fd[c4];
+                    for (int c4 = 0; c4 < 4; c4++) W.cntc[(std::size_t)c * 4 + c4] = fsFused.counts[c4];
                     W.hasPacked[c] = 1;
                 }
 
@@ -3857,11 +3868,18 @@ void mainMarkerMT(
                             // the gather below runs as before.
                             const double* fdUse = ownSamples ? fdt : &W.fdc[(std::size_t)c * 4];
                             const uint64_t* col = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
+                            // mtPopcountCtrlFromTotal: the column's code counts
+                            // are over the union samples, so they stand in for
+                            // the control pass only when this trait's cases and
+                            // controls together ARE the union.
+                            const uint64_t* totc = (g_mtPopcountCtrlFromTotal && !ownSamples &&
+                                                    (uint64_t)N_case + (uint64_t)N_ctrl == (uint64_t)n)
+                                                   ? &W.cntc[(std::size_t)c * 4] : nullptr;
                             pcPath = SAIGE::pcSumPair(col, pcCase[t].data(), pcCtrl[t].data(), pcWordsN,
                                                       N_case, N_ctrl, fdUse, pcAsc[t] != 0,
                                                       sum_case, sum_ctrl, t_isMoreOutput,
                                                       case_hom_cnt, case_het_cnt,
-                                                      ctrl_hom_cnt, ctrl_het_cnt);
+                                                      ctrl_hom_cnt, ctrl_het_cnt, totc);
                             if (pcPath == 1) {
                                 #pragma omp atomic
                                 nPcCounts[t]++;
@@ -6128,6 +6146,10 @@ int main(int argc, char* argv[])
             std::cerr << "                     printing why, for anything outside that case." << std::endl;
             std::cerr << "  gpuDevice:         CUDA device index (default: 0)" << std::endl;
             std::cerr << "  gpuBlockSize:      markers per device batch (default: 16384)" << std::endl;
+            std::cerr << "  spaScratch:        true/false (default: false). SPA root bounds once per" << std::endl;
+            std::cerr << "                     pair and thread_local scratch; output byte-identical." << std::endl;
+            std::cerr << "  mtPopcountCtrlFromTotal: true/false (default: false). With mtPopcountAF," << std::endl;
+            std::cerr << "                     control code counts = marker counts - case counts." << std::endl;
             std::cerr << "  gpuPrecision:      fp64 (default) or fp32" << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
@@ -6308,6 +6330,13 @@ int main(int argc, char* argv[])
         // why, unless every trait is quantitative and batchable, the input is
         // PLINK, the models share one sample list, and a device is present.
         g_gpuStep2 = config["useGPU"] ? config["useGPU"].as<bool>() : false;
+        // spaScratch (default false): the SPA block allocates nothing per call
+        // and computes its root bounds once per pair; byte-identical output
+        // (spa_binary.hpp). Any path that reaches SPA honours it.
+        g_spaScratch = config["spaScratch"] ? config["spaScratch"].as<bool>() : false;
+        if (g_spaScratch)
+            std::cout << "  spaScratch: on -- gpos/gneg once per pair, thread_local SPA buffers"
+                      << std::endl;
         if (config["outputFormat"]) {
             const std::string of = config["outputFormat"].as<std::string>();
             if      (of == "text") g_outputFormatSgs = false;
@@ -6903,6 +6932,13 @@ int main(int argc, char* argv[])
                 g_mtFuseGemm = false;
             }
             g_mtPopcountAF = config["mtPopcountAF"] ? config["mtPopcountAF"].as<bool>() : false;
+            g_mtPopcountCtrlFromTotal = config["mtPopcountCtrlFromTotal"]
+                                            ? config["mtPopcountCtrlFromTotal"].as<bool>() : false;
+            if (g_mtPopcountCtrlFromTotal && !g_mtPopcountAF) {
+                std::cout << "  mtPopcountCtrlFromTotal: ignored, it needs mtPopcountAF: true"
+                          << std::endl;
+                g_mtPopcountCtrlFromTotal = false;
+            }
             g_mtBlockSize = config["mtBlockSize"] ? config["mtBlockSize"].as<int>() : 0;
             if (config["mtMemBudgetGB"]) {
                 g_mtMemBudgetGB = config["mtMemBudgetGB"].as<double>();
@@ -6953,6 +6989,9 @@ int main(int argc, char* argv[])
                     g_mtFuseGemm = false;
                 }
             }
+            if (g_mtPopcountCtrlFromTotal)
+                std::cout << "  mtPopcountCtrlFromTotal: on -- control code counts = marker counts - case counts"
+                          << std::endl;
             if (g_mtPopcountAF) {
                 int nCC = 0;
                 for (const auto& M : g_mtctx.meta)

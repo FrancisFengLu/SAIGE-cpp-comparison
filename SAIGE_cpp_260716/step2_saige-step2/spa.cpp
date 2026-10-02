@@ -15,6 +15,7 @@
 #include "spa_binary.hpp"
 // TODO: #include "spa_survival.hpp" when survival trait is ported
 #include "UTIL.hpp"
+#include "phase_timing.hpp"   // PT_* expand to nothing unless -DMT_PHASE_TIMING
 
 
 void SPA(arma::vec & mu, arma::vec & g, double q, double qinv, double pval_noadj, double tol, bool logp, std::string traitType, double & pval, bool & isSPAConverge){
@@ -23,8 +24,18 @@ void SPA(arma::vec & mu, arma::vec & g, double q, double qinv, double pval_noadj
 	RootResult outuni1;
 	RootResult outuni2;
         if( traitType == "binary"){
-          outuni1 = getroot_K1_Binom(0, mu, g, q, tol);
-          outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol);
+          if (g_spaScratch) {
+            // spaScratch: the bounds depend on g alone, so once for both roots.
+            double gpos, gneg;
+            PT_T0(tGpSP);
+            spaGposGneg(g, gpos, gneg);
+            PT_ADD(S_SPA_GPOS, tGpSP);
+            outuni1 = getroot_K1_Binom(0, mu, g, q, tol, 1000, gpos, gneg);
+            outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol, 1000, gpos, gneg);
+          } else {
+            outuni1 = getroot_K1_Binom(0, mu, g, q, tol);
+            outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol);
+          }
         }else if(traitType == "survival"){
           // TODO: Port survival SPA (getroot_K1_Poi)
           throw std::runtime_error("survival trait SPA not yet implemented in standalone");
@@ -86,8 +97,17 @@ void SPA_fast(arma::vec & mu, arma::vec & g, double q, double qinv, double pval_
         RootResult outuni2;
 
         if( traitType == "binary"){
-          outuni1 = getroot_K1_fast_Binom(0, mu, g, q, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol);
-          outuni2 = getroot_K1_fast_Binom(0, mu, g, qinv, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol);
+          if (g_spaScratch) {
+            double gpos, gneg;
+            PT_T0(tGpSP);
+            spaGposGneg(g, gpos, gneg);
+            PT_ADD(S_SPA_GPOS, tGpSP);
+            outuni1 = getroot_K1_fast_Binom(0, mu, g, q, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol, 1000, gpos, gneg);
+            outuni2 = getroot_K1_fast_Binom(0, mu, g, qinv, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol, 1000, gpos, gneg);
+          } else {
+            outuni1 = getroot_K1_fast_Binom(0, mu, g, q, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol);
+            outuni2 = getroot_K1_fast_Binom(0, mu, g, qinv, gNA,gNB,muNA,muNB,NAmu, NAsigma, tol);
+          }
         }else if(traitType == "survival"){
           // TODO: Port survival SPA (getroot_K1_fast_Poi)
           throw std::runtime_error("survival trait SPA_fast not yet implemented in standalone");
@@ -148,8 +168,18 @@ double SPA_pval(arma::vec & mu, arma::vec & g, double q, double qinv, double pva
         RootResult outuni1;
         RootResult outuni2;
         if( traitType == "binary"){
-          outuni1 = getroot_K1_Binom(0, mu, g, q, tol);
-          outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol);
+          if (g_spaScratch) {
+            // spaScratch: the bounds depend on g alone, so once for both roots.
+            double gpos, gneg;
+            PT_T0(tGpSP);
+            spaGposGneg(g, gpos, gneg);
+            PT_ADD(S_SPA_GPOS, tGpSP);
+            outuni1 = getroot_K1_Binom(0, mu, g, q, tol, 1000, gpos, gneg);
+            outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol, 1000, gpos, gneg);
+          } else {
+            outuni1 = getroot_K1_Binom(0, mu, g, q, tol);
+            outuni2 = getroot_K1_Binom(0, mu, g, qinv, tol);
+          }
         }else if(traitType == "survival"){
           // TODO: Port survival SPA
           throw std::runtime_error("survival trait SPA_pval not yet implemented in standalone");
