@@ -42,6 +42,18 @@ enum Slot {
     S_SPA,        // inside getMarkerPval: the SPA block
     S_ER,         // inside getMarkerPval: the ER block
     S_FIRTH,      // inside getMarkerPval: the Firth fit
+    // ---- finalize sub-slots (SPA_CLAIM_GAPS gap 1) ----
+    S_FIN_STAT,   // per-(marker,trait) stat copy: MAC/altFreq/flip + O.altFreq.. writes
+    S_FIN_BATCH,  // useBatch branch: copy Beta/se/Tstat/var + two std::string p-value copies
+    S_FIN_AF,     // AF_case / AF_ctrl: the two index gathers (or pcSumPair)
+    S_FIN_SLOT,   // the rest of the slot writes (O.Beta..varT, AF/N_case/N_ctrl, isSPAConverge); nests S_FIN_AF
+    // ---- fallback sub-slots (S2_REMAINDER): what the scalar path does besides the root-find ----
+    S_FB_IDX,     // main.cpp: {i : g[i]==0} / complement index build (once per flagged marker)
+    S_FB_ALLOC,   // getMarkerPval: constructing gNB/gNA/muNB/muNA (N-sized; mmap under the 64 KB mallopt)
+    S_SPA_PREP,   // getMarkerPval: prepare_spa_inputs (gtilde, m1, the four subsets, NAmu/NAsigma)
+    S_SPA_ROOT,   // getMarkerPval: the SPA_fast / SPA call (two root-finds + two saddle probabilities)
+    S_SPA_GPOS,   // spa_binary.cpp: the gpos/gneg accu(g.elem(find(..))) at the top of each root-find
+    S_PARWALL,    // main.cpp, master thread only: wall of the block-parallel region per chunk
     S_NSLOT
 };
 

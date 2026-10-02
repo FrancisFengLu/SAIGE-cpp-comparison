@@ -9,7 +9,10 @@ namespace PT {
 
 static const char* kSlotName[S_NSLOT] = {
     "read+QC+impute", "batch GEMM", "finalize(total)", "gate", "fallback(total)",
-    "  fb: score recompute", "  fb: SPA", "  fb: ER", "  fb: Firth fit"
+    "  fb: score recompute", "  fb: SPA", "  fb: ER", "  fb: Firth fit",
+    "  fin: stat copy", "  fin: batch copy", "  fin: AF gather", "  fin: slot writes(+AF)",
+    "  fb: index build", "  fb: 4 vec allocs", "  spa: prep inputs", "  spa: root+saddle",
+    "  spa: gpos/gneg", "par-region wall(master)"
 };
 static const char* kCntName[C_NSLOT] = {
     "pairs reaching gate", "gate needSPA", "gate needFirth", "gate needFast",
@@ -40,7 +43,39 @@ void report(double tWrite, int nThreads) {
     const double phase1cpu = T[S_READ] + T[S_GEMM] + T[S_GATE] + finalExcl;
     const double phase2cpu = T[S_FALL];
     std::cout << "  [phase] finalize excl(gate,fallback) cpu-s " << finalExcl << "\n";
+    {
+        const double slotExcl = T[S_FIN_SLOT] - T[S_FIN_AF];
+        const double unattr = finalExcl - T[S_FIN_STAT] - T[S_FIN_BATCH] - T[S_FIN_SLOT];
+        std::cout << "  [phase]   finalize excl = stat copy " << T[S_FIN_STAT]
+                  << " + batch copy " << T[S_FIN_BATCH]
+                  << " + AF gather " << T[S_FIN_AF]
+                  << " + slot writes excl AF " << slotExcl
+                  << " + unattributed(loop/timer overhead) " << unattr << "\n";
+    }
     std::cout << "  [phase] fallback excl(score,SPA,ER,Firth) cpu-s " << fbExcl << "\n";
+    {
+        // S_FB_IDX sits inside S_FALL but outside getMarkerPval; S_FB_ALLOC is
+        // inside getMarkerPval but outside S_SCORE / S_SPA. The remainder is the
+        // call plumbing, StdStat, the q/qinv branch, the post-SPA qnorm +
+        // sprintf, and the munmap of the four vectors at function exit.
+        const double fbRest = fbExcl - T[S_FB_IDX] - T[S_FB_ALLOC];
+        std::cout << "  [phase]   fallback excl = index build " << T[S_FB_IDX]
+                  << " + 4 vec allocs " << T[S_FB_ALLOC]
+                  << " + rest(call/StdStat/qnorm/sprintf/munmap) " << fbRest << "\n";
+        const double spaRest = T[S_SPA] - T[S_SPA_PREP] - T[S_SPA_ROOT];
+        const double rootExcl = T[S_SPA_ROOT] - T[S_SPA_GPOS];
+        std::cout << "  [phase]   SPA = prep inputs " << T[S_SPA_PREP]
+                  << " + root+saddle " << T[S_SPA_ROOT]
+                  << " (of which gpos/gneg " << T[S_SPA_GPOS]
+                  << ", Newton+saddle " << rootExcl << ")"
+                  << " + rest(q/qinv, post qnorm+sprintf) " << spaRest << "\n";
+        const double busy = T[S_READ] + T[S_GEMM] + T[S_FINAL];
+        const double idle = nt * T[S_PARWALL] - busy;
+        std::cout << "  [phase] par-region wall " << T[S_PARWALL] << " s x " << nThreads
+                  << " threads = " << (nt * T[S_PARWALL]) << " thread-s; busy(read+GEMM+finalize) "
+                  << busy << "; idle(barrier imbalance) " << idle
+                  << " thread-s = " << (idle / nt) << " wall-s\n";
+    }
     std::cout << "  [phase] PHASE1 cpu-s " << phase1cpu
               << "  wall-s " << (phase1cpu / nt) << " (+ writer " << tWrite << " s wall)\n";
     std::cout << "  [phase] PHASE2 cpu-s " << phase2cpu

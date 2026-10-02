@@ -15,6 +15,7 @@
 #include <boost/math/distributions/normal.hpp>
 #include "spa_binary.hpp"
 #include "UTIL.hpp"
+#include "phase_timing.hpp"   // PT_* expand to nothing unless -DMT_PHASE_TIMING
 
 
 // SPA thread_local scratch (2026-06-18 refactor, re-applied 2026-06-23):
@@ -66,8 +67,10 @@ RootResult getroot_K1_Binom(double init, arma::vec & mu, arma::vec & g, double q
 	bool Isconverge;
 	double K1_eval, K2_eval, t, tnew, newK1;
 	double prevJump;
+	PT_T0(tGpSB);
 	double gpos = arma::accu( g.elem( find(g > 0) ) );
 	double gneg = arma::accu( g.elem( find(g < 0) ) );
+	PT_ADD(S_SPA_GPOS, tGpSB);
 	if(q >= gpos || q <= gneg){
 		root = std::numeric_limits<double>::infinity();
 		niter = 0;
@@ -287,8 +290,10 @@ RootResult getroot_K1_fast_Binom(double init, arma::vec & mu, arma::vec & g, dou
 	bool Isconverge;
 	double K1_eval, K2_eval, t, tnew, newK1;
 	double prevJump;
+	PT_T0(tGpSB);
 	double gpos = arma::accu( g.elem( find(g > 0) ) );
 	double gneg = arma::accu( g.elem( find(g < 0) ) );
+	PT_ADD(S_SPA_GPOS, tGpSB);
 	if(q >= gpos || q <= gneg){
 		root = std::numeric_limits<double>::infinity();
 		niter = 0;

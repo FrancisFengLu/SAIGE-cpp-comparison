@@ -1001,10 +1001,12 @@ if(!ctx.flagSparseGRM_cur && t_isnoadjCov){
 
   unsigned int iIndexComVecSize = iIndexComVec.n_elem;
   unsigned int iIndexSize = iIndex.n_elem;
+  PT_T0(tAlSG);
   arma::vec gNB(iIndexSize, arma::fill::none);
   arma::vec gNA(iIndexComVecSize, arma::fill::none);
   arma::vec muNB(iIndexSize, arma::fill::none);
   arma::vec muNA(iIndexComVecSize, arma::fill::none);
+  PT_ADD(S_FB_ALLOC, tAlSG);
 
   bool spa_inputs_ready = false;
   auto prepare_spa_inputs = [&]() {
@@ -1048,7 +1050,9 @@ if(!t_isER){
 
         // gtilde, p_iIndexComVecSize, m1, gNA/gNB/muNA/muNB, NAmu, NAsigma,
         // tol1 -- one definition, shared with the conditional SPA block below.
+        PT_T0(tPrSG);
         prepare_spa_inputs();
+        PT_ADD(S_SPA_PREP, tPrSG);
 
    	if(m_traitType == "binary"){
                 q = t_Tstat/sqrt(t_var1/t_var2) + m1;
@@ -1067,12 +1071,14 @@ if(!t_isER){
 	// NAsigma and tol1 used to be recomputed here with exactly the same
 	// expressions prepare_spa_inputs() now uses; the duplicates are gone, not
 	// the arithmetic.
+	PT_T0(tRtSG);
 	if(p_iIndexComVecSize >= 0.5 && !ctx.flagSparseGRM_cur){
         	SPA_fast(m_mu, t_gtilde, q, qinv, pval_noadj, ispvallog, gNA, gNB, muNA, muNB, NAmu, NAsigma, tol1, m_traitType, t_SPApval, t_isSPAConverge);
 
 	}else{
 		SPA(m_mu, t_gtilde, q, qinv, pval_noadj, tol1, ispvallog, m_traitType, t_SPApval, t_isSPAConverge);
 	}
+	PT_ADD(S_SPA_ROOT, tRtSG);
 
     boost::math::normal ns;
     double t_qval;

@@ -3091,6 +3091,7 @@ void mainMarkerMT(
         // decode / p-value formatting / fallback work parallelises along with
         // the BLAS. Results are written to per-marker slots, so the output is
         // independent of how blocks were scheduled.
+        PT_T0(tPwMT);
         #pragma omp parallel for schedule(dynamic, 1)
         for (int blk = 0; blk < nBlocks; blk++) {
             MTBlockWork& W = work[omp_get_thread_num()];
@@ -3535,6 +3536,7 @@ void mainMarkerMT(
                     const bool isCondition = M.isCondition;
                     const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
                     MTTraitChunk& O = out[t];
+                    PT_T0(tStMT);
 
                     // Per-trait marker statistics. Same sample set: the
                     // marker-level values. Own sample set: this trait's.
@@ -3562,6 +3564,7 @@ void mainMarkerMT(
                         O.missingRate[jj] = missingRateVec[jj];
                         O.imputeInfo[jj]  = imputationInfoVec[jj];
                     }
+                    PT_ADD(S_FIN_STAT, tStMT);
                     const bool hi = (MAC > g_MACCutoffforER);
                     PT_CNTIF(C_PAIR_BIN, isBin);
                     PT_CNTIF(C_ER_LOWMAC, isBin && !hi);
@@ -3662,6 +3665,7 @@ void mainMarkerMT(
                     }
 
                     if (useBatch) {
+                        PT_T0(tBcMT);
                         Beta       = W.res.Beta(c, t);
                         seBeta     = W.res.seBeta(c, t);
                         Tstat      = W.res.Tstat(c, t);
@@ -3671,6 +3675,7 @@ void mainMarkerMT(
                         isSPAConverge = false;   // SPA was never invoked
                         #pragma omp atomic
                         nBatched[t]++;
+                        PT_ADD(S_FIN_BATCH, tBcMT);
                     } else {
                         PT_SCOPE(S_FALL);
                         // The genotype vector getMarkerPval sees: the block
@@ -3682,6 +3687,7 @@ void mainMarkerMT(
                         arma::vec* gUse = &gCol;
                         arma::uvec* izUse = &W.idxZ;
                         arma::uvec* inzUse = &W.idxNZ;
+                        PT_T0(tIxMT);
                         if (ownSamples) {
                             const arma::uword nT = (arma::uword)S.n;
                             double* g = W.gT.memptr();
@@ -3713,6 +3719,7 @@ void mainMarkerMT(
                             }
                             idxReady = true;
                         }
+                        PT_ADD(S_FB_IDX, tIxMT);
                         arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
                         W.P2Vec.clear();
                         bool is_gtilde = false;
@@ -3823,6 +3830,7 @@ void mainMarkerMT(
                         }
                     }
 
+                    PT_T0(tSlMT);
                     O.Beta[jj]   = Beta * (1 - 2 * flip);
                     O.seBeta[jj] = seBeta;
                     O.pval[jj]   = pval;
@@ -3831,6 +3839,7 @@ void mainMarkerMT(
                     O.varT[jj]   = varT;
 
                     if (traitType == "binary" || traitType == "survival") {
+                        PT_T0(tAfMT);
                         const arma::uvec& case_idx = obj->m_case_indices;
                         const arma::uvec& ctrl_idx = obj->m_ctrl_indices;
                         const uint32_t N_case = case_idx.n_elem;
@@ -3906,6 +3915,7 @@ void mainMarkerMT(
                                 }
                             }
                         }
+                        PT_ADD(S_FIN_AF, tAfMT);
                         double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
                         double AF_ctrl = (N_ctrl > 0) ? sum_ctrl / N_ctrl / 2.0 : 0.0;
                         if (flip) { AF_case = 1 - AF_case; AF_ctrl = 1 - AF_ctrl; }
@@ -3927,10 +3937,12 @@ void mainMarkerMT(
                     } else if (traitType == "quantitative") {
                         O.N[jj] = differ ? obj->m_n : n;
                     }
+                    PT_ADD(S_FIN_SLOT, tSlMT);
                 }  // for t
             }  // for jj (finalize)
             PT_ADD(S_FINAL, tFiMT);
         }  // for blk (omp)
+        PT_ADD(S_PARWALL, tPwMT);
 
         // ---- write this chunk's rows, one file per trait ----
         // The P files are independent, so they go out in parallel, exactly as
