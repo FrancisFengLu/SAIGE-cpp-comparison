@@ -54,7 +54,24 @@ spa_gpu_test: build/spa_gpu_test.o spa_gpu.cu.o $(CPU_OBJS)
 consts: gen_erfc_consts.cpp
 	$(CXX) -std=c++17 -O0 $< -o build/gen_erfc_consts && build/gen_erfc_consts > erfc_boost53_consts.hpp
 
+# ---- the same gate against the integrator's kernel -------------------------
+# INTEG_DIR holds its gpu_spa.cu + gpu_spa.hpp (a snapshot, or a `git show`
+# of the committed files). integ_shim/ supplies the reducer accessors it
+# links against, so no part of the reducer is needed.
+INTEG_DIR ?= /opt/saige/logs/spa-gpu-lib/integ_snapshot
+
+build/integ_gpu_spa.cu.o: $(INTEG_DIR)/gpu_spa.cu $(INTEG_DIR)/gpu_spa.hpp integ_shim/gpu_step2.hpp
+	@mkdir -p build
+	$(NVCC) $(NVCCFLAGS) -Iinteg_shim -I$(INTEG_DIR) -c $< -o $@
+
+build/spa_gpu_test_integ.o: spa_gpu_test.cpp spa_gpu.hpp $(INTEG_DIR)/gpu_spa.hpp integ_shim/gpu_step2.hpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -DWITH_INTEGRATOR -Iinteg_shim -I$(INTEG_DIR) $(INCLUDES) -c $< -o $@
+
+spa_gpu_test_integ: build/spa_gpu_test_integ.o spa_gpu.cu.o build/integ_gpu_spa.cu.o $(CPU_OBJS)
+	$(CXX) $(CXXFLAGS) $^ $(LIBS) -L$(CUDA_HOME)/lib64 -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64 -o $@
+
 clean:
-	rm -rf build spa_gpu.cu.o spa_gpu_stub.o spa_gpu_test
+	rm -rf build spa_gpu.cu.o spa_gpu_stub.o spa_gpu_test spa_gpu_test_integ
 
 .PHONY: all stub consts clean

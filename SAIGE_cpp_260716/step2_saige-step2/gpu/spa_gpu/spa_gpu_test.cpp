@@ -1,21 +1,25 @@
-// spa_gpu_test -- the device SPA (spa_gpu.hpp) against the shipped CPU SPA,
-// pair by pair, on identical inputs. Simulated data (no individual-level
-// data goes near this box): N samples, p covariates, T binary traits with
-// chosen case fractions, M markers spanning MAC 1 to MAF 0.5 with missing
-// calls, allele flips and the MAC-gated .clean() zeroing, all expressed
-// through the PLINK 2-bit codes + 4-entry dosage table the step-2 reducer
-// stages. For every (marker, trait) pair a score statistic z is drawn so
-// that the full-N and the carriers-only variants, the linear and the log
-// domain, out-of-support roots and the K2 guard are all exercised.
+// spa_gpu_test -- a device SPA against the shipped CPU SPA, pair by pair, on
+// identical inputs. Simulated data (no individual-level data goes near this
+// box): N samples, p covariates, T binary traits with chosen case fractions,
+// M markers spanning MAC 1 to MAF 0.5 with missing calls, allele flips and the
+// MAC-gated .clean() zeroing, all expressed through the PLINK 2-bit codes +
+// 4-entry dosage table the step-2 reducer stages. For every (marker, trait)
+// pair a score statistic z is drawn so that the full-N and the carriers-only
+// variants, the linear and the log domain, out-of-support roots and the K2
+// guard are all exercised.
 //
 //   CPU  getadjGFast's arithmetic -> g~, m1, the variant rule, NAmu / NAsigma,
 //        q / qinv, then spa.cpp's SPA / SPA_fast (and the inner getroot /
 //        Get_Saddle_Prob calls replayed to expose roots, iteration counts and
 //        the saddle flags), then getMarkerPval's host post-rules (quantile
 //        step, p == 0, the printed string)
-//   GPU  Tstat / var1 / var2 / pno handed to spa_gpu::run() with fast = -1
-//        (the device applies the variant rule itself), then the same
-//        post-rules
+//   GPU  Tstat / var1 / var2 / pno handed to the device SPA, then the same
+//        post-rules. Two implementations can be driven:
+//          --impl mine    gpu/spa_gpu (this library), fast = -1 so the device
+//                         applies the variant rule itself
+//          --impl integ   the integrator's gpu/gpu_spa.cu, compiled against
+//                         integ_shim/ (Makefile target spa_gpu_test_integ);
+//                         it takes the variant from the caller
 //
 // Gate: variant, convergence, saddle flags, out-of-support flags and
 // iteration counts must be identical for every pair; p-values are reported
@@ -25,7 +29,8 @@
 //   spa_gpu_test [--n N] [--p P] [--traits r1,r2,...] [--markers M] [--pairs K]
 //                [--seed S] [--threads T] [--blocks B] [--erfc-mode 0|1]
 //                [--device D] [--tsv FILE] [--bench] [--erfc-sweep] [--no-gate]
-//                [--zmix a,b,c,d]  (weights of the |z| bands [2,5) [5,15) [15,37) [37,50))
+//                [--impl mine|integ] [--zmix a,b,c,d]
+//                (zmix: weights of the |z| bands [2,5) [5,15) [15,37) [37,50))
 #include <armadillo>
 #include <omp.h>
 #include <boost/math/distributions/normal.hpp>
@@ -40,6 +45,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -49,6 +55,10 @@
 #include "UTIL.hpp"
 #include "score_format.hpp"
 #include "spa_gpu.hpp"
+#ifdef WITH_INTEGRATOR
+#include "gpu_step2.hpp"   // integ_shim/
+#include "gpu_spa.hpp"     // the integrator's header (snapshot dir)
+#endif
 
 using namespace saige::spa_gpu;
 
@@ -59,7 +69,7 @@ struct Opts {
     int erfcMode = 1, device = 0;
     std::vector<double> rates = {0.5, 0.10, 0.05, 0.01};
     std::vector<double> zmix = {0.45, 0.25, 0.15, 0.15};
-    std::string tsv;
+    std::string tsv, impl = "mine";
     bool bench = false, erfcSweep = false, gate = true;
 };
 
@@ -103,7 +113,7 @@ Marker makeMarker(int N, std::mt19937_64& rng, int kind, double maf, int mac, do
     std::vector<unsigned> code(N, 3u);
     std::uniform_real_distribution<double> U(0, 1);
     if (kind == 0) {
-        // exactly `mac` alt alleles: hets, with a hom every fourth allele when mac >= 4
+        // exactly `mac` alt alleles: hets, with a hom every third carrier when mac >= 4
         std::vector<int> idx(N); for (int i = 0; i < N; ++i) idx[i] = i;
         std::shuffle(idx.begin(), idx.end(), rng);
         int left = mac, k = 0;
@@ -252,6 +262,100 @@ void cpuPair(const Trait& T, const Marker& M, double z, double vr, CpuRes& r, st
 }
 
 // ---------------------------------------------------------------------------
+// Device implementations behind one interface
+// ---------------------------------------------------------------------------
+struct GRes {
+    double pval; int conv; bool fast; int s1, s2; int niter1, niter2; double root1, root2; double m1; int nnz;
+    unsigned status; int reason1, reason2; bool hasBits;   // status / reasons only from spa_gpu
+};
+
+struct Impl {
+    virtual ~Impl() {}
+    virtual const char* name() const = 0;
+    // Solve the pairs idx[] (fastMode -1: device decides when supported, else the CPU's choice).
+    virtual bool solve(const std::vector<int>& idx, int fastMode, std::vector<GRes>& res,
+                       double* kernelSec, double* h2dSec, double* d2hSec) = 0;
+    virtual bool decidesVariant() const = 0;
+};
+
+struct PairSrc {
+    const std::vector<CpuRes>* cres; const std::vector<int>* pm; const std::vector<int>* pt;
+};
+
+struct MineImpl : Impl {
+    Spa* S = nullptr; Geno geno; PairSrc src; int maxPairs = 0;
+    const char* name() const override { return "spa_gpu (this library)"; }
+    bool decidesVariant() const override { return true; }
+    bool solve(const std::vector<int>& idx, int fastMode, std::vector<GRes>& res, double* ks, double* hs, double* ds) override
+    {
+        res.resize(idx.size());
+        double k0, h0, d0, k1, h1, d1; long long n0, n1;
+        timings(S, &k0, &h0, &d0, &n0);
+        for (std::size_t s0 = 0; s0 < idx.size(); s0 += maxPairs) {
+            const int kc = (int)std::min<std::size_t>(maxPairs, idx.size() - s0);
+            PairIn* pi = in(S);
+            for (int k = 0; k < kc; ++k) {
+                const int j = idx[s0 + k]; const CpuRes& c = (*src.cres)[j];
+                pi[k].slot = (*src.pm)[j]; pi[k].trait = (*src.pt)[j];
+                pi[k].fast = (fastMode < 0) ? -1 : (c.fast ? 1 : 0);
+                pi[k].logp = c.logp ? 1 : 0;
+                pi[k].Tstat = c.Tstat; pi[k].var1 = c.var1; pi[k].var2 = c.var2; pi[k].pno = c.pno;
+            }
+            if (!run(S, geno, kc)) { std::fprintf(stderr, "spa_gpu::run failed: %s\n", lastError()); return false; }
+            const PairOut* po = out(S);
+            for (int k = 0; k < kc; ++k) {
+                GRes& g = res[s0 + k];
+                g.pval = po[k].pval; g.conv = po[k].conv; g.fast = (po[k].status & ST_FAST) != 0;
+                g.s1 = po[k].s1; g.s2 = po[k].s2; g.niter1 = po[k].niter1; g.niter2 = po[k].niter2;
+                g.root1 = po[k].root1; g.root2 = po[k].root2; g.m1 = po[k].m1; g.nnz = po[k].nnz;
+                g.status = po[k].status; g.reason1 = po[k].reason1; g.reason2 = po[k].reason2; g.hasBits = true;
+            }
+        }
+        timings(S, &k1, &h1, &d1, &n1);
+        if (ks) *ks = k1 - k0; if (hs) *hs = h1 - h0; if (ds) *ds = d1 - d0;
+        return true;
+    }
+};
+
+#ifdef WITH_INTEGRATOR
+struct IntegImpl : Impl {
+    saige::gpu2::Spa* S = nullptr; saige::gpu2::Reducer R; PairSrc src; int maxPairs = 0;
+    const char* name() const override { return "integrator gpu/gpu_spa.cu (snapshot)"; }
+    bool decidesVariant() const override { return false; }
+    bool solve(const std::vector<int>& idx, int, std::vector<GRes>& res, double* ks, double* hs, double* ds) override
+    {
+        res.resize(idx.size());
+        double k0, k1; long long n0, n1;
+        saige::gpu2::spaTimings(S, &k0, &n0);
+        auto w0 = std::chrono::steady_clock::now();
+        for (std::size_t s0 = 0; s0 < idx.size(); s0 += maxPairs) {
+            const int kc = (int)std::min<std::size_t>(maxPairs, idx.size() - s0);
+            saige::gpu2::SpaPairIn* pi = saige::gpu2::spaIn(S);
+            for (int k = 0; k < kc; ++k) {
+                const int j = idx[s0 + k]; const CpuRes& c = (*src.cres)[j];
+                pi[k].slot = (*src.pm)[j]; pi[k].trait = (*src.pt)[j];
+                pi[k].fast = c.fast ? 1 : 0; pi[k].logp = c.logp ? 1 : 0;
+                pi[k].Tstat = c.Tstat; pi[k].var1 = c.var1; pi[k].var2 = c.var2; pi[k].pno = c.pno;
+            }
+            if (!saige::gpu2::spaRun(S, &R, kc)) { std::fprintf(stderr, "gpu2::spaRun failed\n"); return false; }
+            const saige::gpu2::SpaPairOut* po = saige::gpu2::spaOut(S);
+            for (int k = 0; k < kc; ++k) {
+                GRes& g = res[s0 + k]; const CpuRes& c = (*src.cres)[idx[s0 + k]];
+                g.pval = po[k].pval; g.conv = po[k].conv; g.fast = c.fast;
+                g.s1 = po[k].s1; g.s2 = po[k].s2; g.niter1 = po[k].niter1; g.niter2 = po[k].niter2;
+                g.root1 = po[k].root1; g.root2 = po[k].root2; g.m1 = po[k].m1; g.nnz = -1;
+                g.status = 0; g.reason1 = g.reason2 = 0; g.hasBits = false;
+            }
+        }
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+        saige::gpu2::spaTimings(S, &k1, &n1);
+        if (ks) *ks = k1 - k0; if (hs) *hs = wall - (k1 - k0); if (ds) *ds = 0;   // its timer covers the kernel only
+        return true;
+    }
+};
+#endif
+
+// ---------------------------------------------------------------------------
 // Comparison bookkeeping
 // ---------------------------------------------------------------------------
 struct Tally {
@@ -265,18 +369,19 @@ struct Cmp {
     double rel, dlog10, droot;
 };
 
-Cmp compare(const CpuRes& c, const PairOut& g, bool gConvF, const std::string& gStr)
+Cmp compare(const CpuRes& c, const GRes& g, bool gConvF, const std::string& gStr)
 {
     Cmp o;
-    const bool gFast = (g.status & ST_FAST) != 0;
-    o.variantOk = (gFast == c.fast);
+    o.variantOk = (g.fast == c.fast);
     o.convOk = ((g.conv != 0) == c.conv);
     const bool bothRoots = c.r1.Isconverge && c.r2.Isconverge;
     if (bothRoots) o.saddleOk = (g.s1 == (c.s1.isSaddle ? 1 : 0)) && (g.s2 == (c.s2.isSaddle ? 1 : 0));
     else o.saddleOk = (g.s1 == -1 && g.s2 == -1);
     const bool cInf1 = std::isinf(c.r1.root) && c.r1.niter == 0, cInf2 = std::isinf(c.r2.root) && c.r2.niter == 0;
-    o.infOk = (((g.status & ST_ROOT1_INF) != 0) == cInf1) && (((g.status & ST_ROOT2_INF) != 0) == cInf2)
-           && (((g.status & ST_ROOT1_FAIL) != 0) == !c.r1.Isconverge) && (((g.status & ST_ROOT2_FAIL) != 0) == !c.r2.Isconverge);
+    const bool gInf1 = g.hasBits ? ((g.status & ST_ROOT1_INF) != 0) : (std::isinf(g.root1) && g.niter1 == 0);
+    const bool gInf2 = g.hasBits ? ((g.status & ST_ROOT2_INF) != 0) : (std::isinf(g.root2) && g.niter2 == 0);
+    o.infOk = (gInf1 == cInf1) && (gInf2 == cInf2);
+    if (g.hasBits) o.infOk = o.infOk && (((g.status & ST_ROOT1_FAIL) != 0) == !c.r1.Isconverge) && (((g.status & ST_ROOT2_FAIL) != 0) == !c.r2.Isconverge);
     o.iterOk = (g.niter1 == c.r1.niter) && (g.niter2 == c.r2.niter);
     o.convFOk = (gConvF == c.convF);
     o.strOk = (gStr == c.str);
@@ -397,10 +502,8 @@ int erfcSweep(const Opts& o)
     std::printf("  %-26s %8s %8s %12s | %12s %12s %10s %14s\n", "band", "n", "port==", "port maxulp", "cuda maxulp", "cuda maxrel", "zero mism", "cuda>1e-13 at z");
     for (const Band& b : bands)
         std::printf("  %-26s %8ld %8ld %12.2f | %12.2f %12.2e %10ld %14.5f\n", b.name, b.n, b.exact, b.maxUlpPort, b.maxUlpCuda, b.maxRelCuda, b.zeroMismatch, b.firstCudaDiff);
-    // in p-value terms: p = erfc(z)/2, Z = z*sqrt(2)
     std::printf("  p-value terms: p = erfc(z)/2; z = 26.55 is p ~ %.3e (Z = %.2f); z = 27.3 is p ~ %.3e; z = 28 is p = 0 on the host (Z = %.3f)\n",
                 boost::math::erfc(26.55) / 2, 26.55 * std::sqrt(2.0), boost::math::erfc(27.3) / 2, 28 * std::sqrt(2.0));
-    // print the special points
     for (int i = n - 9; i < n; ++i) std::printf("  z=%-12.6g host=%-24.17g port=%-24.17g cuda=%-24.17g\n", z[i], host[i], port[i], cu[i]);
     return 0;
 }
@@ -425,6 +528,7 @@ int main(int argc, char** argv)
         else if (a == "--traits") o.rates = parseList(next());
         else if (a == "--zmix") o.zmix = parseList(next());
         else if (a == "--tsv") o.tsv = next();
+        else if (a == "--impl") o.impl = next();
         else if (a == "--bench") o.bench = true;
         else if (a == "--erfc-sweep") o.erfcSweep = true;
         else if (a == "--no-gate") o.gate = false;
@@ -432,6 +536,9 @@ int main(int argc, char** argv)
     }
     if (o.erfcSweep) return erfcSweep(o);
     if (o.p < 1 || o.p > PMAX) { std::fprintf(stderr, "--p must be 1..%d\n", PMAX); return 2; }
+#ifndef WITH_INTEGRATOR
+    if (o.impl == "integ") { std::fprintf(stderr, "--impl integ needs the spa_gpu_test_integ build\n"); return 2; }
+#endif
     omp_set_num_threads(o.threads);
     const int N = o.N, p = o.p, T = (int)o.rates.size();
     std::mt19937_64 rng(o.seed);
@@ -485,8 +592,7 @@ int main(int argc, char** argv)
     }
 
     // ---- pairs
-    struct Pair { int m, t; double z, vr; };
-    std::vector<Pair> pairs;
+    std::vector<int> pm, pt; std::vector<double> pz, pvr;
     {
         std::vector<std::pair<int, int>> all;
         for (int m = 0; m < o.M; ++m) for (int t = 0; t < T; ++t) all.push_back({m, t});
@@ -498,19 +604,18 @@ int main(int argc, char** argv)
         for (int m = 0; m < std::min(o.M, 2 * nFixed); ++m) for (int t = 0; t < T; ++t) if (!have[(std::size_t)m * T + t]) all.push_back({m, t});
         const double wsum = o.zmix[0] + o.zmix[1] + o.zmix[2] + o.zmix[3];
         for (auto& pr : all) {
-            Pair P; P.m = pr.first; P.t = pr.second;
+            pm.push_back(pr.first); pt.push_back(pr.second);
             const double u = U(rng) * wsum; double zlo, zhi;
             if (u < o.zmix[0]) { zlo = 2; zhi = 5; }
             else if (u < o.zmix[0] + o.zmix[1]) { zlo = 5; zhi = 15; }
             else if (u < o.zmix[0] + o.zmix[1] + o.zmix[2]) { zlo = 15; zhi = 37; }
             else { zlo = 37; zhi = 50; }
-            P.z = (U(rng) < 0.5 ? -1 : 1) * (zlo + U(rng) * (zhi - zlo));
-            P.vr = 0.85 + 0.3 * U(rng);
-            pairs.push_back(P);
+            pz.push_back((U(rng) < 0.5 ? -1 : 1) * (zlo + U(rng) * (zhi - zlo)));
+            pvr.push_back(0.85 + 0.3 * U(rng));
         }
     }
-    const int K = (int)pairs.size();
-    std::printf("spa_gpu_test: N=%d p=%d traits=%d (case rates", N, p, T);
+    const int K = (int)pm.size();
+    std::printf("spa_gpu_test: impl=%s N=%d p=%d traits=%d (case rates", o.impl.c_str(), N, p, T);
     for (double r : o.rates) std::printf(" %g", r);
     std::printf(") markers=%d pairs=%d seed=%d threads=%d blocks=%d erfcMode=%d\n", o.M, K, o.seed, o.threads, o.blocks, o.erfcMode);
 
@@ -519,13 +624,13 @@ int main(int argc, char** argv)
     std::vector<std::string> noSpa(K);
     auto t0 = std::chrono::steady_clock::now();
     #pragma omp parallel for schedule(dynamic, 16)
-    for (int k = 0; k < K; ++k) cpuPair(traits[pairs[k].t], markers[pairs[k].m], pairs[k].z, pairs[k].vr, cres[k], noSpa[k]);
+    for (int k = 0; k < K; ++k) cpuPair(traits[pt[k]], markers[pm[k]], pz[k], pvr[k], cres[k], noSpa[k]);
     const double tCpu = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     long nFastCpu = 0, nLogCpu = 0;
     for (auto& c : cres) { nFastCpu += c.fast; nLogCpu += c.logp; }
     std::printf("CPU reference: %.1f s on %d threads (%.3f ms/pair); fast variant %ld, log domain %ld\n", tCpu, o.threads, tCpu / K * 1e3, nFastCpu, nLogCpu);
 
-    // ---- GPU
+    // ---- device: this library always provides the genotype upload
     std::vector<TraitArgs> ta(T);
     for (int t = 0; t < T; ++t) { ta[t].mu = traits[t].mu.memptr(); ta[t].XV = traits[t].XV.memptr(); ta[t].XXVX_inv = traits[t].XXVX_inv.memptr(); ta[t].p = p; }
     CreateArgs ca;
@@ -536,36 +641,39 @@ int main(int argc, char** argv)
     if (!S) { std::fprintf(stderr, "spa_gpu::create failed: %s\n", lastError()); return 2; }
     Geno geno;
     if (!uploadPacked(S, packedAll.data(), bpv, lutAll.data(), o.M, &geno)) { std::fprintf(stderr, "uploadPacked: %s\n", lastError()); return 2; }
-    std::printf("GPU: device bytes %.1f MB (scratch %d blocks x 16N)\n", deviceBytes(S) / 1048576.0, o.blocks);
+    std::printf("GPU: spa_gpu device bytes %.1f MB (scratch %d blocks x 16N)\n", deviceBytes(S) / 1048576.0, o.blocks);
 
-    auto runAll = [&](int fastMode, std::vector<PairOut>& res, double* wall) {
-        res.resize(K);
-        auto w0 = std::chrono::steady_clock::now();
-        for (int k0 = 0; k0 < K; k0 += ca.maxPairs) {
-            const int kc = std::min(ca.maxPairs, K - k0);
-            PairIn* pi = in(S);
-            for (int k = 0; k < kc; ++k) {
-                const CpuRes& c = cres[k0 + k];
-                pi[k].slot = pairs[k0 + k].m; pi[k].trait = pairs[k0 + k].t;
-                pi[k].fast = (fastMode < 0) ? -1 : (c.fast ? 1 : 0);
-                pi[k].logp = c.logp ? 1 : 0;
-                pi[k].Tstat = c.Tstat; pi[k].var1 = c.var1; pi[k].var2 = c.var2; pi[k].pno = c.pno;
-            }
-            if (!run(S, geno, kc)) { std::fprintf(stderr, "spa_gpu::run failed: %s\n", lastError()); std::exit(2); }
-            std::memcpy(res.data() + k0, out(S), (std::size_t)kc * sizeof(PairOut));
-        }
-        *wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
-    };
-    std::vector<PairOut> gres, gres2;
-    double wall1 = 0, wall2 = 0;
-    runAll(-1, gres, &wall1);           // the device decides the variant
-    runAll(0, gres2, &wall2);           // the caller decides (as the integrator does)
+    PairSrc src{&cres, &pm, &pt};
+    std::unique_ptr<Impl> impl;
+    if (o.impl == "mine") {
+        auto* m = new MineImpl(); m->S = S; m->geno = geno; m->src = src; m->maxPairs = ca.maxPairs; impl.reset(m);
+    }
+#ifdef WITH_INTEGRATOR
+    else if (o.impl == "integ") {
+        auto* m = new IntegImpl();
+        std::vector<saige::gpu2::SpaTraitArgs> ita(T);
+        for (int t = 0; t < T; ++t) { ita[t].mu = ta[t].mu; ita[t].XV = ta[t].XV; ita[t].XXVX_inv = ta[t].XXVX_inv; ita[t].p = p; }
+        saige::gpu2::SpaCreateArgs ia;
+        ia.device = o.device; ia.N = N; ia.nTraits = T; ia.traits = ita.data(); ia.maxPairs = ca.maxPairs;
+        ia.tol = ca.tol; ia.maxiter = 1000; ia.blocks = o.blocks;
+        m->S = saige::gpu2::spaCreate(ia);
+        if (!m->S) { std::fprintf(stderr, "gpu2::spaCreate failed\n"); return 2; }
+        m->R.pk = geno.packed; m->R.lut = geno.lut; m->R.bpv = geno.bpv;
+        m->src = src; m->maxPairs = ca.maxPairs; impl.reset(m);
+        std::printf("GPU: integrator kernel created, device bytes %.1f MB\n", saige::gpu2::spaDeviceBytes(m->S) / 1048576.0);
+    }
+#endif
+    else { std::fprintf(stderr, "unknown --impl %s\n", o.impl.c_str()); return 2; }
+
+    std::vector<int> allIdx(K); for (int k = 0; k < K; ++k) allIdx[k] = k;
+    std::vector<GRes> gres, gres2;
+    double k1, h1, d1, k2, h2, d2;
+    if (!impl->solve(allIdx, -1, gres, &k1, &h1, &d1)) return 2;    // device decides the variant (where supported)
+    if (!impl->solve(allIdx, 0, gres2, &k2, &h2, &d2)) return 2;    // the caller decides, as the integrator does
     long diffDecide = 0;
-    for (int k = 0; k < K; ++k) if (std::memcmp(&gres[k], &gres2[k], sizeof(PairOut)) != 0) diffDecide++;
-    double tk, th, td; long long np;
-    timings(S, &tk, &th, &td, &np);
-    std::printf("GPU: two passes over %d pairs: wall %.3f + %.3f s; device kernel %.3f s, H2D %.3f s, D2H %.3f s over %lld pairs -> %.2f us/pair kernel; results with fast=-1 vs fast given: %ld pairs differ\n",
-                K, wall1, wall2, tk, th, td, np, tk / np * 1e6, diffDecide);
+    for (int k = 0; k < K; ++k) if (std::memcmp(&gres[k], &gres2[k], sizeof(GRes)) != 0) diffDecide++;
+    std::printf("GPU [%s]: %d pairs twice: kernel %.3f + %.3f s (%.2f us/pair), H2D %.3f s, D2H %.3f s; results with the variant %s vs given by the caller: %ld pairs differ\n",
+                impl->name(), K, k1, k2, (k1 + k2) / (2.0 * K) * 1e6, h1 + h2, d1 + d2, impl->decidesVariant() ? "decided on the device" : "(no device decision)", diffDecide);
 
     // ---- compare
     int rc = 0;
@@ -576,75 +684,68 @@ int main(int argc, char** argv)
         FILE* ft = o.tsv.empty() ? nullptr : std::fopen(o.tsv.c_str(), "w");
         if (ft) std::fprintf(ft, "m\tt\trate\tmac\tz\tfast_c\tfast_g\tlogp\tTstat\tvar1\tvar2\tpno\tnnz_c\tnnz_g\tm1_c\tm1_g\tr1c\tr1g\tr2c\tr2g\tn1c\tn1g\tn2c\tn2g\ts1c\ts1g\ts2c\ts2g\tconvc\tconvg\tstatus\treason1\treason2\tpc\tpg\tconvFc\tconvFg\tstrc\tstrg\n");
         for (int k = 0; k < K; ++k) {
-            const CpuRes& c = cres[k]; const PairOut& g = gres[k];
+            const CpuRes& c = cres[k]; const GRes& g = gres[k];
             std::string gStr; const bool gConvF = postRules(g.pval, c.logp, g.conv != 0, gStr, noSpa[k]);
             const Cmp cm = compare(c, g, gConvF, gStr);
             tally(all, c, cm);
             tally(by[std::string("variant: ") + (c.fast ? "fast (carriers)" : "full N")], c, cm);
             tally(by[std::string("domain: ") + (c.logp ? "log-p" : "linear")], c, cm);
-            char buf[64]; std::snprintf(buf, sizeof(buf), "case rate %g", traits[pairs[k].t].rate); tally(by[buf], c, cm);
+            char buf[64]; std::snprintf(buf, sizeof(buf), "case rate %g", traits[pt[k]].rate); tally(by[buf], c, cm);
             tally(by[zBand(c.z)], c, cm);
-            tally(by[macBand(markers[pairs[k].m].mac)], c, cm);
-            if (markers[pairs[k].m].nMissing > 0) tally(by["markers with missing calls"], c, cm);
-            if (markers[pairs[k].m].flip) tally(by["markers with allele flip"], c, cm);
-            if (markers[pairs[k].m].cleaned) tally(by["markers with .clean() zeroing"], c, cm);
+            tally(by[macBand(markers[pm[k]].mac)], c, cm);
+            if (markers[pm[k]].nMissing > 0) tally(by["markers with missing calls"], c, cm);
+            if (markers[pm[k]].flip) tally(by["markers with allele flip"], c, cm);
+            if (markers[pm[k]].cleaned) tally(by["markers with .clean() zeroing"], c, cm);
             const bool routingOk = cm.variantOk && cm.convOk && cm.saddleOk && cm.infOk && cm.iterOk && cm.convFOk && cm.strOk && cm.zeroOk;
             if (!routingOk) bad.push_back(k);
             if (ft) std::fprintf(ft, "%d\t%d\t%g\t%g\t%.6g\t%d\t%d\t%d\t%.17g\t%.17g\t%.17g\t%.17g\t%d\t%d\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%d\t%d\t%.17g\t%.17g\t%d\t%d\t%s\t%s\n",
-                pairs[k].m, pairs[k].t, traits[pairs[k].t].rate, markers[pairs[k].m].mac, c.z, (int)c.fast, (int)((g.status & ST_FAST) != 0), (int)c.logp,
+                pm[k], pt[k], traits[pt[k]].rate, markers[pm[k]].mac, c.z, (int)c.fast, (int)g.fast, (int)c.logp,
                 c.Tstat, c.var1, c.var2, c.pno, c.nnz, g.nnz, c.m1, g.m1, c.r1.root, g.root1, c.r2.root, g.root2, c.r1.niter, g.niter1, c.r2.niter, g.niter2,
                 (c.r1.Isconverge && c.r2.Isconverge) ? (int)c.s1.isSaddle : -1, g.s1, (c.r1.Isconverge && c.r2.Isconverge) ? (int)c.s2.isSaddle : -1, g.s2,
                 (int)c.conv, g.conv, g.status, g.reason1, g.reason2, c.pval, g.pval, (int)c.convF, (int)gConvF, c.str.c_str(), gStr.c_str());
         }
         if (ft) std::fclose(ft);
-        std::printf("\nACCURACY GATE (CPU = shipped spa.cpp / spa_binary.cpp; identical inputs; fast decided on the device)\n");
+        std::printf("\nACCURACY GATE [%s] (CPU = shipped spa.cpp / spa_binary.cpp; identical inputs)\n", impl->name());
         printTally("all pairs", all);
         for (auto& kv : by) printTally(kv.first, kv.second);
         const long mm = all.mmVariant + all.mmConv + all.mmSaddle + all.mmInf + all.mmIter + all.mmConvF + all.mmStr + all.mmZero;
-        std::printf("\nRESULT: %s -- routing mismatches %ld of %ld pairs; max rel |dp| = %.3e, max |dlog10 p| = %.3e, max |droot| = %.3e; printed strings differ on %ld pairs\n",
-                    mm == 0 ? "PASS" : "FAIL", mm, all.n, all.maxRel, all.maxDlog10, all.maxDroot, all.mmStr);
+        std::printf("\nRESULT [%s]: %s -- routing mismatches %ld of %ld pairs; max rel |dp| = %.3e, max |dlog10 p| = %.3e, max |droot| = %.3e; printed strings differ on %ld pairs\n",
+                    impl->name(), mm == 0 ? "PASS" : "FAIL", mm, all.n, all.maxRel, all.maxDlog10, all.maxDroot, all.mmStr);
         for (std::size_t i = 0; i < bad.size() && i < 20; ++i) {
-            const int k = bad[i]; const CpuRes& c = cres[k]; const PairOut& g = gres[k];
+            const int k = bad[i]; const CpuRes& c = cres[k]; const GRes& g = gres[k];
+            std::string gStr; postRules(g.pval, c.logp, g.conv != 0, gStr, noSpa[k]);
             std::printf("  mismatch pair %d: m=%d t=%d mac=%g z=%.4g fast c/g=%d/%d logp=%d | roots c (%.17g,%d,%d) (%.17g,%d,%d) g (%.17g,%d) (%.17g,%d) status=%u reasons=%d,%d | saddle c=%d,%d g=%d,%d | conv c/g=%d/%d p c/g=%.17g/%.17g str %s / %s\n",
-                k, pairs[k].m, pairs[k].t, markers[pairs[k].m].mac, c.z, (int)c.fast, (int)((g.status & ST_FAST) != 0), (int)c.logp,
+                k, pm[k], pt[k], markers[pm[k]].mac, c.z, (int)c.fast, (int)g.fast, (int)c.logp,
                 c.r1.root, c.r1.niter, (int)c.r1.Isconverge, c.r2.root, c.r2.niter, (int)c.r2.Isconverge, g.root1, g.niter1, g.root2, g.niter2, g.status, g.reason1, g.reason2,
                 (c.r1.Isconverge && c.r2.Isconverge) ? (int)c.s1.isSaddle : -1, (c.r1.Isconverge && c.r2.Isconverge) ? (int)c.s2.isSaddle : -1, g.s1, g.s2,
-                (int)c.conv, g.conv, c.pval, g.pval, c.str.c_str(), "(see tsv)");
+                (int)c.conv, g.conv, c.pval, g.pval, c.str.c_str(), gStr.c_str());
         }
         if (mm != 0) rc = 1;
     }
 
     // ---- throughput
     if (o.bench) {
-        std::printf("\nTHROUGHPUT (device kernel time from events; H2D = pair table %zu B/pair, D2H = results %zu B/pair; best of 3)\n", sizeof(PairIn), sizeof(PairOut));
+        std::printf("\nTHROUGHPUT [%s] (device kernel time from events; pair table %zu B/pair in, results %zu B/pair out; best of 3)\n", impl->name(), sizeof(PairIn), sizeof(PairOut));
         auto bench = [&](const char* name, const std::vector<int>& idx) {
             if (idx.empty()) return;
-            const int n = std::min((int)idx.size(), ca.maxPairs);
+            std::vector<int> sub(idx.begin(), idx.begin() + std::min((int)idx.size(), ca.maxPairs));
             double best = 1e30, bh = 0, bd = 0;
             for (int rep = 0; rep < 3; ++rep) {
-                PairIn* pi = in(S);
-                for (int k = 0; k < n; ++k) {
-                    const CpuRes& c = cres[idx[k]];
-                    pi[k].slot = pairs[idx[k]].m; pi[k].trait = pairs[idx[k]].t; pi[k].fast = c.fast ? 1 : 0; pi[k].logp = c.logp ? 1 : 0;
-                    pi[k].Tstat = c.Tstat; pi[k].var1 = c.var1; pi[k].var2 = c.var2; pi[k].pno = c.pno;
-                }
-                double k0, h0, d0, k1, h1, d1; long long n0, n1;
-                timings(S, &k0, &h0, &d0, &n0);
-                if (!run(S, geno, n)) { std::fprintf(stderr, "run: %s\n", lastError()); std::exit(2); }
-                timings(S, &k1, &h1, &d1, &n1);
-                if (k1 - k0 < best) { best = k1 - k0; bh = h1 - h0; bd = d1 - d0; }
+                std::vector<GRes> r; double ks, hs, ds;
+                if (!impl->solve(sub, 0, r, &ks, &hs, &ds)) std::exit(2);
+                if (ks < best) { best = ks; bh = hs; bd = ds; }
             }
-            double itSum = 0; for (int k = 0; k < n; ++k) itSum += cres[idx[k]].r1.niter + cres[idx[k]].r2.niter;
+            double itSum = 0; for (int k : sub) itSum += cres[k].r1.niter + cres[k].r2.niter;
+            const int n = (int)sub.size();
             std::printf("  %-36s pairs=%6d  kernel %.2f us/pair  (%.0f pairs/s)   H2D %.3f us/pair  D2H %.3f us/pair   mean Newton steps per pair %.2f\n",
                         name, n, best / n * 1e6, n / best, bh / n * 1e6, bd / n * 1e6, itSum / n);
         };
-        std::vector<int> allIdx, fullIdx, fastIdx, linIdx, logIdx;
+        std::vector<int> fullIdx, fastIdx, linIdx, logIdx;
         std::map<int, std::vector<int>> byTrait;
         for (int k = 0; k < K; ++k) {
-            allIdx.push_back(k);
             (cres[k].fast ? fastIdx : fullIdx).push_back(k);
             (cres[k].logp ? logIdx : linIdx).push_back(k);
-            byTrait[pairs[k].t].push_back(k);
+            byTrait[pt[k]].push_back(k);
         }
         bench("all pairs (mix)", allIdx);
         bench("full-N variant only", fullIdx);
@@ -660,6 +761,10 @@ int main(int argc, char** argv)
             std::snprintf(b, sizeof(b), "case rate %g, fast", traits[kv.first].rate); bench(b, f);
         }
     }
+#ifdef WITH_INTEGRATOR
+    if (auto* m = dynamic_cast<IntegImpl*>(impl.get())) saige::gpu2::spaDestroy(m->S);
+#endif
+    impl.reset();
     destroy(S);
     return rc;
 }
