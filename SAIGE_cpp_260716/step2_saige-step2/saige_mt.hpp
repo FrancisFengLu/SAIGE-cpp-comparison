@@ -403,18 +403,34 @@ void scoreTestBatchMT(const MTContext& t_ctx,
 
 // Same kernel, but the sample-space reductions in t_scr were produced
 // elsewhere -- by the GPU path in gpu/gpu_step2.hpp -- so only the O(p^2) /
-// O(P) tail runs here. Restricted to quantitative, batchable traits whose
-// sample list is the union's, because that is the case in which the four
-// prefilled quantities are the whole of scoreTestBatchMT's sample-space work.
-// See the definition in saige_mt.cpp for the exact contract on t_scr; it
-// throws rather than silently reading the wrong rows if the trait set does not
-// match.
+// O(P) tail runs here. t_scr holds the WHOLE block (every column of the
+// caller's block, Bblk wide), and the call scores columns [t_j0, t_j1) of it;
+// the GPU loop keeps high-MAC markers at the front and low-MAC ones at the
+// back of each block exactly as mainMarkerMT does, so each trait set gets one
+// call per contiguous range. Restricted to batchable traits whose sample list
+// is the union's, because that is the case in which the prefilled quantities
+// are the whole of scoreTestBatchMT's sample-space work. Both throw rather
+// than silently reading the wrong rows if the trait set does not match.
+//
+//   t_scr must hold, with STACK rows (row r is stack column r):
+//     Zall   sumP x Bblk      Astack^T G             both
+//     GWqnt  sumP x Bblk      Xstack^T G             quantitative rows only read
+//     GR     Bblk x P         G^T RES
+//     Gsq    Bblk             colsum(G % G)          quantitative
+//     GWbin  sumPbin x Bblk   WXstack^T G            binary
+//     G2Mu2  Bblk x nBin      (G % G)^T MU2bin       binary
 void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               const std::vector<int>& t_traitSet,
                               int t_j0, int t_j1,
                               const arma::mat& t_VR,
                               MTScratch& t_scr,
                               MTBlockResult& t_out);
+void scoreTestBatchMTBinPre(const MTContext& t_ctx,
+                            const std::vector<int>& t_traitSet,
+                            int t_j0, int t_j1,
+                            const arma::mat& t_VR,
+                            MTScratch& t_scr,
+                            MTBlockResult& t_out);
 
 
 #ifdef MTFOLD_PROF

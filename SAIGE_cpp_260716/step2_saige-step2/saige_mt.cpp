@@ -1157,23 +1157,37 @@ void scoreTestBatchMT(const MTContext& t_ctx,
 
 
 // ---------------------------------------------------------------------------
-// GPU-fed variant of scoreTestBatchMT: the sample-space reductions are already
-// in t_scr, so this does only the O(p^2) / O(P) tail.
+// GPU-fed variants of scoreTestBatchMT: the sample-space reductions are already
+// in t_scr (for the whole block), so these do only the O(p^2) / O(P) tail on
+// the block columns [t_j0, t_j1). Contract: saige_mt.hpp.
 //
-// Scope, enforced by the caller's gate (main.cpp, mainMarkerMT): every trait in
-// t_traitSet is quantitative, batchable, and has the union's sample list. That
-// is the case in which scoreTestBatchMT's body reduces to Zall / GWqnt / Gsq /
-// GR -- no MU2bin, no MASKq, no MTBlockAdj -- which is exactly what the GPU
-// computes. Anything else keeps the CPU kernel.
-//
-// t_scr must hold, for the block columns [t_j0, t_j1) indexed 0-based:
-//   Zall   sumP x B    Astack^T G
-//   GWqnt  sumP x B    Xstack^T G
-//   GR     B x P       G^T RES      (only the t_traitSet columns are read)
-//   Gsq    B           colsum(G % G)
-// with STACK rows, i.e. row r is stack column r -- so the traits in t_traitSet
-// must start at stack column 0. Throws if they do not, rather than reading the
-// wrong rows.
+// Identical expressions to scoreTestBatchMT's non-adjusted branch, applied to
+// the column range through submatrix views, so every (marker, trait) pair's
+// S and var2 are formed from the same per-trait contractions in the same
+// order; only the sample-space inputs came from the device.
+// ---------------------------------------------------------------------------
+namespace {
+
+inline void preCheckWidth(const MTScratch& t_scr, const MTContext& t_ctx, int t_j1,
+                          bool t_bin, const char* t_who)
+{
+    const arma::uword W = static_cast<arma::uword>(t_j1);
+    if (t_scr.Zall.n_rows != (arma::uword)t_ctx.sumP || t_scr.Zall.n_cols < W ||
+        t_scr.GR.n_rows < W || t_scr.GR.n_cols != (arma::uword)t_ctx.P)
+        throw std::runtime_error(std::string(t_who) + ": prefilled Zall / GR have the wrong shape");
+    if (t_bin) {
+        if (t_scr.GWbin.n_rows != (arma::uword)t_ctx.sumPbin || t_scr.GWbin.n_cols < W ||
+            t_scr.G2Mu2.n_rows < W || t_scr.G2Mu2.n_cols != (arma::uword)t_ctx.nBin)
+            throw std::runtime_error(std::string(t_who) + ": prefilled GWbin / G2Mu2 have the wrong shape");
+    } else {
+        if (t_scr.GWqnt.n_rows != (arma::uword)t_ctx.sumP || t_scr.GWqnt.n_cols < W ||
+            t_scr.Gsq.n_elem < W)
+            throw std::runtime_error(std::string(t_who) + ": prefilled GWqnt / Gsq have the wrong shape");
+    }
+}
+
+}  // namespace
+
 void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               const std::vector<int>& t_traitSet,
                               int t_j0, int t_j1,
@@ -1181,37 +1195,71 @@ void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               MTScratch& t_scr,
                               MTBlockResult& t_out)
 {
-    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
     if (t_traitSet.empty() || t_j1 <= t_j0) return;
-
-    int c0 = std::numeric_limits<int>::max();
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         if (M.kind != TraitKind::Quantitative)
             throw std::runtime_error("scoreTestBatchMTQuantPre: non-quantitative trait");
         if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion)
             throw std::runtime_error("scoreTestBatchMTQuantPre: trait has its own sample list");
-        c0 = std::min(c0, M.colOff);
     }
-    if (c0 != 0)
-        throw std::runtime_error("scoreTestBatchMTQuantPre: trait set does not start at stack column 0");
+    preCheckWidth(t_scr, t_ctx, t_j1, false, "scoreTestBatchMTQuantPre");
+    const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
+    const arma::vec Gsq = t_scr.Gsq.subvec(c0, c1);
 
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         const arma::uword r0 = static_cast<arma::uword>(M.colOff);
         const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
-        const auto Z_t = t_scr.Zall.rows(r0, r1);                    // p x B
+        const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
+        const arma::mat W_t = t_scr.GWqnt.submat(r0, c0, r1, c1);       // p x B
 
-        // Identical expressions to scoreTestBatchMT's non-adjusted branch.
         arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
         arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
-        arma::rowvec gwz = arma::sum(t_scr.GWqnt.rows(r0, r1) % Z_t, 0);
+        arma::rowvec gwz = arma::sum(W_t % Z_t, 0);
 
-        arma::vec S    = (t_scr.GR.col(t) - saz.t()) / M.tau0;
-        arma::vec var2 = zxz.t() * M.tau0 + t_scr.Gsq - 2.0 * gwz.t();
-        if (S.n_elem != B || var2.n_elem != B)
-            throw std::runtime_error("scoreTestBatchMTQuantPre: prefilled scratch has the wrong width");
+        arma::vec S    = (t_scr.GR.submat(c0, (arma::uword)t, c1, (arma::uword)t) - saz.t()) / M.tau0;
+        arma::vec var2 = zxz.t() * M.tau0 + Gsq - 2.0 * gwz.t();
+        emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+    }
+}
 
+void scoreTestBatchMTBinPre(const MTContext& t_ctx,
+                            const std::vector<int>& t_traitSet,
+                            int t_j0, int t_j1,
+                            const arma::mat& t_VR,
+                            MTScratch& t_scr,
+                            MTBlockResult& t_out)
+{
+    if (t_traitSet.empty() || t_j1 <= t_j0) return;
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        if (M.kind != TraitKind::Binary)
+            throw std::runtime_error("scoreTestBatchMTBinPre: non-binary trait");
+        if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion)
+            throw std::runtime_error("scoreTestBatchMTBinPre: trait has its own sample list");
+        if (M.binOff < 0 || M.binIdx < 0)
+            throw std::runtime_error("scoreTestBatchMTBinPre: trait has no binary stack block");
+    }
+    preCheckWidth(t_scr, t_ctx, t_j1, true, "scoreTestBatchMTBinPre");
+    const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
+
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        const arma::uword r0 = static_cast<arma::uword>(M.colOff);
+        const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
+        const arma::uword w0 = static_cast<arma::uword>(M.binOff);
+        const arma::uword w1 = w0 + static_cast<arma::uword>(M.p) - 1;
+        const arma::uword bi = static_cast<arma::uword>(M.binIdx);
+        const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
+        const arma::mat W_t = t_scr.GWbin.submat(w0, c0, w1, c1);       // p x B
+
+        arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+        arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+        arma::rowvec gwz = arma::sum(W_t % Z_t, 0);
+
+        arma::vec S    = (t_scr.GR.submat(c0, (arma::uword)t, c1, (arma::uword)t) - saz.t()) / M.tau0;
+        arma::vec var2 = zxz.t() + t_scr.G2Mu2.submat(c0, bi, c1, bi) - 2.0 * gwz.t();
         emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
     }
 }

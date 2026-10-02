@@ -12,9 +12,10 @@
 // for missing calls, and the MAC-gated .clean() zeroing. All three are
 // functions of the 2-bit code alone, so they collapse into four floats per
 // marker and the kernel stays branch-free -- no separate missing-value path,
-// and imputation costs nothing.
+// and imputation costs nothing. The binary-trait second GEMM reuses the same
+// kernel with the squared table.
 //
-// Determinism: for a given (N, K, maxSlots, slotsPerPass, precision) every
+// Determinism: for a given (N, K1, K2, maxSlots, slotsPerPass, precision) every
 // launch shape is fixed, so two runs of the same configuration produce
 // bit-identical C. cuBLAS is left in PEDANTIC math mode so no TF32 or
 // reduced-precision reduction can be substituted on a device newer than the
@@ -131,36 +132,93 @@ decode_lut_any(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
         o[i] = pick(L, (unsigned)((row[i >> 2] >> ((i & 3) * 2)) & 3u));
 }
 
+// Code counts: one block per slot; for each mask, every thread popcounts its
+// share of the words of (column AND mask) and the block reduces the three
+// counts. The column (one row, 12.5 KB at N = 50,000) stays in L1 across the
+// masks; the masks (nMask * words * 8 B) are shared by every block and sit in
+// L2. Same arithmetic as popcount_af.hpp's pcCountCodes, including the
+// derivation of the fourth count from the mask population.
+__device__ __forceinline__ unsigned warpSumU(unsigned v)
+{
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
+__global__ void __launch_bounds__(256)
+count_codes(const uint8_t* __restrict__ packed, std::size_t bpv, int words,
+            const uint64_t* __restrict__ masks, const uint32_t* __restrict__ maskPop,
+            int nMask, uint32_t* __restrict__ out)
+{
+    __shared__ unsigned sh[3][8];
+    const int s = blockIdx.x;
+    const uint64_t* __restrict__ col = reinterpret_cast<const uint64_t*>(packed + (std::size_t)s * bpv);
+    const uint64_t M55 = 0x5555555555555555ULL;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int m = 0; m < nMask; ++m) {
+        const uint64_t* __restrict__ mk = masks + (std::size_t)m * words;
+        unsigned n11 = 0, n10 = 0, n01 = 0;
+        for (int w = threadIdx.x; w < words; w += blockDim.x) {
+            const uint64_t x  = col[w] & mk[w];
+            const uint64_t lo = x & M55;
+            const uint64_t hi = (x >> 1) & M55;
+            n11 += (unsigned)__popcll(hi & lo);
+            n10 += (unsigned)__popcll(hi & ~lo);
+            n01 += (unsigned)__popcll(lo & ~hi);
+        }
+        n11 = warpSumU(n11); n10 = warpSumU(n10); n01 = warpSumU(n01);
+        if (lane == 0) { sh[0][wid] = n11; sh[1][wid] = n10; sh[2][wid] = n01; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned a = 0, b = 0, c = 0;
+            for (int k = 0; k < (int)(blockDim.x >> 5); ++k) { a += sh[0][k]; b += sh[1][k]; c += sh[2][k]; }
+            uint32_t* o = out + ((std::size_t)s * nMask + m) * 4;
+            // PLINK codes: 00 HOM_ALT, 01 MISSING, 10 HET, 11 HOM_REF
+            o[3] = a; o[2] = b; o[1] = c; o[0] = maskPop[m] - a - b - c;
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 
 struct Reducer {
-    int  N = 0, K = 0, maxSlots = 0;
+    int  N = 0, K1 = 0, K2 = 0, maxSlots = 0, nMask = 0, words = 0;
     bool fp64 = true;
-    std::size_t bpv = 0;
+    std::size_t bpv = 0;           // padded row stride, bytes (multiple of 8)
     std::size_t esz = 0;           // sizeof(T)
     int slotsPerPass = 0;          // markers per device pass; two are resident
 
     // pinned host staging
     unsigned char* hPacked = nullptr;
     double*        hLut    = nullptr;
-    void*          hC      = nullptr;
+    double*        hLut2   = nullptr;  // squared table, filled in reduce()
+    void*          hC1     = nullptr;
+    void*          hC2     = nullptr;
+    uint32_t*      hCnt    = nullptr;
 
     // device
-    void*          dB   = nullptr;      // N x K
-    void*          dC   = nullptr;      // maxSlots x K
-    unsigned char* dPk[2]  = {nullptr, nullptr};
-    double*        dLut[2] = {nullptr, nullptr};
+    void*          dB1  = nullptr;      // N x K1
+    void*          dB2  = nullptr;      // N x K2
+    void*          dC1  = nullptr;      // maxSlots x K1
+    void*          dC2  = nullptr;      // maxSlots x K2
+    unsigned char* dPk  = nullptr;      // maxSlots x bpv, resident for the superblock
+    double*        dLut = nullptr;      // maxSlots x 4
+    double*        dLut2 = nullptr;     // maxSlots x 4
+    uint64_t*      dMask = nullptr;     // nMask x words
+    uint32_t*      dMaskPop = nullptr;  // nMask
+    uint32_t*      dCnt = nullptr;      // maxSlots x nMask x 4
     void*          dG[2]   = {nullptr, nullptr};
 
     cudaStream_t   st[2] = {nullptr, nullptr};
+    cudaEvent_t    evUp = nullptr;      // packed + tables landed
     cudaEvent_t    ev[2][4] = {{nullptr, nullptr, nullptr, nullptr},
                                {nullptr, nullptr, nullptr, nullptr}};
     bool           evLive[2] = {false, false};
     cublasHandle_t cub = nullptr;
 
-    double tH2D = 0, tDec = 0, tGemm = 0, tD2H = 0;
+    double tH2D = 0, tDec = 0, tGemm = 0, tD2H = 0, tPopc = 0;
     std::size_t devBytes = 0;
 };
 
@@ -168,13 +226,14 @@ namespace {
 
 // Fold buffer `b`'s recorded stage times into the totals. Only called where the
 // stream has already been synchronised, so it never adds a stall of its own.
+// ev[b][0..3]: start, after decode(G), after GEMM1, after decode(G^2)+GEMM2.
 void harvest(Reducer* r, int b)
 {
     if (!r->evLive[b]) return;
     float ms = 0;
-    if (cudaEventElapsedTime(&ms, r->ev[b][0], r->ev[b][1]) == cudaSuccess) r->tH2D  += ms * 1e-3;
-    if (cudaEventElapsedTime(&ms, r->ev[b][1], r->ev[b][2]) == cudaSuccess) r->tDec  += ms * 1e-3;
-    if (cudaEventElapsedTime(&ms, r->ev[b][2], r->ev[b][3]) == cudaSuccess) r->tGemm += ms * 1e-3;
+    if (cudaEventElapsedTime(&ms, r->ev[b][0], r->ev[b][1]) == cudaSuccess) r->tDec  += ms * 1e-3;
+    if (cudaEventElapsedTime(&ms, r->ev[b][1], r->ev[b][2]) == cudaSuccess) r->tGemm += ms * 1e-3;
+    if (r->K2 > 0 && cudaEventElapsedTime(&ms, r->ev[b][2], r->ev[b][3]) == cudaSuccess) r->tGemm += ms * 1e-3;
     r->evLive[b] = false;
 }
 
@@ -212,65 +271,91 @@ std::string describe(int t_device)
     return std::string(buf);
 }
 
-Reducer* create(int t_device, int t_N, int t_K, const double* t_B, int t_maxSlots,
-                bool t_fp64)
+int maskWords(int t_N) { return (t_N + 31) / 32; }
+
+Reducer* create(const CreateArgs& a)
 {
-    if (t_N <= 0 || t_K <= 0 || t_maxSlots <= 0 || t_B == nullptr) return nullptr;
-    if (cudaSetDevice(t_device) != cudaSuccess) return nullptr;
+    if (a.N <= 0 || a.K1 <= 0 || a.maxSlots <= 0 || a.B1 == nullptr) return nullptr;
+    if (a.K2 > 0 && a.B2 == nullptr) return nullptr;
+    if (a.nMask > 0 && a.masks == nullptr) return nullptr;
+    if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
 
     Reducer* r = new Reducer();
-    r->N = t_N; r->K = t_K; r->maxSlots = t_maxSlots; r->fp64 = t_fp64;
-    r->bpv = (std::size_t)((t_N + 3) / 4);
-    r->esz = t_fp64 ? sizeof(double) : sizeof(float);
+    r->N = a.N; r->K1 = a.K1; r->K2 = a.K2; r->maxSlots = a.maxSlots; r->fp64 = a.fp64;
+    r->nMask = a.nMask;
+    r->words = maskWords(a.N);
+    r->bpv = (std::size_t)r->words * 8;           // >= (N+3)/4, whole 64-bit words
+    r->esz = a.fp64 ? sizeof(double) : sizeof(float);
 
     // dG is the big one: slotsPerPass * N elements, twice over. Keep each
     // buffer near 512 MB and never wider than the caller's batch.
-    const std::size_t perSlot = (std::size_t)t_N * r->esz;
+    const std::size_t perSlot = (std::size_t)a.N * r->esz;
     long long sp = (long long)((512ull << 20) / perSlot);
     if (sp < 1) sp = 1;
-    if (sp > t_maxSlots) sp = t_maxSlots;
+    if (sp > a.maxSlots) sp = a.maxSlots;
     if (sp > 4096) sp = 4096;
     r->slotsPerPass = (int)sp;
 
     auto fail = [&]() -> Reducer* { destroy(r); return nullptr; };
 
-    if (cudaHostAlloc((void**)&r->hPacked, (std::size_t)t_maxSlots * r->bpv,
-                      cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (cudaHostAlloc((void**)&r->hLut, (std::size_t)t_maxSlots * 4 * sizeof(double),
-                      cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (cudaHostAlloc(&r->hC, (std::size_t)t_maxSlots * t_K * r->esz,
-                      cudaHostAllocDefault) != cudaSuccess) return fail();
+    const std::size_t nSlots = (std::size_t)a.maxSlots;
+    if (cudaHostAlloc((void**)&r->hPacked, nSlots * r->bpv, cudaHostAllocDefault) != cudaSuccess) return fail();
+    std::memset(r->hPacked, 0, nSlots * r->bpv);   // the padding bytes stay zero for good
+    if (cudaHostAlloc((void**)&r->hLut, nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
+    if (cudaHostAlloc((void**)&r->hLut2, nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
+    if (cudaHostAlloc(&r->hC1, nSlots * a.K1 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
+    if (a.K2 > 0 && cudaHostAlloc(&r->hC2, nSlots * a.K2 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
+    if (a.nMask > 0 && cudaHostAlloc((void**)&r->hCnt, nSlots * a.nMask * 4 * sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess) return fail();
 
     std::size_t db = 0;
     auto dev = [&](void** p, std::size_t n) {
         if (cudaMalloc(p, n) != cudaSuccess) { *p = nullptr; return false; }
         db += n; return true;
     };
-    if (!dev(&r->dB, (std::size_t)t_N * t_K * r->esz)) return fail();
-    if (!dev(&r->dC, (std::size_t)t_maxSlots * t_K * r->esz)) return fail();
-    for (int b = 0; b < 2; ++b) {
-        if (!dev((void**)&r->dPk[b],  (std::size_t)r->slotsPerPass * r->bpv)) return fail();
-        if (!dev((void**)&r->dLut[b], (std::size_t)r->slotsPerPass * 4 * sizeof(double))) return fail();
-        if (!dev(&r->dG[b],           (std::size_t)r->slotsPerPass * t_N * r->esz)) return fail();
+    if (!dev(&r->dB1, (std::size_t)a.N * a.K1 * r->esz)) return fail();
+    if (!dev(&r->dC1, nSlots * a.K1 * r->esz)) return fail();
+    if (a.K2 > 0) {
+        if (!dev(&r->dB2, (std::size_t)a.N * a.K2 * r->esz)) return fail();
+        if (!dev(&r->dC2, nSlots * a.K2 * r->esz)) return fail();
+    }
+    if (!dev((void**)&r->dPk,   nSlots * r->bpv)) return fail();
+    if (!dev((void**)&r->dLut,  nSlots * 4 * sizeof(double))) return fail();
+    if (!dev((void**)&r->dLut2, nSlots * 4 * sizeof(double))) return fail();
+    for (int b = 0; b < 2; ++b)
+        if (!dev(&r->dG[b], (std::size_t)r->slotsPerPass * a.N * r->esz)) return fail();
+    if (a.nMask > 0) {
+        if (!dev((void**)&r->dMask, (std::size_t)a.nMask * r->words * sizeof(uint64_t))) return fail();
+        if (!dev((void**)&r->dMaskPop, (std::size_t)a.nMask * sizeof(uint32_t))) return fail();
+        if (!dev((void**)&r->dCnt, nSlots * a.nMask * 4 * sizeof(uint32_t))) return fail();
+        if (cudaMemcpy(r->dMask, a.masks, (std::size_t)a.nMask * r->words * sizeof(uint64_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+        std::vector<uint32_t> pop(a.nMask, 0);
+        for (int m = 0; m < a.nMask; ++m) {
+            unsigned long long c = 0;
+            for (int w = 0; w < r->words; ++w)
+                c += (unsigned long long)__builtin_popcountll(a.masks[(std::size_t)m * r->words + w] & 0x5555555555555555ULL);
+            pop[m] = (uint32_t)c;
+        }
+        if (cudaMemcpy(r->dMaskPop, pop.data(), pop.size() * sizeof(uint32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) return fail();
     }
     r->devBytes = db;
 
-    const std::size_t nB = (std::size_t)t_N * t_K;
-    if (t_fp64) {
-        if (cudaMemcpy(r->dB, t_B, nB * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail();
-    } else {
-        std::vector<float> bf(nB);
-        for (std::size_t i = 0; i < nB; ++i) bf[i] = (float)t_B[i];
-        if (cudaMemcpy(r->dB, bf.data(), nB * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
-            return fail();
-    }
+    auto upload = [&](void* dst, const double* src, std::size_t n) -> bool {
+        if (a.fp64) return cudaMemcpy(dst, src, n * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
+        std::vector<float> bf(n);
+        for (std::size_t i = 0; i < n; ++i) bf[i] = (float)src[i];
+        return cudaMemcpy(dst, bf.data(), n * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (!upload(r->dB1, a.B1, (std::size_t)a.N * a.K1)) return fail();
+    if (a.K2 > 0 && !upload(r->dB2, a.B2, (std::size_t)a.N * a.K2)) return fail();
 
     for (int b = 0; b < 2; ++b) {
         if (cudaStreamCreate(&r->st[b]) != cudaSuccess) return fail();
         for (int k = 0; k < 4; ++k)
             if (cudaEventCreate(&r->ev[b][k]) != cudaSuccess) return fail();
     }
+    if (cudaEventCreate(&r->evUp) != cudaSuccess) return fail();
     if (cublasCreate(&r->cub) != CUBLAS_STATUS_SUCCESS) return fail();
     // No TF32, no split-k reduced-precision accumulation: the tolerance this
     // path is validated at assumes plain IEEE multiply-add in T.
@@ -285,34 +370,51 @@ void destroy(Reducer* r)
     for (int b = 0; b < 2; ++b) {
         for (int k = 0; k < 4; ++k) if (r->ev[b][k]) cudaEventDestroy(r->ev[b][k]);
         if (r->st[b]) cudaStreamDestroy(r->st[b]);
-        if (r->dPk[b])  cudaFree(r->dPk[b]);
-        if (r->dLut[b]) cudaFree(r->dLut[b]);
-        if (r->dG[b])   cudaFree(r->dG[b]);
+        if (r->dG[b]) cudaFree(r->dG[b]);
     }
-    if (r->dB) cudaFree(r->dB);
-    if (r->dC) cudaFree(r->dC);
+    if (r->evUp) cudaEventDestroy(r->evUp);
+    if (r->dB1) cudaFree(r->dB1);
+    if (r->dB2) cudaFree(r->dB2);
+    if (r->dC1) cudaFree(r->dC1);
+    if (r->dC2) cudaFree(r->dC2);
+    if (r->dPk) cudaFree(r->dPk);
+    if (r->dLut) cudaFree(r->dLut);
+    if (r->dLut2) cudaFree(r->dLut2);
+    if (r->dMask) cudaFree(r->dMask);
+    if (r->dMaskPop) cudaFree(r->dMaskPop);
+    if (r->dCnt) cudaFree(r->dCnt);
     if (r->hPacked) cudaFreeHost(r->hPacked);
     if (r->hLut)    cudaFreeHost(r->hLut);
-    if (r->hC)      cudaFreeHost(r->hC);
+    if (r->hLut2)   cudaFreeHost(r->hLut2);
+    if (r->hC1)     cudaFreeHost(r->hC1);
+    if (r->hC2)     cudaFreeHost(r->hC2);
+    if (r->hCnt)    cudaFreeHost(r->hCnt);
     delete r;
 }
 
-unsigned char* packed(Reducer* r)             { return r ? r->hPacked : nullptr; }
-double*        lut(Reducer* r)                { return r ? r->hLut : nullptr; }
-std::size_t    bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
-bool           isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
-const float*   outCf(const Reducer* r)        { return (r && !r->fp64) ? (const float*)r->hC : nullptr; }
-const double*  outCd(const Reducer* r)        { return (r &&  r->fp64) ? (const double*)r->hC : nullptr; }
-std::size_t    ldC(const Reducer* r)          { return r ? (std::size_t)r->maxSlots : 0; }
-std::size_t    deviceBytes(const Reducer* r)  { return r ? r->devBytes : 0; }
+unsigned char*  packed(Reducer* r)             { return r ? r->hPacked : nullptr; }
+double*         lut(Reducer* r)                { return r ? r->hLut : nullptr; }
+std::size_t     bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
+bool            isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
+const float*    outCf(const Reducer* r)        { return (r && !r->fp64) ? (const float*)r->hC1 : nullptr; }
+const double*   outCd(const Reducer* r)        { return (r &&  r->fp64) ? (const double*)r->hC1 : nullptr; }
+const float*    outC2f(const Reducer* r)       { return (r && !r->fp64 && r->K2 > 0) ? (const float*)r->hC2 : nullptr; }
+const double*   outC2d(const Reducer* r)       { return (r &&  r->fp64 && r->K2 > 0) ? (const double*)r->hC2 : nullptr; }
+std::size_t     ldC(const Reducer* r)          { return r ? (std::size_t)r->maxSlots : 0; }
+const uint32_t* outCounts(const Reducer* r)    { return (r && r->nMask > 0) ? r->hCnt : nullptr; }
+std::size_t     deviceBytes(const Reducer* r)  { return r ? r->devBytes : 0; }
+const void*     devicePacked(const Reducer* r) { return r ? r->dPk : nullptr; }
+const void*     deviceLut(const Reducer* r)    { return r ? r->dLut : nullptr; }
+void*           deviceStream(const Reducer* r) { return r ? (void*)r->st[0] : nullptr; }
 
-void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d2h)
+void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d2h, double* popc)
 {
     if (!r) return;
     if (h2d)  *h2d  = r->tH2D;
     if (dec)  *dec  = r->tDec;
     if (gemm) *gemm = r->tGemm;
     if (d2h)  *d2h  = r->tD2H;
+    if (popc) *popc = r->tPopc;
 }
 
 bool reduce(Reducer* r, int t_nSlots)
@@ -324,6 +426,38 @@ bool reduce(Reducer* r, int t_nSlots)
     const float  onef = 1.f, zerof = 0.f;
     const double oned = 1.0, zerod = 0.0;
     const bool x4 = ((r->N & 3) == 0);
+    const std::size_t nS = (std::size_t)t_nSlots;
+
+    // Squared table for the second GEMM: fd[c]*fd[c] in double, the product the
+    // CPU kernel's Gb % Gb forms per cell.
+    if (r->K2 > 0)
+        for (std::size_t i = 0; i < nS * 4; ++i) r->hLut2[i] = r->hLut[i] * r->hLut[i];
+
+    // Everything from the previous reduce() has been harvested already; both
+    // streams are idle at the top of a call.
+    cudaEvent_t a0 = nullptr, a1 = nullptr;
+    const bool timed = (cudaEventCreate(&a0) == cudaSuccess) && (cudaEventCreate(&a1) == cudaSuccess);
+    if (timed) cudaEventRecord(a0, r->st[0]);
+    CKR(cudaMemcpyAsync(r->dPk, r->hPacked, nS * r->bpv, cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaMemcpyAsync(r->dLut, r->hLut, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+    if (r->K2 > 0)
+        CKR(cudaMemcpyAsync(r->dLut2, r->hLut2, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaEventRecord(r->evUp, r->st[0]));
+    if (timed) {
+        cudaEventRecord(a1, r->st[0]);
+    }
+    // Code counts on the second stream, behind the upload.
+    cudaEvent_t p0 = nullptr, p1 = nullptr;
+    if (r->nMask > 0) {
+        CKR(cudaStreamWaitEvent(r->st[1], r->evUp, 0));
+        if (timed) { cudaEventCreate(&p0); cudaEventCreate(&p1); cudaEventRecord(p0, r->st[1]); }
+        count_codes<<<t_nSlots, 256, 0, r->st[1]>>>(r->dPk, r->bpv, r->words, r->dMask,
+                                                    r->dMaskPop, r->nMask, r->dCnt);
+        CKR(cudaGetLastError());
+        if (timed) cudaEventRecord(p1, r->st[1]);
+        CKR(cudaMemcpyAsync(r->hCnt, r->dCnt, nS * r->nMask * 4 * sizeof(uint32_t),
+                            cudaMemcpyDeviceToHost, r->st[1]));
+    }
 
     int pass = 0;
     for (int s0 = 0; s0 < t_nSlots; s0 += r->slotsPerPass, ++pass) {
@@ -335,42 +469,64 @@ bool reduce(Reducer* r, int t_nSlots)
         // times (free: the wait had to happen anyway).
         CKR(cudaStreamSynchronize(s));
         harvest(r, b);
+        CKR(cudaStreamWaitEvent(s, r->evUp, 0));
+
+        const unsigned char* pk = r->dPk + (std::size_t)s0 * r->bpv;
+        const double* lu  = r->dLut  + (std::size_t)s0 * 4;
+        const double* lu2 = r->dLut2 + (std::size_t)s0 * 4;
 
         CKR(cudaEventRecord(r->ev[b][0], s));
-        CKR(cudaMemcpyAsync(r->dPk[b], r->hPacked + (std::size_t)s0 * r->bpv,
-                            (std::size_t)sc * r->bpv, cudaMemcpyHostToDevice, s));
-        CKR(cudaMemcpyAsync(r->dLut[b], r->hLut + (std::size_t)s0 * 4,
-                            (std::size_t)sc * 4 * sizeof(double),
-                            cudaMemcpyHostToDevice, s));
-        CKR(cudaEventRecord(r->ev[b][1], s));
-
         if (r->fp64) {
             double* g = (double*)r->dG[b];
-            if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(r->dPk[b], r->bpv, r->N, r->dLut[b], g);
-            else    decode_lut_any<double><<<sc, 256, 0, s>>>(r->dPk[b], r->bpv, r->N, r->dLut[b], g);
+            if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
+            else    decode_lut_any<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
         } else {
             float* g = (float*)r->dG[b];
-            if (x4) decode_lut_x4<float><<<sc, 256, 0, s>>>(r->dPk[b], r->bpv, r->N, r->dLut[b], g);
-            else    decode_lut_any<float><<<sc, 256, 0, s>>>(r->dPk[b], r->bpv, r->N, r->dLut[b], g);
+            if (x4) decode_lut_x4<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
+            else    decode_lut_any<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
         }
         CKR(cudaGetLastError());
-        CKR(cudaEventRecord(r->ev[b][2], s));
+        CKR(cudaEventRecord(r->ev[b][1], s));
 
         CBR(cublasSetStream(r->cub, s));
-        // C(sc x K) = dG^T (sc x N) * dB (N x K), into rows [s0, s0+sc) of the
-        // maxSlots x K result.
+        // C1(sc x K1) = dG^T (sc x N) * dB1 (N x K1), into rows [s0, s0+sc) of
+        // the maxSlots x K1 result.
         if (r->fp64) {
-            CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K, r->N,
+            CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K1, r->N,
                             &oned, (const double*)r->dG[b], r->N,
-                            (const double*)r->dB, r->N,
-                            &zerod, (double*)r->dC + s0, r->maxSlots));
+                            (const double*)r->dB1, r->N,
+                            &zerod, (double*)r->dC1 + s0, r->maxSlots));
         } else {
-            CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K, r->N,
+            CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K1, r->N,
                             &onef, (const float*)r->dG[b], r->N,
-                            (const float*)r->dB, r->N,
-                            &zerof, (float*)r->dC + s0, r->maxSlots));
+                            (const float*)r->dB1, r->N,
+                            &zerof, (float*)r->dC1 + s0, r->maxSlots));
         }
-        CKR(cudaEventRecord(r->ev[b][3], s));
+        CKR(cudaEventRecord(r->ev[b][2], s));
+
+        if (r->K2 > 0) {
+            // Same buffer, squared table, second right operand.
+            if (r->fp64) {
+                double* g = (double*)r->dG[b];
+                if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                else    decode_lut_any<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                CKR(cudaGetLastError());
+                CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K2, r->N,
+                                &oned, (const double*)r->dG[b], r->N,
+                                (const double*)r->dB2, r->N,
+                                &zerod, (double*)r->dC2 + s0, r->maxSlots));
+            } else {
+                float* g = (float*)r->dG[b];
+                if (x4) decode_lut_x4<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                else    decode_lut_any<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                CKR(cudaGetLastError());
+                CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K2, r->N,
+                                &onef, (const float*)r->dG[b], r->N,
+                                (const float*)r->dB2, r->N,
+                                &zerof, (float*)r->dC2 + s0, r->maxSlots));
+            }
+            CKR(cudaEventRecord(r->ev[b][3], s));
+        }
         r->evLive[b] = true;
     }
 
@@ -378,24 +534,37 @@ bool reduce(Reducer* r, int t_nSlots)
     CKR(cudaStreamSynchronize(r->st[1]));
     harvest(r, 0);
     harvest(r, 1);
-
-    cudaEvent_t a = nullptr, z = nullptr;
-    const bool timed = (cudaEventCreate(&a) == cudaSuccess) &&
-                       (cudaEventCreate(&z) == cudaSuccess);
-    if (timed) cudaEventRecord(a, r->st[0]);
-    // Only the first t_nSlots rows of each of the K columns are live.
-    CKR(cudaMemcpy2DAsync(r->hC, (std::size_t)r->maxSlots * r->esz,
-                          r->dC,  (std::size_t)r->maxSlots * r->esz,
-                          (std::size_t)t_nSlots * r->esz, (std::size_t)r->K,
-                          cudaMemcpyDeviceToHost, r->st[0]));
-    if (timed) cudaEventRecord(z, r->st[0]);
-    CKR(cudaStreamSynchronize(r->st[0]));
     if (timed) {
         float ms = 0;
-        if (cudaEventElapsedTime(&ms, a, z) == cudaSuccess) r->tD2H += ms * 1e-3;
+        if (cudaEventElapsedTime(&ms, a0, a1) == cudaSuccess) r->tH2D += ms * 1e-3;
+        if (p0 && p1 && cudaEventElapsedTime(&ms, p0, p1) == cudaSuccess) r->tPopc += ms * 1e-3;
     }
-    if (a) cudaEventDestroy(a);
-    if (z) cudaEventDestroy(z);
+
+    cudaEvent_t z0 = nullptr, z1 = nullptr;
+    const bool timed2 = timed && (cudaEventCreate(&z0) == cudaSuccess) && (cudaEventCreate(&z1) == cudaSuccess);
+    if (timed2) cudaEventRecord(z0, r->st[0]);
+    // Only the first t_nSlots rows of each of the K columns are live.
+    CKR(cudaMemcpy2DAsync(r->hC1, (std::size_t)r->maxSlots * r->esz,
+                          r->dC1, (std::size_t)r->maxSlots * r->esz,
+                          nS * r->esz, (std::size_t)r->K1,
+                          cudaMemcpyDeviceToHost, r->st[0]));
+    if (r->K2 > 0)
+        CKR(cudaMemcpy2DAsync(r->hC2, (std::size_t)r->maxSlots * r->esz,
+                              r->dC2, (std::size_t)r->maxSlots * r->esz,
+                              nS * r->esz, (std::size_t)r->K2,
+                              cudaMemcpyDeviceToHost, r->st[0]));
+    if (timed2) cudaEventRecord(z1, r->st[0]);
+    CKR(cudaStreamSynchronize(r->st[0]));
+    if (timed2) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, z0, z1) == cudaSuccess) r->tD2H += ms * 1e-3;
+    }
+    if (a0) cudaEventDestroy(a0);
+    if (a1) cudaEventDestroy(a1);
+    if (p0) cudaEventDestroy(p0);
+    if (p1) cudaEventDestroy(p1);
+    if (z0) cudaEventDestroy(z0);
+    if (z1) cudaEventDestroy(z1);
     return true;
 }
 

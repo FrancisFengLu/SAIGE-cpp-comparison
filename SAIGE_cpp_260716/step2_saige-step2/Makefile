@@ -159,10 +159,10 @@ ifeq ($(USE_CUDA),1)
   CUDA_HOME ?= $(patsubst %/bin/,%,$(dir $(NVCC_PATH)))
   SM        ?= 70
   NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(SM) -lineinfo -Xcompiler -fPIC
-  GPU_OBJ   := gpu/gpu_step2.cu.o
+  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
-  GPU_OBJ   := gpu/gpu_step2_stub.o
+  GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o
 endif
 
 MAKEFLAGS += --no-builtin-rules
@@ -196,6 +196,12 @@ tools/sgs_fidelity: tools/sgs_fidelity.cpp sgs_format.hpp
 tools/out_fieldcmp: tools/out_fieldcmp.cpp
 	$(CXX) $(CXXFLAGS) tools/out_fieldcmp.cpp -o $@
 
+# The device saddlepoint kernel against the production CPU SPA, pair by pair
+# (USE_CUDA=1 only; links every step-2 object but main.o plus the CUDA objects).
+#   make USE_CUDA=1 SM=70 tools/spa_gpu_check
+tools/spa_gpu_check: tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(GPU_OBJ) $(LIBS) -o $@
+
 # Accuracy + cost of score_vec.hpp's chi-square(1) tail against boost's.
 tools/mtvec_tail_accuracy: tools/mtvec_tail_accuracy.cpp score_vec.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/mtvec_tail_accuracy.cpp $(filter -lmvec,$(LIBS)) -o $@
@@ -208,6 +214,12 @@ $(TARGET): $(OBJECTS) $(GPU_OBJ)
 
 gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
+
+# The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU
+# build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /
+# log bound and the difference in speed is not measurable.
+gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp
+	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 clean:
 	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt \

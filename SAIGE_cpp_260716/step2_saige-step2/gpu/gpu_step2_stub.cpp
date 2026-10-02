@@ -19,19 +19,27 @@ bool available(int, std::string* t_why)
 
 std::string describe(int) { return std::string(); }
 
-Reducer* create(int, int, int, const double*, int, bool) { return nullptr; }
+int maskWords(int t_N) { return (t_N + 31) / 32; }
+
+Reducer* create(const CreateArgs&) { return nullptr; }
 void     destroy(Reducer*) {}
 
-unsigned char* packed(Reducer*)            { return nullptr; }
-double*        lut(Reducer*)               { return nullptr; }
-std::size_t    bytesPerSlot(const Reducer*) { return 0; }
-bool           reduce(Reducer*, int)       { return false; }
-bool           isFp64(const Reducer*)       { return false; }
-const float*   outCf(const Reducer*)       { return nullptr; }
-const double*  outCd(const Reducer*)       { return nullptr; }
-std::size_t    ldC(const Reducer*)         { return 0; }
-std::size_t    deviceBytes(const Reducer*) { return 0; }
-void           timings(const Reducer*, double*, double*, double*, double*) {}
+unsigned char*  packed(Reducer*)              { return nullptr; }
+double*         lut(Reducer*)                 { return nullptr; }
+std::size_t     bytesPerSlot(const Reducer*)  { return 0; }
+bool            reduce(Reducer*, int)         { return false; }
+bool            isFp64(const Reducer*)        { return false; }
+const float*    outCf(const Reducer*)         { return nullptr; }
+const double*   outCd(const Reducer*)         { return nullptr; }
+const float*    outC2f(const Reducer*)        { return nullptr; }
+const double*   outC2d(const Reducer*)        { return nullptr; }
+std::size_t     ldC(const Reducer*)           { return 0; }
+const uint32_t* outCounts(const Reducer*)     { return nullptr; }
+std::size_t     deviceBytes(const Reducer*)   { return 0; }
+void            timings(const Reducer*, double*, double*, double*, double*, double*) {}
+const void*     devicePacked(const Reducer*)  { return nullptr; }
+const void*     deviceLut(const Reducer*)     { return nullptr; }
+void*           deviceStream(const Reducer*)  { return nullptr; }
 
 }  // namespace gpu2
 }  // namespace saige

@@ -168,6 +168,15 @@ inline double pcReplaySum(const uint64_t* t_col, const uint64_t* t_mask, int t_n
 inline bool pcIsHom(double t_d) { return t_d >= 1.5 && t_d <= 2.0; }
 inline bool pcIsHet(double t_d) { return t_d >= 0.5 && t_d < 1.5; }
 
+inline int pcSumPairFromCounts(const uint64_t nc[4], const uint64_t no[4],
+                               const uint64_t* t_col,
+                               const uint64_t* t_caseMask, const uint64_t* t_ctrlMask, int t_nWords,
+                               const double* t_fd, bool t_ascending,
+                               double& t_sumCase, double& t_sumCtrl,
+                               bool t_moreOutput,
+                               uint32_t& t_caseHom, uint32_t& t_caseHet,
+                               uint32_t& t_ctrlHom, uint32_t& t_ctrlHet);
+
 // The whole per-(marker, trait) computation. Returns
 //   0  not done: a mean-imputed missing call sits in the case or control set
 //      and the trait's sample positions do not ascend, so the sequential sum
@@ -199,6 +208,23 @@ inline int pcSumPair(const uint64_t* t_col,
     } else {
         pcCountCodes(t_col, t_ctrlMask, t_nWords, t_nCtrl, no);
     }
+    return pcSumPairFromCounts(nc, no, t_col, t_caseMask, t_ctrlMask, t_nWords, t_fd, t_ascending,
+                               t_sumCase, t_sumCtrl, t_moreOutput,
+                               t_caseHom, t_caseHet, t_ctrlHom, t_ctrlHet);
+}
+
+// The decision and the sums, given the case / control code counts from
+// wherever they were computed (pcCountCodes here, count_codes on the device in
+// gpu_step2.cu). Same return codes as pcSumPair.
+inline int pcSumPairFromCounts(const uint64_t nc[4], const uint64_t no[4],
+                               const uint64_t* t_col,
+                               const uint64_t* t_caseMask, const uint64_t* t_ctrlMask, int t_nWords,
+                               const double* t_fd, bool t_ascending,
+                               double& t_sumCase, double& t_sumCtrl,
+                               bool t_moreOutput,
+                               uint32_t& t_caseHom, uint32_t& t_caseHet,
+                               uint32_t& t_ctrlHom, uint32_t& t_ctrlHet)
+{
     const bool missInt  = pcIsInteger(t_fd[PC_MISSING]);
     const bool caseInt  = missInt || nc[PC_MISSING] == 0;
     const bool ctrlInt  = missInt || no[PC_MISSING] == 0;
