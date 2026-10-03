@@ -44,5 +44,11 @@ fi
 pw=0
 while pgrep -f "$PAT" > /dev/null; do sleep 10; pw=$((pw + 10)); done
 echo "$(date +%T) box free (mode=$mode, waited ${waited}s + ${pw}s for processes); running: $(basename "$BIN") $*" >> "$LOG"
-"$BIN" "$@" >> "$LOG" 2>&1
+if [ "${1:-}" = "--script" ]; then
+    # several short commands under one pause window; the script runs from this
+    # directory and writes to $LOG itself (it inherits stdout)
+    (cd "$HERE" && bash "$2") >> "$LOG" 2>&1
+else
+    "$BIN" "$@" >> "$LOG" 2>&1
+fi
 echo "exit=$? $(date +%T)" >> "$LOG"
