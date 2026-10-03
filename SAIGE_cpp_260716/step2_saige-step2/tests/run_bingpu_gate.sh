@@ -40,12 +40,19 @@ mkdir -p "$WORK"
 FAIL=0
 echo "workdir $WORK"; echo "cpu     $CPU"; echo "gpu     $GPU"; echo "cases   $CASES"; echo "gpuSpa  $SPA"; echo
 
-head_yaml() {   # head_yaml <bed> <extra keys...>
+# head_yaml <bed> <extra keys...>. yaml-cpp keeps the FIRST of two equal keys,
+# so the Firth / isMoreOutput trio is emitted once, from FIRTH / MORE: FIRTH=1
+# means isFirth + is_Firth_beta true with pCutoffforFirth 0.05 (the models
+# carry 0.01), MORE=1 means isMoreOutput.
+FIRTH=0; MORE=0
+head_yaml() {
   local BED=$1; shift
   echo "genoType: plink"; echo "plinkFile: $BED"
   echo "minMAF: 0"; echo "minMAC: 1"; echo "maxMissRate: 0.15"
   echo "AlleleOrder: alt-first"; echo "LOCO: false"; echo "isnoadjCov: false"
-  echo "isMoreOutput: false"; echo "isFirth: false"; echo "is_Firth_beta: false"
+  echo "isMoreOutput: $([ "$MORE" = 1 ] && echo true || echo false)"
+  if [ "$FIRTH" = 1 ]; then echo "isFirth: true"; echo "is_Firth_beta: true"; echo "pCutoffforFirth: 0.05"
+  else echo "isFirth: false"; echo "is_Firth_beta: false"; fi
   echo "MACCutoffforER: 4"; echo "relatednessCutoff: 0"; echo "nThreads: 8"
   echo "mtPopcountAF: true"; echo "spaScratch: true"; echo "mtPopcountCtrlFromTotal: true"
   for L in "$@"; do echo "$L"; done
@@ -61,9 +68,11 @@ cfg_for() {     # cfg_for <case> <outdir> <extra...>
     bal8_g200k)   head_yaml /opt/saige/logs/binsplit/data/g200k "$@"; bal_models 8 "$OD" ;;
     imb7_g200k)   head_yaml /opt/saige/logs/binsplit/data/g200k "$@"; imb_models "$OD" ;;
     imb7_g50k)    head_yaml /opt/saige/logs/binsplit/data/g50k "$@"; imb_models "$OD" ;;
-    mid_b8)       head_yaml /opt/saige/data/mid "isMoreOutput: true" "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "$@"; bal_models 8 "$OD" ;;
-    rare520_imb)  head_yaml /opt/saige/logs/gpuassess/rare520 "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "isMoreOutput: true" "$@"; imb_models "$OD" ;;
-    grare500_imb) head_yaml /opt/saige/logs/binsplit/data/grare500 "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "$@"; imb_models "$OD" ;;
+    mid_b8)       FIRTH=1 MORE=1 head_yaml /opt/saige/data/mid "$@"; bal_models 8 "$OD" ;;
+    mid_b8_nofirth) FIRTH=0 MORE=1 head_yaml /opt/saige/data/mid "$@"; bal_models 8 "$OD" ;;
+    rare520_imb)  FIRTH=1 MORE=1 head_yaml /opt/saige/logs/gpuassess/rare520 "$@"; imb_models "$OD" ;;
+    grare500_imb) FIRTH=1 MORE=0 head_yaml /opt/saige/logs/binsplit/data/grare500 "$@"; imb_models "$OD" ;;
+    imb7_g50k_firth) FIRTH=1 MORE=0 head_yaml /opt/saige/logs/binsplit/data/g50k "$@"; imb_models "$OD" ;;
     mixed_g50k)   head_yaml /opt/saige/logs/binsplit/data/g50k "$@"
                   local k; for k in 1 2 3 4; do
                     one_model "b$k" "$BAL/m/y$k" "$BAL/mvr_y$k.varianceRatio.txt" "$OD"
@@ -93,6 +102,18 @@ for C in $CASES; do
   run_one "$CPU" "$C" cpu_sgs "outputFormat: sgs" || FAIL=1
   run_one "$GPU" "$C" gpu_sgs "outputFormat: sgs" "${GPUKEYS[@]}" || FAIL=1
   if grep -q 'useGPU: refused' "$WORK/$C/gpu_text/log.txt"; then echo "    FAIL: GPU path refused"; FAIL=1; fi
+  # A "Firth on" case must have exercised Firth on both paths (see the FIRTH
+  # note above head_yaml): the per-trait "[trait] Firth approx was applied to N
+  # markers" lines must sum to > 0 (the 2026-10-03 03:21-04:34 runs summed the
+  # word "to" -- field 6 -- and printed a false FAIL for every Firth case; the
+  # numbers were rechecked from the kept logs), and the GPU gate line must show needFirth.
+  if grep -q '^is_Firth_beta: true' "$WORK/$C/cpu_text/cfg.yaml"; then
+    for V in cpu_text gpu_text; do
+      nf=$(grep -h 'Firth approx was applied to' "$WORK/$C/$V/log.txt" | grep -oP 'applied to \K[0-9]+' | awk '{s+=$1} END{print s+0}')
+      [ "$nf" -gt 0 ] && echo "    $V: Firth applied to $nf (marker, trait) pairs" || { echo "    FAIL: $V ran with the Firth path never taken"; FAIL=1; }
+    done
+    grep -h '^  gate:' "$WORK/$C/gpu_text/log.txt" | grep -q 'needFirth [1-9]' || grep -h 'device SPA:' "$WORK/$C/gpu_text/log.txt" | grep -q '[1-9][0-9]* asked for Firth' || echo "    note: the GPU gate flagged no pair for Firth before SPA (Firth decided after SPA only)"
+  fi
   grep -h '^  gate:\|^  AF_case/AF_ctrl:\|^  GPU coverage\|^  gpuSpa:\|device SPA' "$WORK/$C/gpu_text/log.txt" | sed 's/^/    /'
   # 1. sgs -> text round trip of the GPU run
   rm -rf "$WORK/$C/gpu_sgs/txt"; mkdir -p "$WORK/$C/gpu_sgs/txt"

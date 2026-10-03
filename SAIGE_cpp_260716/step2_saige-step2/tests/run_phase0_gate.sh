@@ -32,12 +32,19 @@ mkdir -p "$WORK"
 FAIL=0
 echo "workdir  $WORK"; echo "new      $NEW"; echo "baseline $BASE"; echo "cases    $CASES"; echo
 
-head_yaml() {   # head_yaml <bed> <extra keys...>
+# head_yaml <bed> <extra keys...>. yaml-cpp keeps the FIRST of two equal keys,
+# so the Firth / isMoreOutput trio is emitted once, from FIRTH / MORE: set
+# FIRTH=1 for isFirth + is_Firth_beta true with pCutoffforFirth 0.05 (the
+# models carry 0.01), MORE=1 for isMoreOutput.
+FIRTH=0; MORE=0
+head_yaml() {
   local BED=$1; shift
   echo "genoType: plink"; echo "plinkFile: $BED"
   echo "minMAF: 0"; echo "minMAC: 1"; echo "maxMissRate: 0.15"
   echo "AlleleOrder: alt-first"; echo "LOCO: false"; echo "isnoadjCov: false"
-  echo "isMoreOutput: false"; echo "isFirth: false"; echo "is_Firth_beta: false"
+  echo "isMoreOutput: $([ "$MORE" = 1 ] && echo true || echo false)"
+  if [ "$FIRTH" = 1 ]; then echo "isFirth: true"; echo "is_Firth_beta: true"; echo "pCutoffforFirth: 0.05"
+  else echo "isFirth: false"; echo "is_Firth_beta: false"; fi
   echo "MACCutoffforER: 4"; echo "relatednessCutoff: 0"; echo "nThreads: 8"
   echo "mtPopcountAF: true"
   for L in "$@"; do echo "$L"; done
@@ -54,13 +61,13 @@ cfg_for() {     # cfg_for <case> <outdir> <switches: on|off>
   local C=$1 OD=$2 SW=$3 X=()
   [ "$SW" = on ] && X=("spaScratch: true" "mtPopcountCtrlFromTotal: true")
   case "$C" in
-    mid_b8)      head_yaml /opt/saige/data/mid "isMoreOutput: true" "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "${X[@]}"
+    mid_b8)      FIRTH=1 MORE=1 head_yaml /opt/saige/data/mid "${X[@]}"
                  bal_models 8 "$OD" ;;
-    g50k_imb7)   head_yaml /opt/saige/logs/binsplit/data/g50k "${X[@]}"
+    g50k_imb7)   FIRTH=0 MORE=0 head_yaml /opt/saige/logs/binsplit/data/g50k "${X[@]}"
                  imb_models "$OD" ;;
-    rare520_imb) head_yaml /opt/saige/logs/gpuassess/rare520 "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "isMoreOutput: true" "${X[@]}"
+    rare520_imb) FIRTH=1 MORE=1 head_yaml /opt/saige/logs/gpuassess/rare520 "${X[@]}"
                  imb_models "$OD" ;;
-    grare500_imb) head_yaml /opt/saige/logs/binsplit/data/grare500 "isFirth: true" "is_Firth_beta: true" "pCutoffforFirth: 0.05" "${X[@]}"
+    grare500_imb) FIRTH=1 MORE=0 head_yaml /opt/saige/logs/binsplit/data/grare500 "${X[@]}"
                  imb_models "$OD" ;;
     *) echo "unknown case $C" >&2; return 1 ;;
   esac
@@ -80,6 +87,15 @@ for C in $CASES; do
   run_one "$BASE" "$C" base off || FAIL=1
   run_one "$NEW"  "$C" off  off || FAIL=1
   run_one "$NEW"  "$C" on   on  || FAIL=1
+  # A "Firth on" case must have exercised Firth: the per-trait summary line
+  # counts the fits (yaml-cpp keeps the first of two equal keys, which is how
+  # an earlier version of this script ran every Firth case with Firth off).
+  if grep -q '^is_Firth_beta: true' "$WORK/$C/on/cfg.yaml"; then
+    for V in base off on; do
+      nf=$(grep -h 'Firth approx was applied to' "$WORK/$C/$V/log.txt" | grep -oP 'applied to \K[0-9]+' | awk '{s+=$1} END{print s+0}')
+      [ "$nf" -gt 0 ] && echo "    $V: Firth applied to $nf (marker, trait) pairs" || { echo "    FAIL: $V ran with the Firth path never taken"; FAIL=1; }
+    done
+  fi
   grep -q 'spaScratch: on' "$WORK/$C/on/log.txt" || { echo "    FAIL: spaScratch not reported on"; FAIL=1; }
   grep -q 'mtPopcountCtrlFromTotal: on' "$WORK/$C/on/log.txt" || { echo "    FAIL: mtPopcountCtrlFromTotal not reported on"; FAIL=1; }
   nd=0
