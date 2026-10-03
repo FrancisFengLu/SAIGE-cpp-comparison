@@ -43,12 +43,14 @@
 //   * per-term arithmetic is associated exactly as Armadillo's expression
 //     templates evaluate it, and the build uses --fmad=false (the CPU is
 //     -std=c++17, so it does not contract either);
-//   * the normal tail is Boost's own 53-bit erfc (erf.hpp, Boost 1.85),
-//     ported operation for operation including the error-compensated
-//     exp(-z^2) and the "z >= 28 is zero" cutoff, so the smallest p the CPU
-//     can print and the point where it becomes 0 (or -inf in the log domain)
-//     are the same on both sides; erfcMode = 0 switches to CUDA's erfc for
-//     measuring the difference (SPA_GPU_LIB.md section "The tail");
+//   * the normal tail: the CPU's boost::math::cdf(normal) evaluates erfc in
+//     long double and narrows, i.e. it is the correctly rounded double down
+//     into the subnormals, 0 from z ~ 27.226 (p ~ 2.5e-324). The device uses
+//     Boost's 53-bit rational approximations with exp(-z^2) scaled so the
+//     only rounding into the subnormal range is the final one
+//     (erfc_boost53.cuh), which reproduces the subnormal p and the p == 0
+//     cutoff; erfcMode selects CUDA's erfc or the literal port for measuring
+//     the difference (SPA_GPU_LIB.md section 4);
 //   * K2's sum skips non-finite terms like sum_arma1 does; Korg and K1 keep
 //     them like arma::sum does.
 // fp64 throughout: in fp32 the squared denominator of K2 underflows.
@@ -91,7 +93,9 @@ struct CreateArgs {
     // interleaved; the fast variant stores carriers only). 256 blocks keep a
     // V100 busy; at N = 435k that is 1.8 GB, so lower it if memory is tight.
     int blocks = 256;
-    // 1: Boost's 53-bit erfc, ported (default). 0: CUDA libm erfc.
+    // 1 (default): Boost's 53-bit erfc with the underflow deferred to one
+    // final rounding, so subnormal p and the p == 0 cutoff are the CPU's
+    // (erfc_boost53.cuh). 2: the literal Boost 53-bit port. 0: CUDA libm.
     int erfcMode = 1;
 };
 
@@ -181,10 +185,11 @@ void timings(const Spa* t_s, double* t_kernel, double* t_h2d, double* t_d2h,
 std::size_t deviceBytes(const Spa* t_s);
 const char* lastError();
 
-// Instrumentation for the tail study: evaluate, on the device, the ported
-// Boost erfc and CUDA's erfc at n points. Needs no Spa.
-bool debugErfc(int t_device, const double* t_z, int t_n, double* t_boostPort,
-               double* t_cuda);
+// Instrumentation for the tail study: evaluate, on the device, the scaled
+// port (erfcMode 1), the literal port (erfcMode 2) and CUDA's erfc (erfcMode
+// 0) at n points. Needs no Spa.
+bool debugErfc(int t_device, const double* t_z, int t_n, double* t_scaledPort,
+               double* t_literalPort, double* t_cuda);
 
 }  // namespace spa_gpu
 }  // namespace saige

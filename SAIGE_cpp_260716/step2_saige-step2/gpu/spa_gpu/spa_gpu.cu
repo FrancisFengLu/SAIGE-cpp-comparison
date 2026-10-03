@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-#include "erfc_boost53_consts.hpp"
+#include "erfc_boost53.cuh"
 
 namespace saige {
 namespace spa_gpu {
@@ -53,99 +53,13 @@ thread_local std::string g_lastErr;
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     g_lastErr = std::string(#x) + ": " + cudaGetErrorString(e_); return false; } } while (0)
 
-// ---------------------------------------------------------------------------
-// Boost.Math 53-bit erf_imp, ported operation for operation (erf.hpp, Boost
-// 1.85). Polynomials are evaluated as boost/math/tools/detail/
-// polynomial_horner3_20.hpp does for GCC (BOOST_MATH_POLY_METHOD 3), so the
-// rounding sequence is the CPU's. The only non-ported pieces are exp, floor,
-// frexp and ldexp (the latter three are exact).
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ double poly5(const double* a, double x)
-{
-    const double x2 = x * x;
-    double t0 = a[4] * x2 + a[2];
-    double t1 = a[3] * x2 + a[1];
-    t0 *= x2; t0 += a[0];
-    t1 *= x;
-    return t0 + t1;
-}
-__device__ __forceinline__ double poly6(const double* a, double x)
-{
-    const double x2 = x * x;
-    double t0 = a[5] * x2 + a[3];
-    double t1 = a[4] * x2 + a[2];
-    t0 *= x2; t1 *= x2;
-    t0 += a[1]; t1 += a[0];
-    t0 *= x;
-    return t0 + t1;
-}
-__device__ __forceinline__ double poly7(const double* a, double x)
-{
-    const double x2 = x * x;
-    double t0 = a[6] * x2 + a[4];
-    double t1 = a[5] * x2 + a[3];
-    t0 *= x2; t1 *= x2;
-    t0 += a[2]; t1 += a[1];
-    t0 *= x2; t0 += a[0];
-    t1 *= x;
-    return t0 + t1;
-}
-
-// exp(-z^2) with the squaring error compensated, as Boost does for z >= 1.5.
-__device__ __forceinline__ double expNegSqCompensated(double z)
-{
-    int expon;
-    double hi = floor(ldexp(frexp(z, &expon), 26));
-    hi = ldexp(hi, expon - 26);
-    const double lo = z - hi;
-    const double sq = z * z;
-    const double err_sqr = ((hi * hi - sq) + 2 * hi * lo) + lo * lo;
-    return exp(-sq) * exp(-err_sqr) / z;
-}
-
-__device__ double erfImp53(double z, bool invert)
-{
-    if (isnan(z)) return CUDART_NAN;        // Boost raises a domain error here
-    if (z < 0) {
-        if (!invert)       return -erfImp53(-z, false);
-        else if (z < -0.5) return 2 - erfImp53(-z, true);
-        else               return 1 + erfImp53(-z, false);
-    }
-    double result;
-    if (z < 0.5) {
-        if (z < 1e-10) {
-            result = (z == 0) ? 0.0 : (z * 1.125 + z * ERF_C_SMALL);
-        } else {
-            const double zz = z * z;
-            result = z * (ERF_Y1 + poly5(ERF_P1, zz) / poly5(ERF_Q1, zz));
-        }
-    } else if (invert ? (z < 28) : (z < ERF_Z_ERF_LIMIT)) {
-        invert = !invert;
-        if (z < 1.5) {
-            result = ERF_Y2 + poly6(ERF_P2, z - 0.5) / poly7(ERF_Q2, z - 0.5);
-            result *= exp(-z * z) / z;
-        } else if (z < 2.5) {
-            result = ERF_Y3 + poly6(ERF_P3, z - 1.5) / poly6(ERF_Q3, z - 1.5);
-            result *= expNegSqCompensated(z);
-        } else if (z < 4.5) {
-            result = ERF_Y4 + poly6(ERF_P4, z - 3.5) / poly6(ERF_Q4, z - 3.5);
-            result *= expNegSqCompensated(z);
-        } else {
-            result = ERF_Y5 + poly7(ERF_P5, 1 / z) / poly7(ERF_Q5, 1 / z);
-            result *= expNegSqCompensated(z);
-        }
-    } else {
-        // Any value of z larger than 28 will underflow to zero (Boost's words).
-        result = 0;
-        invert = !invert;
-    }
-    if (invert) result = 1 - result;
-    return result;
-}
-
+// Boost's erfc, ported: erfc_boost53.cuh. mode 1: scaled port (default),
+// 2: literal port, anything else: CUDA libm.
 __device__ __forceinline__ double erfcSel(double z, int mode)
 {
-    return mode ? erfImp53(z, true) : erfc(z);
+    if (mode == 1) return erfc53::erfImp53s(z, true);
+    if (mode == 2) return erfc53::erfImp53(z, true);
+    return erfc(z);
 }
 
 // boost::math::cdf(complement(normal(0,1), x)) and cdf(normal(0,1), x):
@@ -526,12 +440,13 @@ spaKernel(const KParams P)
     }
 }
 
-__global__ void erfcDebugKernel(const double* z, int n, double* a, double* b)
+__global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, double* c)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    a[i] = erfImp53(z[i], true);
-    b[i] = erfc(z[i]);
+    a[i] = erfc53::erfImp53s(z[i], true);
+    b[i] = erfc53::erfImp53(z[i], true);
+    c[i] = erfc(z[i]);
 }
 
 }  // namespace
@@ -717,20 +632,22 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     return true;
 }
 
-bool debugErfc(int device, const double* z, int n, double* a, double* b)
+bool debugErfc(int device, const double* z, int n, double* a, double* b, double* c)
 {
     if (n <= 0) return true;
     CK(cudaSetDevice(device));
-    double *dz = nullptr, *da = nullptr, *db = nullptr;
+    double *dz = nullptr, *da = nullptr, *db = nullptr, *dc = nullptr;
     CK(cudaMalloc(&dz, n * sizeof(double)));
     CK(cudaMalloc(&da, n * sizeof(double)));
     CK(cudaMalloc(&db, n * sizeof(double)));
+    CK(cudaMalloc(&dc, n * sizeof(double)));
     CK(cudaMemcpy(dz, z, n * sizeof(double), cudaMemcpyHostToDevice));
-    erfcDebugKernel<<<(n + 255) / 256, 256>>>(dz, n, da, db);
+    erfcDebugKernel<<<(n + 255) / 256, 256>>>(dz, n, da, db, dc);
     CK(cudaGetLastError());
     CK(cudaMemcpy(a, da, n * sizeof(double), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(b, db, n * sizeof(double), cudaMemcpyDeviceToHost));
-    cudaFree(dz); cudaFree(da); cudaFree(db);
+    CK(cudaMemcpy(c, dc, n * sizeof(double), cudaMemcpyDeviceToHost));
+    cudaFree(dz); cudaFree(da); cudaFree(db); cudaFree(dc);
     return true;
 }
 

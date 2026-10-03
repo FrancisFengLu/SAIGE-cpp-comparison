@@ -18,7 +18,7 @@ void timings(const Spa*, double* k, double* h, double* d, long long* n)
 }
 std::size_t deviceBytes(const Spa*) { return 0; }
 const char* lastError() { return "built without CUDA (spa_gpu_stub.cpp)"; }
-bool debugErfc(int, const double*, int, double*, double*) { return false; }
+bool debugErfc(int, const double*, int, double*, double*, double*) { return false; }
 
 }  // namespace spa_gpu
 }  // namespace saige

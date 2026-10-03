@@ -458,53 +458,63 @@ void printTally(const std::string& name, const Tally& t)
 int erfcSweep(const Opts& o)
 {
     std::vector<double> z;
-    for (double x = -3.0; x < 26.0; x += 1e-3) z.push_back(x);
-    for (double x = 26.0; x < 28.5; x += 1e-5) z.push_back(x);
-    z.push_back(28.0); z.push_back(27.999999); z.push_back(0.0); z.push_back(0.5); z.push_back(1.5); z.push_back(2.5); z.push_back(4.5);
+    for (double x = -3.0; x < 26.5; x += 1e-3) z.push_back(x);
+    for (double x = 26.5; x < 28.2; x += 1e-6) z.push_back(x);          // the subnormal zone, finely
+    std::mt19937_64 rng(3); std::uniform_real_distribution<double> U(-3, 28);
+    for (int i = 0; i < 300000; ++i) z.push_back(U(rng));
+    z.push_back(28.0); z.push_back(27.999999); z.push_back(27.2); z.push_back(0.0); z.push_back(0.5); z.push_back(1.5); z.push_back(2.5); z.push_back(4.5);
     z.push_back(std::numeric_limits<double>::infinity()); z.push_back(-std::numeric_limits<double>::infinity());
     const int n = (int)z.size();
-    std::vector<double> port(n), cu(n), host(n);
-    if (!debugErfc(o.device, z.data(), n, port.data(), cu.data())) { std::fprintf(stderr, "debugErfc: %s\n", lastError()); return 2; }
+    std::vector<double> dev[3], host(n);
+    for (auto& v : dev) v.resize(n);
+    if (!debugErfc(o.device, z.data(), n, dev[0].data(), dev[1].data(), dev[2].data())) { std::fprintf(stderr, "debugErfc: %s\n", lastError()); return 2; }
     for (int i = 0; i < n; ++i) host[i] = std::isnan(z[i]) ? NAN : boost::math::erfc(z[i]);
+    const char* names[3] = {"scaled port (mode 1, default)", "literal port (mode 2)", "CUDA libm erfc (mode 0)"};
     auto ulpDiff = [](double a, double b) -> double {
         if (a == b) return 0;
-        if (!std::isfinite(a) || !std::isfinite(b)) return std::numeric_limits<double>::infinity();
-        if (a == 0 || b == 0) return std::numeric_limits<double>::infinity();
+        if (!std::isfinite(a) || !std::isfinite(b) || a == 0 || b == 0) return std::numeric_limits<double>::infinity();
         return std::fabs(a - b) / std::fabs(std::nexttoward(a, b) - a);
     };
-    struct Band { const char* name; double lo, hi; long n = 0, exact = 0, zeroMismatch = 0; double maxUlpPort = 0, maxUlpCuda = 0, maxRelCuda = 0; double firstCudaDiff = NAN; };
+    const double dmin = std::numeric_limits<double>::denorm_min(), nmin = std::numeric_limits<double>::min();
+    struct Band { const char* name; double lo, hi; long n = 0, exact[3] = {0, 0, 0}, zeroMis[3] = {0, 0, 0}; double maxUlp[3] = {0, 0, 0}, maxGrid[3] = {0, 0, 0}; };
     std::vector<Band> bands = { {"z < 0.5", -4, 0.5}, {"[0.5,1.5)", 0.5, 1.5}, {"[1.5,2.5)", 1.5, 2.5}, {"[2.5,4.5)", 2.5, 4.5},
-                                {"[4.5,26.5) p > ~1e-308", 4.5, 26.55}, {"[26.55,27.3) denormal p", 26.55, 27.3}, {"[27.3,28)", 27.3, 28.0}, {"z >= 28", 28.0, 1e300} };
-    double zPortZero = NAN, zCudaZero = NAN, zHostZero = NAN;
-    long portExact = 0, portTotal = 0, portUlp1 = 0;
+                                {"[4.5,26.55) normal p", 4.5, 26.55}, {"[26.55,27.3) subnormal p", 26.55, 27.3}, {"[27.3,28)", 27.3, 28.0}, {"z >= 28", 28.0, 1e300} };
+    double zZero[4] = {NAN, NAN, NAN, NAN};   // host, modes
+    double logMaxDiff[3] = {0, 0, 0};          // |log(dev) - log(host)| where both non-zero (the log-domain p)
     for (int i = 0; i < n; ++i) {
         if (!std::isfinite(z[i])) continue;
+        const double h = host[i];
+        if (std::isnan(zZero[0]) && h == 0 && z[i] > 0) zZero[0] = z[i];
+        for (int m = 0; m < 3; ++m) {
+            const double d = dev[m][i];
+            if (std::isnan(zZero[m + 1]) && d == 0 && z[i] > 0) zZero[m + 1] = z[i];
+            if (h != 0 && d != 0) logMaxDiff[m] = std::max(logMaxDiff[m], std::fabs(std::log(d) - std::log(h)));
+        }
         for (Band& b : bands) if (z[i] >= b.lo && z[i] < b.hi) {
             b.n++;
-            const double up = ulpDiff(port[i], host[i]), uc = ulpDiff(cu[i], host[i]);
-            if (port[i] == host[i]) b.exact++;
-            if ((host[i] == 0) != (cu[i] == 0)) b.zeroMismatch++;
-            if (host[i] != 0 && port[i] != 0 && std::isfinite(up)) b.maxUlpPort = std::max(b.maxUlpPort, up);
-            if (host[i] != 0 && cu[i] != 0 && std::isfinite(uc)) { b.maxUlpCuda = std::max(b.maxUlpCuda, uc); b.maxRelCuda = std::max(b.maxRelCuda, std::fabs(cu[i] - host[i]) / host[i]); }
-            if (std::isnan(b.firstCudaDiff) && host[i] != 0 && std::fabs(cu[i] - host[i]) / host[i] > 1e-13) b.firstCudaDiff = z[i];
+            for (int m = 0; m < 3; ++m) {
+                const double d = dev[m][i];
+                if (d == h) b.exact[m]++;
+                if ((h == 0) != (d == 0)) b.zeroMis[m]++;
+                const bool sub = (h != 0 && std::fabs(h) < nmin) || (d != 0 && std::fabs(d) < nmin);
+                if (sub) b.maxGrid[m] = std::max(b.maxGrid[m], std::fabs(d - h) / dmin);
+                else if (h != 0 && d != 0) { const double u = ulpDiff(d, h); if (std::isfinite(u)) b.maxUlp[m] = std::max(b.maxUlp[m], u); }
+            }
         }
-        portTotal++;
-        if (port[i] == host[i]) portExact++;
-        else if (ulpDiff(port[i], host[i]) <= 1.0) portUlp1++;
-        if (std::isnan(zHostZero) && host[i] == 0 && z[i] > 0) zHostZero = z[i];
-        if (std::isnan(zPortZero) && port[i] == 0 && z[i] > 0) zPortZero = z[i];
-        if (std::isnan(zCudaZero) && cu[i] == 0 && z[i] > 0) zCudaZero = z[i];
     }
-    std::printf("erfc tail study: %d arguments; host = boost::math::erfc (Boost 1.85, 53-bit), port = erfImp53 on the device, cuda = CUDA libm erfc\n", n);
-    std::printf("  port vs host: bit-identical at %ld / %ld arguments, within 1 ulp at %ld more\n", portExact, portTotal, portUlp1);
-    std::printf("  first positive z with erfc == 0:  host %.6f   port %.6f   cuda %.6f   (p = erfc/2: host 0 at Z = z*sqrt2 = %.4f)\n",
-                zHostZero, zPortZero, zCudaZero, zHostZero * std::sqrt(2.0));
-    std::printf("  %-26s %8s %8s %12s | %12s %12s %10s %14s\n", "band", "n", "port==", "port maxulp", "cuda maxulp", "cuda maxrel", "zero mism", "cuda>1e-13 at z");
-    for (const Band& b : bands)
-        std::printf("  %-26s %8ld %8ld %12.2f | %12.2f %12.2e %10ld %14.5f\n", b.name, b.n, b.exact, b.maxUlpPort, b.maxUlpCuda, b.maxRelCuda, b.zeroMismatch, b.firstCudaDiff);
-    std::printf("  p-value terms: p = erfc(z)/2; z = 26.55 is p ~ %.3e (Z = %.2f); z = 27.3 is p ~ %.3e; z = 28 is p = 0 on the host (Z = %.3f)\n",
-                boost::math::erfc(26.55) / 2, 26.55 * std::sqrt(2.0), boost::math::erfc(27.3) / 2, 28 * std::sqrt(2.0));
-    for (int i = n - 9; i < n; ++i) std::printf("  z=%-12.6g host=%-24.17g port=%-24.17g cuda=%-24.17g\n", z[i], host[i], port[i], cu[i]);
+    std::printf("erfc tail study on the device: %d arguments; host = boost::math::erfc (Boost 1.85, evaluated in long double, i.e. correctly rounded, 0 from z = %.7f)\n", n, zZero[0]);
+    std::printf("  first positive z with erfc == 0: host %.7f | %s %.7f | %s %.7f | %s %.7f\n", zZero[0], names[0], zZero[1], names[1], zZero[2], names[2], zZero[3]);
+    for (int m = 0; m < 3; ++m) std::printf("  max |log(dev) - log(host)| over arguments where both are non-zero: %s %.3e\n", names[m], logMaxDiff[m]);
+    std::printf("  per band: n, then for each mode [bit-identical, max ulp (normal), max subnormal grid units, zero/non-zero disagreements]\n");
+    std::printf("  %-26s %8s | %-32s | %-32s | %-32s\n", "band", "n", names[0], names[1], names[2]);
+    for (const Band& b : bands) {
+        std::printf("  %-26s %8ld |", b.name, b.n);
+        for (int m = 0; m < 3; ++m) std::printf(" %7ld %6.2f %8.0f %7ld |", b.exact[m], b.maxUlp[m], b.maxGrid[m], b.zeroMis[m]);
+        std::printf("\n");
+    }
+    std::printf("  p-value terms: p = erfc(z)/2, Z = z*sqrt2: z = 26.55 -> p %.3e (Z %.2f); z = 27.226 -> host 0 (Z %.3f); z = 28 (Z %.3f)\n",
+                boost::math::erfc(26.55) / 2, 26.55 * std::sqrt(2.0), 27.226 * std::sqrt(2.0), 28 * std::sqrt(2.0));
+    for (int i = n - 10; i < n; ++i) std::printf("  z=%-12.6g host=%-24.17g scaled=%-24.17g literal=%-24.17g cuda=%-24.17g\n", z[i], host[i], dev[0][i], dev[1][i], dev[2][i]);
     return 0;
 }
 
