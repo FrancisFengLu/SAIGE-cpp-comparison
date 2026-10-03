@@ -24,10 +24,11 @@ int maskWords(int t_N) { return (t_N + 31) / 32; }
 Reducer* create(const CreateArgs&) { return nullptr; }
 void     destroy(Reducer*) {}
 
-unsigned char*  packed(Reducer*)              { return nullptr; }
-double*         lut(Reducer*)                 { return nullptr; }
+unsigned char*  packed(Reducer*, int)         { return nullptr; }
+double*         lut(Reducer*, int)            { return nullptr; }
 std::size_t     bytesPerSlot(const Reducer*)  { return 0; }
-bool            reduce(Reducer*, int)         { return false; }
+int             stagingSets(const Reducer*)   { return 0; }
+bool            reduce(Reducer*, int, int)    { return false; }
 bool            isFp64(const Reducer*)        { return false; }
 const float*    outCf(const Reducer*)         { return nullptr; }
 const double*   outCd(const Reducer*)         { return nullptr; }

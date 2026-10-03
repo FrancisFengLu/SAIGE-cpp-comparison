@@ -26,6 +26,9 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <exception>
 #include <omp.h>
 #include "phase_timing.hpp"
 
@@ -294,6 +297,27 @@ int  g_gpuBlockSize = 16384;
 // GEMM. fp64 costs about 40% more GEMM time on a V100 -- a few percent of a
 // real run -- and agrees with the CPU path near 1e-15 rather than near 1e-6.
 bool g_gpuFp64    = true;
+// Config key gpuPrefetch (default false): on the GPU path, read + QC + stage
+// superblock k+1 on a reader thread while the device call, the host tail and
+// the device SPA / Firth of superblock k run. The pinned staging buffers and
+// the per-block state are a ring of gpuPrefetchSets sets (default 3: with
+// marker_chunksize 10000 and 9984 markers per superblock a chunk is one big
+// superblock and one of 16 markers, so a depth of one would leave the reader
+// idle through every big compute); the reader runs gpuPrefetchThreads OpenMP
+// threads of its own (default 2, the disk is the bottleneck on a cold read).
+// Nothing about the arithmetic or the order of the results changes: every
+// superblock is still reduced, finalized and written in input order from the
+// same staged bytes. OFF: the strictly serial loop as before. S2_PIPELINE.md.
+bool g_gpuPrefetch        = false;
+int  g_gpuPrefetchSets    = 3;
+int  g_gpuPrefetchThreads = 2;
+// Config key parallelModelLoad (default false): load the P null models of a
+// multi-trait run concurrently (min(P, nThreads) threads) instead of one after
+// another. Each model's loader log goes to its own buffer and is printed in
+// config order afterwards, so stdout is unchanged; the loaded objects are the
+// same bytes. Serial when checkpointDir is set (the checkpoint files are
+// written per model into one directory). S2_PIPELINE.md.
+bool g_parallelModelLoad  = false;
 
 // Output file prefix strings
 std::string g_outputFilePrefixGroup;
@@ -2488,6 +2512,11 @@ bool mainMarkerMTGpu(
                     SAIGE::pcAscending(oi.memptr(), oi.n_elem)) ? 1 : 0;
     }
 
+    // gpuPrefetch: a ring of staging sets (pinned rows + tables, per-block
+    // state) so the reader can fill one while the device and the host tail
+    // work on another. 1 without it.
+    const bool prefetch = g_gpuPrefetch;
+    const int  nSets    = prefetch ? std::max(2, g_gpuPrefetchSets) : 1;
     saige::gpu2::Reducer* R = nullptr;
     {
         std::vector<double> Bf((std::size_t)n * K1);
@@ -2504,7 +2533,7 @@ bool mainMarkerMTGpu(
         a.device = g_gpuDevice; a.N = n;
         a.K1 = K1; a.B1 = Bf.data();
         a.K2 = K2; a.B2 = anyBin ? ctx.MU2bin.memptr() : nullptr;
-        a.maxSlots = slots; a.fp64 = g_gpuFp64;
+        a.maxSlots = slots; a.fp64 = g_gpuFp64; a.stagingSets = nSets;
         a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
         R = saige::gpu2::create(a);
     }
@@ -2514,8 +2543,6 @@ bool mainMarkerMTGpu(
     }
     const std::size_t bpv = saige::gpu2::bytesPerSlot(R);
     const std::size_t nbRow = (std::size_t)(n + 3) / 4;   // bytes the reader writes per row
-    unsigned char* hPk = saige::gpu2::packed(R);
-    double*        hLu = saige::gpu2::lut(R);
 
     std::cout << "  useGPU: " << saige::gpu2::describe(g_gpuDevice)
               << "; " << (g_gpuFp64 ? "fp64" : "fp32")
@@ -2526,6 +2553,10 @@ bool mainMarkerMTGpu(
               << " x " << Bblk << "), "
               << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
               << std::endl;
+    if (prefetch)
+        std::cout << "  gpuPrefetch: " << nSets << " staging sets of " << slots << " markers ("
+                  << ((std::size_t)nSets * slots * (bpv + 4 * sizeof(double)) >> 20)
+                  << " MiB pinned), " << g_gpuPrefetchThreads << " reader thread(s)" << std::endl;
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
     saige::spa_gpu::Spa* SL = nullptr;     // gpuSpaImpl: lib
@@ -2679,34 +2710,81 @@ bool mainMarkerMTGpu(
 
     const int nThreadsHere = std::max(1, omp_get_max_threads());
     std::vector<MTBlockWork> work(nThreadsHere);
-    std::vector<GpuBlk>      blks(nSub);
+
+    // ---------------- the superblock schedule ----------------
+    // The work is a sequence of superblocks; a chunk (marker_chunksize, the
+    // unit the output is written in) is one or more of them. Laid out up front
+    // so a reader thread can run ahead of the compute by whole superblocks,
+    // across chunk boundaries (gpuPrefetch). It is exactly the sequence the
+    // nested chunk / superblock loops below walk: the same (chunkStart, sb,
+    // nb) triples in the same order, so superblock k's bytes are where loop
+    // iteration k expects them.
+    struct SbDesc { int ci, chunkStart, qc, sb, nb; bool first; };
+    std::vector<SbDesc> sched;
+    for (int chunkStart = 0, ci = 0; chunkStart < q; chunkStart += chunkSize, ci++) {
+        const int chunkEnd = std::min(chunkStart + chunkSize, q);
+        const int qc = chunkEnd - chunkStart;
+        const int nBlocks = (qc + Bblk - 1) / Bblk;
+        for (int sb = 0; sb < nBlocks; sb += nSub) {
+            SbDesc d;
+            d.ci = ci; d.chunkStart = chunkStart; d.qc = qc; d.sb = sb;
+            d.nb = std::min(sb + nSub, nBlocks) - sb;
+            d.first = (sb == 0);
+            sched.push_back(d);
+        }
+    }
+    const int K = (int)sched.size();
+
+    // ---------------- staging ring ----------------
+    // Set s holds superblock k's pinned packed rows + tables (the reducer's)
+    // and its per-block state; chunk ci's marker columns live in meta[ci %
+    // nSets]. nSets = 1 without gpuPrefetch: exactly the single buffers the
+    // serial loop used. With it, the reader may be at most nSets - 1
+    // superblocks ahead, so a chunk's columns are reset only after the chunk
+    // nSets chunks back has been written (every chunk is >= 1 superblock, and
+    // a set is released only after the write that follows its superblock).
+    std::vector<unsigned char*> hPkSet(nSets, nullptr);
+    std::vector<double*>        hLuSet(nSets, nullptr);
+    for (int s = 0; s < nSets; s++) {
+        hPkSet[s] = saige::gpu2::packed(R, s);
+        hLuSet[s] = saige::gpu2::lut(R, s);
+        if (hPkSet[s] == nullptr || hLuSet[s] == nullptr) {
+            saige::gpu2::destroy(R);
+            throw std::runtime_error("mainMarkerMTGpu: the reducer has fewer staging sets than requested");
+        }
+    }
+    std::vector<std::vector<GpuBlk>> blks(nSets, std::vector<GpuBlk>(nSub));
+    struct ChunkMeta {
+        std::vector<std::string> markerVec, chrVec, posVec, refVec, altVec;
+        std::vector<double> altFreqVec, altCountsVec, imputationInfoVec, missingRateVec;
+        void reset(int qc) {
+            markerVec.assign(qc, std::string()); chrVec.assign(qc, std::string());
+            posVec.assign(qc, std::string()); refVec.assign(qc, std::string());
+            altVec.assign(qc, std::string());
+            altFreqVec.assign(qc, 0.0); altCountsVec.assign(qc, 0.0);
+            imputationInfoVec.assign(qc, 0.0); missingRateVec.assign(qc, 0.0);
+        }
+    };
+    std::vector<ChunkMeta> meta(nSets);
 
     std::atomic<int> firstEndIdx{q};
     const int imputeCase = string_to_case.at(g_impute_method);
 
-    for (int chunkStart = 0; chunkStart < q; chunkStart += chunkSize) {
-        const int chunkEnd = std::min(chunkStart + chunkSize, q);
-        const int qc = chunkEnd - chunkStart;
-        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
-
-        std::vector<std::string> markerVec(qc), chrVec(qc), posVec(qc),
-                                 refVec(qc), altVec(qc);
-        std::vector<double> altFreqVec(qc, 0.0), altCountsVec(qc, 0.0),
-                            imputationInfoVec(qc, 0.0), missingRateVec(qc, 0.0);
-        for (int t = 0; t < P; t++) out[t].reset(qc);
-
-        const int nBlocks = (qc + Bblk - 1) / Bblk;
-
-        for (int sb = 0; sb < nBlocks; sb += nSub) {
-            const int sbEnd = std::min(sb + nSub, nBlocks);
-            const int nb = sbEnd - sb;
-
-            // ---------------- phase 1: read + QC + stage ----------------
-            double t0 = omp_get_wtime();
-            #pragma omp parallel for schedule(dynamic, 1)
+    // ---------------- phase 1: read + QC + stage one superblock ----------------
+    // Into staging set s, on nThr OpenMP threads of the calling thread's team.
+    // The body is the serial loop's phase 1 unchanged; only where it writes
+    // (set s, the chunk's own marker columns) is parameterised.
+    auto readSuperblock = [&](const SbDesc& d, int s, int nThr) {
+        const int chunkStart = d.chunkStart, qc = d.qc, sb = d.sb, nb = d.nb;
+        ChunkMeta& CM = meta[d.ci % nSets];
+        if (d.first) CM.reset(qc);
+        std::vector<GpuBlk>& B = blks[s];
+        unsigned char* hPkS = hPkSet[s];
+        double*        hLuS = hLuSet[s];
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(nThr)
             for (int bi = 0; bi < nb; bi++) {
                 const int blk = sb + bi;
-                GpuBlk& S = blks[bi];
+                GpuBlk& S = B[bi];
                 S.ensure(Bblk, P);
                 const int jj0 = blk * Bblk;
                 const int jj1 = std::min(jj0 + Bblk, qc);
@@ -2735,16 +2813,16 @@ bool mainMarkerMTGpu(
                         continue;
                     }
 
-                    chrVec[jj]    = fs.chr;
-                    posVec[jj]    = std::to_string(fs.pd);
-                    refVec[jj]    = fs.ref;
-                    altVec[jj]    = fs.alt;
-                    markerVec[jj] = fs.marker;
+                    CM.chrVec[jj]    = fs.chr;
+                    CM.posVec[jj]    = std::to_string(fs.pd);
+                    CM.refVec[jj]    = fs.ref;
+                    CM.altVec[jj]    = fs.alt;
+                    CM.markerVec[jj] = fs.marker;
                     double altFreq   = fs.altFreq;
                     double altCounts = fs.altCounts;
-                    altFreqVec[jj]        = altFreq;
-                    missingRateVec[jj]    = fs.missingRate;
-                    imputationInfoVec[jj] = fs.imputeInfo;
+                    CM.altFreqVec[jj]        = altFreq;
+                    CM.missingRateVec[jj]    = fs.missingRate;
+                    CM.imputationInfoVec[jj] = fs.imputeInfo;
 
                     // Pre-impute QC -- the same four tests, the same order.
                     double MAF = std::min(altFreq, 1 - altFreq);
@@ -2768,8 +2846,8 @@ bool mainMarkerMTGpu(
                         (MAC < g_marker_minMAC_cutoff)) {
                         continue;
                     }
-                    altFreqVec[jj]   = altFreq;
-                    altCountsVec[jj] = altCounts;
+                    CM.altFreqVec[jj]   = altFreq;
+                    CM.altCountsVec[jj] = altCounts;
 
                     // ---- stage the marker for the device ----
                     // High MAC from the block's base up, low MAC (ER for a
@@ -2777,12 +2855,12 @@ bool mainMarkerMTGpu(
                     // its block, so each tail call gets a contiguous range.
                     const bool hi = (MAC > g_MACCutoffforER);
                     const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
-                    ptr_gPLINKobj->copyFusedPacked_ts(fs, hPk + (slotBase + c) * bpv);
+                    ptr_gPLINKobj->copyFusedPacked_ts(fs, hPkS + (slotBase + c) * bpv);
                     double ss = 0.0;
                     for (int k = 0; k < 4; k++) {
                         S.fdc[(std::size_t)c * 4 + k]  = fs.fd[k];
                         S.cntc[(std::size_t)c * 4 + k] = fs.counts[k];
-                        hLu[(slotBase + c) * 4 + k]    = fs.fd[k];
+                        hLuS[(slotBase + c) * 4 + k]    = fs.fd[k];
                         ss += fs.fd[k] * fs.fd[k] * (double)fs.counts[k];
                     }
                     S.ssc[c]   = ss;
@@ -2806,23 +2884,122 @@ bool mainMarkerMTGpu(
                 // header comment). Give them an all-zero table so they decode to
                 // zeros and cannot produce a NaN that would poison a GEMM tile.
                 for (int c = S.nHi; c < Bblk - S.nLo; c++) {
-                    std::memset(hPk + (slotBase + c) * bpv, 0, nbRow);
-                    for (int k = 0; k < 4; k++) hLu[(slotBase + c) * 4 + k] = 0.0;
+                    std::memset(hPkS + (slotBase + c) * bpv, 0, nbRow);
+                    for (int k = 0; k < 4; k++) hLuS[(slotBase + c) * 4 + k] = 0.0;
                 }
             }
-            tRead += omp_get_wtime() - t0;
+    };
+
+    // ---------------- the reader thread (gpuPrefetch) ----------------
+    // Produces superblocks 0, 1, 2, ... into sets k % nSets, waiting for a set
+    // the consumer has not yet released. The loop below consumes them in the
+    // same order. An exception in the reader is parked and rethrown on this
+    // thread; halt() stops the reader and joins it, and runs before the
+    // reducer (whose pinned buffers the reader writes) is destroyed.
+    struct SbPrefetch {
+        std::mutex m;
+        std::condition_variable cvFill, cvFree;
+        std::vector<char> filled;
+        bool stop = false, done = false;
+        std::exception_ptr err;
+        std::thread th;
+        double tRead = 0;              // the reader's own wall over its superblocks
+        void halt() {
+            { std::lock_guard<std::mutex> lk(m); stop = true; }
+            cvFree.notify_all();
+            if (th.joinable()) th.join();
+        }
+        ~SbPrefetch() { halt(); }
+    } rd;
+    if (prefetch) {
+        rd.filled.assign(nSets, 0);
+        const int nReadThr = g_gpuPrefetchThreads;
+        rd.th = std::thread([&, nReadThr]() {
+            try {
+                for (int k = 0; k < K; k++) {
+                    const SbDesc& d = sched[k];
+                    // The same end-of-input rule the consumer applies at a
+                    // chunk start (firstEndIdx is only ever lowered, by a
+                    // failed read inside an earlier superblock, which is
+                    // complete before the reader gets here).
+                    if (d.first && d.chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
+                    const int s = k % nSets;
+                    {
+                        std::unique_lock<std::mutex> lk(rd.m);
+                        rd.cvFree.wait(lk, [&]{ return rd.stop || !rd.filled[s]; });
+                        if (rd.stop) break;
+                    }
+                    const double tr0 = omp_get_wtime();
+                    readSuperblock(d, s, nReadThr);
+                    rd.tRead += omp_get_wtime() - tr0;
+                    { std::lock_guard<std::mutex> lk(rd.m); rd.filled[s] = 1; }
+                    rd.cvFill.notify_all();
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(rd.m);
+                rd.err = std::current_exception();
+            }
+            { std::lock_guard<std::mutex> lk(rd.m); rd.done = true; }
+            rd.cvFill.notify_all();
+        });
+    }
+    double tWait = 0;                  // consumer time spent waiting for the reader
+    bool readerEnded = false;
+    const double tLoop0 = omp_get_wtime();
+
+    int kSb = 0;                       // superblock counter, = index into sched
+    for (int chunkStart = 0, ci = 0; chunkStart < q; chunkStart += chunkSize, ci++) {
+        const int chunkEnd = std::min(chunkStart + chunkSize, q);
+        const int qc = chunkEnd - chunkStart;
+        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
+
+        // The chunk's marker columns; reset by whoever reads the chunk's first
+        // superblock (readSuperblock), on this thread or on the reader's.
+        ChunkMeta& CM = meta[ci % nSets];
+        for (int t = 0; t < P; t++) out[t].reset(qc);
+
+        const int nBlocks = (qc + Bblk - 1) / Bblk;
+
+        for (int sb = 0; sb < nBlocks; sb += nSub, kSb++) {
+            const int sbEnd = std::min(sb + nSub, nBlocks);
+            const int nb = sbEnd - sb;
+            const SbDesc& d = sched[kSb];
+            const int s = kSb % nSets;
+            std::vector<GpuBlk>& blksS = blks[s];
+            unsigned char* hPkS = hPkSet[s];
+
+            // ---------------- phase 1: read + QC + stage ----------------
+            double t0 = omp_get_wtime();
+            if (prefetch) {
+                std::unique_lock<std::mutex> lk(rd.m);
+                rd.cvFill.wait(lk, [&]{ return rd.filled[s] || rd.err || rd.done; });
+                if (rd.err) {
+                    std::exception_ptr e = rd.err;
+                    lk.unlock();
+                    rd.halt();
+                    saige::gpu2::destroy(R);
+                    std::rethrow_exception(e);
+                }
+                if (!rd.filled[s]) { readerEnded = true; break; }   // the reader stopped at this chunk's start
+                lk.unlock();
+                tWait += omp_get_wtime() - t0;
+            } else {
+                readSuperblock(d, s, nThreadsHere);
+                tRead += omp_get_wtime() - t0;
+            }
 
             // ---------------- phase 2: the device ----------------
             t0 = omp_get_wtime();
             const int nSlotsThis = nb * Bblk;
-            if (!saige::gpu2::reduce(R, nSlotsThis)) {
+            if (!saige::gpu2::reduce(R, nSlotsThis, s)) {
+                rd.halt();
                 saige::gpu2::destroy(R);
                 throw std::runtime_error(
                     "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
                     "without useGPU (or with useGPU: false) to finish on the CPU.");
             }
             tGpu += omp_get_wtime() - t0;
-            for (int bi = 0; bi < nb; bi++) nSlotsUsed += blks[bi].nHi + blks[bi].nLo;
+            for (int bi = 0; bi < nb; bi++) nSlotsUsed += blksS[bi].nHi + blksS[bi].nLo;
             nSlotsTotal += nSlotsThis;
 
             // ---------------- phase 3: tail + finalize ----------------
@@ -2838,7 +3015,7 @@ bool mainMarkerMTGpu(
             #pragma omp parallel for schedule(dynamic, 1)
             for (int bi = 0; bi < nb; bi++) {
                 const int blk = sb + bi;
-                GpuBlk& S = blks[bi];
+                GpuBlk& S = blksS[bi];
                 MTBlockWork& W = work[omp_get_thread_num()];
                 const int jj0 = blk * Bblk;
                 const int jj1 = std::min(jj0 + Bblk, qc);
@@ -2903,7 +3080,7 @@ bool mainMarkerMTGpu(
                     const double* fdc = &S.fdc[(std::size_t)c * 4];
                     const uint64_t* cntc = &S.cntc[(std::size_t)c * 4];
                     const std::size_t slot = slotBase + c;
-                    const unsigned char* pk = hPk + slot * bpv;
+                    const unsigned char* pk = hPkS + slot * bpv;
                     bool gReady = false;       // dense column + index vectors built on demand
                     auto buildDense = [&]() {
                         if (gReady) return;
@@ -3254,6 +3431,7 @@ bool mainMarkerMTGpu(
                     if (!okRun) {
                         saige::gpu2::spaDestroy(SP);
                         saige::spa_gpu::destroy(SL);
+                        rd.halt();
                         saige::gpu2::destroy(R);
                         throw std::runtime_error(
                             std::string("mainMarkerMTGpu: the device SPA failed mid-run (") +
@@ -3270,7 +3448,7 @@ bool mainMarkerMTGpu(
                         else { o.pval = lo[k].pval; o.conv = lo[k].conv; o.s1 = lo[k].s1; o.s2 = lo[k].s2;
                                o.niter1 = lo[k].niter1; o.niter2 = lo[k].niter2; o.root1 = lo[k].root1; o.root2 = lo[k].root2; o.m1 = lo[k].m1; }
                         MTBlockWork& W = work[omp_get_thread_num()];
-                        GpuBlk& S = blks[pd.bi];
+                        GpuBlk& S = blksS[pd.bi];
                         const int t = pd.t, c = pd.c, jj = pd.jj;
                         const int i = chunkStart + jj;
                         SAIGE::SAIGEClass* obj = g_saigeObjs[t];
@@ -3281,7 +3459,7 @@ bool mainMarkerMTGpu(
                         const double altFreq = S.AFc[c];
                         const bool flip = (S.flipc[c] != 0);
                         const double* fdc = &S.fdc[(std::size_t)c * 4];
-                        const unsigned char* pk = hPk + ((std::size_t)pd.bi * Bblk + c) * bpv;
+                        const unsigned char* pk = hPkS + ((std::size_t)pd.bi * Bblk + c) * bpv;
 
                         // ---- getMarkerPval's post-SPA rules, on the device's p ----
                         double spaP = o.pval;
@@ -3479,6 +3657,7 @@ bool mainMarkerMTGpu(
                         saige::gpu2::firthDestroy(FP);
                         saige::gpu2::spaDestroy(SP);
                         saige::spa_gpu::destroy(SL);
+                        rd.halt();
                         saige::gpu2::destroy(R);
                         throw std::runtime_error(
                             std::string("mainMarkerMTGpu: the device Firth failed mid-run (") +
@@ -3490,7 +3669,7 @@ bool mainMarkerMTGpu(
                     for (int k = 0; k < nF; k++) {
                         const PendFirth& pf = allF[k];
                         const saige::gpu2::FirthPairOut& o = fo[k];
-                        GpuBlk& S = blks[pf.bi];
+                        GpuBlk& S = blksS[pf.bi];
                         const int t = pf.t, jj = pf.jj;
                         MTTraitChunk& O = out[t];
                         const bool flip = (S.flipc[pf.c] != 0);
@@ -3525,7 +3704,12 @@ bool mainMarkerMTGpu(
                 }
                 tFirth += omp_get_wtime() - tf0;
             }
+            if (prefetch) {
+                { std::lock_guard<std::mutex> lk(rd.m); rd.filled[s] = 0; }
+                rd.cvFree.notify_all();
+            }
         }  // superblock
+        if (readerEnded) break;
 
         // ---- write this chunk's rows, one file per trait ----
         // The traits are independent files, so they go out in parallel; at
@@ -3533,8 +3717,8 @@ bool mainMarkerMTGpu(
         const double tw = omp_get_wtime();
         if (g_outputFormatSgs) {
             SAIGE::outfast::MarkerCols MC;
-            MC.chr = &chrVec; MC.pos = &posVec; MC.mid = &markerVec;
-            MC.ref = &refVec; MC.alt = &altVec;
+            MC.chr = &CM.chrVec; MC.pos = &CM.posVec; MC.mid = &CM.markerVec;
+            MC.ref = &CM.refVec; MC.alt = &CM.altVec;
             std::vector<SAIGE::outfast::TraitCols> TC(P);
             for (int t = 0; t < P; t++) {
                 MTTraitChunk& O = out[t];
@@ -3573,7 +3757,7 @@ bool mainMarkerMTGpu(
                                     t_isFirth,
                                     mFirth[t],
                                     mFirthConverge[t],
-                                    chrVec, posVec, markerVec, refVec, altVec,
+                                    CM.chrVec, CM.posVec, CM.markerVec, CM.refVec, CM.altVec,
                                     O.altCounts, O.altFreq,
                                     O.imputeInfo, O.missingRate,
                                     O.Beta, O.seBeta, O.Tstat, O.varT,
@@ -3594,6 +3778,10 @@ bool mainMarkerMTGpu(
         dumpRoutes(out, chunkStart == 0);
         tWrite += omp_get_wtime() - tw;
     }  // chunk
+    rd.halt();
+    const double tLoop = omp_get_wtime() - tLoop0;
+    if (prefetch) tRead = rd.tRead;
+
 
     double gH2D = 0, gDec = 0, gGemm = 0, gD2H = 0, gPopc = 0, gSpa = 0;
     long long gSpaPairs = 0;
@@ -3677,6 +3865,15 @@ bool mainMarkerMTGpu(
     std::cout << "  [gpu device time] H2D " << gH2D << " s, decode " << gDec
               << " s, GEMM " << gGemm << " s, popcount " << gPopc << " s, D2H " << gD2H << " s"
               << std::endl;
+    // With gpuPrefetch the read+QC+stage figure above is the reader thread's
+    // own wall, overlapped with the rest; what the main loop actually lost to
+    // it is the wait below.
+    std::cout << "  [gpu pipeline] main loop " << tLoop << " s; gpuPrefetch "
+              << (prefetch ? "on" : "off") << ", " << nSets << " staging set(s)";
+    if (prefetch)
+        std::cout << ", reader wall " << tRead << " s on " << g_gpuPrefetchThreads
+                  << " thread(s), consumer waited " << tWait << " s for it";
+    std::cout << std::endl;
 
     timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
     return true;
@@ -6957,6 +7154,14 @@ int main(int argc, char* argv[])
             std::cerr << "  gpuFirth:          true/false (default: false). With gpuSpa, the Firth fit of a" << std::endl;
             std::cerr << "                     pair whose p-value asks for it runs on the device." << std::endl;
             std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
+            std::cerr << "  gpuPrefetch:       true/false (default: false). Read + QC + stage the next" << std::endl;
+            std::cerr << "                     superblock on a reader thread while the current one" << std::endl;
+            std::cerr << "                     computes; same results in the same order." << std::endl;
+            std::cerr << "  gpuPrefetchSets:   staging sets in the ring (default 3, >= 2)" << std::endl;
+            std::cerr << "  gpuPrefetchThreads: OpenMP threads of the reader (default 2)" << std::endl;
+            std::cerr << "  parallelModelLoad: true/false (default: false). Load the null models" << std::endl;
+            std::cerr << "                     of a multi-trait run concurrently (min(P, nThreads)" << std::endl;
+            std::cerr << "                     threads); same objects, same log, in config order." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -7193,6 +7398,25 @@ int main(int argc, char* argv[])
             else if (gp == "fp32") g_gpuFp64 = false;
             else throw std::runtime_error("gpuPrecision must be fp64 or fp32, not '" + gp + "'");
         }
+        g_gpuPrefetch = config["gpuPrefetch"] ? config["gpuPrefetch"].as<bool>() : false;
+        if (config["gpuPrefetchSets"]) {
+            g_gpuPrefetchSets = config["gpuPrefetchSets"].as<int>();
+            if (g_gpuPrefetchSets < 2) throw std::runtime_error("gpuPrefetchSets must be >= 2");
+        }
+        if (config["gpuPrefetchThreads"]) {
+            g_gpuPrefetchThreads = config["gpuPrefetchThreads"].as<int>();
+            if (g_gpuPrefetchThreads < 1) throw std::runtime_error("gpuPrefetchThreads must be >= 1");
+        }
+        if (g_gpuPrefetch && !g_gpuStep2)
+            std::cout << "  gpuPrefetch: ignored, useGPU is false" << std::endl;
+        else if (g_gpuPrefetch)
+            std::cout << "  gpuPrefetch: on -- the next superblock is read while the current one "
+                         "computes (" << g_gpuPrefetchSets << " staging sets, "
+                      << g_gpuPrefetchThreads << " reader thread(s))" << std::endl;
+        g_parallelModelLoad = config["parallelModelLoad"] ? config["parallelModelLoad"].as<bool>() : false;
+        if (g_parallelModelLoad)
+            std::cout << "  parallelModelLoad: on -- the null models are loaded concurrently"
+                      << std::endl;
         if (g_gpuStep2) {
             std::string gpuWhy;
             if (!saige::gpu2::available(g_gpuDevice, &gpuWhy)) {
@@ -7492,10 +7716,57 @@ int main(int argc, char* argv[])
         std::cout << "===== Loading null model" << (numTraits > 1 ? "s" : "")
                   << " =====" << std::endl;
         std::vector<NullModelData> nms(numTraits);
+        // parallelModelLoad: the P loads are independent (each reads its own
+        // directory into its own NullModelData; the loader keeps no shared
+        // state), so they run on min(P, nThreads) threads, each writing its
+        // progress lines into a per-model buffer. The buffers are then printed
+        // in config order, followed by the same per-trait summary as the
+        // serial loop prints, so stdout is byte for byte the serial log. An
+        // exception in any load is rethrown here after the logs of the models
+        // before it (in config order) have been printed, which is what the
+        // serial loop would have shown before throwing. Checkpoint output
+        // (checkpointDir) writes fixed file names per model, so that case
+        // stays serial.
+        const int nLoadThreads = std::min(numTraits, std::max(1, omp_get_max_threads()));
+        const bool loadParallel = g_parallelModelLoad && numTraits > 1 &&
+                                  nLoadThreads > 1 && !g_writeCheckpoints;
+        std::vector<std::string> loadLogs;
+        if (loadParallel) {
+            loadLogs.resize(numTraits);
+            std::vector<std::exception_ptr> loadErr(numTraits);
+            const double tl0 = omp_get_wtime();
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(nLoadThreads)
+            for (int ti = 0; ti < numTraits; ti++) {
+                std::ostringstream os;
+                os.copyfmt(std::cout);   // same flags (boolalpha is set by now) as the serial log
+                try {
+                    nms[ti] = loadNullModel(modelSpecs[ti].modelFile,
+                                            modelSpecs[ti].varianceRatioFile,
+                                            useLOCO, locoChrom, relatednessCutoff, os);
+                } catch (...) {
+                    loadErr[ti] = std::current_exception();
+                }
+                loadLogs[ti] = os.str();
+            }
+            const double tl1 = omp_get_wtime();
+            for (int ti = 0; ti < numTraits; ti++) {
+                if (loadErr[ti]) {
+                    for (int tj = 0; tj <= ti; tj++) std::cout << loadLogs[tj];
+                    std::cout << std::flush;
+                    std::rethrow_exception(loadErr[ti]);
+                }
+            }
+            std::cerr << "[TIMING] parallelModelLoad: " << numTraits << " models on " << nLoadThreads
+                      << " threads in " << (tl1 - tl0) << " s\n";  // TIMING_INSTRUMENT_REMOVE_ME
+        }
         for (int ti = 0; ti < numTraits; ti++) {
-            nms[ti] = loadNullModel(modelSpecs[ti].modelFile,
-                                    modelSpecs[ti].varianceRatioFile,
-                                    useLOCO, locoChrom, relatednessCutoff);
+            if (loadParallel) {
+                std::cout << loadLogs[ti];
+            } else {
+                nms[ti] = loadNullModel(modelSpecs[ti].modelFile,
+                                        modelSpecs[ti].varianceRatioFile,
+                                        useLOCO, locoChrom, relatednessCutoff);
+            }
             const NullModelData& nmi = nms[ti];
             if (numTraits > 1) {
                 std::cout << "  --- [" << ti << "] " << modelSpecs[ti].traitName

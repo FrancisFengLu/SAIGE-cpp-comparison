@@ -81,13 +81,14 @@ void loadVarianceRatios(const std::string & filepath,
                         arma::vec & varRatio_sparse,
                         arma::vec & varRatio_null_noXadj,
                         arma::vec & cateVarRatioMinMACVecExclude,
-                        arma::vec & cateVarRatioMaxMACVecInclude) {
+                        arma::vec & cateVarRatioMaxMACVecInclude,
+                        std::ostream & t_log) {
     std::ifstream infile(filepath);
     if (!infile.is_open()) {
         throw std::runtime_error("loadVarianceRatios: cannot open file: " + filepath);
     }
 
-    std::cout << "  Loading variance ratios from: " << filepath << std::endl;
+    t_log << "  Loading variance ratios from: " << filepath << std::endl;
 
     // Temporary vectors to accumulate values
     std::vector<double> vr_null_vec;
@@ -218,7 +219,7 @@ void loadVarianceRatios(const std::string & filepath,
                 mac_max_vec.push_back(1e10);
             }
         }
-        std::cout << "    Label format detected: "
+        t_log << "    Label format detected: "
                   << label_sparse_vec.size() << " sparse, "
                   << label_null_vec.size() << " null, "
                   << label_noXadj_vec.size() << " null_noXadj rows" << std::endl;
@@ -246,9 +247,9 @@ void loadVarianceRatios(const std::string & filepath,
         varRatio_null_noXadj(i)             = vr_noXadj_vec[i];
     }
 
-    std::cout << "  Loaded " << nrows << " variance ratio categories" << std::endl;
+    t_log << "  Loaded " << nrows << " variance ratio categories" << std::endl;
     for (size_t i = 0; i < nrows; i++) {
-        std::cout << "    VR[" << i << "]: null=" << varRatio_null(i)
+        t_log << "    VR[" << i << "]: null=" << varRatio_null(i)
                   << "  sparse=" << varRatio_sparse(i)
                   << "  MAC=[" << cateVarRatioMinMACVecExclude(i)
                   << ", " << cateVarRatioMaxMACVecInclude(i)
@@ -315,19 +316,20 @@ NullModelData loadNullModel(const std::string & model_dir,
                             const std::string & varianceRatio_file,
                             bool t_LOCO,
                             const std::string & t_chrom,
-                            double t_relatednessCutoff) {
+                            double t_relatednessCutoff,
+                            std::ostream & t_log) {
 
     NullModelData data;
 
-    std::cout << "========================================" << std::endl;
-    std::cout << "Loading null model from: " << model_dir << std::endl;
-    std::cout << "========================================" << std::endl;
+    t_log << "========================================" << std::endl;
+    t_log << "Loading null model from: " << model_dir << std::endl;
+    t_log << "========================================" << std::endl;
 
     // =========================================================================
     // 1. Parse nullmodel.json from model_dir using yaml-cpp (yaml-cpp can parse JSON)
     // =========================================================================
     std::string json_path = model_dir + "/nullmodel.json";
-    std::cout << "\n[1/5] Parsing JSON manifest: " << json_path << std::endl;
+    t_log << "\n[1/5] Parsing JSON manifest: " << json_path << std::endl;
 
     if (!std::filesystem::exists(json_path)) {
         throw std::runtime_error("nullmodel.json not found at: " + json_path);
@@ -342,7 +344,7 @@ NullModelData loadNullModel(const std::string & model_dir,
         tau_node = config["tau"];
     } else if (config["theta"]) {
         tau_node = config["theta"];
-        std::cout << "  [note: using 'theta' key as tau (C++ Step 1 format)]" << std::endl;
+        t_log << "  [note: using 'theta' key as tau (C++ Step 1 format)]" << std::endl;
     } else {
         throw std::runtime_error("Missing 'tau' or 'theta' in nullmodel.json");
     }
@@ -356,7 +358,7 @@ NullModelData loadNullModel(const std::string & model_dir,
     } else {
         throw std::runtime_error("Invalid tau/theta format in nullmodel.json");
     }
-    std::cout << "  tau = [" << data.tau0 << ", " << data.tau1 << "]" << std::endl;
+    t_log << "  tau = [" << data.tau0 << ", " << data.tau1 << "]" << std::endl;
 
     // --- traitType ---
     if (config["traitType"]) {
@@ -369,7 +371,7 @@ NullModelData loadNullModel(const std::string & model_dir,
             throw std::runtime_error("Missing 'traitType' in nullmodel.json");
         }
     }
-    std::cout << "  traitType = " << data.traitType << std::endl;
+    t_log << "  traitType = " << data.traitType << std::endl;
 
     // --- n (sample size) ---
     if (config["n"]) {
@@ -460,16 +462,16 @@ NullModelData loadNullModel(const std::string & model_dir,
         }
     }
 
-    std::cout << "  n = " << data.n << ", p = " << data.p << std::endl;
-    std::cout << "  SPA_Cutoff = " << data.SPA_Cutoff << std::endl;
-    std::cout << "  impute_method = " << data.impute_method << std::endl;
-    std::cout << "  flagSparseGRM = " << data.flagSparseGRM << std::endl;
-    std::cout << "  isFastTest = " << data.isFastTest << std::endl;
-    std::cout << "  isnoadjCov = " << data.isnoadjCov << std::endl;
-    std::cout << "  isCondition = " << data.isCondition << std::endl;
-    std::cout << "  is_Firth_beta = " << data.is_Firth_beta << std::endl;
-    std::cout << "  pCutoffforFirth = " << data.pCutoffforFirth << std::endl;
-    std::cout << "  sampleIDs: " << data.sampleIDs.size() << " entries" << std::endl;
+    t_log << "  n = " << data.n << ", p = " << data.p << std::endl;
+    t_log << "  SPA_Cutoff = " << data.SPA_Cutoff << std::endl;
+    t_log << "  impute_method = " << data.impute_method << std::endl;
+    t_log << "  flagSparseGRM = " << data.flagSparseGRM << std::endl;
+    t_log << "  isFastTest = " << data.isFastTest << std::endl;
+    t_log << "  isnoadjCov = " << data.isnoadjCov << std::endl;
+    t_log << "  isCondition = " << data.isCondition << std::endl;
+    t_log << "  is_Firth_beta = " << data.is_Firth_beta << std::endl;
+    t_log << "  pCutoffforFirth = " << data.pCutoffforFirth << std::endl;
+    t_log << "  sampleIDs: " << data.sampleIDs.size() << " entries" << std::endl;
 
     // =========================================================================
     // 1b. LOCO: read the model-side flags and decide whether to swap in the
@@ -493,7 +495,7 @@ NullModelData loadNullModel(const std::string & model_dir,
 
     if (!t_LOCO) {
         // LOCO off: ignore any chr<j>/ directories entirely.
-        std::cout << "  LOCO: not applied (LOCO=false in step-2 config)" << std::endl;
+        t_log << "  LOCO: not applied (LOCO=false in step-2 config)" << std::endl;
     } else {
         // Guard 1 (readInGLMM.R:79): requested LOCO but step 1 did not run it.
         if (!data.model_hasLOCO) {
@@ -522,7 +524,7 @@ NullModelData loadNullModel(const std::string & model_dir,
             // Guard 3 (readInGLMM.R:107-113): non-autosome, or an autosome that
             // step 1 did not emit. SILENT fallback to the full-genome fit --
             // no error, no non-zero exit. A log line only.
-            std::cout << "  LOCO: chromosome '" << t_chrom
+            t_log << "  LOCO: chromosome '" << t_chrom
                       << "' has no LOCO result in the null model; "
                       << "using the full-genome fit." << std::endl;
         } else {
@@ -544,7 +546,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                 }
             }
             data.loco_applied = true;
-            std::cout << "  LOCO: leaving chromosome " << chromNum
+            t_log << "  LOCO: leaving chromosome " << chromNum
                       << " out; per-chromosome fit will be read from "
                       << loco_dir << std::endl;
         }
@@ -568,83 +570,83 @@ NullModelData loadNullModel(const std::string & model_dir,
     // =========================================================================
     // 2. Load .arma vectors
     // =========================================================================
-    std::cout << "\n[2/5] Loading .arma vector files..." << std::endl;
+    t_log << "\n[2/5] Loading .arma vector files..." << std::endl;
 
     data.mu  = loadArmaVec(armaPath("mu"));
-    std::cout << "  mu:  " << data.mu.n_elem << " elements" << std::endl;
+    t_log << "  mu:  " << data.mu.n_elem << " elements" << std::endl;
 
     data.res = loadArmaVec(armaPath("res"));
-    std::cout << "  res: " << data.res.n_elem << " elements" << std::endl;
+    t_log << "  res: " << data.res.n_elem << " elements" << std::endl;
 
     data.y   = loadArmaVec(model_dir + "/y.arma");
-    std::cout << "  y:   " << data.y.n_elem << " elements" << std::endl;
+    t_log << "  y:   " << data.y.n_elem << " elements" << std::endl;
 
     data.V   = loadArmaVec(armaPath("V"));
-    std::cout << "  V:   " << data.V.n_elem << " elements" << std::endl;
+    t_log << "  V:   " << data.V.n_elem << " elements" << std::endl;
 
     data.S_a = loadArmaVec(armaPath("S_a"));
-    std::cout << "  S_a: " << data.S_a.n_elem << " elements" << std::endl;
+    t_log << "  S_a: " << data.S_a.n_elem << " elements" << std::endl;
 
     // Update n from vector size if not set from JSON
     if (data.n == 0) {
         data.n = static_cast<int>(data.y.n_elem);
-        std::cout << "  [inferred n = " << data.n << " from y.arma]" << std::endl;
+        t_log << "  [inferred n = " << data.n << " from y.arma]" << std::endl;
     }
 
     // =========================================================================
     // 3. Load .arma matrices
     // =========================================================================
-    std::cout << "\n[3/5] Loading .arma matrix files..." << std::endl;
+    t_log << "\n[3/5] Loading .arma matrix files..." << std::endl;
 
     data.X          = loadArmaMat(model_dir + "/X.arma");
-    std::cout << "  X:          " << data.X.n_rows << " x " << data.X.n_cols << std::endl;
+    t_log << "  X:          " << data.X.n_rows << " x " << data.X.n_cols << std::endl;
 
     data.XVX        = loadArmaMat(armaPath("XVX"));
-    std::cout << "  XVX:        " << data.XVX.n_rows << " x " << data.XVX.n_cols << std::endl;
+    t_log << "  XVX:        " << data.XVX.n_rows << " x " << data.XVX.n_cols << std::endl;
 
     data.XVX_inv    = loadArmaMat(armaPath("XVX_inv"));
-    std::cout << "  XVX_inv:    " << data.XVX_inv.n_rows << " x " << data.XVX_inv.n_cols << std::endl;
+    t_log << "  XVX_inv:    " << data.XVX_inv.n_rows << " x " << data.XVX_inv.n_cols << std::endl;
 
     data.XXVX_inv   = loadArmaMat(armaPath("XXVX_inv"));
-    std::cout << "  XXVX_inv:   " << data.XXVX_inv.n_rows << " x " << data.XXVX_inv.n_cols << std::endl;
+    t_log << "  XXVX_inv:   " << data.XXVX_inv.n_rows << " x " << data.XXVX_inv.n_cols << std::endl;
 
     data.XV         = loadArmaMat(armaPath("XV"));
-    std::cout << "  XV:         " << data.XV.n_rows << " x " << data.XV.n_cols << std::endl;
+    t_log << "  XV:         " << data.XV.n_rows << " x " << data.XV.n_cols << std::endl;
 
     data.XVX_inv_XV = loadArmaMat(armaPath("XVX_inv_XV"));
-    std::cout << "  XVX_inv_XV: " << data.XVX_inv_XV.n_rows << " x " << data.XVX_inv_XV.n_cols << std::endl;
+    t_log << "  XVX_inv_XV: " << data.XVX_inv_XV.n_rows << " x " << data.XVX_inv_XV.n_cols << std::endl;
 
     // Update p from matrix dimensions if not set from JSON
     if (data.p == 0) {
         data.p = static_cast<int>(data.XV.n_rows);
-        std::cout << "  [inferred p = " << data.p << " from XV.arma]" << std::endl;
+        t_log << "  [inferred p = " << data.p << " from XV.arma]" << std::endl;
     }
 
     // --- Sigma_iXXSigma_iX: optional, default to 1x1 zero matrix ---
     if (!tryLoadArmaMat(model_dir + "/Sigma_iXXSigma_iX.arma", data.Sigma_iXXSigma_iX)) {
         data.Sigma_iXXSigma_iX = arma::mat(1, 1, arma::fill::zeros);
-        std::cout << "  Sigma_iXXSigma_iX: not found, using 1x1 zero (dummy)" << std::endl;
+        t_log << "  Sigma_iXXSigma_iX: not found, using 1x1 zero (dummy)" << std::endl;
     } else {
-        std::cout << "  Sigma_iXXSigma_iX: " << data.Sigma_iXXSigma_iX.n_rows
+        t_log << "  Sigma_iXXSigma_iX: " << data.Sigma_iXXSigma_iX.n_rows
                   << " x " << data.Sigma_iXXSigma_iX.n_cols << std::endl;
     }
 
     // =========================================================================
     // 4. Compute derived quantities
     // =========================================================================
-    std::cout << "\n[4/5] Computing derived quantities..." << std::endl;
+    t_log << "\n[4/5] Computing derived quantities..." << std::endl;
 
     // --- tauvec ---
     data.tauvec = arma::vec(2);
     data.tauvec(0) = data.tau0;
     data.tauvec(1) = data.tau1;
-    std::cout << "  tauvec = [" << data.tauvec(0) << ", " << data.tauvec(1) << "]" << std::endl;
+    t_log << "  tauvec = [" << data.tauvec(0) << ", " << data.tauvec(1) << "]" << std::endl;
 
     // --- mu2: mu*(1-mu) for binary, 1/tau[0] for quantitative ---
     int n = data.n;
     if (data.traitType == "binary") {
         data.mu2 = data.mu % (1.0 - data.mu);
-        std::cout << "  mu2 = mu*(1-mu) [binary], range: ["
+        t_log << "  mu2 = mu*(1-mu) [binary], range: ["
                   << data.mu2.min() << ", " << data.mu2.max() << "]" << std::endl;
     } else {
         // quantitative: mu2 = 1/tau[0] for all elements
@@ -654,16 +656,16 @@ NullModelData loadNullModel(const std::string & model_dir,
         //   and for quantitative the variance weight is 1/tau[0].
         // The CLAUDE.md says: "fill(1.0/tau0) for quantitative"
         data.mu2 = arma::vec(n, arma::fill::ones) * (1.0 / data.tau0);
-        std::cout << "  mu2 = 1/tau[0] = " << (1.0 / data.tau0)
+        t_log << "  mu2 = 1/tau[0] = " << (1.0 / data.tau0)
                   << " [quantitative, all " << n << " elements]" << std::endl;
     }
 
     // --- offset: try to load, else zeros ---
     if (!tryLoadArmaVec(armaPath("offset"), data.offset)) {
         data.offset = arma::vec(n, arma::fill::zeros);
-        std::cout << "  offset: not found, using zeros(" << n << ")" << std::endl;
+        t_log << "  offset: not found, using zeros(" << n << ")" << std::endl;
     } else {
-        std::cout << "  offset: " << data.offset.n_elem << " elements" << std::endl;
+        t_log << "  offset: " << data.offset.n_elem << " elements" << std::endl;
     }
 
     // --- resout: try to load, else leave empty ---
@@ -673,39 +675,40 @@ NullModelData loadNullModel(const std::string & model_dir,
     // SKATExactBin_Work checks res_out.is_empty() and initializes if needed.
     if (!tryLoadArmaVec(model_dir + "/resout.arma", data.resout)) {
         data.resout = arma::vec();  // empty vector, matching R's integer(0)
-        std::cout << "  resout: not found, using empty vector (matches R's NULL res.out)" << std::endl;
+        t_log << "  resout: not found, using empty vector (matches R's NULL res.out)" << std::endl;
     } else {
-        std::cout << "  resout: " << data.resout.n_elem << " elements" << std::endl;
+        t_log << "  resout: " << data.resout.n_elem << " elements" << std::endl;
     }
 
     // =========================================================================
     // 5. Load variance ratios
     // =========================================================================
-    std::cout << "\n[5/5] Loading variance ratios..." << std::endl;
+    t_log << "\n[5/5] Loading variance ratios..." << std::endl;
 
     loadVarianceRatios(varianceRatio_file,
                        data.varRatio_null,
                        data.varRatio_sparse,
                        data.varRatio_null_noXadj,
                        data.cateVarRatioMinMACVecExclude,
-                       data.cateVarRatioMaxMACVecInclude);
+                       data.cateVarRatioMaxMACVecInclude,
+                       t_log);
 
     // =========================================================================
     // Optional: Load sparse GRM
     // =========================================================================
     data.dimNum = 0;
     if (data.flagSparseGRM) {
-        std::cout << "\n[Optional] Loading sparse GRM files..." << std::endl;
+        t_log << "\n[Optional] Loading sparse GRM files..." << std::endl;
 
         bool locLoaded = tryLoadArmaUmat(model_dir + "/sparseGRM_locationMat.arma", data.locationMat);
         bool valLoaded = tryLoadArmaVec(model_dir + "/sparseGRM_valueVec.arma", data.valueVec);
 
         if (locLoaded && valLoaded) {
             data.dimNum = data.n;
-            std::cout << "  sparseGRM_locationMat: " << data.locationMat.n_rows
+            t_log << "  sparseGRM_locationMat: " << data.locationMat.n_rows
                       << " x " << data.locationMat.n_cols << std::endl;
-            std::cout << "  sparseGRM_valueVec: " << data.valueVec.n_elem << " elements" << std::endl;
-            std::cout << "  dimNum = " << data.dimNum << std::endl;
+            t_log << "  sparseGRM_valueVec: " << data.valueVec.n_elem << " elements" << std::endl;
+            t_log << "  dimNum = " << data.dimNum << std::endl;
 
             // The two files hold the sparse GRM K itself (step 1 saves the kinship
             // it read, reindexed to this model's samples). SAIGEClass solves
@@ -750,7 +753,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                 if (nKeep != nnz0) {
                     data.valueVec.resize(nKeep);
                     data.locationMat.resize(2, nKeep);
-                    std::cout << "  Removing " << (nnz0 - nKeep)
+                    t_log << "  Removing " << (nnz0 - nKeep)
                               << " elements in the sparse GRM < " << t_relatednessCutoff
                               << " (" << nDropDiag << " on the diagonal)" << std::endl;
                     if (nDropDiag > 0) {
@@ -775,7 +778,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                                         : data.tau0;
                 ++nDiag;
             }
-            std::cout << "  sparse Sigma = tau1*K + "
+            t_log << "  sparse Sigma = tau1*K + "
                       << (data.traitType == "binary" ? "diag(1/mu2)" : "tau0*I")
                       << " (" << nDiag << " diagonal entries)" << std::endl;
         } else {
@@ -812,27 +815,27 @@ NullModelData loadNullModel(const std::string & model_dir,
         // No sparse GRM: set dummy values
         data.locationMat = arma::umat(2, 1, arma::fill::zeros);
         data.valueVec = arma::vec(1, arma::fill::zeros);
-        std::cout << "\n  Sparse GRM: not requested (flagSparseGRM=false)" << std::endl;
+        t_log << "\n  Sparse GRM: not requested (flagSparseGRM=false)" << std::endl;
     }
 
     // =========================================================================
     // Summary
     // =========================================================================
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Null model loaded successfully." << std::endl;
-    std::cout << "  n=" << data.n << "  p=" << data.p
+    t_log << "\n========================================" << std::endl;
+    t_log << "Null model loaded successfully." << std::endl;
+    t_log << "  n=" << data.n << "  p=" << data.p
               << "  traitType=" << data.traitType << std::endl;
-    std::cout << "  tau=[" << data.tau0 << ", " << data.tau1 << "]" << std::endl;
-    std::cout << "  VR categories: " << data.varRatio_null.n_elem << std::endl;
-    std::cout << "  Sparse GRM: " << (data.dimNum > 0 ? "YES" : "NO") << std::endl;
-    std::cout << "========================================" << std::endl;
+    t_log << "  tau=[" << data.tau0 << ", " << data.tau1 << "]" << std::endl;
+    t_log << "  VR categories: " << data.varRatio_null.n_elem << std::endl;
+    t_log << "  Sparse GRM: " << (data.dimNum > 0 ? "YES" : "NO") << std::endl;
+    t_log << "========================================" << std::endl;
 
     // === CHECKPOINT OUTPUT BEGIN ===
     if (g_writeCheckpoints && !g_checkpointDir.empty()) {
         // Create checkpoint directory if it doesn't exist
         std::filesystem::create_directories(g_checkpointDir);
 
-        std::cout << "\nWriting checkpoint files to: " << g_checkpointDir << std::endl;
+        t_log << "\nWriting checkpoint files to: " << g_checkpointDir << std::endl;
 
         // --- ckpt_01_null_model.txt ---
         {
@@ -847,7 +850,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                 ofs << "tau1\t" << data.tau1 << std::endl;
                 ofs << "SPA_Cutoff\t" << data.SPA_Cutoff << std::endl;
                 ofs.close();
-                std::cout << "  Written: ckpt_01_null_model.txt" << std::endl;
+                t_log << "  Written: ckpt_01_null_model.txt" << std::endl;
             } else {
                 std::cerr << "  WARNING: Could not write ckpt_01_null_model.txt" << std::endl;
             }
@@ -864,7 +867,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                     ofs << (i + 1) << "\t" << data.mu(i) << std::endl;
                 }
                 ofs.close();
-                std::cout << "  Written: ckpt_02_mu.txt" << std::endl;
+                t_log << "  Written: ckpt_02_mu.txt" << std::endl;
             } else {
                 std::cerr << "  WARNING: Could not write ckpt_02_mu.txt" << std::endl;
             }
@@ -881,7 +884,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                     ofs << (i + 1) << "\t" << data.res(i) << std::endl;
                 }
                 ofs.close();
-                std::cout << "  Written: ckpt_03_res.txt" << std::endl;
+                t_log << "  Written: ckpt_03_res.txt" << std::endl;
             } else {
                 std::cerr << "  WARNING: Could not write ckpt_03_res.txt" << std::endl;
             }
@@ -901,7 +904,7 @@ NullModelData loadNullModel(const std::string & model_dir,
                     ofs << std::endl;
                 }
                 ofs.close();
-                std::cout << "  Written: ckpt_04_XVX.txt" << std::endl;
+                t_log << "  Written: ckpt_04_XVX.txt" << std::endl;
             } else {
                 std::cerr << "  WARNING: Could not write ckpt_04_XVX.txt" << std::endl;
             }
@@ -922,13 +925,13 @@ NullModelData loadNullModel(const std::string & model_dir,
                         << data.varRatio_null_noXadj(i) << std::endl;
                 }
                 ofs.close();
-                std::cout << "  Written: ckpt_05_variance_ratios.txt" << std::endl;
+                t_log << "  Written: ckpt_05_variance_ratios.txt" << std::endl;
             } else {
                 std::cerr << "  WARNING: Could not write ckpt_05_variance_ratios.txt" << std::endl;
             }
         }
 
-        std::cout << "Checkpoint output complete." << std::endl;
+        t_log << "Checkpoint output complete." << std::endl;
     }
     // === CHECKPOINT OUTPUT END ===
 

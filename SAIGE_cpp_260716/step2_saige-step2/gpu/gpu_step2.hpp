@@ -108,6 +108,12 @@ struct CreateArgs {
     // layout popcount_af.hpp's pcBuildMask writes), 11 in every selected
     // sample's 2-bit field. nMask = 0: no counts.
     int nMask = 0; const uint64_t* masks = nullptr;
+    // Pinned staging sets (packed + lut), each maxSlots wide. 1 is the
+    // original single set. More than one lets the caller fill set s+1 on the
+    // host while reduce(set s) and the host work after it run (the read /
+    // compute overlap of config key gpuPrefetch, S2_PIPELINE.md). Nothing on
+    // the device changes: every set uploads into the same device buffers.
+    int stagingSets = 1;
 };
 
 // Returns nullptr on ANY failure (no device, allocation refused, ...). The
@@ -133,13 +139,18 @@ int maskWords(int t_N);
 //             starts -- which is a difference from the CPU's INPUT, not from
 //             its arithmetic. In fp32 mode the kernel narrows it itself, so
 //             the two modes still see the same table.
-unsigned char* packed(Reducer* t_r);
-double*        lut(Reducer* t_r);
+//   t_set     which staging set (0 .. stagingSets()-1); the single set of a
+//             reducer created with stagingSets = 1 is set 0.
+unsigned char* packed(Reducer* t_r, int t_set = 0);
+double*        lut(Reducer* t_r, int t_set = 0);
 std::size_t    bytesPerSlot(const Reducer* t_r);
+int            stagingSets(const Reducer* t_r);
 
-// Reduce slots [0, t_nSlots). Returns false on any CUDA error, in which case
-// the results are undefined and the caller must fall back for this batch.
-bool reduce(Reducer* t_r, int t_nSlots);
+// Reduce slots [0, t_nSlots) of staging set t_set. Returns false on any CUDA
+// error, in which case the results are undefined and the caller must fall
+// back for this batch. Synchronous: on return the host result buffers are
+// filled and staging set t_set is no longer read by the device.
+bool reduce(Reducer* t_r, int t_nSlots, int t_set = 0);
 
 // Results of the last reduce(): C1 is t_maxSlots x K1 column-major, so element
 // (slot, k) sits at index (std::size_t)k * ldC() + slot; C2 likewise with K2

@@ -190,9 +190,11 @@ struct Reducer {
     std::size_t esz = 0;           // sizeof(T)
     int slotsPerPass = 0;          // markers per device pass; two are resident
 
-    // pinned host staging
-    unsigned char* hPacked = nullptr;
-    double*        hLut    = nullptr;
+    // pinned host staging: nSets sets of (packed, lut); hLut2 is one buffer,
+    // filled from the set being reduced
+    int            nSets   = 1;
+    std::vector<unsigned char*> hPacked;
+    std::vector<double*>        hLut;
     double*        hLut2   = nullptr;  // squared table, filled in reduce()
     void*          hC1     = nullptr;
     void*          hC2     = nullptr;
@@ -299,9 +301,14 @@ Reducer* create(const CreateArgs& a)
     auto fail = [&]() -> Reducer* { destroy(r); return nullptr; };
 
     const std::size_t nSlots = (std::size_t)a.maxSlots;
-    if (cudaHostAlloc((void**)&r->hPacked, nSlots * r->bpv, cudaHostAllocDefault) != cudaSuccess) return fail();
-    std::memset(r->hPacked, 0, nSlots * r->bpv);   // the padding bytes stay zero for good
-    if (cudaHostAlloc((void**)&r->hLut, nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
+    r->nSets = a.stagingSets < 1 ? 1 : a.stagingSets;
+    r->hPacked.assign((std::size_t)r->nSets, nullptr);
+    r->hLut.assign((std::size_t)r->nSets, nullptr);
+    for (int s = 0; s < r->nSets; ++s) {
+        if (cudaHostAlloc((void**)&r->hPacked[s], nSlots * r->bpv, cudaHostAllocDefault) != cudaSuccess) return fail();
+        std::memset(r->hPacked[s], 0, nSlots * r->bpv);   // the padding bytes stay zero for good
+        if (cudaHostAlloc((void**)&r->hLut[s], nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
+    }
     if (cudaHostAlloc((void**)&r->hLut2, nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
     if (cudaHostAlloc(&r->hC1, nSlots * a.K1 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
     if (a.K2 > 0 && cudaHostAlloc(&r->hC2, nSlots * a.K2 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
@@ -383,8 +390,8 @@ void destroy(Reducer* r)
     if (r->dMask) cudaFree(r->dMask);
     if (r->dMaskPop) cudaFree(r->dMaskPop);
     if (r->dCnt) cudaFree(r->dCnt);
-    if (r->hPacked) cudaFreeHost(r->hPacked);
-    if (r->hLut)    cudaFreeHost(r->hLut);
+    for (unsigned char* p : r->hPacked) if (p) cudaFreeHost(p);
+    for (double* p : r->hLut) if (p) cudaFreeHost(p);
     if (r->hLut2)   cudaFreeHost(r->hLut2);
     if (r->hC1)     cudaFreeHost(r->hC1);
     if (r->hC2)     cudaFreeHost(r->hC2);
@@ -392,9 +399,10 @@ void destroy(Reducer* r)
     delete r;
 }
 
-unsigned char*  packed(Reducer* r)             { return r ? r->hPacked : nullptr; }
-double*         lut(Reducer* r)                { return r ? r->hLut : nullptr; }
+unsigned char*  packed(Reducer* r, int s)      { return (r && s >= 0 && s < r->nSets) ? r->hPacked[s] : nullptr; }
+double*         lut(Reducer* r, int s)         { return (r && s >= 0 && s < r->nSets) ? r->hLut[s] : nullptr; }
 std::size_t     bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
+int             stagingSets(const Reducer* r)  { return r ? r->nSets : 0; }
 bool            isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
 const float*    outCf(const Reducer* r)        { return (r && !r->fp64) ? (const float*)r->hC1 : nullptr; }
 const double*   outCd(const Reducer* r)        { return (r &&  r->fp64) ? (const double*)r->hC1 : nullptr; }
@@ -417,11 +425,14 @@ void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d
     if (popc) *popc = r->tPopc;
 }
 
-bool reduce(Reducer* r, int t_nSlots)
+bool reduce(Reducer* r, int t_nSlots, int t_set)
 {
     if (!r) return false;
     if (t_nSlots <= 0) return true;
     if (t_nSlots > r->maxSlots) { lastErr = "nSlots > maxSlots"; return false; }
+    if (t_set < 0 || t_set >= r->nSets) { lastErr = "staging set out of range"; return false; }
+    const unsigned char* hPk = r->hPacked[(std::size_t)t_set];
+    const double*        hLu = r->hLut[(std::size_t)t_set];
 
     const float  onef = 1.f, zerof = 0.f;
     const double oned = 1.0, zerod = 0.0;
@@ -431,15 +442,15 @@ bool reduce(Reducer* r, int t_nSlots)
     // Squared table for the second GEMM: fd[c]*fd[c] in double, the product the
     // CPU kernel's Gb % Gb forms per cell.
     if (r->K2 > 0)
-        for (std::size_t i = 0; i < nS * 4; ++i) r->hLut2[i] = r->hLut[i] * r->hLut[i];
+        for (std::size_t i = 0; i < nS * 4; ++i) r->hLut2[i] = hLu[i] * hLu[i];
 
     // Everything from the previous reduce() has been harvested already; both
     // streams are idle at the top of a call.
     cudaEvent_t a0 = nullptr, a1 = nullptr;
     const bool timed = (cudaEventCreate(&a0) == cudaSuccess) && (cudaEventCreate(&a1) == cudaSuccess);
     if (timed) cudaEventRecord(a0, r->st[0]);
-    CKR(cudaMemcpyAsync(r->dPk, r->hPacked, nS * r->bpv, cudaMemcpyHostToDevice, r->st[0]));
-    CKR(cudaMemcpyAsync(r->dLut, r->hLut, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaMemcpyAsync(r->dPk, hPk, nS * r->bpv, cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaMemcpyAsync(r->dLut, hLu, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
     if (r->K2 > 0)
         CKR(cudaMemcpyAsync(r->dLut2, r->hLut2, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
     CKR(cudaEventRecord(r->evUp, r->st[0]));

@@ -2,6 +2,7 @@
 #define NULL_MODEL_LOADER_HPP
 
 #include <armadillo>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -93,11 +94,16 @@ bool locoChromLabelsMatch(const std::string & a, const std::string & b);
 // See LOCO_FORMAT.md and R's readInGLMM.R:78-113.
 // t_relatednessCutoff: sparse GRM entries K_ij < cutoff are dropped before
 // Sigma is built (R step 2 --relatednessCutoff, setSparseSigma_new).
+// t_log: where the loader's progress lines go (std::cout by default). A
+// caller loading several models at once hands each its own stringstream and
+// prints them in order afterwards, so the log reads as it did serially
+// (config key parallelModelLoad, S2_PIPELINE.md). Warnings stay on std::cerr.
 NullModelData loadNullModel(const std::string & model_dir,
                             const std::string & varianceRatio_file,
                             bool t_LOCO = false,
                             const std::string & t_chrom = "",
-                            double t_relatednessCutoff = 0.0);
+                            double t_relatednessCutoff = 0.0,
+                            std::ostream & t_log = std::cout);
 
 // Load a single armadillo vector from binary file
 arma::vec loadArmaVec(const std::string & filepath);
@@ -112,6 +118,7 @@ void loadVarianceRatios(const std::string & filepath,
                         arma::vec & varRatio_sparse,
                         arma::vec & varRatio_null_noXadj,
                         arma::vec & cateVarRatioMinMACVecExclude,
-                        arma::vec & cateVarRatioMaxMACVecInclude);
+                        arma::vec & cateVarRatioMaxMACVecInclude,
+                        std::ostream & t_log = std::cout);
 
 #endif
