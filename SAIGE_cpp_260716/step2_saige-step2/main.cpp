@@ -63,6 +63,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "gpu_step2.hpp"
 #include "gpu_spa.hpp"
 #include "spa_gpu/spa_gpu.hpp"   // the SPA GPU library (gpuSpaImpl: lib)
+#include "gpu_firth.hpp"          // Firth on the device (gpuFirth)
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
@@ -275,6 +276,14 @@ bool g_gpuSpa = false;
 // inputs, same host post-rules; kept side by side for the comparison in
 // S2_BINARY_GPU.md.
 std::string g_gpuSpaImpl = "lib";
+// Config key gpuFirth (needs gpuSpa): the Firth fit of a pair whose final
+// p-value asks for it runs on the device (gpu/gpu_firth.cu) instead of the pair
+// going back to the CPU scalar path whole, and the gate's Firth pre-screen no
+// longer keeps such a pair away from the device SPA. gpuFirthMaxStep is
+// fast_logistf_fit_simple's step cap (15, SAIGE's). ER pairs (MAC <= the ER
+// cutoff) and pairs that need the fast-test recompute stay on the CPU.
+bool g_gpuFirth = false;
+double g_gpuFirthMaxStep = 15.0;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2572,7 +2581,47 @@ bool mainMarkerMTGpu(
     if (anyBin)
         std::cout << "  gpuBinary: " << nBin << " binary trait(s) on the device; SPA "
                   << (spaDev ? (SL ? "on the device (gpuSpa, gpu/spa_gpu library)" : "on the device (gpuSpa, gpu/gpu_spa.cu)") : "on the CPU scalar path")
-                  << ", Firth / ER / fast-test recompute on the CPU scalar path" << std::endl;
+                  << (g_gpuFirth ? ", Firth see gpuFirth below; ER / fast-test recompute on the CPU scalar path"
+                                 : ", Firth / ER / fast-test recompute on the CPU scalar path") << std::endl;
+    // ---- device Firth (gpuFirth): per-trait y / offset / XV / XXVX_inv resident ----
+    saige::gpu2::Firth* FP = nullptr;
+    if (anyBin && g_gpuFirth && spaDev) {
+        std::vector<saige::gpu2::FirthTraitArgs> fa(nBin);
+        bool ok = true, any = false;
+        for (int t : binTraits) {
+            const int b = ctx.meta[t].binIdx;
+            SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+            if ((int)obj->m_y.n_elem != n || (int)obj->m_offset.n_elem != n ||
+                (int)obj->m_XV.n_rows != obj->m_p || (int)obj->m_XV.n_cols != n ||
+                (int)obj->m_XXVX_inv.n_rows != n || (int)obj->m_XXVX_inv.n_cols != obj->m_p ||
+                obj->m_p > saige::gpu2::FIRTH_PMAX) {
+                ok = false; break;
+            }
+            fa[b].y = obj->m_y.memptr(); fa[b].offset = obj->m_offset.memptr();
+            fa[b].XV = obj->m_XV.memptr(); fa[b].XXVX_inv = obj->m_XXVX_inv.memptr();
+            fa[b].p = obj->m_p;
+            if (ctx.meta[t].is_Firth_beta) any = true;
+        }
+        if (ok && any) {
+            saige::gpu2::FirthCreateArgs fc;
+            fc.device = g_gpuDevice; fc.N = n; fc.nTraits = nBin; fc.traits = fa.data();
+            fc.maxPairs = slots * nBin;
+            fc.maxit = 50; fc.maxstep = g_gpuFirthMaxStep; fc.xconv = 1e-5; fc.gconv = 1e-5; fc.blocks = 256;
+            FP = saige::gpu2::firthCreate(fc);
+        }
+        if (!any)
+            std::cout << "  gpuFirth: no binary trait has is_Firth_beta; nothing to do" << std::endl;
+        else if (FP == nullptr)
+            std::cout << "  gpuFirth: device setup failed (or a model's shape is unexpected); "
+                         "Firth stays on the CPU scalar path" << std::endl;
+        else
+            std::cout << "  gpuFirth: " << nBin << " traits' y / offset / XV / XXVX_inv resident, "
+                      << (saige::gpu2::firthDeviceBytes(FP) >> 20) << " MiB, step cap " << g_gpuFirthMaxStep
+                      << ", up to " << (long)slots * nBin << " pairs per device batch" << std::endl;
+    } else if (g_gpuFirth && anyBin) {
+        std::cout << "  gpuFirth: ignored, the device SPA is not active" << std::endl;
+    }
+    const bool firthDev = (FP != nullptr);
 
     // ---------------- per-trait one-time setup (as mainMarkerMT) ----------------
     std::vector<char> isSingleVR(P, 0);
@@ -2590,6 +2639,13 @@ bool mainMarkerMTGpu(
     std::vector<long> nDevSpa(P, 0), nDevSpaFirth(P, 0);
     std::vector<std::vector<PendSpa>> pend(std::max(1, omp_get_max_threads()));
     double tSpa = 0;
+    // Pairs whose p-value asked for Firth, fitted on the device after the SPA
+    // pass (gpuFirth): the batch / device-SPA result stands, only Beta / seBeta
+    // and the Firth flags change.
+    struct PendFirth { int bi, jj, c, t; double p; char logp; };
+    std::vector<std::vector<PendFirth>> pendF(std::max(1, omp_get_max_threads()));
+    std::vector<long> nDevFirth(P, 0);
+    double tFirth = 0;
     std::vector<MTTraitChunk> out(P);
     long nSlotsUsed = 0, nSlotsTotal = 0;
 
@@ -2953,8 +3009,15 @@ bool mainMarkerMTGpu(
                         bool isSPAConverge = false;
                         bool is_Firth = false, is_FirthConverge = false;
 
-                        const bool toDev = spaDev && isBin && hi && needSPA && !needFirth && !needFast;
-                        if (useBatch || toDev) {
+                        // With gpuFirth the Firth pre-screen no longer parks a
+                        // pair on the CPU: its SPA runs on the device and the
+                        // Firth decision is taken on that p-value (phase 4),
+                        // as the scalar path takes it on the SPA p-value.
+                        const bool toDev = spaDev && isBin && hi && needSPA && !needFast && (!needFirth || firthDev);
+                        // No SPA (|StdStat| <= cutoff) but the normal p asks for
+                        // Firth: the batch result stands and only the fit runs.
+                        const bool toFirthOnly = firthDev && isBin && hi && !needSPA && needFirth && !needFast;
+                        if (useBatch || toDev || toFirthOnly) {
                             Beta       = W.res.Beta(c, t);
                             seBeta     = W.res.seBeta(c, t);
                             Tstat      = W.res.Tstat(c, t);
@@ -2975,6 +3038,13 @@ bool mainMarkerMTGpu(
                                 pd.fast = ((double)cz / (double)n >= 0.5) ? 1 : 0;
                                 pend[omp_get_thread_num()].push_back(pd);
                             } else {
+                                if (toFirthOnly) {
+                                    PendFirth pf;
+                                    pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                    pf.p = W.res.pvalRaw(c, t);
+                                    pf.logp = (W.res.pvalIsLog[t][c] != 0) ? 1 : 0;
+                                    pendF[omp_get_thread_num()].push_back(pf);
+                                }
                                 #pragma omp atomic
                                 nBatched[t]++;
                             }
@@ -3253,12 +3323,13 @@ bool mainMarkerMTGpu(
                         } else {
                             pvalStr = O.pvalNA[jj]; pvalFinal = pd.pno;
                         }
-                        // ---- Firth on the SPA p-value: whole pair back to the CPU ----
+                        // ---- Firth on the SPA p-value: the device fit (gpuFirth,
+                        // phase 5) or, without it, the whole pair back to the CPU ----
                         bool wantFirth = false;
                         if (M.is_Firth_beta)
                             wantFirth = islog ? (pvalFinal <= std::log(M.pCutoffforFirth))
                                               : (pvalFinal <= M.pCutoffforFirth);
-                        if (wantFirth) {
+                        if (wantFirth && !firthDev) {
                             double* g = W.tmpG.memptr();
                             for (int u = 0; u < n; u++)
                                 g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
@@ -3380,10 +3451,79 @@ bool mainMarkerMTGpu(
                             O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
                             #pragma omp atomic
                             nDevSpa[t]++;
+                            if (wantFirth) {   // firthDev: fitted in phase 5 on this p
+                                PendFirth pf;
+                                pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                pf.p = pvalFinal; pf.logp = islog ? 1 : 0;
+                                pendF[omp_get_thread_num()].push_back(pf);
+                            }
                         }
                     }
                 }
                 tSpa += omp_get_wtime() - t0;
+            }
+
+            // ---------------- phase 5: device Firth on the pairs whose p asked for it ----------------
+            if (firthDev) {
+                const double tf0 = omp_get_wtime();
+                std::vector<PendFirth> allF;
+                for (auto& v : pendF) { allF.insert(allF.end(), v.begin(), v.end()); v.clear(); }
+                const int nF = (int)allF.size();
+                if (nF > 0) {
+                    saige::gpu2::FirthPairIn* fin = saige::gpu2::firthIn(FP);
+                    for (int k = 0; k < nF; k++) {
+                        fin[k].slot  = (int)((std::size_t)allF[k].bi * Bblk + allF[k].c);
+                        fin[k].trait = ctx.meta[allF[k].t].binIdx;
+                    }
+                    if (!saige::gpu2::firthRun(FP, R, nF)) {
+                        saige::gpu2::firthDestroy(FP);
+                        saige::gpu2::spaDestroy(SP);
+                        saige::spa_gpu::destroy(SL);
+                        saige::gpu2::destroy(R);
+                        throw std::runtime_error(
+                            std::string("mainMarkerMTGpu: the device Firth failed mid-run (") +
+                            saige::gpu2::firthLastError() +
+                            "). Rerun without gpuFirth to keep Firth on the CPU.");
+                    }
+                    const saige::gpu2::FirthPairOut* fo = saige::gpu2::firthOut(FP);
+                    #pragma omp parallel for schedule(dynamic, 64)
+                    for (int k = 0; k < nF; k++) {
+                        const PendFirth& pf = allF[k];
+                        const saige::gpu2::FirthPairOut& o = fo[k];
+                        GpuBlk& S = blks[pf.bi];
+                        const int t = pf.t, jj = pf.jj;
+                        MTTraitChunk& O = out[t];
+                        const bool flip = (S.flipc[pf.c] != 0);
+                        // getMarkerPval after fast_logistf_fit_simple: the fit's
+                        // beta (for the flipped allele when flipped), seBeta
+                        // back-calculated from the p-value, which Firth leaves alone.
+                        double qv;
+                        boost::math::normal ns;
+                        try {
+                            if (pf.logp) {
+                                const double half = std::exp(pf.p / 2.0);
+                                qv = (half > 0 && half < 1) ? boost::math::quantile(complement(ns, half))
+                                                            : std::numeric_limits<double>::infinity();
+                            } else {
+                                qv = boost::math::quantile(complement(ns, pf.p / 2));
+                            }
+                        } catch (const std::overflow_error&) {
+                            qv = std::numeric_limits<double>::infinity();
+                        }
+                        O.Beta[jj]   = o.beta * (1 - 2 * flip);
+                        O.seBeta[jj] = std::fabs(o.beta) / std::fabs(qv);
+                        O.route[jj]  = (unsigned char)(O.route[jj] | 32 | (o.conv ? 64 : 0));
+                        #pragma omp atomic
+                        mFirth[t] += 1;
+                        if (o.conv) {
+                            #pragma omp atomic
+                            mFirthConverge[t] += 1;
+                        }
+                        #pragma omp atomic
+                        nDevFirth[t]++;
+                    }
+                }
+                tFirth += omp_get_wtime() - tf0;
             }
         }  // superblock
 
@@ -3460,6 +3600,9 @@ bool mainMarkerMTGpu(
     saige::gpu2::timings(R, &gH2D, &gDec, &gGemm, &gD2H, &gPopc);
     if (SP) saige::gpu2::spaTimings(SP, &gSpa, &gSpaPairs);
     if (SL) { double h2 = 0, d2 = 0; saige::spa_gpu::timings(SL, &gSpa, &h2, &d2, &gSpaPairs); }
+    double gFirth = 0; long long gFirthPairs = 0;
+    if (FP) saige::gpu2::firthTimings(FP, &gFirth, &gFirthPairs);
+    saige::gpu2::firthDestroy(FP);
     saige::gpu2::spaDestroy(SP);
     saige::spa_gpu::destroy(SL);
     saige::gpu2::destroy(R);
@@ -3469,7 +3612,9 @@ bool mainMarkerMTGpu(
         std::cout << "[" << g_traitMeta[t].name << "] " << numtestTotal[t]
                   << " markers were tested (" << nBatched[t] << " on the GPU"
                   << (spaDev ? " + " + std::to_string(nDevSpa[t]) + " with the device SPA" : std::string())
-                  << ", " << nFallback[t] << " via the scalar CPU path)." << std::endl;
+                  << ", " << nFallback[t] << " via the scalar CPU path"
+                  << (firthDev ? "; " + std::to_string(nDevFirth[t]) + " Firth fits on the device" : std::string())
+                  << ")." << std::endl;
         totBatch += nBatched[t] + nDevSpa[t];
         totFall  += nFallback[t];
         if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
@@ -3499,6 +3644,14 @@ bool mainMarkerMTGpu(
                       << d << " kept the device result, " << df
                       << " asked for Firth and went back to the CPU scalar path" << std::endl;
         }
+        if (firthDev) {
+            long d = 0, mf = 0, mc = 0;
+            for (int t = 0; t < P; t++) { d += nDevFirth[t]; mf += mFirth[t]; mc += mFirthConverge[t]; }
+            std::cout << "  device Firth: " << gFirthPairs << " pairs fitted in " << gFirth << " s of kernel time ("
+                      << (gFirthPairs > 0 ? gFirth / (double)gFirthPairs * 1e6 : 0.0) << " us/pair); "
+                      << d << " of the " << mf << " Firth fits (" << mc << " converged) ran on the device, "
+                      << (mf - d) << " on the CPU (ER / fast-test pairs)" << std::endl;
+        }
         std::cout << "  AF_case/AF_ctrl: " << (a + b + g) << " pairs -- device counts "
                   << a << ", exact replay " << b << ", gather (no replay for the trait) " << g
                   << std::endl;
@@ -3519,7 +3672,7 @@ bool mainMarkerMTGpu(
                   << std::endl;
     }
     std::cout << "  [gpu breakdown] read+QC+stage " << tRead << " s, device call "
-              << tGpu << " s, tail+finalize " << tFin << " s, device SPA + post " << tSpa
+              << tGpu << " s, tail+finalize " << tFin << " s, device SPA + post " << tSpa << " s, device Firth + post " << tFirth
               << " s, output write " << tWrite << " s" << std::endl;
     std::cout << "  [gpu device time] H2D " << gH2D << " s, decode " << gDec
               << " s, GEMM " << gGemm << " s, popcount " << gPopc << " s, D2H " << gD2H << " s"
@@ -6801,6 +6954,9 @@ int main(int argc, char* argv[])
             std::cerr << "                     pairs take the device saddlepoint kernel." << std::endl;
             std::cerr << "  gpuSpaImpl:        lib (default) or own: the SPA GPU library (gpu/spa_gpu)" << std::endl;
             std::cerr << "                     or the integrator's kernel (gpu/gpu_spa.cu)." << std::endl;
+            std::cerr << "  gpuFirth:          true/false (default: false). With gpuSpa, the Firth fit of a" << std::endl;
+            std::cerr << "                     pair whose p-value asks for it runs on the device." << std::endl;
+            std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -7016,6 +7172,13 @@ int main(int argc, char* argv[])
         if (g_gpuSpa && !g_gpuBinary) {
             std::cout << "  gpuSpa: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSpa = false;
+        }
+        g_gpuFirth = config["gpuFirth"] ? config["gpuFirth"].as<bool>() : false;
+        if (config["gpuFirthMaxStep"]) g_gpuFirthMaxStep = config["gpuFirthMaxStep"].as<double>();
+        if (g_gpuFirth && !(g_gpuFirthMaxStep > 0)) throw std::runtime_error("gpuFirthMaxStep must be > 0");
+        if (g_gpuFirth && !g_gpuSpa) {
+            std::cout << "  gpuFirth: ignored, it needs gpuSpa: true" << std::endl;
+            g_gpuFirth = false;
         }
         if ((g_gpuBinary || g_gpuSpa) && !g_gpuStep2)
             std::cout << "  gpuBinary / gpuSpa: ignored, useGPU is false" << std::endl;

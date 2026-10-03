@@ -159,10 +159,10 @@ ifeq ($(USE_CUDA),1)
   CUDA_HOME ?= $(patsubst %/bin/,%,$(dir $(NVCC_PATH)))
   SM        ?= 70
   NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(SM) -lineinfo -Xcompiler -fPIC
-  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o
+  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
-  GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o gpu/spa_gpu/spa_gpu_stub.o
+  GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o gpu/spa_gpu/spa_gpu_stub.o gpu/gpu_firth_stub.o
 endif
 
 MAKEFLAGS += --no-builtin-rules
@@ -219,6 +219,11 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 # build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /
 # log bound and the difference in speed is not measurable.
 gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp
+	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
+
+# Firth on the device (gpu/gpu_firth.hpp, config key gpuFirth): the same
+# one-block-per-pair shape as the SPA kernels, --fmad=false for the same reason.
+gpu/gpu_firth.cu.o: gpu/gpu_firth.cu gpu/gpu_firth.hpp gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # The SPA GPU library (gpu/spa_gpu/, from branch spa-gpu-lib, SPA_GPU_LIB.md):
