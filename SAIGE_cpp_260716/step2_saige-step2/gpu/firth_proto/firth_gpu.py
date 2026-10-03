@@ -260,7 +260,7 @@ def validate(a):
         with open(a.dump, 'w') as f:
             f.write('pair\tbeta_gpu\tse_gpu\tflag_gpu\tstrict_gpu\titer_gpu\tsing_gpu\talpha_gpu\n')
             for k in range(npairs0):
-                f.write(f'{int(cpu["pair"][k])}\t{gb[k]!r}\t{gse[k]!r}\t{gflag[k]}\t{r["strict"][k]}\t{giter[k]}\t{r["singular"][k]}\t{r["alpha"][k]!r}\n')
+                f.write(f'{int(cpu["pair"][k])}\t{float(gb[k])!r}\t{float(gse[k])!r}\t{gflag[k]}\t{r["strict"][k]}\t{giter[k]}\t{r["singular"][k]}\t{float(r["alpha"][k])!r}\n')
 
 def synth(a):
     """Throughput at a biobank N: random 2-bit columns (no missing), y ~ 5% cases, offset ~ N(-3, 0.7)."""

@@ -6,7 +6,7 @@ def read_tsv(path):
     out = {}
     for j, k in enumerate(h):
         col = [r[j] for r in rows]
-        try: out[k] = np.array([float(v) for v in col])
+        try: out[k] = np.array([float(v[11:-1] if v.startswith('np.float64(') else v) for v in col])
         except ValueError: out[k] = np.array(col)
     return out
 def join(a, b, keys=('pair',)):
