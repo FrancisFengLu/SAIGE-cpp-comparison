@@ -3109,10 +3109,10 @@ bool mainMarkerMTGpu(
                         const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
                         MTTraitChunk& O = out[t];
 
-                        O.altFreq[jj]     = altFreqVec[jj];
-                        O.altCounts[jj]   = altCountsVec[jj];
-                        O.missingRate[jj] = missingRateVec[jj];
-                        O.imputeInfo[jj]  = imputationInfoVec[jj];
+                        O.altFreq[jj]     = CM.altFreqVec[jj];
+                        O.altCounts[jj]   = CM.altCountsVec[jj];
+                        O.missingRate[jj] = CM.missingRateVec[jj];
+                        O.imputeInfo[jj]  = CM.imputationInfoVec[jj];
 
                         // Fast-test recompute context, exactly as mainMarkerMT
                         // computes it (main.cpp, "W1-1").
