@@ -260,6 +260,16 @@ def main():
 
     B, RB, srcB = load_run(a.B, traits)
     print("A: %s (%s, %d traits)   B: %s (%s, %d traits)" % (a.A, srcA, len(A), a.B, srcB, len(B)))
+    if srcA != srcB:
+        # One side is text, whose float columns are printed with "%.6g" (6
+        # significant digits); the sgs side holds the fp64 values. Compare at
+        # the text's precision by passing the sgs side through the same format.
+        q6 = np.vectorize(lambda v: float("%.6g" % v) if not np.isnan(v) else v, otypes=[float])
+        for runs in ((A,) if srcA == "sgs" else (B,)):
+            for t in runs:
+                for h, v in runs[t].items():
+                    if isinstance(v, np.ndarray) and v.dtype.kind == "f": runs[t][h] = q6(v)
+        print("mixed sources: fp64 columns of the sgs side rounded to the text's %.6g before comparing")
     bad = 0
     only = sorted(set(A) ^ set(B))
     if only: print("traits on one side only: %s" % only); bad += 1
@@ -305,8 +315,9 @@ def main():
                 va = np.array([p_float(s) for s in sa]); vb = np.array([p_float(s) for s in sb])
                 both_nan = np.isnan(la) & np.isnan(lb)
                 one_nan = np.isnan(la) != np.isnan(lb)
-                d = np.where(both_nan, 0.0, np.abs(la - lb))
-                d = np.where(np.isinf(la) & np.isinf(lb), 0.0, d)
+                with np.errstate(invalid="ignore"):
+                    d = np.where(both_nan, 0.0, np.abs(la - lb))
+                    d = np.where(np.isinf(la) & np.isinf(lb), 0.0, d)
                 d[one_nan] = np.inf
                 m = dlog.setdefault(h, [0.0, 0])
                 m[0] = max(m[0], float(np.nanmax(d)) if d.size else 0.0); m[1] += int((d > 0).sum())
