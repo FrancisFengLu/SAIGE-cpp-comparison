@@ -62,6 +62,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "out_fast.hpp"
 #include "gpu_step2.hpp"
 #include "gpu_spa.hpp"
+#include "spa_gpu/spa_gpu.hpp"   // the SPA GPU library (gpuSpaImpl: lib)
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
@@ -267,6 +268,13 @@ bool g_gpuBinary = false;
 // SPA alone (no Firth, no fast-test recompute, MAC above the ER cutoff) take
 // the device saddlepoint kernel (gpu/gpu_spa.hpp) instead of getMarkerPval.
 bool g_gpuSpa = false;
+// Config key gpuSpaImpl (needs gpuSpa): "lib" (default) runs the flagged pairs
+// through gpu/spa_gpu (SPA_GPU_LIB.md: carriers-only scans, one pass per
+// Newton step, Boost's erfc with deferred underflow so p == 0 falls where the
+// CPU's does); "own" runs gpu/gpu_spa.cu, the integrator's kernel. Same
+// inputs, same host post-rules; kept side by side for the comparison in
+// S2_BINARY_GPU.md.
+std::string g_gpuSpaImpl = "lib";
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2510,7 +2518,8 @@ bool mainMarkerMTGpu(
               << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
               << std::endl;
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
-    saige::gpu2::Spa* SP = nullptr;
+    saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
+    saige::spa_gpu::Spa* SL = nullptr;     // gpuSpaImpl: lib
     std::vector<arma::vec> muCopy;   // get_mu copies; kept alive until spaCreate returns
     if (anyBin && g_gpuSpa) {
         std::vector<saige::gpu2::SpaTraitArgs> ta(nBin);
@@ -2530,26 +2539,39 @@ bool mainMarkerMTGpu(
             ta[b].XXVX_inv = obj->m_XXVX_inv.memptr();
             ta[b].p = obj->m_p;
         }
-        if (ok) {
+        if (ok && g_gpuSpaImpl == "own") {
             saige::gpu2::SpaCreateArgs sa;
             sa.device = g_gpuDevice; sa.N = n; sa.nTraits = nBin; sa.traits = ta.data();
             sa.maxPairs = slots * nBin;
             sa.tol = std::pow(std::numeric_limits<double>::epsilon(), 0.25);
             sa.maxiter = 1000; sa.blocks = 256;
             SP = saige::gpu2::spaCreate(sa);
+        } else if (ok) {
+            // The library's structs are field-for-field the same contract.
+            std::vector<saige::spa_gpu::TraitArgs> tl(nBin);
+            for (int b = 0; b < nBin; b++) {
+                tl[b].mu = ta[b].mu; tl[b].XV = ta[b].XV; tl[b].XXVX_inv = ta[b].XXVX_inv; tl[b].p = ta[b].p;
+            }
+            saige::spa_gpu::CreateArgs la;
+            la.device = g_gpuDevice; la.N = n; la.nTraits = nBin; la.traits = tl.data();
+            la.maxPairs = slots * nBin;
+            la.tol = std::pow(std::numeric_limits<double>::epsilon(), 0.25);
+            la.maxiter = 1000; la.blocks = 256; la.erfcMode = 1;
+            SL = saige::spa_gpu::create(la);
         }
-        if (SP == nullptr)
+        if (SP == nullptr && SL == nullptr)
             std::cout << "  gpuSpa: device setup failed (or a model's shape is unexpected); "
                          "SPA stays on the CPU scalar path" << std::endl;
         else
-            std::cout << "  gpuSpa: " << nBin << " traits' mu / XV / XXVX_inv resident, "
-                      << (saige::gpu2::spaDeviceBytes(SP) >> 20) << " MiB, up to "
-                      << (long)slots * nBin << " pairs per device batch" << std::endl;
+            std::cout << "  gpuSpa: " << (SL ? "gpu/spa_gpu library" : "gpu/gpu_spa.cu kernel") << " (gpuSpaImpl: "
+                      << g_gpuSpaImpl << "), " << nBin << " traits' mu / XV / XXVX_inv resident, "
+                      << ((SL ? saige::spa_gpu::deviceBytes(SL) : saige::gpu2::spaDeviceBytes(SP)) >> 20)
+                      << " MiB, up to " << (long)slots * nBin << " pairs per device batch" << std::endl;
     }
-    const bool spaDev = (SP != nullptr);
+    const bool spaDev = (SP != nullptr || SL != nullptr);
     if (anyBin)
         std::cout << "  gpuBinary: " << nBin << " binary trait(s) on the device; SPA "
-                  << (spaDev ? "on the device (gpuSpa)" : "on the CPU scalar path")
+                  << (spaDev ? (SL ? "on the device (gpuSpa, gpu/spa_gpu library)" : "on the device (gpuSpa, gpu/gpu_spa.cu)") : "on the CPU scalar path")
                   << ", Firth / ER / fast-test recompute on the CPU scalar path" << std::endl;
 
     // ---------------- per-trait one-time setup (as mainMarkerMT) ----------------
@@ -3133,26 +3155,50 @@ bool mainMarkerMTGpu(
                 for (auto& v : pend) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
                 const int nPend = (int)all.size();
                 if (nPend > 0) {
-                    saige::gpu2::SpaPairIn* in = saige::gpu2::spaIn(SP);
+                    saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
+                    saige::spa_gpu::PairIn*   inl = SL ? saige::spa_gpu::in(SL) : nullptr;
                     for (int k = 0; k < nPend; k++) {
                         const PendSpa& pd = all[k];
-                        in[k].slot = (int)((std::size_t)pd.bi * Bblk + pd.c);
-                        in[k].trait = ctx.meta[pd.t].binIdx;
-                        in[k].fast = pd.fast; in[k].logp = pd.logp;
-                        in[k].Tstat = pd.Tstat; in[k].var1 = pd.var1; in[k].var2 = pd.var2; in[k].pno = pd.pno;
+                        const int slot = (int)((std::size_t)pd.bi * Bblk + pd.c);
+                        const int bt = ctx.meta[pd.t].binIdx;
+                        if (in) {
+                            in[k].slot = slot; in[k].trait = bt;
+                            in[k].fast = pd.fast; in[k].logp = pd.logp;
+                            in[k].Tstat = pd.Tstat; in[k].var1 = pd.var1; in[k].var2 = pd.var2; in[k].pno = pd.pno;
+                        } else {
+                            inl[k].slot = slot; inl[k].trait = bt;
+                            inl[k].fast = pd.fast; inl[k].logp = pd.logp;
+                            inl[k].Tstat = pd.Tstat; inl[k].var1 = pd.var1; inl[k].var2 = pd.var2; inl[k].pno = pd.pno;
+                        }
                     }
-                    if (!saige::gpu2::spaRun(SP, R, nPend)) {
+                    bool okRun;
+                    if (SP) {
+                        okRun = saige::gpu2::spaRun(SP, R, nPend);
+                    } else {
+                        saige::spa_gpu::Geno geno;
+                        geno.packed = (const unsigned char*)saige::gpu2::devicePacked(R);
+                        geno.bpv    = saige::gpu2::bytesPerSlot(R);
+                        geno.lut    = (const double*)saige::gpu2::deviceLut(R);
+                        okRun = saige::spa_gpu::run(SL, geno, nPend);
+                    }
+                    if (!okRun) {
                         saige::gpu2::spaDestroy(SP);
+                        saige::spa_gpu::destroy(SL);
                         saige::gpu2::destroy(R);
                         throw std::runtime_error(
-                            "mainMarkerMTGpu: the device SPA failed mid-run. Rerun without "
-                            "gpuSpa to keep SPA on the CPU.");
+                            std::string("mainMarkerMTGpu: the device SPA failed mid-run (") +
+                            (SL ? saige::spa_gpu::lastError() : "gpu_spa") +
+                            "). Rerun without gpuSpa to keep SPA on the CPU.");
                     }
-                    const saige::gpu2::SpaPairOut* so = saige::gpu2::spaOut(SP);
+                    const saige::gpu2::SpaPairOut* so = SP ? saige::gpu2::spaOut(SP) : nullptr;
+                    const saige::spa_gpu::PairOut* lo = SL ? saige::spa_gpu::out(SL) : nullptr;
                     #pragma omp parallel for schedule(dynamic, 64)
                     for (int k = 0; k < nPend; k++) {
                         const PendSpa& pd = all[k];
-                        const saige::gpu2::SpaPairOut& o = so[k];
+                        saige::gpu2::SpaPairOut o;
+                        if (so) { o = so[k]; }
+                        else { o.pval = lo[k].pval; o.conv = lo[k].conv; o.s1 = lo[k].s1; o.s2 = lo[k].s2;
+                               o.niter1 = lo[k].niter1; o.niter2 = lo[k].niter2; o.root1 = lo[k].root1; o.root2 = lo[k].root2; o.m1 = lo[k].m1; }
                         MTBlockWork& W = work[omp_get_thread_num()];
                         GpuBlk& S = blks[pd.bi];
                         const int t = pd.t, c = pd.c, jj = pd.jj;
@@ -3413,7 +3459,9 @@ bool mainMarkerMTGpu(
     long long gSpaPairs = 0;
     saige::gpu2::timings(R, &gH2D, &gDec, &gGemm, &gD2H, &gPopc);
     if (SP) saige::gpu2::spaTimings(SP, &gSpa, &gSpaPairs);
+    if (SL) { double h2 = 0, d2 = 0; saige::spa_gpu::timings(SL, &gSpa, &h2, &d2, &gSpaPairs); }
     saige::gpu2::spaDestroy(SP);
+    saige::spa_gpu::destroy(SL);
     saige::gpu2::destroy(R);
 
     long totBatch = 0, totFall = 0;
@@ -6751,6 +6799,8 @@ int main(int argc, char* argv[])
             std::cerr << "                     traits on the device too (gate + AF counts included)." << std::endl;
             std::cerr << "  gpuSpa:            true/false (default: false). With gpuBinary, SPA-flagged" << std::endl;
             std::cerr << "                     pairs take the device saddlepoint kernel." << std::endl;
+            std::cerr << "  gpuSpaImpl:        lib (default) or own: the SPA GPU library (gpu/spa_gpu)" << std::endl;
+            std::cerr << "                     or the integrator's kernel (gpu/gpu_spa.cu)." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -6958,6 +7008,11 @@ int main(int argc, char* argv[])
         if (config["gpuDevice"]) g_gpuDevice = config["gpuDevice"].as<int>();
         g_gpuBinary = config["gpuBinary"] ? config["gpuBinary"].as<bool>() : false;
         g_gpuSpa    = config["gpuSpa"]    ? config["gpuSpa"].as<bool>()    : false;
+        if (config["gpuSpaImpl"]) {
+            g_gpuSpaImpl = config["gpuSpaImpl"].as<std::string>();
+            if (g_gpuSpaImpl != "lib" && g_gpuSpaImpl != "own")
+                throw std::runtime_error("gpuSpaImpl must be lib or own, not '" + g_gpuSpaImpl + "'");
+        }
         if (g_gpuSpa && !g_gpuBinary) {
             std::cout << "  gpuSpa: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSpa = false;

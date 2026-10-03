@@ -159,10 +159,10 @@ ifeq ($(USE_CUDA),1)
   CUDA_HOME ?= $(patsubst %/bin/,%,$(dir $(NVCC_PATH)))
   SM        ?= 70
   NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(SM) -lineinfo -Xcompiler -fPIC
-  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o
+  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
-  GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o
+  GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o gpu/spa_gpu/spa_gpu_stub.o
 endif
 
 MAKEFLAGS += --no-builtin-rules
@@ -221,8 +221,15 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
+# The SPA GPU library (gpu/spa_gpu/, from branch spa-gpu-lib, SPA_GPU_LIB.md):
+# same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
+# Boost's 53-bit erfc with the underflow deferred. Config key gpuSpaImpl picks
+# it (lib, the default) or gpu_spa.cu (own).
+gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp
+	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
+
 clean:
-	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d $(TARGET) tools/sgs2txt \
+	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
 	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy
 
 test_region: $(TARGET)
