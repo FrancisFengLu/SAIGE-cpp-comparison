@@ -5,6 +5,7 @@
 #define SAIGE_HPP
 
 #include <armadillo>
+#include <limits>
 #include <random>
 #include <atomic>
 #include <cstdint>
@@ -36,6 +37,11 @@ struct PerMarkerCtx {
     // branch. Derived from the marker's position in the input (never from
     // thread id / schedule) so ER p-values are reproducible run-to-run.
     uint64_t erSeedStream = 0;
+    // gpuSparse (main.cpp, mainMarkerMTGpu): var2 = g~' Sigma^-1 g~ already
+    // formed on the device from the resident block inverse. When finite and
+    // flagSparseGRM_cur is set, scoreTest uses it instead of solving Sigma for
+    // this marker. NaN (the default) everywhere else, so no other caller moves.
+    double presetVar2 = std::numeric_limits<double>::quiet_NaN();
 };
 
 // Fused-kernel mode + A/B validation accumulators (Pillar 1).

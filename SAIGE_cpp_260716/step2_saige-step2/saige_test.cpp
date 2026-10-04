@@ -237,6 +237,12 @@ void SAIGEClass::scoreTest(arma::vec & t_GVec,
     if(!ctx.flagSparseGRM_cur){
       t_P2Vec = t_gtilde % m_mu2 *m_tauvec[0];
       var2m = dot(t_P2Vec , t_gtilde);
+    }else if(std::isfinite(ctx.presetVar2) && !m_isVarPsadj){
+      // gpuSparse: the device already formed g~' Sigma^-1 g~ for this pair
+      // (block-diagonal inverse, fp64). t_P2Vec stays empty; its only readers
+      // are conditional analysis and region tests, which the GPU path refuses.
+      var2m = arma::vec(1);
+      var2m(0) = ctx.presetVar2;
     }else{
       t_P2Vec = getPCG1ofSigmaAndGtilde(t_gtilde, 100, 0.02);
       var2m = dot(t_P2Vec , t_gtilde);

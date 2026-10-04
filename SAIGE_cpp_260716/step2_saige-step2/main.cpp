@@ -68,6 +68,9 @@ extern "C" void openblas_set_num_threads(int);
 #include "gpu_spa.hpp"
 #include "spa_gpu/spa_gpu.hpp"   // the SPA GPU library (gpuSpaImpl: lib)
 #include "gpu_firth.hpp"          // Firth on the device (gpuFirth)
+#include "gpu_sparse.hpp"         // sparse-GRM variance on the device (gpuSparse)
+#include "s2_gpu_sparse.hpp"
+#include "score_format.hpp"
 #include "UTIL.hpp"
 #include "cct.hpp"
 #include "spa.hpp"
@@ -322,6 +325,18 @@ double g_gpuFirthMaxStep = 15.0;
 // sample masks. Binary traits only among the traits with their own list. Off:
 // such a set is refused and runs on the CPU, as before.
 bool g_gpuOwnSampleSets = false;
+// Config key gpuSparse (needs gpuBinary, fp64): binary traits whose model
+// carries a sparse GRM get their exact variance g~' Sigma^-1 g~ on the device
+// from the explicit block-diagonal inverse (s2_gpu_sparse.hpp,
+// gpu/gpu_sparse.hpp) instead of a per-marker CPU solve. Fast test on: the
+// recompute pairs (first-pass p < cutoff, ER cutoff < MAC <= the sparse
+// MAC category) run first pass + recompute through the batch result and the
+// device SPA / Firth. Fast test off: the trait is no longer refused -- every
+// pair's first pass takes the sparse variance in the batch tail. ER pairs keep
+// the CPU scalar path but are handed the device variance. gpuSparseMaxPairs
+// caps the within-block pair count (the kernel costs pairs x markers).
+bool g_gpuSparse = false;
+long long g_gpuSparseMaxPairs = 50000000LL;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2406,6 +2421,12 @@ struct PendSpa {
     double MAC, AF;
     char   flip;
     double fd[4];
+    // gpuSparse, fast test on: 0 = an ordinary pair; 1 = the dense first pass
+    // of a pair that needs the fast-test recompute (Firth deferred, as
+    // g_firthDefer does on the CPU); 2 = that recompute's own SPA, on the
+    // sparse variance. vrFast is the recompute's variance ratio.
+    char   stage = 0;
+    double vrFast = 1.0;
 };
 
 // Per-block state that has to survive the barrier between the read phase and
@@ -2483,7 +2504,14 @@ bool mainMarkerMTGpu(
             if (M.kind != SAIGE::TraitKind::Quantitative && M.kind != SAIGE::TraitKind::Binary) {
                 why = "trait '" + M.name + "' is neither quantitative nor binary"; break;
             }
-            if (!M.batchable)   { why = "trait '" + M.name + "': " + SAIGE::batchableReason(M); break; }
+            // gpuSparse: a binary trait refused only because its first pass is
+            // the sparse variance (isFastTest=false) is batchable here -- the
+            // tail takes g~' Sigma^-1 g~ from the device (s2_gpu_sparse.hpp).
+            // Whether the device data could actually be built is checked below.
+            const bool sparseFirstOK = g_gpuSparse && M.kind == SAIGE::TraitKind::Binary &&
+                                       M.flagSparseGRM && !M.isFastTest && !M.isCondition && !M.isnoadjCov;
+            if (!M.batchable && !sparseFirstOK)
+                                { why = "trait '" + M.name + "': " + SAIGE::batchableReason(M); break; }
             if (M.isCondition)  { why = "trait '" + M.name + "' runs conditional analysis"; break; }
             if (!ctx.sampleSetsDiffer && g_saigeObjs[t]->m_n != g_saigeObjs[0]->m_n) { why = "models disagree on n"; break; }
             if (ctx.sampleSetsDiffer) {
@@ -2553,6 +2581,60 @@ bool mainMarkerMTGpu(
                      "(stacked constants are not n rows)" << std::endl;
         return false;
     }
+
+    // ---- gpuSparse: block-diagonal Sigma^-1 per sparse-GRM binary trait ----
+    // Built before the reducer, whose operands it extends:
+    //   B1 += [XV' | B XXVX_inv] (2 x N x sumPbin)      -> z = XV g, (B XXVX_inv)'g
+    //   B2 += diag(B) (N x nBin)                        -> sum_i B_ii g_i^2
+    // and the cross terms 2 B_ij g_i g_j come from gpu/gpu_sparse.cu.
+    s2gs::Plan spPlan;
+    bool spDev = false;
+    std::vector<char> spFirst(P, 0);   // trait's first pass is the sparse variance (isFastTest=false)
+    {
+        bool needFirst = false;
+        for (int t = 0; t < P; t++) {
+            const SAIGE::TraitMeta& M = ctx.meta[t];
+            if (M.kind == SAIGE::TraitKind::Binary && M.flagSparseGRM && !M.isFastTest) {
+                spFirst[t] = 1; needFirst = true;
+            }
+        }
+        if (g_gpuSparse && anyBin) {
+            std::string spWhy;
+            if (!g_gpuFp64) spWhy = "gpuPrecision is fp32; the sparse variance is fp64 only";
+            else if (differ) spWhy = "the models do not share one sample list (not implemented with gpuOwnSampleSets)";
+            else spWhy = s2gs::build(ctx, g_saigeObjs, s2blk::config().refreshBudgetS,
+                                     g_gpuSparseMaxPairs, spPlan);
+            if (spWhy.empty()) {
+                for (int t = 0; t < P; t++)
+                    if (spFirst[t] && !spPlan.on[ctx.meta[t].binIdx]) {
+                        spWhy = "trait '" + ctx.meta[t].name + "' has no device sparse variance"; break;
+                    }
+            }
+            if (!spWhy.empty()) {
+                if (needFirst) {
+                    std::cout << "  useGPU: refused, running on the CPU (gpuSparse: " << spWhy << ")" << std::endl;
+                    return false;
+                }
+                std::cout << "  gpuSparse: not active (" << spWhy << "); the sparse variance stays on the CPU"
+                          << std::endl;
+            } else {
+                spDev = true;
+                std::cout << "  gpuSparse: " << spPlan.nOn << " of " << nBin << " binary traits carry a sparse GRM; "
+                          << "block-diagonal Sigma^-1 built in " << spPlan.secs << " s (largest block "
+                          << spPlan.maxBlock << ", " << spPlan.nBlocksMax << " blocks, " << spPlan.nPairs
+                          << " within-block pairs)" << std::endl;
+            }
+        } else if (needFirst) {
+            // Unreachable through the gate above (it lets such a trait through
+            // only with gpuSparse), kept so the invariant is explicit.
+            std::cout << "  useGPU: refused, running on the CPU (sparse first pass without gpuSparse)" << std::endl;
+            return false;
+        }
+    }
+    const int oXV = K1;                          // first XV' column in C1 (spDev)
+    const int oBY = K1 + sumPbin;                // first B XXVX_inv column in C1 (spDev)
+    const int K1x = spDev ? K1 + 2 * sumPbin : K1;
+    const int K2x = spDev ? K2 + nBin : K2;
     int Bblk = g_mtBlockSize;
     if (Bblk <= 0) {
         const double budget = g_mtMemBudgetGB * 1024.0 * 1024.0 * 1024.0;
@@ -2624,10 +2706,22 @@ bool mainMarkerMTGpu(
         if (K1 > oGM)
             std::memcpy(Bf.data() + (std::size_t)n * oGM, ctx.MU2bin.memptr(),
                         (std::size_t)n * nBin * sizeof(double));
+        std::vector<double> B2x;
+        if (spDev) {
+            Bf.resize((std::size_t)n * K1x);
+            std::memcpy(Bf.data() + (std::size_t)n * oXV, spPlan.XVt.memptr(),
+                        (std::size_t)n * sumPbin * sizeof(double));
+            std::memcpy(Bf.data() + (std::size_t)n * oBY, spPlan.BY.memptr(),
+                        (std::size_t)n * sumPbin * sizeof(double));
+            B2x.resize((std::size_t)n * K2x);
+            std::memcpy(B2x.data(), ctx.MU2bin.memptr(), (std::size_t)n * nBin * sizeof(double));
+            std::memcpy(B2x.data() + (std::size_t)n * nBin, spPlan.Bdiag.memptr(),
+                        (std::size_t)n * nBin * sizeof(double));
+        }
         saige::gpu2::CreateArgs a;
         a.device = g_gpuDevice; a.N = n;
-        a.K1 = K1; a.B1 = Bf.data();
-        a.K2 = K2; a.B2 = anyBin ? ctx.MU2bin.memptr() : nullptr;
+        a.K1 = K1x; a.B1 = Bf.data();
+        a.K2 = K2x; a.B2 = spDev ? B2x.data() : (anyBin ? ctx.MU2bin.memptr() : nullptr);
         a.maxSlots = slots; a.fp64 = g_gpuFp64; a.stagingSets = nSets;
         a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
         a.decodeX2 = g_gpuDecodeX2;
@@ -2661,6 +2755,30 @@ bool mainMarkerMTGpu(
         std::cout << "  gpuPrefetch: " << nSets << " staging sets of " << slots << " markers ("
                   << ((std::size_t)nSets * slots * (bpv + 4 * sizeof(double)) >> 20)
                   << " MiB pinned), " << g_gpuPrefetchThreads << " reader thread(s)" << std::endl;
+    // ---- gpuSparse: the within-block cross terms ----
+    saige::gpu2::SpQuad* SQ = nullptr;
+    if (spDev) {
+        saige::gpu2::SpQuadCreateArgs qa;
+        qa.device = g_gpuDevice; qa.N = n; qa.nTraits = nBin; qa.nPairs = spPlan.nPairs;
+        qa.pi = spPlan.pi.data(); qa.pj = spPlan.pj.data(); qa.w = spPlan.w.data();
+        qa.maxSlots = slots;
+        SQ = saige::gpu2::spqCreate(qa);
+        if (SQ == nullptr) {
+            bool needFirst = false;
+            for (int t = 0; t < P; t++) if (spFirst[t]) needFirst = true;
+            if (needFirst) {
+                saige::gpu2::destroy(R);
+                std::cout << "  useGPU: refused, running on the CPU (gpuSparse: device setup failed)" << std::endl;
+                return false;
+            }
+            std::cout << "  gpuSparse: device setup failed; the sparse variance stays on the CPU" << std::endl;
+            spDev = false;
+        } else {
+            std::cout << "  gpuSparse: XV' and Sigma^-1 XXVX_inv in C1 columns [" << oXV << ", " << K1x << "), diag(Sigma^-1) in C2 columns ["
+                      << K2 << ", " << K2x << "), " << spPlan.nPairs << " cross-term pairs x " << nBin
+                      << " traits resident (" << (saige::gpu2::spqDeviceBytes(SQ) >> 20) << " MiB)" << std::endl;
+        }
+    }
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
     saige::spa_gpu::Spa* SL = nullptr;     // gpuSpaImpl: lib
@@ -2843,6 +2961,64 @@ bool mainMarkerMTGpu(
     double tFirth = 0;
     std::vector<MTTraitChunk> out(P);
     long nSlotsUsed = 0, nSlotsTotal = 0;
+
+    // ---- gpuSparse helpers ----
+    // scoreTest's S and var2 for one (slot, binary trait) of the current
+    // superblock, from the device's columns, with z = XV g:
+    //   S    = (g'res - z'(XXVX_inv' res)) / tau0
+    //   var2 = z'(Y'BY)z + g'Bg - 2 z'(BY)'g        (Y = XXVX_inv, B = Sigma^-1)
+    // var2 in the order the batch tail forms its dense var2.
+    auto spStats = [&](std::size_t slot, int t, double& S, double& var2) {
+        const SAIGE::TraitMeta& M = ctx.meta[t];
+        const double* Cd1 = saige::gpu2::outCd(R);
+        const double* Cd2 = saige::gpu2::outC2d(R);
+        const std::size_t ldc = saige::gpu2::ldC(R);
+        const int p = M.p, b = M.binIdx;
+        double z[64], gw[64];
+        for (int r = 0; r < p; r++) {
+            z[r]  = Cd1[(std::size_t)(oXV + M.binOff + r) * ldc + slot];
+            gw[r] = Cd1[(std::size_t)(oBY + M.binOff + r) * ldc + slot];
+        }
+        const arma::mat& X = spPlan.YBY[t];
+        const arma::vec& yr = spPlan.Yres[t];
+        double zxz = 0.0, gwz = 0.0, zyr = 0.0;
+        for (int r = 0; r < p; r++) {
+            double a = 0.0;
+            for (int q2 = 0; q2 < p; q2++) a += X(r, q2) * z[q2];
+            zxz += z[r] * a;
+            gwz += gw[r] * z[r];
+            zyr += z[r] * yr[r];
+        }
+        const double Q = Cd2[(std::size_t)(K2 + b) * ldc + slot] +
+                         saige::gpu2::spqOut(SQ)[slot * (std::size_t)nBin + b];
+        var2 = zxz + Q - 2.0 * gwz;
+        S = (Cd1[(std::size_t)(oR + t) * ldc + slot] - zyr) / M.tau0;
+    };
+    auto var2sp = [&](std::size_t slot, int t) -> double {
+        double S, v2; spStats(slot, t, S, v2); return v2;
+    };
+    // The fast-test recompute of getMarkerPval on the sparse variance: S and
+    // var2 as scoreTest forms them, var1 = var2 * the recompute's variance
+    // ratio, then format_score_result and the SPA gate, as getMarkerPval.
+    struct SpRc { double Beta, seBeta, Tstat, var1, var2, pno; std::string str; bool islog, spa; };
+    auto spRecompute = [&](std::size_t slot, int t, double vr) -> SpRc {
+        SpRc r;
+        double S, v2;
+        spStats(slot, t, S, v2);
+        SAIGE::format_score_result(S, v2 * vr, v2, r.Beta, r.seBeta, r.str, r.pno, r.islog,
+                                   r.Tstat, r.var1, r.var2);
+        const double sd = std::abs(r.Tstat) / std::sqrt(r.var1);
+        r.spa = !std::isnan(sd) && sd > ctx.meta[t].SPA_Cutoff;
+        return r;
+    };
+    bool spAnyFirst = false;
+    std::vector<int> binTraitsDense;
+    for (int t : binTraits) {
+        if (spDev && spFirst[t]) spAnyFirst = true;
+        else binTraitsDense.push_back(t);
+    }
+    std::vector<long> nDevFast(P, 0), nSpPreset(P, 0);
+    std::vector<std::vector<PendSpa>> pend2(std::max(1, omp_get_max_threads()));
 
     // Coarse wall-clock stages, for the end-to-end breakdown the GPU work is
     // supposed to be judged on. omp_get_wtime, summed over the serial sections
@@ -3329,6 +3505,13 @@ bool mainMarkerMTGpu(
                     "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
                     "without useGPU (or with useGPU: false) to finish on the CPU.");
             }
+            if (spDev && !saige::gpu2::spqRun(SQ, R, nSlotsThis)) {
+                saige::gpu2::spqDestroy(SQ);
+                saige::gpu2::destroy(R);
+                throw std::runtime_error(
+                    std::string("mainMarkerMTGpu: the device sparse variance failed mid-run (") +
+                    saige::gpu2::spqLastError() + "). Rerun without gpuSparse.");
+            }
             tGpu += omp_get_wtime() - t0;
             for (int bi = 0; bi < nb; bi++) nSlotsUsed += blksS[bi].nHi + blksS[bi].nLo;
             nSlotsTotal += nSlotsThis;
@@ -3402,7 +3585,33 @@ bool mainMarkerMTGpu(
                     if (nLo > 0)
                         SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, W.scr, W.res);
                 }
-                if (anyBin && nHi > 0) {
+                if (anyBin && nHi > 0 && spAnyFirst) {
+                    // isFastTest=false sparse traits: the first pass IS the
+                    // sparse score test, formed from the device's columns and
+                    // emitted exactly as the batch tail emits (emitBlockResults).
+                    if (!binTraitsDense.empty())
+                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, W.scr, W.res);
+                    for (int t : binTraits) {
+                        if (!spFirst[t]) continue;
+                        for (int j = 0; j < nHi; j++) {
+                            double Sv, v2;
+                            spStats(slotBase + j, t, Sv, v2);
+                            const double v1 = v2 * S.VR(j, t);
+                            double Beta_, seBeta_, pval_, T_, v1o, v2o;
+                            bool islogp = false;
+                            std::string pvalStr_;
+                            SAIGE::format_score_result(Sv, v1, v2, Beta_, seBeta_, pvalStr_, pval_,
+                                                       islogp, T_, v1o, v2o);
+                            W.res.Beta(j, t) = Beta_;   W.res.seBeta(j, t) = seBeta_;
+                            W.res.Tstat(j, t) = T_;     W.res.var1(j, t) = v1o;
+                            W.res.var2(j, t) = v2o;
+                            W.res.StdStat(j, t) = std::fabs(Sv) / std::sqrt(v1);
+                            W.res.pvalRaw(j, t) = pval_;
+                            W.res.pvalStr[t][j] = pvalStr_;
+                            W.res.pvalIsLog[t][j] = islogp ? 1 : 0;
+                        }
+                    }
+                } else if (anyBin && nHi > 0) {
                     if (differ)
                         SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraits, 0, nHi, S.VR, S.adj, W.scr, W.res);
                     else
@@ -3583,7 +3792,85 @@ bool mainMarkerMTGpu(
                         // No SPA (|StdStat| <= cutoff) but the normal p asks for
                         // Firth: the batch result stands and only the fit runs.
                         const bool toFirthOnly = firthDev && isBin && hi && !needSPA && needFirth && !needFast;
-                        if (useBatch || toDev || toFirthOnly) {
+                        // gpuSparse, fast test on: the pair's recompute context
+                        // is the sparse variance, which the device holds. First
+                        // pass = this batch result (+ device SPA when flagged;
+                        // Firth deferred, as g_firthDefer does), then the
+                        // recompute on the device variance (+ device SPA / Firth).
+                        const bool spT = spDev && isBin && spPlan.on[M.binIdx];
+                        bool devFast = false;
+                        double vrFast = 1.0;
+                        if (spT && spaDev && hi && needFast &&
+                            !(MAC > obj->m_cateVarRatioMinMACVecExclude.back()) && obj->m_flagSparseGRM) {
+                            devFast = true;
+                            bool dummyHas3;
+                            vrFast = isSingleVR[t] ? obj->computeSingleVarianceRatio(true, false)
+                                                   : obj->computeVarianceRatio(MAC, true, false, dummyHas3);
+                        }
+                        bool devFastDone = false;
+                        if (devFast) {
+                            const std::size_t slotG = slotBase + c;
+                            if (needSPA) {
+                                Beta       = W.res.Beta(c, t);
+                                seBeta     = W.res.seBeta(c, t);
+                                Tstat      = W.res.Tstat(c, t);
+                                varT       = W.res.var1(c, t);
+                                pval       = W.res.pvalStr[t][c];
+                                pval_noSPA = pval;
+                                PendSpa pd;
+                                pd.bi = bi; pd.jj = jj; pd.c = c; pd.t = t;
+                                pd.Tstat = Tstat; pd.var1 = varT; pd.var2 = W.res.var2(c, t);
+                                pd.pno = W.res.pvalRaw(c, t);
+                                pd.logp = (W.res.pvalIsLog[t][c] != 0) ? 1 : 0;
+                                uint64_t cz = 0;
+                                for (int k = 0; k < 4; k++) if (fdt[k] == 0.0) cz += cntt[k];
+                                pd.fast = ((double)cz / nT >= 0.5) ? 1 : 0;   // first pass: dense ctx
+                                pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
+                                for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
+                                pd.stage = 1; pd.vrFast = vrFast;
+                                pend[omp_get_thread_num()].push_back(pd);
+                                devFastDone = true;
+                            } else {
+                                // First pass p (the batch's, no SPA) is below the
+                                // cutoff -- that is what needFast tested -- so the
+                                // recompute happens now.
+                                const SpRc rc = spRecompute(slotG, t, vrFast);
+                                bool wantF = false;
+                                if (!rc.spa && M.is_Firth_beta)
+                                    wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
+                                                     : (rc.pno <= M.pCutoffforFirth);
+                                if (rc.spa || !wantF || firthDev) {
+                                    Beta = rc.Beta; seBeta = rc.seBeta; Tstat = rc.Tstat; varT = rc.var1;
+                                    pval = rc.str; pval_noSPA = rc.str;
+                                    if (rc.spa) {
+                                        PendSpa pd;
+                                        pd.bi = bi; pd.jj = jj; pd.c = c; pd.t = t;
+                                        pd.Tstat = rc.Tstat; pd.var1 = rc.var1; pd.var2 = rc.var2;
+                                        pd.pno = rc.pno; pd.logp = rc.islog ? 1 : 0;
+                                        pd.fast = 0;   // sparse ctx: getMarkerPval takes the full-N SPA
+                                        pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
+                                        for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
+                                        pd.stage = 2; pd.vrFast = vrFast;
+                                        pend[omp_get_thread_num()].push_back(pd);
+                                    } else {
+                                        if (wantF) {
+                                            PendFirth pf;
+                                            pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                            pf.p = rc.pno; pf.logp = rc.islog ? 1 : 0;
+                                            pf.flip = flip ? 1 : 0;
+                                            for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
+                                            pendF[omp_get_thread_num()].push_back(pf);
+                                        }
+                                        #pragma omp atomic
+                                        nDevFast[t]++;
+                                    }
+                                    devFastDone = true;
+                                }
+                            }
+                        }
+                        if (devFastDone) {
+                            isSPAConverge = false;   // set by phase 4 when SPA runs
+                        } else if (useBatch || toDev || toFirthOnly) {
                             Beta       = W.res.Beta(c, t);
                             seBeta     = W.res.seBeta(c, t);
                             Tstat      = W.res.Tstat(c, t);
@@ -3601,7 +3888,9 @@ bool mainMarkerMTGpu(
                                 pd.logp = (W.res.pvalIsLog[t][c] != 0) ? 1 : 0;
                                 uint64_t cz = 0;
                                 for (int k = 0; k < 4; k++) if (fdt[k] == 0.0) cz += cntt[k];
-                                pd.fast = ((double)cz / nT >= 0.5) ? 1 : 0;
+                                // The fast (carriers + normal tail) SPA variant
+                                // is never taken on a sparse first pass.
+                                pd.fast = (!sparseCur && (double)cz / nT >= 0.5) ? 1 : 0;
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
                                 pend[omp_get_thread_num()].push_back(pd);
@@ -3629,6 +3918,11 @@ bool mainMarkerMTGpu(
                             ctx_first.isnoadjCov_cur    = noadjCur;
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
                             ctx_first.varRatioVal       = S.VR(c, t);
+                            if (spT && sparseCur) {   // gpuSparse: the device variance, no CPU solve
+                                ctx_first.presetVar2 = var2sp(slotBase + c, t);
+                                #pragma omp atomic
+                                nSpPreset[t]++;
+                            }
                             // A3: thread_local, set before every call.
                             g_firthDefer = (obj->m_isFastTest && isBin &&
                                             MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
@@ -3671,6 +3965,11 @@ bool mainMarkerMTGpu(
                                               ctx_fast.isnoadjCov_cur, dummyHas);
                                 }
                                 g_firthDefer = false;   // Firth runs once, here
+                                if (spT && ctx_fast.flagSparseGRM_cur) {
+                                    ctx_fast.presetVar2 = var2sp(slotBase + c, t);
+                                    #pragma omp atomic
+                                    nSpPreset[t]++;
+                                }
                                 obj->getMarkerPval(
                                     *gUse, *inzUse, *izUse,
                                     Beta, seBeta, pval, pval_noSPA,
@@ -3814,6 +4113,10 @@ bool mainMarkerMTGpu(
                 t0 = omp_get_wtime();
                 std::vector<PendSpa> all;
                 for (auto& v : pend) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
+                // gpuSparse: a first-pass SPA (stage 1) can ask for the
+                // recompute's own SPA (stage 2), so the device SPA runs again on
+                // what the post-rules parked in pend2 until nothing is left.
+                while (!all.empty()) {
                 // gpuSpaOrder: trait -- the blocks in flight then share one
                 // trait's XXVX_inv / mu in L2. Stable, so a trait's pairs keep
                 // their marker order; results are indexed by jj, not by k.
@@ -3821,7 +4124,7 @@ bool mainMarkerMTGpu(
                     std::stable_sort(all.begin(), all.end(),
                                      [](const PendSpa& x, const PendSpa& y) { return x.t < y.t; });
                 const int nPend = (int)all.size();
-                if (nPend > 0) {
+                {
                     saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
                     saige::spa_gpu::PairIn*   inl = SL ? saige::spa_gpu::in(SL) : nullptr;
                     double* plut = SL ? saige::spa_gpu::pairLut(SL) : nullptr;   // gpuOwnSampleSets only
@@ -3924,13 +4227,68 @@ bool mainMarkerMTGpu(
                         } else {
                             pvalStr = O.pvalNA[jj]; pvalFinal = pd.pno;
                         }
+                        bool forceCpu = false;
+                        if (pd.stage == 1) {
+                            // The dense first pass of a fast-test pair is done.
+                            // The scalar path recomputes when its printed p is
+                            // below the cutoff; Firth was deferred to that call.
+                            double pnum;
+                            try { pnum = std::stod(pvalStr); }
+                            catch (const std::invalid_argument&) { pnum = 0; }
+                            catch (const std::out_of_range&)     { pnum = 0; }
+                            if (!(pnum < obj->m_pval_cutoff_for_fastTest)) {
+                                O.pval[jj]   = pvalStr;
+                                O.seBeta[jj] = seBeta;
+                                O.isSPAConverge[jj] = conv ? 1 : 0;
+                                O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
+                                #pragma omp atomic
+                                nDevFast[t]++;
+                                continue;
+                            }
+                            const SpRc rc = spRecompute((std::size_t)pd.bi * Bblk + c, t, pd.vrFast);
+                            bool wantF = false;
+                            if (!rc.spa && M.is_Firth_beta)
+                                wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
+                                                 : (rc.pno <= M.pCutoffforFirth);
+                            if (!rc.spa && wantF && !firthDev) {
+                                forceCpu = true;          // the whole pair on the CPU, below
+                            } else {
+                                O.Beta[jj]   = rc.Beta * (1 - 2 * flip);
+                                O.seBeta[jj] = rc.seBeta;
+                                O.Tstat[jj]  = rc.Tstat * (1 - 2 * flip);
+                                O.varT[jj]   = rc.var1;
+                                O.pval[jj]   = rc.str;
+                                O.pvalNA[jj] = rc.str;
+                                O.isSPAConverge[jj] = 0;
+                                O.route[jj] = (unsigned char)(O.route[jj] & 0x0F);
+                                if (rc.spa) {
+                                    PendSpa p2 = pd;
+                                    p2.stage = 2; p2.fast = 0;
+                                    p2.Tstat = rc.Tstat; p2.var1 = rc.var1; p2.var2 = rc.var2;
+                                    p2.pno = rc.pno; p2.logp = rc.islog ? 1 : 0;
+                                    pend2[omp_get_thread_num()].push_back(p2);
+                                } else {
+                                    if (wantF) {
+                                        PendFirth pf;
+                                        pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                        pf.p = rc.pno; pf.logp = rc.islog ? 1 : 0;
+                                        pf.flip = pd.flip;
+                                        for (int k = 0; k < 4; k++) pf.fd[k] = pd.fd[k];
+                                        pendF[omp_get_thread_num()].push_back(pf);
+                                    }
+                                    #pragma omp atomic
+                                    nDevFast[t]++;
+                                }
+                                continue;
+                            }
+                        }
                         // ---- Firth on the SPA p-value: the device fit (gpuFirth,
                         // phase 5) or, without it, the whole pair back to the CPU ----
                         bool wantFirth = false;
                         if (M.is_Firth_beta)
                             wantFirth = islog ? (pvalFinal <= std::log(M.pCutoffforFirth))
                                               : (pvalFinal <= M.pCutoffforFirth);
-                        if (wantFirth && !firthDev) {
+                        if ((wantFirth && !firthDev) || forceCpu) {
                             arma::vec gOwn;
                             arma::vec*  gUse = &W.tmpG;
                             arma::uvec* izUse = &W.idxZ;
@@ -4001,6 +4359,11 @@ bool mainMarkerMTGpu(
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
                             ctx_first.varRatioVal       = S.VR(c, t);
                             g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
+                            if (spDev && spPlan.on[M.binIdx] && sparseCur) {
+                                ctx_first.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
+                                #pragma omp atomic
+                                nSpPreset[t]++;
+                            }
                             obj->getMarkerPval(
                                 *gUse, *inzUse, *izUse,
                                 Beta, seB, pval, pval_noSPA,
@@ -4036,6 +4399,11 @@ bool mainMarkerMTGpu(
                                               ctx_fast.isnoadjCov_cur, dummyHas);
                                 }
                                 g_firthDefer = false;
+                                if (spDev && spPlan.on[M.binIdx] && ctx_fast.flagSparseGRM_cur) {
+                                    ctx_fast.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
+                                    #pragma omp atomic
+                                    nSpPreset[t]++;
+                                }
                                 obj->getMarkerPval(
                                     *gUse, *inzUse, *izUse,
                                     Beta, seB, pval, pval_noSPA,
@@ -4077,8 +4445,13 @@ bool mainMarkerMTGpu(
                             O.seBeta[jj] = seBeta;
                             O.isSPAConverge[jj] = conv ? 1 : 0;
                             O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
-                            #pragma omp atomic
-                            nDevSpa[t]++;
+                            if (pd.stage == 2) {
+                                #pragma omp atomic
+                                nDevFast[t]++;
+                            } else {
+                                #pragma omp atomic
+                                nDevSpa[t]++;
+                            }
                             if (wantFirth) {   // firthDev: fitted in phase 5 on this p
                                 PendFirth pf;
                                 pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
@@ -4090,6 +4463,9 @@ bool mainMarkerMTGpu(
                         }
                     }
                 }
+                all.clear();
+                for (auto& v : pend2) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
+                }   // while: stage-2 SPA rounds
                 tSpa += omp_get_wtime() - t0;
             }
 
@@ -4246,6 +4622,9 @@ bool mainMarkerMTGpu(
     if (SL) { double h2 = 0, d2 = 0; saige::spa_gpu::timings(SL, &gSpa, &h2, &d2, &gSpaPairs); }
     double gFirth = 0; long long gFirthPairs = 0;
     if (FP) saige::gpu2::firthTimings(FP, &gFirth, &gFirthPairs);
+    double gSpq = 0; long long gSpqSlots = 0;
+    if (SQ) saige::gpu2::spqTimings(SQ, &gSpq, &gSpqSlots);
+    saige::gpu2::spqDestroy(SQ);
     saige::gpu2::firthDestroy(FP);
     saige::gpu2::spaDestroy(SP);
     saige::spa_gpu::destroy(SL);
@@ -4259,7 +4638,7 @@ bool mainMarkerMTGpu(
                   << ", " << nFallback[t] << " via the scalar CPU path"
                   << (firthDev ? "; " + std::to_string(nDevFirth[t]) + " Firth fits on the device" : std::string())
                   << ")." << std::endl;
-        totBatch += nBatched[t] + nDevSpa[t];
+        totBatch += nBatched[t] + nDevSpa[t] + nDevFast[t];
         totFall  += nFallback[t];
         if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
             std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
@@ -4299,6 +4678,21 @@ bool mainMarkerMTGpu(
         std::cout << "  AF_case/AF_ctrl: " << (a + b + g) << " pairs -- device counts "
                   << a << ", exact replay " << b << ", gather (no replay for the trait) " << g
                   << std::endl;
+    }
+    if (spDev) {
+        long df = 0, pr = 0;
+        for (int t = 0; t < P; t++) { df += nDevFast[t]; pr += nSpPreset[t]; }
+        int nf = 0;
+        for (int t = 0; t < P; t++) nf += spFirst[t];
+        std::cout << "  gpuSparse: cross-term kernel " << gSpq << " s over " << gSpqSlots << " slots; "
+                  << nf << " trait(s) with the sparse first pass in the batch tail; "
+                  << df << " fast-test recompute pairs finished on the device; "
+                  << pr << " CPU scalar calls handed the device variance (no CPU solve)" << std::endl;
+        for (int t = 0; t < P; t++)
+            if (nDevFast[t] > 0 || spFirst[t])
+                std::cout << "    [" << g_traitMeta[t].name << "] fast-test recompute on the device "
+                          << nDevFast[t] << ", device variance handed to the CPU " << nSpPreset[t]
+                          << (spFirst[t] ? ", sparse first pass" : "") << std::endl;
     }
     if (nSlotsTotal > 0) {
         std::cout << "  device slots: " << nSlotsUsed << " / " << nSlotsTotal
@@ -7633,6 +8027,10 @@ int main(int argc, char* argv[])
             std::cerr << "  parallelModelLoad: true/false (default: false). Load the null models" << std::endl;
             std::cerr << "                     of a multi-trait run concurrently (min(P, nThreads)" << std::endl;
             std::cerr << "                     threads); same objects, same log, in config order." << std::endl;
+            std::cerr << "  gpuSparse:         true/false (default: false). With gpuBinary, sparse-GRM" << std::endl;
+            std::cerr << "                     binary traits get g~'Sigma^-1 g~ on the device from the" << std::endl;
+            std::cerr << "                     block-diagonal inverse; isFastTest=false traits become batchable." << std::endl;
+            std::cerr << "  gpuSparseMaxPairs: cap on within-block sample pairs (default 5e7)." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -7872,6 +8270,12 @@ int main(int argc, char* argv[])
         if (g_gpuFirth && !g_gpuSpa) {
             std::cout << "  gpuFirth: ignored, it needs gpuSpa: true" << std::endl;
             g_gpuFirth = false;
+        }
+        g_gpuSparse = config["gpuSparse"] ? config["gpuSparse"].as<bool>() : false;
+        if (config["gpuSparseMaxPairs"]) g_gpuSparseMaxPairs = config["gpuSparseMaxPairs"].as<long long>();
+        if (g_gpuSparse && !g_gpuBinary) {
+            std::cout << "  gpuSparse: ignored, it needs gpuBinary: true" << std::endl;
+            g_gpuSparse = false;
         }
         if ((g_gpuBinary || g_gpuSpa) && !g_gpuStep2)
             std::cout << "  gpuBinary / gpuSpa: ignored, useGPU is false" << std::endl;
