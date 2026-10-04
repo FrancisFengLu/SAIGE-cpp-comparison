@@ -37,9 +37,11 @@ BT=/opt/saige/data/bingpu_test
 BAL=/opt/saige/logs/binsplit/models/spa
 mkdir -p "$WORK"
 FAIL=0
-echo "workdir $WORK"; echo "base    $BASE"; echo "new     $NEW"; echo "sgs2txt $CVT"; echo "cases   $CASES"; echo
+echo "workdir $WORK"; echo "base    $BASE"; echo "new     $NEW"; echo "sgs2txt $CVT"; echo "cases   $CASES"; echo "on keys ${ON_EXTRA:-(defaults)}"; echo
 
 ONKEYS=("gpuPrefetch: true" "parallelModelLoad: true")
+# ON_EXTRA="key: value" in the environment adds one more key to the on run (e.g. gpuPrefetchThreads: 8).
+[ -n "${ON_EXTRA:-}" ] && ONKEYS+=("$ON_EXTRA")
 ON2KEYS=("gpuPrefetch: true" "gpuPrefetchSets: 2" "gpuPrefetchThreads: 1" "parallelModelLoad: true")
 GPUKEYS=("useGPU: true" "gpuBinary: true" "gpuSpa: true" "gpuSpaImpl: lib")
 
@@ -97,9 +99,12 @@ cmp_dirs() {  # cmp_dirs <dirA> <dirB> <label>: the same file names, every file 
 }
 loader_log() { sed -n '/===== Loading null model/,/===== Setting global variables/p' "$1" | grep -v '^\[TIMING\]'; }
 sgs2txt_dir() {  # sgs2txt_dir <sgsdir> <txtdir>
-  rm -rf "$2"; mkdir -p "$2"
+  # the .sgs header names the markers file under the common path $CD/out, which
+  # was moved aside after the run: point that path at <sgsdir> while converting
+  rm -rf "$2" "$CD/out"; mkdir -p "$2"; ln -s "$1" "$CD/out"
   local f b
   for f in "$1"/*.txt.sgs; do [[ "$f" == *".markers.sgs" ]] && continue; b=$(basename "$f" .sgs); "$CVT" -o "$2/$b" "$f" > /dev/null 2>&1 || { echo "    sgs2txt failed: $b"; FAIL=1; }; done
+  rm -f "$CD/out"
 }
 
 for C in $CASES; do
