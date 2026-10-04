@@ -114,6 +114,12 @@ struct CreateArgs {
     // compute overlap of config key gpuPrefetch, S2_PIPELINE.md). Nothing on
     // the device changes: every set uploads into the same device buffers.
     int stagingSets = 1;
+    // fp64 decode with one 16-byte store per thread, lanes contiguous, instead
+    // of two 16-byte stores per thread 32 bytes apart (default false; only
+    // takes effect with fp64 and N % 4 == 0). Same output; on a V100 it
+    // removes the read-modify-write that half-written sectors cost on ECC'd
+    // HBM2 (S2_KERNEL_ROOFLINE.md).
+    bool decodeX2 = false;
 };
 
 // Returns nullptr on ANY failure (no device, allocation refused, ...). The

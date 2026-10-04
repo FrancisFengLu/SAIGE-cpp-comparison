@@ -118,6 +118,29 @@ decode_lut_x4(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
     }
 }
 
+// fp64 variant with lane-contiguous stores (CreateArgs::decodeX2). The x4
+// kernel's thread writes its 32 bytes as two 16-byte stores, so across a warp
+// each store instruction touches 32 sectors by half; the ECC'd HBM2 of a V100
+// turns a half-written sector into a read-modify-write, and ncu shows the
+// kernel reading 0.55 byte and writing 1.7 bytes from DRAM per payload byte
+// (S2_KERNEL_ROOFLINE.md). Here thread i takes samples 2i, 2i+1 -- one
+// 16-byte store, lanes contiguous -- so a warp's store covers 16 whole sectors.
+// Same table, same values, same positions: the output is identical.
+__global__ void __launch_bounds__(256)
+decode_lut_x2(const uint8_t* __restrict__ packed, std::size_t bpv, int N,
+              const double* __restrict__ lut, double* __restrict__ dG)
+{
+    const int m = blockIdx.x;
+    const uint8_t* __restrict__ row = packed + (std::size_t)m * bpv;
+    const Lut4<double> L = loadLut<double>(lut, m);
+    double* __restrict__ o = dG + (std::size_t)m * N;
+    const int nh = N >> 1;
+    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+        const unsigned p = (unsigned)row[h >> 1] >> ((h & 1) * 4);
+        *reinterpret_cast<double2*>(o + 2 * h) = make_double2(pick(L, p & 3u), pick(L, (p >> 2) & 3u));
+    }
+}
+
 // General N. One sample per thread-iteration; used only when N % 4 != 0.
 template <typename T>
 __global__ void __launch_bounds__(256)
@@ -186,6 +209,7 @@ count_codes(const uint8_t* __restrict__ packed, std::size_t bpv, int words,
 struct Reducer {
     int  N = 0, K1 = 0, K2 = 0, maxSlots = 0, nMask = 0, words = 0;
     bool fp64 = true;
+    bool decodeX2 = false;
     std::size_t bpv = 0;           // padded row stride, bytes (multiple of 8)
     std::size_t esz = 0;           // sizeof(T)
     int slotsPerPass = 0;          // markers per device pass; two are resident
@@ -284,6 +308,7 @@ Reducer* create(const CreateArgs& a)
 
     Reducer* r = new Reducer();
     r->N = a.N; r->K1 = a.K1; r->K2 = a.K2; r->maxSlots = a.maxSlots; r->fp64 = a.fp64;
+    r->decodeX2 = a.decodeX2 && a.fp64 && ((a.N & 3) == 0);
     r->nMask = a.nMask;
     r->words = maskWords(a.N);
     r->bpv = (std::size_t)r->words * 8;           // >= (N+3)/4, whole 64-bit words
@@ -489,7 +514,8 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
         CKR(cudaEventRecord(r->ev[b][0], s));
         if (r->fp64) {
             double* g = (double*)r->dG[b];
-            if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
+            if (r->decodeX2) decode_lut_x2<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
+            else if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
             else    decode_lut_any<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
         } else {
             float* g = (float*)r->dG[b];
@@ -519,7 +545,8 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
             // Same buffer, squared table, second right operand.
             if (r->fp64) {
                 double* g = (double*)r->dG[b];
-                if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                if (r->decodeX2) decode_lut_x2<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
+                else if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
                 else    decode_lut_any<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
                 CKR(cudaGetLastError());
                 CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K2, r->N,
