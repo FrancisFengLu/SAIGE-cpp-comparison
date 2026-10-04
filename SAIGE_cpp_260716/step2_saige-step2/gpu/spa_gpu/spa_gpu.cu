@@ -456,9 +456,8 @@ __device__ void saddle2(const Ctx& C, double z1, double q1, double z2, double q2
     *p2 = saddleTail(z2, q2, k1b, k2b, logp, erfcMode, s2);
 }
 
-template <bool FUSED, bool DYN, int MINB>
-__global__ void __launch_bounds__(NT, MINB)
-spaKernel(const KParams P)
+template <bool FUSED, bool DYN>
+__device__ __forceinline__ void spaBody(const KParams& P)
 {
     __shared__ double sh[NACC][NWARP];
     __shared__ int shK;
@@ -624,19 +623,26 @@ spaKernel(const KParams P)
     }
 }
 
-// The 16 instantiations (fused x dynamic x minBlocksPerSM 1..4). MINB is the
-// __launch_bounds__ minimum-blocks hint: 1 leaves ptxas free (128 registers
-// for the unfused kernel, 194 for the fused one, i.e. 2 resp. 1 blocks of 8
-// warps per SM on a V100); 2 / 3 / 4 cap the registers at 128 / 85 / 64 and
-// spill the rest, buying 16 / 24 / 32 resident warps per SM.
+// minBlocksPerSM 0 (default): the kernel as it was before the hint existed,
+// __launch_bounds__(NT) only -- ptxas picks 128 registers for the unfused
+// kernel (2 blocks of 8 warps per SM on a V100) and 194 for the fused one.
+// 1..4: __launch_bounds__(NT, MINB). An explicit 1 is NOT the same as no hint:
+// ptxas then takes 162 registers for the unfused kernel (1 block per SM).
+// 2 / 3 / 4 cap the registers at 128 / 80 / 64 and spill the rest.
+template <bool FUSED, bool DYN>
+__global__ void __launch_bounds__(NT) spaKernel0(const KParams P) { spaBody<FUSED, DYN>(P); }
+template <bool FUSED, bool DYN, int MINB>
+__global__ void __launch_bounds__(NT, MINB) spaKernel(const KParams P) { spaBody<FUSED, DYN>(P); }
+
 template <bool F, bool D>
 void launchSpaM(int minb, int grid, cudaStream_t st, const KParams& P)
 {
     switch (minb) {
+        case 1:  spaKernel<F, D, 1><<<grid, NT, 0, st>>>(P); break;
         case 2:  spaKernel<F, D, 2><<<grid, NT, 0, st>>>(P); break;
         case 3:  spaKernel<F, D, 3><<<grid, NT, 0, st>>>(P); break;
         case 4:  spaKernel<F, D, 4><<<grid, NT, 0, st>>>(P); break;
-        default: spaKernel<F, D, 1><<<grid, NT, 0, st>>>(P); break;
+        default: spaKernel0<F, D><<<grid, NT, 0, st>>>(P); break;
     }
 }
 void launchSpa(int fused, int dyn, int minb, int grid, cudaStream_t st, const KParams& P)
@@ -660,7 +666,7 @@ __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, do
 
 struct Spa {
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxiter = 1000, erfcMode = 1;
-    int fused = 0, dyn = 0, minb = 1;
+    int fused = 0, dyn = 0, minb = 0;
     int* dCounter = nullptr;
     double tol = 0.0;
     std::size_t traitStride = 0;
@@ -702,7 +708,7 @@ Spa* create(const CreateArgs& a)
     s->blocks = a.blocks > 0 ? a.blocks : 256;
     s->maxiter = a.maxiter; s->tol = a.tol; s->erfcMode = a.erfcMode;
     s->fused = a.fusedRoots ? 1 : 0; s->dyn = a.dynamicPairs ? 1 : 0;
-    s->minb = (a.minBlocksPerSM >= 1 && a.minBlocksPerSM <= 4) ? a.minBlocksPerSM : 1;
+    s->minb = (a.minBlocksPerSM >= 1 && a.minBlocksPerSM <= 4) ? a.minBlocksPerSM : 0;
     s->traitStride = (std::size_t)a.N * pMax;
 
     auto fail = [&](const char* what) -> Spa* {

@@ -112,12 +112,13 @@ struct CreateArgs {
     // table sorted by trait, the trait's XXVX_inv and mu then stay in L2
     // across the blocks that need them. Per-pair arithmetic is unchanged.
     int dynamicPairs = 0;
-    // Occupancy hint (default 1 = none): the kernel's __launch_bounds__
-    // minimum blocks per SM, 1..4. On a V100 the unfused kernel compiles to
-    // 128 registers (2 blocks of 8 warps per SM) and the fused one to 194 (1
-    // block); 2 / 3 / 4 cap the registers at 128 / 85 / 64 and spill the rest
-    // to local memory for 16 / 24 / 32 resident warps. Arithmetic unchanged.
-    int minBlocksPerSM = 1;
+    // Occupancy hint (default 0 = none): the kernel's __launch_bounds__
+    // minimum blocks per SM, 1..4. With no hint the unfused kernel compiles to
+    // 128 registers on a V100 (2 blocks of 8 warps per SM) and the fused one to
+    // 194 (1 block); an explicit 1 lets the unfused one grow to 162 (1 block);
+    // 2 / 3 / 4 cap the registers at 128 / 80 / 64 and spill the rest to local
+    // memory for 16 / 24 / 32 resident warps. Arithmetic unchanged.
+    int minBlocksPerSM = 0;
 };
 
 // Device-resident genotype source for the slots PairIn::slot names. Exactly

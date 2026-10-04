@@ -292,13 +292,13 @@ std::string g_gpuSpaImpl = "lib";
 bool g_gpuSpaTraitMajor = false;
 bool g_gpuSpaFused = false;
 bool g_gpuSpaDynamic = false;
-//   gpuSpaMinBlocks: 1 (default) .. 4 -- the SPA kernel's __launch_bounds__
+//   gpuSpaMinBlocks: 0 (default, no hint) .. 4 -- the SPA kernel's __launch_bounds__
 //     minimum blocks per SM (spa_gpu.hpp minBlocksPerSM); 2 keeps the fused
 //     kernel at two resident blocks per SM like the unfused one.
 //   gpuDecodeX2: the fp64 decode stores lane-contiguous 16-byte pairs instead
 //     of two 16-byte halves 32 bytes apart (gpu_step2.hpp decodeX2); same
 //     dosages, same positions.
-int  g_gpuSpaMinBlocks = 1;
+int  g_gpuSpaMinBlocks = 0;
 bool g_gpuDecodeX2 = false;
 // Config key gpuFirth (needs gpuSpa): the Firth fit of a pair whose final
 // p-value asks for it runs on the device (gpu/gpu_firth.cu) instead of the pair
@@ -7233,8 +7233,8 @@ int main(int argc, char* argv[])
         g_gpuSpaDynamic = config["gpuSpaDynamic"] ? config["gpuSpaDynamic"].as<bool>() : false;
         if (config["gpuSpaMinBlocks"]) {
             g_gpuSpaMinBlocks = config["gpuSpaMinBlocks"].as<int>();
-            if (g_gpuSpaMinBlocks < 1 || g_gpuSpaMinBlocks > 4)
-                throw std::runtime_error("gpuSpaMinBlocks must be 1..4");
+            if (g_gpuSpaMinBlocks < 0 || g_gpuSpaMinBlocks > 4)
+                throw std::runtime_error("gpuSpaMinBlocks must be 0..4 (0 = no hint)");
         }
         g_gpuDecodeX2 = config["gpuDecodeX2"] ? config["gpuDecodeX2"].as<bool>() : false;
         if ((g_gpuSpaFused || g_gpuSpaDynamic) && g_gpuSpaImpl != "lib")
