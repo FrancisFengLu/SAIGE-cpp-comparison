@@ -72,12 +72,18 @@ cfg_g200k() {
     echo "    varianceRatioFile: $BAL/mvr_y$m.varianceRatio.txt"; echo "    outputFile: $OD/y$k.txt"
   done
 }
+# Every variant of a case writes to the SAME output directory, <casedir>/out,
+# moved to <casedir>/<variant>/out after the run: a per-trait .sgs file's
+# header carries the markers file's path (out_fast.cpp, so sgs2txt can find
+# it), so two runs can only be byte-identical when they were given the same
+# outputFile. Text files carry no path; the same rule costs them nothing.
 run_one() {   # run_one <bin> <casedir> <variant> <cfg-generator> <generator args...>
   local BIN=$1 CD=$2 V=$3 GEN=$4; shift 4
   local D="$CD/$V"
-  rm -rf "$D"; mkdir -p "$D/out" "$D/routes"
+  rm -rf "$D" "$CD/out"; mkdir -p "$D/routes" "$CD/out"
   $GEN "$@" > "$D/cfg.yaml" || return 1
   ( cd "$D" && SAIGE_STEP2_ROUTE_DUMP="$D/routes" /usr/bin/time -f '%e %P' -o wall "$BIN" cfg.yaml > log.txt 2>&1 ); local rc=$?
+  mv "$CD/out" "$D/out"
   echo "    $V rc=$rc wall=$(cut -d' ' -f1 "$D/wall" 2>/dev/null)s cpu=$(cut -d' ' -f2 "$D/wall" 2>/dev/null) $(grep -h 'useGPU: refused' "$D/log.txt" | head -1) $(grep -h '\[gpu pipeline\]' "$D/log.txt" | sed 's/^ *//')"
   [ $rc = 0 ] || FAIL=1
   return $rc
@@ -102,17 +108,17 @@ for C in $CASES; do
   case "$C" in
     bt:*)
       R=${C#bt:}
-      run_one "$BASE" "$CD" base cfg_bt "$R" "$CD/base/out"
-      run_one "$NEW"  "$CD" off  cfg_bt "$R" "$CD/off/out"
-      run_one "$NEW"  "$CD" on   cfg_bt "$R" "$CD/on/out"  "${ONKEYS[@]}"
-      run_one "$NEW"  "$CD" on2  cfg_bt "$R" "$CD/on2/out" "${ON2KEYS[@]}"
+      run_one "$BASE" "$CD" base cfg_bt "$R" "$CD/out"
+      run_one "$NEW"  "$CD" off  cfg_bt "$R" "$CD/out"
+      run_one "$NEW"  "$CD" on   cfg_bt "$R" "$CD/out"  "${ONKEYS[@]}"
+      run_one "$NEW"  "$CD" on2  cfg_bt "$R" "$CD/out" "${ON2KEYS[@]}"
       ;;
     g200k:*)
       P=$(echo "$C" | cut -d: -f2); FMT=$(echo "$C" | cut -d: -f3)
-      run_one "$BASE" "$CD" base cfg_g200k "$P" "$FMT" "$CD/base/out"
-      run_one "$NEW"  "$CD" off  cfg_g200k "$P" "$FMT" "$CD/off/out"
-      run_one "$NEW"  "$CD" on   cfg_g200k "$P" "$FMT" "$CD/on/out"  "${ONKEYS[@]}"
-      run_one "$NEW"  "$CD" on2  cfg_g200k "$P" "$FMT" "$CD/on2/out" "${ON2KEYS[@]}"
+      run_one "$BASE" "$CD" base cfg_g200k "$P" "$FMT" "$CD/out"
+      run_one "$NEW"  "$CD" off  cfg_g200k "$P" "$FMT" "$CD/out"
+      run_one "$NEW"  "$CD" on   cfg_g200k "$P" "$FMT" "$CD/out"  "${ONKEYS[@]}"
+      run_one "$NEW"  "$CD" on2  cfg_g200k "$P" "$FMT" "$CD/out" "${ON2KEYS[@]}"
       ;;
     *) echo "    unknown case $C"; FAIL=1; continue;;
   esac
