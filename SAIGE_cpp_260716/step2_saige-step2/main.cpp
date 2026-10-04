@@ -45,6 +45,7 @@ extern "C" void openblas_set_num_threads(int);
 #include <sys/stat.h>
 #include <unordered_map>
 #include <numeric>
+#include <algorithm>
 #include <malloc.h>  // mallopt() — glibc heap-hoarding mitigation
 #include <cstdlib>   // getenv (W2 fused-decode rollback switch)
 
@@ -276,6 +277,29 @@ bool g_gpuSpa = false;
 // inputs, same host post-rules; kept side by side for the comparison in
 // S2_BINARY_GPU.md.
 std::string g_gpuSpaImpl = "lib";
+// Three device-SPA tuning keys (all default off; S2_KERNEL_ROOFLINE.md). None
+// changes a pair's arithmetic, so the outputs are bit-identical either way.
+//   gpuSpaOrder: marker (default) | trait -- the superblock's flagged pairs
+//     go to the device sorted by trait (stable, marker order kept within a
+//     trait), so the blocks in flight share a trait's XXVX_inv and mu in L2
+//     instead of each pulling a different trait's 1.6 MB from HBM.
+//   gpuSpaFused: one pass over the stored (g~, mu) serves both Newton solves
+//     of a pair, and one pass both tails (spa_gpu.hpp fusedRoots).
+//   gpuSpaDynamic: blocks take pairs from a device counter instead of a fixed
+//     grid stride, keeping the in-flight pairs consecutive (spa_gpu.hpp
+//     dynamicPairs). Only the library implementation (gpuSpaImpl: lib) reads
+//     gpuSpaFused / gpuSpaDynamic; gpuSpaOrder applies to both.
+bool g_gpuSpaTraitMajor = false;
+bool g_gpuSpaFused = false;
+bool g_gpuSpaDynamic = false;
+//   gpuSpaMinBlocks: 1 (default) .. 4 -- the SPA kernel's __launch_bounds__
+//     minimum blocks per SM (spa_gpu.hpp minBlocksPerSM); 2 keeps the fused
+//     kernel at two resident blocks per SM like the unfused one.
+//   gpuDecodeX2: the fp64 decode stores lane-contiguous 16-byte pairs instead
+//     of two 16-byte halves 32 bytes apart (gpu_step2.hpp decodeX2); same
+//     dosages, same positions.
+int  g_gpuSpaMinBlocks = 1;
+bool g_gpuDecodeX2 = false;
 // Config key gpuFirth (needs gpuSpa): the Firth fit of a pair whose final
 // p-value asks for it runs on the device (gpu/gpu_firth.cu) instead of the pair
 // going back to the CPU scalar path whole, and the gate's Firth pre-screen no
@@ -2506,6 +2530,7 @@ bool mainMarkerMTGpu(
         a.K2 = K2; a.B2 = anyBin ? ctx.MU2bin.memptr() : nullptr;
         a.maxSlots = slots; a.fp64 = g_gpuFp64;
         a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
+        a.decodeX2 = g_gpuDecodeX2;
         R = saige::gpu2::create(a);
     }
     if (R == nullptr) {
@@ -2525,6 +2550,7 @@ bool mainMarkerMTGpu(
               << ", " << slots << " markers per device batch (" << nSub
               << " x " << Bblk << "), "
               << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
+              << (g_gpuDecodeX2 ? ", decode x2" : "")
               << std::endl;
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
@@ -2566,6 +2592,9 @@ bool mainMarkerMTGpu(
             la.maxPairs = slots * nBin;
             la.tol = std::pow(std::numeric_limits<double>::epsilon(), 0.25);
             la.maxiter = 1000; la.blocks = 256; la.erfcMode = 1;
+            la.fusedRoots = g_gpuSpaFused ? 1 : 0;
+            la.dynamicPairs = g_gpuSpaDynamic ? 1 : 0;
+            la.minBlocksPerSM = g_gpuSpaMinBlocks;
             SL = saige::spa_gpu::create(la);
         }
         if (SP == nullptr && SL == nullptr)
@@ -2575,7 +2604,12 @@ bool mainMarkerMTGpu(
             std::cout << "  gpuSpa: " << (SL ? "gpu/spa_gpu library" : "gpu/gpu_spa.cu kernel") << " (gpuSpaImpl: "
                       << g_gpuSpaImpl << "), " << nBin << " traits' mu / XV / XXVX_inv resident, "
                       << ((SL ? saige::spa_gpu::deviceBytes(SL) : saige::gpu2::spaDeviceBytes(SP)) >> 20)
-                      << " MiB, up to " << (long)slots * nBin << " pairs per device batch" << std::endl;
+                      << " MiB, up to " << (long)slots * nBin << " pairs per device batch"
+                      << "; pair order " << (g_gpuSpaTraitMajor ? "trait" : "marker")
+                      << (SL ? (g_gpuSpaFused ? ", fused passes" : ", unfused passes") : "")
+                      << (SL ? (g_gpuSpaDynamic ? ", dynamic pairs" : ", strided pairs") : "")
+                      << (SL ? ", minBlocks " + std::to_string(g_gpuSpaMinBlocks) : std::string())
+                      << std::endl;
     }
     const bool spaDev = (SP != nullptr || SL != nullptr);
     if (anyBin)
@@ -3223,6 +3257,12 @@ bool mainMarkerMTGpu(
                 t0 = omp_get_wtime();
                 std::vector<PendSpa> all;
                 for (auto& v : pend) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
+                // gpuSpaOrder: trait -- the blocks in flight then share one
+                // trait's XXVX_inv / mu in L2. Stable, so a trait's pairs keep
+                // their marker order; results are indexed by jj, not by k.
+                if (g_gpuSpaTraitMajor)
+                    std::stable_sort(all.begin(), all.end(),
+                                     [](const PendSpa& x, const PendSpa& y) { return x.t < y.t; });
                 const int nPend = (int)all.size();
                 if (nPend > 0) {
                     saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
@@ -3468,6 +3508,9 @@ bool mainMarkerMTGpu(
                 const double tf0 = omp_get_wtime();
                 std::vector<PendFirth> allF;
                 for (auto& v : pendF) { allF.insert(allF.end(), v.begin(), v.end()); v.clear(); }
+                if (g_gpuSpaTraitMajor)
+                    std::stable_sort(allF.begin(), allF.end(),
+                                     [](const PendFirth& x, const PendFirth& y) { return x.t < y.t; });
                 const int nF = (int)allF.size();
                 if (nF > 0) {
                     saige::gpu2::FirthPairIn* fin = saige::gpu2::firthIn(FP);
@@ -6954,6 +6997,17 @@ int main(int argc, char* argv[])
             std::cerr << "                     pairs take the device saddlepoint kernel." << std::endl;
             std::cerr << "  gpuSpaImpl:        lib (default) or own: the SPA GPU library (gpu/spa_gpu)" << std::endl;
             std::cerr << "                     or the integrator's kernel (gpu/gpu_spa.cu)." << std::endl;
+            std::cerr << "  gpuSpaOrder:       marker (default) or trait: order of the flagged pairs sent" << std::endl;
+            std::cerr << "                     to the device SPA (trait keeps a trait's constants in L2)." << std::endl;
+            std::cerr << "  gpuSpaFused:       true/false (default: false). One pass per Newton step for" << std::endl;
+            std::cerr << "                     both roots of a pair, one for both tails (lib only)." << std::endl;
+            std::cerr << "  gpuSpaDynamic:     true/false (default: false). Blocks take pairs from a" << std::endl;
+            std::cerr << "                     device counter instead of a fixed stride (lib only)." << std::endl;
+            std::cerr << "  gpuSpaMinBlocks:   1 (default) .. 4: the SPA kernel's minimum resident blocks" << std::endl;
+            std::cerr << "                     per SM (register cap 128 / 85 / 64 for 2 / 3 / 4; lib only)." << std::endl;
+            std::cerr << "  gpuDecodeX2:       true/false (default: false). fp64 decode with lane-contiguous" << std::endl;
+            std::cerr << "                     16-byte stores (no half-written sectors on ECC HBM2)." << std::endl;
+            std::cerr << "                     All five leave every output bit-identical." << std::endl;
             std::cerr << "  gpuFirth:          true/false (default: false). With gpuSpa, the Firth fit of a" << std::endl;
             std::cerr << "                     pair whose p-value asks for it runs on the device." << std::endl;
             std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
@@ -7169,6 +7223,22 @@ int main(int argc, char* argv[])
             if (g_gpuSpaImpl != "lib" && g_gpuSpaImpl != "own")
                 throw std::runtime_error("gpuSpaImpl must be lib or own, not '" + g_gpuSpaImpl + "'");
         }
+        if (config["gpuSpaOrder"]) {
+            const std::string so = config["gpuSpaOrder"].as<std::string>();
+            if      (so == "marker") g_gpuSpaTraitMajor = false;
+            else if (so == "trait")  g_gpuSpaTraitMajor = true;
+            else throw std::runtime_error("gpuSpaOrder must be marker or trait, not '" + so + "'");
+        }
+        g_gpuSpaFused   = config["gpuSpaFused"]   ? config["gpuSpaFused"].as<bool>()   : false;
+        g_gpuSpaDynamic = config["gpuSpaDynamic"] ? config["gpuSpaDynamic"].as<bool>() : false;
+        if (config["gpuSpaMinBlocks"]) {
+            g_gpuSpaMinBlocks = config["gpuSpaMinBlocks"].as<int>();
+            if (g_gpuSpaMinBlocks < 1 || g_gpuSpaMinBlocks > 4)
+                throw std::runtime_error("gpuSpaMinBlocks must be 1..4");
+        }
+        g_gpuDecodeX2 = config["gpuDecodeX2"] ? config["gpuDecodeX2"].as<bool>() : false;
+        if ((g_gpuSpaFused || g_gpuSpaDynamic) && g_gpuSpaImpl != "lib")
+            std::cout << "  gpuSpaFused / gpuSpaDynamic: ignored, they need gpuSpaImpl: lib" << std::endl;
         if (g_gpuSpa && !g_gpuBinary) {
             std::cout << "  gpuSpa: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSpa = false;

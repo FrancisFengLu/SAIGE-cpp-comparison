@@ -108,6 +108,12 @@ struct CreateArgs {
     // layout popcount_af.hpp's pcBuildMask writes), 11 in every selected
     // sample's 2-bit field. nMask = 0: no counts.
     int nMask = 0; const uint64_t* masks = nullptr;
+    // fp64 decode with one 16-byte store per thread, lanes contiguous, instead
+    // of two 16-byte stores per thread 32 bytes apart (default false; only
+    // takes effect with fp64 and N % 4 == 0). Same output; on a V100 it
+    // removes the read-modify-write that half-written sectors cost on ECC'd
+    // HBM2 (S2_KERNEL_ROOFLINE.md).
+    bool decodeX2 = false;
 };
 
 // Returns nullptr on ANY failure (no device, allocation refused, ...). The

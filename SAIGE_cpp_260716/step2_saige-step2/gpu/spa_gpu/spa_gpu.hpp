@@ -97,6 +97,27 @@ struct CreateArgs {
     // final rounding, so subnormal p and the p == 0 cutoff are the CPU's
     // (erfc_boost53.cuh). 2: the literal Boost 53-bit port. 0: CUDA libm.
     int erfcMode = 1;
+    // Pass fusion (default off). The two Newton solves of a pair (q and qinv)
+    // and the two saddlepoint tails read the same stored (g~, mu) pairs; with
+    // fusedRoots != 0 one pass over them serves both solves, so a pair makes
+    // about half as many passes. Each root still visits exactly the sequence
+    // of t the unfused solve visits and each per-thread partial sum is
+    // accumulated in the same order, so every output field is bit-identical
+    // to fusedRoots = 0; only the memory traffic changes
+    // (S2_KERNEL_ROOFLINE.md).
+    int fusedRoots = 0;
+    // Dynamic pair assignment (default off): blocks take the next pair from a
+    // device counter instead of a fixed grid stride, so the blocks in flight
+    // always work on a window of consecutive pairs. With the caller's pair
+    // table sorted by trait, the trait's XXVX_inv and mu then stay in L2
+    // across the blocks that need them. Per-pair arithmetic is unchanged.
+    int dynamicPairs = 0;
+    // Occupancy hint (default 1 = none): the kernel's __launch_bounds__
+    // minimum blocks per SM, 1..4. On a V100 the unfused kernel compiles to
+    // 128 registers (2 blocks of 8 warps per SM) and the fused one to 194 (1
+    // block); 2 / 3 / 4 cap the registers at 128 / 85 / 64 and spill the rest
+    // to local memory for 16 / 24 / 32 resident warps. Arithmetic unchanged.
+    int minBlocksPerSM = 1;
 };
 
 // Device-resident genotype source for the slots PairIn::slot names. Exactly

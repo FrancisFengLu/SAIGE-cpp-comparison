@@ -145,6 +145,7 @@ struct KParams {
     double* scratch;             // blocks x 2N doubles
     double tol; int maxiter; int erfcMode;
     PairOut* out;
+    int* counter;                // dynamicPairs: next pair index (zeroed per run)
 };
 
 struct GenoCol {
@@ -260,12 +261,158 @@ __device__ void getroot(const Ctx& C, double q, double gpos, double gneg, double
     *root = t; *niter = rep; *conv = c;
 }
 
-// Get_Saddle_Prob_Binom / Get_Saddle_Prob_fast_Binom.
-__device__ double saddle(const Ctx& C, double zeta, double q, int logp, int erfcMode,
-                         double (*sh)[NWARP], int* isSaddle)
+// ---------------------------------------------------------------------------
+// Fused passes (CreateArgs::fusedRoots). One pass over the stored pairs
+// serves both Newton solves (or both tails) of a pair. Per root the per-thread
+// accumulation is the same sequence of additions as passK1K2 / passK0K2, and
+// blockReduce adds the warp partials in the same order, so each root's sums
+// are bit-identical to the unfused pass; e1 / e2 are block-uniform, so there is
+// no divergence, and a root that is not wanted this pass costs no arithmetic.
+// ---------------------------------------------------------------------------
+__device__ void passK1K2x2(const Ctx& C, bool e1, double t1, double q1, bool e2, double t2, double q2,
+                           double (*sh)[NWARP], double* K1a, double* K2a, double* K1b, double* K2b)
 {
-    double k1, k2;
-    passK0K2(C, zeta, sh, &k1, &k2);
+    double a[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const double2 e = C.buf[i];
+        const double g = e.x, m = e.y;
+        if (e1) {
+            const double ex = exp(-g * t1);
+            const double d  = (1 - m) * ex + m;
+            a[0] += (m * g) / d;
+            const double term = ((1 - m) * m * (g * g * ex)) / (d * d);
+            if (isfinite(term)) a[1] += term;
+        }
+        if (e2) {
+            const double ex = exp(-g * t2);
+            const double d  = (1 - m) * ex + m;
+            a[2] += (m * g) / d;
+            const double term = ((1 - m) * m * (g * g * ex)) / (d * d);
+            if (isfinite(term)) a[3] += term;
+        }
+    }
+    blockReduce<4>(a, sh);
+    if (e1) {
+        if (C.fast) { const double temp3 = C.NAmu + C.NAsigma * t1; *K1a = a[0] + temp3 - q1; *K2a = a[1] + C.NAsigma; }
+        else        { *K1a = a[0] - q1; *K2a = a[1]; }
+    }
+    if (e2) {
+        if (C.fast) { const double temp3 = C.NAmu + C.NAsigma * t2; *K1b = a[2] + temp3 - q2; *K2b = a[3] + C.NAsigma; }
+        else        { *K1b = a[2] - q2; *K2b = a[3]; }
+    }
+}
+
+__device__ void passK0K2x2(const Ctx& C, double t1, double t2, double (*sh)[NWARP],
+                           double* K0a, double* K2a, double* K0b, double* K2b)
+{
+    double a[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const double2 e = C.buf[i];
+        const double g = e.x, m = e.y;
+        {
+            a[0] += log(1 - m + m * exp(g * t1));
+            const double ex = exp(-g * t1);
+            const double d  = (1 - m) * ex + m;
+            const double term = ((1 - m) * m * (g * g * ex)) / (d * d);
+            if (isfinite(term)) a[1] += term;
+        }
+        {
+            a[2] += log(1 - m + m * exp(g * t2));
+            const double ex = exp(-g * t2);
+            const double d  = (1 - m) * ex + m;
+            const double term = ((1 - m) * m * (g * g * ex)) / (d * d);
+            if (isfinite(term)) a[3] += term;
+        }
+    }
+    blockReduce<4>(a, sh);
+    if (C.fast) {
+        *K0a = a[0] + C.NAmu * t1 + 0.5 * C.NAsigma * (t1 * t1);  *K2a = a[1] + C.NAsigma;
+        *K0b = a[2] + C.NAmu * t2 + 0.5 * C.NAsigma * (t2 * t2);  *K2b = a[3] + C.NAsigma;
+    } else {
+        *K0a = a[0]; *K2a = a[1];
+        *K0b = a[2]; *K2b = a[3];
+    }
+}
+
+// Both Newton solves of a pair in lockstep: getroot()'s control flow kept per
+// root (its own t, K1, K2, prevJump, rep, failure reason), every pass shared.
+// A root finishes when getroot() would have; the other continues alone, its
+// passes then carrying one root's arithmetic.
+struct RootSt {
+    double q, t, K1, K2, prevJump, tn, nK1, nK2;
+    int rep, c, reason;
+    bool live, eval, inf;
+};
+
+__device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double gneg, double tol, int maxiter,
+                         double (*sh)[NWARP],
+                         double* root1, int* niter1, int* conv1, int* reason1,
+                         double* root2, int* niter2, int* conv2, int* reason2)
+{
+    RootSt R[2];
+    R[0].q = q1; R[1].q = q2;
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        RootSt& S = R[r];
+        S.reason = RS_OK; S.t = 0.0; S.K1 = 0.0; S.K2 = 0.0; S.prevJump = CUDART_INF;
+        S.tn = 0.0; S.nK1 = 0.0; S.nK2 = 0.0; S.rep = 1; S.c = 1; S.eval = false;
+        S.inf  = (S.q >= gpos || S.q <= gneg);
+        S.live = !S.inf;
+    }
+    if (R[0].live || R[1].live)
+        passK1K2x2(C, R[0].live, 0.0, q1, R[1].live, 0.0, q2, sh, &R[0].K1, &R[0].K2, &R[1].K1, &R[1].K2);
+    while (R[0].live || R[1].live) {
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            RootSt& S = R[r];
+            S.eval = false;
+            if (!S.live) continue;
+            if (!C.fast && (!isfinite(S.K2) || fabs(S.K2) < 1e-15)) { S.c = 0; S.reason = RS_K2_GUARD; S.live = false; continue; }
+            const double tnew = S.t - S.K1 / S.K2;
+            if (C.fast ? isnan(tnew) : !isfinite(tnew)) { S.c = 0; S.reason = RS_TNEW; S.live = false; continue; }
+            if (fabs(tnew - S.t) < tol) { S.c = 1; S.live = false; continue; }
+            if (S.rep == maxiter) { S.c = 0; S.reason = RS_MAXITER; S.live = false; continue; }
+            S.tn = tnew; S.eval = true;
+        }
+        if (!(R[0].eval || R[1].eval)) continue;
+        passK1K2x2(C, R[0].eval, R[0].tn, q1, R[1].eval, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
+        bool re0 = false, re1 = false;
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            RootSt& S = R[r];
+            if (!S.eval) continue;
+            const bool flipped = C.fast ? ((S.K1 * S.nK1) < 0) : (sgn(S.K1) != sgn(S.nK1));
+            if (flipped) {
+                if (fabs(S.tn - S.t) > (S.prevJump - tol)) {
+                    S.tn = S.t + (double)sgn(S.nK1 - S.K1) * S.prevJump / 2;
+                    if (r == 0) re0 = true; else re1 = true;
+                } else {
+                    S.prevJump = fabs(S.tn - S.t);
+                }
+            }
+        }
+        if (re0 || re1) {
+            passK1K2x2(C, re0, R[0].tn, q1, re1, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
+            if (re0) R[0].prevJump = R[0].prevJump / 2;
+            if (re1) R[1].prevJump = R[1].prevJump / 2;
+        }
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            RootSt& S = R[r];
+            if (!S.eval) continue;
+            S.rep = S.rep + 1;
+            S.t = S.tn; S.K1 = S.nK1; S.K2 = S.nK2;
+        }
+    }
+    *reason1 = R[0].reason; *reason2 = R[1].reason;
+    if (R[0].inf) { *root1 = CUDART_INF; *niter1 = 0; *conv1 = 1; } else { *root1 = R[0].t; *niter1 = R[0].rep; *conv1 = R[0].c; }
+    if (R[1].inf) { *root2 = CUDART_INF; *niter2 = 0; *conv2 = 1; } else { *root2 = R[1].t; *niter2 = R[1].rep; *conv2 = R[1].c; }
+}
+
+// The scalar tail of Get_Saddle_Prob_*_Binom once Korg(zeta) and K2(zeta) are
+// known; shared by the unfused and the fused path.
+__device__ double saddleTail(double zeta, double q, double k1, double k2, int logp, int erfcMode, int* isSaddle)
+{
     const double temp1 = zeta * q - k1;
     *isSaddle = 0;
     bool flagrun = false;
@@ -290,10 +437,31 @@ __device__ double saddle(const Ctx& C, double zeta, double q, int logp, int erfc
     }
 }
 
-__global__ void __launch_bounds__(NT)
+// Get_Saddle_Prob_Binom / Get_Saddle_Prob_fast_Binom.
+__device__ double saddle(const Ctx& C, double zeta, double q, int logp, int erfcMode,
+                         double (*sh)[NWARP], int* isSaddle)
+{
+    double k1, k2;
+    passK0K2(C, zeta, sh, &k1, &k2);
+    return saddleTail(zeta, q, k1, k2, logp, erfcMode, isSaddle);
+}
+
+// Both tails of a pair from one pass (fusedRoots).
+__device__ void saddle2(const Ctx& C, double z1, double q1, double z2, double q2, int logp, int erfcMode,
+                        double (*sh)[NWARP], double* p1, int* s1, double* p2, int* s2)
+{
+    double k1a, k2a, k1b, k2b;
+    passK0K2x2(C, z1, z2, sh, &k1a, &k2a, &k1b, &k2b);
+    *p1 = saddleTail(z1, q1, k1a, k2a, logp, erfcMode, s1);
+    *p2 = saddleTail(z2, q2, k1b, k2b, logp, erfcMode, s2);
+}
+
+template <bool FUSED, bool DYN, int MINB>
+__global__ void __launch_bounds__(NT, MINB)
 spaKernel(const KParams P)
 {
     __shared__ double sh[NACC][NWARP];
+    __shared__ int shK;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int N = P.N;
     double2* buf = reinterpret_cast<double2*>(P.scratch) + (std::size_t)blockIdx.x * N;
@@ -301,7 +469,15 @@ spaKernel(const KParams P)
     const int segLo = (int)(((long long)N * warp) / NWARP);
     const int segHi = (int)(((long long)N * (warp + 1)) / NWARP);
 
-    for (int k = blockIdx.x; k < P.nPairs; k += gridDim.x) {
+    for (int k = blockIdx.x; ; k += gridDim.x) {
+        if (DYN) {
+            // next pair from the shared counter; every thread reads shK before
+            // the end-of-pair barrier, so the next write cannot race it
+            if (tid == 0) shK = atomicAdd(P.counter, 1);
+            __syncthreads();
+            k = shK;
+        }
+        if (k >= P.nPairs) break;
         const PairIn pin = P.in[k];
         GenoCol G;
         if (P.dense) {
@@ -408,8 +584,12 @@ spaKernel(const KParams P)
 
         unsigned status = (fast ? ST_FAST : 0u) | (pin.logp ? ST_LOGP : 0u);
         double r1, r2; int n1, n2, c1, c2, rs1, rs2;
-        getroot(C, q,    gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1);
-        getroot(C, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r2, &n2, &c2, &rs2);
+        if (FUSED) {
+            getroot2(C, q, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1, &r2, &n2, &c2, &rs2);
+        } else {
+            getroot(C, q,    gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1);
+            getroot(C, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r2, &n2, &c2, &rs2);
+        }
         if (n1 == 0 && isinf(r1)) status |= ST_ROOT1_INF;
         if (n2 == 0 && isinf(r2)) status |= ST_ROOT2_INF;
         if (!c1) status |= ST_ROOT1_FAIL;
@@ -418,8 +598,12 @@ spaKernel(const KParams P)
         double pv, p1 = 0.0, p2 = 0.0; int conv, s1 = -1, s2 = -1;
         if (c1 && c2) {
             // spa.cpp SPA / SPA_fast: a tail that is not a saddle withdraws convergence
-            p1 = saddle(C, r1, q,    pin.logp, P.erfcMode, sh, &s1);
-            p2 = saddle(C, r2, qinv, pin.logp, P.erfcMode, sh, &s2);
+            if (FUSED) {
+                saddle2(C, r1, q, r2, qinv, pin.logp, P.erfcMode, sh, &p1, &s1, &p2, &s2);
+            } else {
+                p1 = saddle(C, r1, q,    pin.logp, P.erfcMode, sh, &s1);
+                p2 = saddle(C, r2, qinv, pin.logp, P.erfcMode, sh, &s2);
+            }
             conv = 1;
             if (!s1) { conv = 0; status |= ST_SADDLE1_FAIL; p1 = pin.logp ? pin.pno - LOG2 : pin.pno / 2; }
             if (!s2) { conv = 0; status |= ST_SADDLE2_FAIL; p2 = pin.logp ? pin.pno - LOG2 : pin.pno / 2; }
@@ -440,6 +624,27 @@ spaKernel(const KParams P)
     }
 }
 
+// The 16 instantiations (fused x dynamic x minBlocksPerSM 1..4). MINB is the
+// __launch_bounds__ minimum-blocks hint: 1 leaves ptxas free (128 registers
+// for the unfused kernel, 194 for the fused one, i.e. 2 resp. 1 blocks of 8
+// warps per SM on a V100); 2 / 3 / 4 cap the registers at 128 / 85 / 64 and
+// spill the rest, buying 16 / 24 / 32 resident warps per SM.
+template <bool F, bool D>
+void launchSpaM(int minb, int grid, cudaStream_t st, const KParams& P)
+{
+    switch (minb) {
+        case 2:  spaKernel<F, D, 2><<<grid, NT, 0, st>>>(P); break;
+        case 3:  spaKernel<F, D, 3><<<grid, NT, 0, st>>>(P); break;
+        case 4:  spaKernel<F, D, 4><<<grid, NT, 0, st>>>(P); break;
+        default: spaKernel<F, D, 1><<<grid, NT, 0, st>>>(P); break;
+    }
+}
+void launchSpa(int fused, int dyn, int minb, int grid, cudaStream_t st, const KParams& P)
+{
+    if (fused) { if (dyn) launchSpaM<true, true>(minb, grid, st, P);  else launchSpaM<true, false>(minb, grid, st, P); }
+    else       { if (dyn) launchSpaM<false, true>(minb, grid, st, P); else launchSpaM<false, false>(minb, grid, st, P); }
+}
+
 __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, double* c)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -455,6 +660,8 @@ __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, do
 
 struct Spa {
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxiter = 1000, erfcMode = 1;
+    int fused = 0, dyn = 0, minb = 1;
+    int* dCounter = nullptr;
     double tol = 0.0;
     std::size_t traitStride = 0;
     PairIn*  hIn  = nullptr;
@@ -494,6 +701,8 @@ Spa* create(const CreateArgs& a)
     s->N = a.N; s->nTraits = a.nTraits; s->maxPairs = a.maxPairs;
     s->blocks = a.blocks > 0 ? a.blocks : 256;
     s->maxiter = a.maxiter; s->tol = a.tol; s->erfcMode = a.erfcMode;
+    s->fused = a.fusedRoots ? 1 : 0; s->dyn = a.dynamicPairs ? 1 : 0;
+    s->minb = (a.minBlocksPerSM >= 1 && a.minBlocksPerSM <= 4) ? a.minBlocksPerSM : 1;
     s->traitStride = (std::size_t)a.N * pMax;
 
     auto fail = [&](const char* what) -> Spa* {
@@ -515,6 +724,7 @@ Spa* create(const CreateArgs& a)
     if (!dev((void**)&s->dXX, (std::size_t)a.nTraits * s->traitStride * sizeof(double))) return fail("");
     if (!dev((void**)&s->dP,  (std::size_t)a.nTraits * sizeof(int))) return fail("");
     if (!dev((void**)&s->dScratch, (std::size_t)s->blocks * 2 * a.N * sizeof(double))) return fail("");
+    if (!dev((void**)&s->dCounter, sizeof(int))) return fail("");
     s->devBytes = db;
     std::vector<int> pv(a.nTraits);
     for (int t = 0; t < a.nTraits; ++t) {
@@ -542,6 +752,7 @@ void destroy(Spa* s)
     if (s->dXX) cudaFree(s->dXX);
     if (s->dP) cudaFree(s->dP);
     if (s->dScratch) cudaFree(s->dScratch);
+    if (s->dCounter) cudaFree(s->dCounter);
     if (s->dGPk) cudaFree(s->dGPk);
     if (s->dGLut) cudaFree(s->dGLut);
     if (s->dGDense) cudaFree(s->dGDense);
@@ -613,12 +824,14 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     P.N = s->N; P.MU = s->dMu; P.XV = s->dXV; P.XX = s->dXX; P.pOfTrait = s->dP; P.traitStride = s->traitStride;
     P.in = s->dIn; P.nPairs = nPairs; P.scratch = s->dScratch;
     P.tol = s->tol; P.maxiter = s->maxiter; P.erfcMode = s->erfcMode; P.out = s->dOut;
+    P.counter = s->dCounter;
 
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CK(cudaEventRecord(s->ev[0], s->st));
     CK(cudaMemcpyAsync(s->dIn, s->hIn, (std::size_t)nPairs * sizeof(PairIn), cudaMemcpyHostToDevice, s->st));
+    if (s->dyn) CK(cudaMemsetAsync(s->dCounter, 0, sizeof(int), s->st));
     CK(cudaEventRecord(s->ev[1], s->st));
-    spaKernel<<<grid, NT, 0, s->st>>>(P);
+    launchSpa(s->fused, s->dyn, s->minb, grid, s->st, P);
     CK(cudaGetLastError());
     CK(cudaEventRecord(s->ev[2], s->st));
     CK(cudaMemcpyAsync(s->hOut, s->dOut, (std::size_t)nPairs * sizeof(PairOut), cudaMemcpyDeviceToHost, s->st));
