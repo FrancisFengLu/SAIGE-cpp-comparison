@@ -1264,4 +1264,112 @@ void scoreTestBatchMTBinPre(const MTContext& t_ctx,
     }
 }
 
+void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
+                               const std::vector<int>& t_traitSet,
+                               int t_j0, int t_j1,
+                               const arma::mat& t_VR,
+                               const MTBlockAdj& t_adj,
+                               MTScratch& t_scr,
+                               MTBlockResult& t_out)
+{
+    if (t_traitSet.empty() || t_j1 <= t_j0) return;
+    bool anyAdj = false;
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        if (M.kind != TraitKind::Binary)
+            throw std::runtime_error("scoreTestBatchMTBinPreAdj: non-binary trait");
+        if (M.binOff < 0 || M.binIdx < 0)
+            throw std::runtime_error("scoreTestBatchMTBinPreAdj: trait has no binary stack block");
+        if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion) anyAdj = true;
+    }
+    preCheckWidth(t_scr, t_ctx, t_j1, true, "scoreTestBatchMTBinPreAdj");
+    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    if (anyAdj) {
+        if (t_scr.GMu2.n_rows < static_cast<arma::uword>(t_j1) ||
+            t_scr.GMu2.n_cols != (arma::uword)t_ctx.nBin)
+            throw std::runtime_error("scoreTestBatchMTBinPreAdj: prefilled GMu2 has the wrong shape");
+        if (t_adj.a.n_rows < static_cast<arma::uword>(t_j1) || t_adj.miss.size() < static_cast<size_t>(t_j1))
+            throw std::runtime_error("scoreTestBatchMTBinPreAdj: t_adj is narrower than the block");
+        // Rows summed over each column's missing cells, columns j0..j1 of the
+        // block (row j - j0 / column j - j0 here), the full stacks: row r is
+        // stack column r, so a trait reads colOff + r / binOff + r. Each entry
+        // is the same sequential sum scoreTestBatchMT forms over its range.
+        t_scr.MissA.zeros(static_cast<arma::uword>(t_ctx.sumP), B);
+        t_scr.MissR.zeros(B, t_ctx.RES.n_cols);
+        t_scr.MissWbin.zeros(static_cast<arma::uword>(t_ctx.sumPbin), B);
+        t_scr.MissMu2.zeros(B, t_ctx.MU2bin.n_cols);
+        for (arma::uword j = 0; j < B; ++j) {
+            const std::vector<arma::uword>& mv = t_adj.miss[static_cast<arma::uword>(t_j0) + j];
+            if (mv.empty()) continue;
+            sumRowsIntoCol(t_ctx.Astack, 0, t_ctx.sumP, mv, t_scr.MissA, j);
+            sumRowsIntoRow(t_ctx.RES, mv, t_scr.MissR, j);
+            sumRowsIntoCol(t_ctx.WXstack, 0, t_ctx.sumPbin, mv, t_scr.MissWbin, j);
+            sumRowsIntoRow(t_ctx.MU2bin, mv, t_scr.MissMu2, j);
+        }
+    }
+    const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
+
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        const arma::uword r0 = static_cast<arma::uword>(M.colOff);
+        const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
+        const arma::uword w0 = static_cast<arma::uword>(M.binOff);
+        const arma::uword w1 = w0 + static_cast<arma::uword>(M.p) - 1;
+        const arma::uword bi = static_cast<arma::uword>(M.binIdx);
+        const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (!adj) {
+            // scoreTestBatchMTBinPre's expressions, unchanged
+            const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
+            const arma::mat W_t = t_scr.GWbin.submat(w0, c0, w1, c1);       // p x B
+            arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+            arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+            arma::rowvec gwz = arma::sum(W_t % Z_t, 0);
+            arma::vec S    = (t_scr.GR.submat(c0, (arma::uword)t, c1, (arma::uword)t) - saz.t()) / M.tau0;
+            arma::vec var2 = zxz.t() + t_scr.G2Mu2.submat(c0, bi, c1, bi) - 2.0 * gwz.t();
+            emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+            continue;
+        }
+        // scoreTestBatchMT's adjusted branch (binary), on the block's columns
+        const arma::uword p = static_cast<arma::uword>(M.p);
+        const arma::vec& sA = t_ctx.sumA[t];
+        const arma::vec& sW = t_ctx.sumW[t];
+        t_scr.Zc.set_size(p, B);
+        t_scr.Wc.set_size(p, B);
+        t_scr.Rc.set_size(B);
+        t_scr.Qc.set_size(B);
+        for (arma::uword j = 0; j < B; ++j) {
+            const arma::uword jo = c0 + j;
+            const double a = t_adj.a(jo, t), b = t_adj.b(jo, t);
+            const double d = t_adj.d(jo, t), q = t_adj.q(jo, t);
+            const bool flip = (a < 0.0), shift = (b != 0.0);
+            const bool miss = (t_adj.nMiss(jo, t) > 0);
+            for (arma::uword r = 0; r < p; ++r) {
+                double z = t_scr.Zall(r0 + r, jo);
+                double w = t_scr.GWbin(w0 + r, jo);
+                if (flip)  { z = -z; w = -w; }
+                if (shift) { z += b * sA[r]; w += b * sW[r]; }
+                if (miss)  { z += d * t_scr.MissA(r0 + r, j); w += d * t_scr.MissWbin(w0 + r, j); }
+                t_scr.Zc(r, j) = z;
+                t_scr.Wc(r, j) = w;
+            }
+            double R = t_scr.GR(jo, t);
+            if (flip)  R = -R;
+            if (shift) R += b * t_ctx.sumR[t];
+            if (miss)  R += d * t_scr.MissR(j, t);
+            t_scr.Rc[j] = R;
+            double Q = t_scr.G2Mu2(jo, bi);
+            if (shift) Q += 2.0 * a * b * t_scr.GMu2(jo, bi) + b * b * t_ctx.sumM[t];
+            if (miss)  Q += q * t_scr.MissMu2(j, bi);
+            t_scr.Qc[j] = Q;
+        }
+        const arma::mat& Z_t = t_scr.Zc;
+        arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+        arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+        arma::rowvec gwz = arma::sum(t_scr.Wc % Z_t, 0);
+        arma::vec S    = (t_scr.Rc - saz.t()) / M.tau0;
+        arma::vec var2 = zxz.t() + t_scr.Qc - 2.0 * gwz.t();
+        emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+    }
+}
+
 }  // namespace SAIGE

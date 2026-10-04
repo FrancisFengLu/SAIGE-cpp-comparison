@@ -311,6 +311,17 @@ bool g_gpuDecodeX2 = false;
 // cutoff) and pairs that need the fast-test recompute stay on the CPU.
 bool g_gpuFirth = false;
 double g_gpuFirthMaxStep = 15.0;
+// Config key gpuOwnSampleSets (default false; S2_GPU_MISSING.md): the GPU path
+// also takes a multi-trait set whose models do not share one sample list
+// (missing phenotypes), as mainMarkerMT does it: the reader and the device work
+// on the union of the lists, every per-sample vector of a trait with its own
+// list is embedded at union length with exact zeros outside its samples (the
+// context already holds the stacks that way), each (marker, trait) pair takes
+// the trait's own QC / impute / flip and the exact affine map onto the union
+// column (MTBlockAdj), and the device case counts, SPA and Firth take per-trait
+// sample masks. Binary traits only among the traits with their own list. Off:
+// such a set is refused and runs on the CPU, as before.
+bool g_gpuOwnSampleSets = false;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2390,6 +2401,11 @@ struct PendSpa {
     int    bi, jj, c, t;
     double Tstat, var1, var2, pno;
     char   logp, fast;
+    // the pair's own marker statistics: the column's, or -- a trait with its
+    // own sample list (gpuOwnSampleSets) -- the trait's
+    double MAC, AF;
+    char   flip;
+    double fd[4];
 };
 
 // Per-block state that has to survive the barrier between the read phase and
@@ -2403,6 +2419,24 @@ struct GpuBlk {
     std::vector<char>     flipc;
     arma::mat             VR;        // Bblk x P
     int nHi = 0, nLo = 0;
+    // ---- gpuOwnSampleSets only: per (slot, trait), as MTBlockWork holds them ----
+    std::vector<char>     qcP, flipP, affP;   // [B*P]
+    arma::mat             MACp, AFp, ACp, MRp, IIp;   // B x P
+    std::vector<double>   fdP;       // [B*P*4] the trait's code -> final dosage table
+    std::vector<uint64_t> cntP;      // [B*P*4] the trait's code counts
+    SAIGE::MTBlockAdj     adj;       // the map from the union column to each trait's vector
+    void ensureDiffer(int B, int P) {
+        const std::size_t BP = (std::size_t)B * (std::size_t)P;
+        qcP.assign(BP, 0); flipP.assign(BP, 0); affP.assign(BP, 0);
+        if (MACp.n_rows != (arma::uword)B || MACp.n_cols != (arma::uword)P) {
+            MACp.set_size(B, P); AFp.set_size(B, P); ACp.set_size(B, P);
+            MRp.set_size(B, P); IIp.set_size(B, P);
+        }
+        fdP.assign(BP * 4, 0.0); cntP.assign(BP * 4, 0);
+        adj.resize(B, P);
+        adj.a.ones(); adj.b.zeros(); adj.d.zeros(); adj.q.zeros(); adj.nMiss.zeros();
+        for (auto& m : adj.miss) m.clear();
+    }
     void ensure(int B, int P) {
         colOf.assign(B, -1);
         isHi.assign(B, 0);
@@ -2439,7 +2473,8 @@ bool mainMarkerMTGpu(
     else if (!g_fusedPlinkDecode)                  why = "SAIGE_STEP2_SCALAR_DECODE=1 is set";
     else if (!g_mtBatch)                           why = "mtBatch is false";
     else if (ctx.P != P || ctx.N <= 0)             why = "no multi-trait context (P == 1 needs `models:` with the GPU path)";
-    else if (ctx.sampleSetsDiffer)                 why = "the models do not share one sample list";
+    else if (ctx.sampleSetsDiffer && !g_gpuOwnSampleSets)
+                                                   why = "the models do not share one sample list (gpuOwnSampleSets: true runs them on the device)";
     else if ((ctx.sumPbin != 0 || ctx.nBin != 0) && !g_gpuBinary)
                                                    why = "binary traits present (gpuBinary: true runs them on the device)";
     if (why.empty()) {
@@ -2450,13 +2485,21 @@ bool mainMarkerMTGpu(
             }
             if (!M.batchable)   { why = "trait '" + M.name + "': " + SAIGE::batchableReason(M); break; }
             if (M.isCondition)  { why = "trait '" + M.name + "' runs conditional analysis"; break; }
-            if (g_saigeObjs[t]->m_n != g_saigeObjs[0]->m_n) { why = "models disagree on n"; break; }
+            if (!ctx.sampleSetsDiffer && g_saigeObjs[t]->m_n != g_saigeObjs[0]->m_n) { why = "models disagree on n"; break; }
+            if (ctx.sampleSetsDiffer) {
+                // as mainMarkerMT requires: m_n is the trait's sample count
+                if (g_saigeObjs[t]->m_n != ctx.samp[t].n) { why = "trait '" + M.name + "': rows in y != sample IDs"; break; }
+                if (!ctx.samp[t].sameAsUnion && M.kind != SAIGE::TraitKind::Binary) {
+                    why = "trait '" + M.name + "' is quantitative with its own sample list (gpuOwnSampleSets covers binary traits)";
+                    break;
+                }
+            }
             if (M.kind == SAIGE::TraitKind::Binary && (M.binOff < 0 || M.binIdx < 0)) {
                 why = "trait '" + M.name + "' has no binary stack block"; break;
             }
         }
     }
-    if (why.empty() && (int)ptr_gPLINKobj->getN() != g_saigeObjs[0]->m_n)
+    if (why.empty() && (int)ptr_gPLINKobj->getN() != (ctx.sampleSetsDiffer ? ctx.N : g_saigeObjs[0]->m_n))
         why = "the reader's sample count is not the models'";
     if (why.empty() && !saige::gpu2::available(g_gpuDevice, &why))
         { /* why already set by available() */ }
@@ -2470,7 +2513,11 @@ bool mainMarkerMTGpu(
         return false;
     }
 
-    const int n = g_saigeObjs[0]->m_n;
+    // Different sample lists (gpuOwnSampleSets): n is the union's, the reader's
+    // and every stack's row count; a trait with its own list is scored on its
+    // samples through the zero embedding and MTBlockAdj, as in mainMarkerMT.
+    const bool differ = ctx.sampleSetsDiffer;
+    const int n = differ ? ctx.N : g_saigeObjs[0]->m_n;
     const int nBin = ctx.nBin;
     const bool anyBin = (nBin > 0);
     const bool anyQnt = !ctx.batchQuantTraits.empty();
@@ -2492,7 +2539,10 @@ bool mainMarkerMTGpu(
     // same way.
     const int sumP = ctx.sumP, sumPbin = ctx.sumPbin, sumPqnt = ctx.sumPqnt, qOff = ctx.qOff;
     const int oW = sumP, oXq = sumP + sumPbin, oR = sumP + sumPbin + sumPqnt;
-    const int K1 = oR + P;
+    // differ: G^T MU2bin too (the flip correction of a trait with its own list,
+    // scoreTestBatchMTBinPreAdj), nBin more columns after RES.
+    const int oGM = oR + P;
+    const int K1 = oR + P + ((differ && nBin > 0) ? nBin : 0);
     const int K2 = nBin;
     if ((int)ctx.Astack.n_rows != n || (int)ctx.Xstack.n_rows != n ||
         (int)ctx.RES.n_rows != n ||
@@ -2526,10 +2576,27 @@ bool mainMarkerMTGpu(
     std::vector<uint64_t> caseMasks((std::size_t)std::max(nBin, 1) * words, 0);
     std::vector<std::vector<uint64_t>> ctrlMask(std::max(nBin, 1));
     std::vector<char> pcAsc(std::max(nBin, 1), 0);
+    // differ: a trait with its own list has its cases / controls at their union
+    // positions, caseU[t][k] = the union index of its k-th case (mainMarkerMT's).
+    std::vector<arma::uvec> caseU(P), ctrlU(P);
+    std::vector<char> ownS(P, 0);
+    if (differ) {
+        for (int t = 0; t < P; t++) {
+            const SAIGE::MTTraitSamples& S = ctx.samp[t];
+            if (S.sameAsUnion) continue;
+            ownS[t] = 1;
+            const arma::uvec& ci = g_saigeObjs[t]->m_case_indices;
+            const arma::uvec& oi = g_saigeObjs[t]->m_ctrl_indices;
+            caseU[t].set_size(ci.n_elem);
+            ctrlU[t].set_size(oi.n_elem);
+            for (arma::uword k = 0; k < ci.n_elem; k++) caseU[t][k] = S.pos.at(ci[k]);
+            for (arma::uword k = 0; k < oi.n_elem; k++) ctrlU[t][k] = S.pos.at(oi[k]);
+        }
+    }
     for (int t : binTraits) {
         const int b = ctx.meta[t].binIdx;
-        const arma::uvec& ci = g_saigeObjs[t]->m_case_indices;
-        const arma::uvec& oi = g_saigeObjs[t]->m_ctrl_indices;
+        const arma::uvec& ci = ownS[t] ? caseU[t] : g_saigeObjs[t]->m_case_indices;
+        const arma::uvec& oi = ownS[t] ? ctrlU[t] : g_saigeObjs[t]->m_ctrl_indices;
         SAIGE::pcBuildMask(ci.memptr(), ci.n_elem, &caseMasks[(std::size_t)b * words]);
         ctrlMask[b].assign((std::size_t)words, 0);
         SAIGE::pcBuildMask(oi.memptr(), oi.n_elem, ctrlMask[b].data());
@@ -2554,6 +2621,9 @@ bool mainMarkerMTGpu(
                         (std::size_t)n * sumPqnt * sizeof(double));
         std::memcpy(Bf.data() + (std::size_t)n * oR, ctx.RES.memptr(),
                     (std::size_t)n * P * sizeof(double));
+        if (K1 > oGM)
+            std::memcpy(Bf.data() + (std::size_t)n * oGM, ctx.MU2bin.memptr(),
+                        (std::size_t)n * nBin * sizeof(double));
         saige::gpu2::CreateArgs a;
         a.device = g_gpuDevice; a.N = n;
         a.K1 = K1; a.B1 = Bf.data();
@@ -2580,6 +2650,13 @@ bool mainMarkerMTGpu(
               << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
               << (g_gpuDecodeX2 ? ", decode x2" : "")
               << std::endl;
+    if (differ) {
+        int nOwn = 0;
+        for (int t = 0; t < P; t++) nOwn += ownS[t] ? 1 : 0;
+        std::cout << "  gpuOwnSampleSets: the reader and the device work on the union of " << n
+                  << " samples; " << nOwn << " of " << P << " traits have their own sample list "
+                     "(zero-embedded stacks, per-trait masks on the device)" << std::endl;
+    }
     if (prefetch)
         std::cout << "  gpuPrefetch: " << nSets << " staging sets of " << slots << " markers ("
                   << ((std::size_t)nSets * slots * (bpv + 4 * sizeof(double)) >> 20)
@@ -2588,7 +2665,37 @@ bool mainMarkerMTGpu(
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
     saige::spa_gpu::Spa* SL = nullptr;     // gpuSpaImpl: lib
     std::vector<arma::vec> muCopy;   // get_mu copies; kept alive until spaCreate returns
-    if (anyBin && g_gpuSpa) {
+    // differ: a trait with its own list has its per-sample model vectors
+    // embedded at union length with exact zeros outside its samples (as the
+    // context's stacks are), plus a 1-bit sample mask for the device SPA /
+    // Firth. Kept alive until those copy them at create.
+    const int words1 = (n + 63) / 64;
+    std::vector<arma::vec> yE(std::max(nBin, 1)), offE(std::max(nBin, 1));
+    std::vector<arma::mat> xvE(std::max(nBin, 1)), xxE(std::max(nBin, 1));
+    std::vector<std::vector<uint64_t>> mask1(std::max(nBin, 1));
+    auto embedRows = [&](int t, int b, const arma::vec& mu) -> bool {
+        const SAIGE::MTTraitSamples& S = ctx.samp[t];
+        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+        const arma::uword nt = (arma::uword)S.n, pp = (arma::uword)obj->m_p;
+        if (mu.n_elem != nt || obj->m_XV.n_rows != pp || obj->m_XV.n_cols != nt ||
+            obj->m_XXVX_inv.n_rows != nt || obj->m_XXVX_inv.n_cols != pp ||
+            obj->m_y.n_elem != nt || obj->m_offset.n_elem != nt || S.pos.size() != nt)
+            return false;
+        muCopy[b].zeros(n); yE[b].zeros(n); offE[b].zeros(n);
+        xvE[b].zeros(pp, n); xxE[b].zeros(n, pp);
+        mask1[b].assign((std::size_t)words1, 0);
+        for (arma::uword k = 0; k < nt; k++) {
+            const arma::uword u = S.pos[k];
+            muCopy[b][u] = mu[k]; yE[b][u] = obj->m_y[k]; offE[b][u] = obj->m_offset[k];
+            for (arma::uword j = 0; j < pp; j++) { xvE[b](j, u) = obj->m_XV(j, k); xxE[b](u, j) = obj->m_XXVX_inv(k, j); }
+            mask1[b][u >> 6] |= 1ull << (u & 63);
+        }
+        return true;
+    };
+    if (anyBin && g_gpuSpa && differ && g_gpuSpaImpl == "own")
+        std::cout << "  gpuSpa: gpuSpaImpl: own does not take per-trait sample lists "
+                     "(gpuOwnSampleSets needs gpuSpaImpl: lib); SPA stays on the CPU scalar path" << std::endl;
+    else if (anyBin && g_gpuSpa) {
         std::vector<saige::gpu2::SpaTraitArgs> ta(nBin);
         muCopy.resize(nBin);
         bool ok = true;
@@ -2596,6 +2703,15 @@ bool mainMarkerMTGpu(
             const int b = ctx.meta[t].binIdx;
             SAIGE::SAIGEClass* obj = g_saigeObjs[t];
             obj->get_mu(muCopy[b]);
+            if (differ && ownS[t]) {
+                const arma::vec mu = muCopy[b];
+                if (obj->m_p > saige::gpu2::SPA_PMAX || !embedRows(t, b, mu)) { ok = false; break; }
+                ta[b].mu = muCopy[b].memptr();
+                ta[b].XV = xvE[b].memptr();
+                ta[b].XXVX_inv = xxE[b].memptr();
+                ta[b].p = obj->m_p;
+                continue;
+            }
             if ((int)muCopy[b].n_elem != n || (int)obj->m_XV.n_rows != obj->m_p ||
                 (int)obj->m_XV.n_cols != n || (int)obj->m_XXVX_inv.n_rows != n ||
                 (int)obj->m_XXVX_inv.n_cols != obj->m_p || obj->m_p > saige::gpu2::SPA_PMAX) {
@@ -2618,6 +2734,7 @@ bool mainMarkerMTGpu(
             std::vector<saige::spa_gpu::TraitArgs> tl(nBin);
             for (int b = 0; b < nBin; b++) {
                 tl[b].mu = ta[b].mu; tl[b].XV = ta[b].XV; tl[b].XXVX_inv = ta[b].XXVX_inv; tl[b].p = ta[b].p;
+                tl[b].mask = mask1[b].empty() ? nullptr : mask1[b].data();
             }
             saige::spa_gpu::CreateArgs la;
             la.device = g_gpuDevice; la.N = n; la.nTraits = nBin; la.traits = tl.data();
@@ -2627,6 +2744,7 @@ bool mainMarkerMTGpu(
             la.fusedRoots = g_gpuSpaFused ? 1 : 0;
             la.dynamicPairs = g_gpuSpaDynamic ? 1 : 0;
             la.minBlocksPerSM = g_gpuSpaMinBlocks;
+            la.ownSamples = differ ? 1 : 0;
             SL = saige::spa_gpu::create(la);
         }
         if (SP == nullptr && SL == nullptr)
@@ -2657,6 +2775,16 @@ bool mainMarkerMTGpu(
         for (int t : binTraits) {
             const int b = ctx.meta[t].binIdx;
             SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+            if (differ && ownS[t]) {
+                // embedded with the device SPA's setup (gpuFirth needs it)
+                if (mask1[b].empty() || obj->m_p > saige::gpu2::FIRTH_PMAX) { ok = false; break; }
+                fa[b].y = yE[b].memptr(); fa[b].offset = offE[b].memptr();
+                fa[b].XV = xvE[b].memptr(); fa[b].XXVX_inv = xxE[b].memptr();
+                fa[b].p = obj->m_p;
+                fa[b].mask = mask1[b].data();
+                if (ctx.meta[t].is_Firth_beta) any = true;
+                continue;
+            }
             if ((int)obj->m_y.n_elem != n || (int)obj->m_offset.n_elem != n ||
                 (int)obj->m_XV.n_rows != obj->m_p || (int)obj->m_XV.n_cols != n ||
                 (int)obj->m_XXVX_inv.n_rows != n || (int)obj->m_XXVX_inv.n_cols != obj->m_p ||
@@ -2673,6 +2801,7 @@ bool mainMarkerMTGpu(
             fc.device = g_gpuDevice; fc.N = n; fc.nTraits = nBin; fc.traits = fa.data();
             fc.maxPairs = slots * nBin;
             fc.maxit = 50; fc.maxstep = g_gpuFirthMaxStep; fc.xconv = 1e-5; fc.gconv = 1e-5; fc.blocks = 256;
+            fc.ownSamples = differ ? 1 : 0;
             FP = saige::gpu2::firthCreate(fc);
         }
         if (!any)
@@ -2708,7 +2837,7 @@ bool mainMarkerMTGpu(
     // Pairs whose p-value asked for Firth, fitted on the device after the SPA
     // pass (gpuFirth): the batch / device-SPA result stands, only Beta / seBeta
     // and the Firth flags change.
-    struct PendFirth { int bi, jj, c, t; double p; char logp; };
+    struct PendFirth { int bi, jj, c, t; double p; char logp; char flip; double fd[4]; };
     std::vector<std::vector<PendFirth>> pendF(std::max(1, omp_get_max_threads()));
     std::vector<long> nDevFirth(P, 0);
     double tFirth = 0;
@@ -2804,6 +2933,7 @@ bool mainMarkerMTGpu(
 
     std::atomic<int> firstEndIdx{q};
     const int imputeCase = string_to_case.at(g_impute_method);
+    static const uint8_t kMissU = 0x1;   // PLINK 2-bit code 01 = missing genotype
 
     // ---------------- phase 1: read + QC + stage one superblock ----------------
     // Into staging set s, on nThr OpenMP threads of the calling thread's team.
@@ -2821,9 +2951,15 @@ bool mainMarkerMTGpu(
                 const int blk = sb + bi;
                 GpuBlk& S = B[bi];
                 S.ensure(Bblk, P);
+                if (differ) S.ensureDiffer(Bblk, P);
                 const int jj0 = blk * Bblk;
                 const int jj1 = std::min(jj0 + Bblk, qc);
                 const std::size_t slotBase = (std::size_t)bi * Bblk;
+                // differ: the marker's union codes and the per-trait scratch
+                std::vector<uint8_t> codesU(differ ? (std::size_t)n : 0);
+                std::vector<char> tq(P, 0), tflip(P, 0);
+                std::vector<double> tMAC(P), tAF(P), tAC(P), tMR(P), tII(P), tfd((std::size_t)P * 4);
+                std::vector<uint64_t> tcnt((std::size_t)P * 4);
 
                 for (int jj = jj0; jj < jj1; jj++) {
                     const int i = chunkStart + jj;
@@ -2832,6 +2968,166 @@ bool mainMarkerMTGpu(
                         #pragma omp critical(progress)
                         std::cout << "Completed " << (i + 1) << "/" << q
                                   << " markers in the chunk." << std::endl;
+                    }
+
+                    if (differ) {
+                        // ---- own sample lists: mainMarkerMT's union read and
+                        // per-trait stats, statement for statement ----
+                        const uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
+                        PLINK::PlinkClass::FusedMarkerStats fsU;
+                        if (!ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsU)) {
+                            #pragma omp critical(endflag)
+                            {
+                                if (i < firstEndIdx.load(std::memory_order_relaxed))
+                                    firstEndIdx.store(i, std::memory_order_relaxed);
+                                g_markerTestEnd = true;
+                            }
+                            continue;
+                        }
+                        CM.chrVec[jj]    = fsU.chr;
+                        CM.posVec[jj]    = std::to_string(fsU.pd);
+                        CM.refVec[jj]    = fsU.ref;
+                        CM.altVec[jj]    = fsU.alt;
+                        CM.markerVec[jj] = fsU.marker;
+                        const uint8_t* codes = codesU.data();
+                        ptr_gPLINKobj->copyFusedCodes_ts(fsU, codesU.data());
+
+                        // the union column's own table
+                        PLINK::PlinkClass::FusedMarkerStats fu;
+                        for (int c4 = 0; c4 < 4; c4++) { fu.counts[c4] = fsU.counts[c4]; fu.dmap[c4] = fsU.dmap[c4]; }
+                        fu.N = (uint32_t)n;
+                        fu.gIndex = gIndex;
+                        ptr_gPLINKobj->fusedPreStatsFromCounts(fu, (uint32_t)n);
+                        {
+                            const double MAFu = std::min(fu.altFreq, 1 - fu.altFreq);
+                            const double MACu = MAFu * n * (1 - fu.missingRate) * 2;
+                            PLINK::finalizeFusedStats(fu, imputeCase, g_dosage_zerod_cutoff,
+                                                      g_dosage_zerod_MAC_cutoff, MACu);
+                        }
+                        bool anyQC = false;
+                        for (int t = 0; t < P; t++) {
+                            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+                            const int nObj = g_saigeObjs[t]->m_n;
+                            tq[t] = 0;
+                            PLINK::PlinkClass::FusedMarkerStats ft;
+                            for (int c4 = 0; c4 < 4; c4++) ft.dmap[c4] = fsU.dmap[c4];
+                            if (TS.sameAsUnion) {
+                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = fsU.counts[c4];
+                            } else if (TS.comp.size() <= TS.pos.size()) {
+                                uint64_t cnt[4] = {fsU.counts[0], fsU.counts[1], fsU.counts[2], fsU.counts[3]};
+                                for (arma::uword u : TS.comp) cnt[codes[u]]--;
+                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
+                            } else {
+                                uint64_t cnt[4] = {0, 0, 0, 0};
+                                for (arma::uword u : TS.pos) cnt[codes[u]]++;
+                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
+                            }
+                            ft.N = (uint32_t)TS.n;
+                            ft.gIndex = gIndex;
+                            ptr_gPLINKobj->fusedPreStatsFromCounts(ft, (uint32_t)TS.n);
+                            double altFreq = ft.altFreq;
+                            const double missingRate = ft.missingRate;
+                            const double imputeInfo = ft.imputeInfo;
+                            tMR[t] = missingRate;
+                            tII[t] = imputeInfo;
+                            double MAF = std::min(altFreq, 1 - altFreq);
+                            double MAC = MAF * nObj * (1 - missingRate) * 2;
+                            if ((missingRate > g_missingRate_cutoff) ||
+                                (MAF < g_marker_minMAF_cutoff) ||
+                                (MAC < g_marker_minMAC_cutoff) ||
+                                (imputeInfo < g_marker_minINFO_cutoff)) {
+                                continue;
+                            }
+                            PLINK::finalizeFusedStats(ft, imputeCase, g_dosage_zerod_cutoff,
+                                                      g_dosage_zerod_MAC_cutoff, MAC);
+                            const bool flip = ft.flip;
+                            altFreq = ft.altFreq_post;
+                            const double altCounts = ft.altCounts_post;
+                            MAC = std::min(altCounts, 2.0 * nObj - altCounts);
+                            MAF = std::min(altFreq, 1 - altFreq);
+                            if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) continue;
+                            tq[t] = 1;
+                            anyQC = true;
+                            tflip[t] = flip ? 1 : 0;
+                            tMAC[t] = MAC;
+                            tAF[t] = altFreq;
+                            tAC[t] = altCounts;
+                            for (int c4 = 0; c4 < 4; c4++) {
+                                tfd[(std::size_t)t * 4 + c4] = ft.fd[c4];
+                                tcnt[(std::size_t)t * 4 + c4] = ft.counts[c4];
+                            }
+                        }
+                        if (!anyQC) continue;
+                        // high-MAC column iff some binary trait scores it with
+                        // the normal approximation (every trait is batchable here)
+                        bool hi = false;
+                        for (int t = 0; t < P; t++)
+                            if (tq[t] && ctx.meta[t].kind == SAIGE::TraitKind::Binary &&
+                                tMAC[t] > g_MACCutoffforER) { hi = true; break; }
+                        const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
+                        ptr_gPLINKobj->copyFusedPacked_ts(fsU, hPkS + (slotBase + c) * bpv);
+                        double ss = 0.0;
+                        for (int k = 0; k < 4; k++) {
+                            S.fdc[(std::size_t)c * 4 + k]  = fu.fd[k];
+                            S.cntc[(std::size_t)c * 4 + k] = fsU.counts[k];
+                            hLuS[(slotBase + c) * 4 + k]    = fu.fd[k];
+                            ss += fu.fd[k] * fu.fd[k] * (double)fsU.counts[k];
+                        }
+                        S.ssc[c]   = ss;
+                        S.colOf[jj - jj0] = c;
+                        S.isHi[c]  = hi ? 1 : 0;
+                        S.MACc[c]  = 0.0;     // per trait below
+                        S.AFc[c]   = 0.0;
+                        S.flipc[c] = fu.flip ? 1 : 0;
+                        std::vector<arma::uword>& mv = S.adj.miss[c];
+                        mv.clear();
+                        if (fu.counts[kMissU] > 0)
+                            for (int u = 0; u < n; u++) if (codes[u] == kMissU) mv.push_back((arma::uword)u);
+                        for (int t = 0; t < P; t++) {
+                            const std::size_t k = (std::size_t)c * (std::size_t)P + (std::size_t)t;
+                            S.qcP[k] = tq[t];
+                            S.adj.a(c, t) = 1.0; S.adj.b(c, t) = 0.0;
+                            S.adj.d(c, t) = 0.0; S.adj.q(c, t) = 0.0;
+                            S.adj.nMiss(c, t) = 0;
+                            S.affP[k] = 0;
+                            S.VR(c, t) = 1.0;
+                            if (!tq[t]) continue;
+                            const double MAC = tMAC[t];
+                            S.flipP[k] = tflip[t];
+                            S.MACp(c, t) = MAC;
+                            S.AFp(c, t)  = tAF[t];
+                            S.ACp(c, t)  = tAC[t];
+                            S.MRp(c, t)  = tMR[t];
+                            S.IIp(c, t)  = tII[t];
+                            const double* fdt = &tfd[(std::size_t)t * 4];
+                            for (int c4 = 0; c4 < 4; c4++) {
+                                S.fdP[k * 4 + c4] = fdt[c4];
+                                S.cntP[k * 4 + c4] = tcnt[(std::size_t)t * 4 + c4];
+                            }
+                            const bool sameFlip = ((tflip[t] != 0) == fu.flip);
+                            const double a = sameFlip ? 1.0 : -1.0;
+                            const double b = sameFlip ? 0.0 : 2.0;
+                            bool aff = true;
+                            for (int c4 = 0; c4 < 4; c4++) {
+                                if ((uint8_t)c4 == kMissU) continue;
+                                if (fdt[c4] != a * fu.fd[c4] + b) aff = false;
+                            }
+                            const double gm = a * fu.fd[kMissU] + b;
+                            S.adj.a(c, t) = a;
+                            S.adj.b(c, t) = b;
+                            S.adj.d(c, t) = fdt[kMissU] - gm;
+                            S.adj.q(c, t) = fdt[kMissU] * fdt[kMissU] - gm * gm;
+                            S.adj.nMiss(c, t) = (arma::uword)tcnt[(std::size_t)t * 4 + kMissU];
+                            S.affP[k] = aff ? 1 : 0;
+                            SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                            const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                            const bool noadjCur  = obj->m_isnoadjCov;
+                            bool dummyHas;
+                            S.VR(c, t) = isSingleVR[t]
+                                ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
+                                : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                        }
+                        continue;
                     }
 
                     char* end;
@@ -3088,6 +3384,11 @@ bool mainMarkerMTGpu(
                     W.scr.G2Mu2.set_size(Bblk, nBin);
                     for (int b = 0; b < nBin; b++)
                         for (int j = 0; j < Bblk; j++) W.scr.G2Mu2(j, b) = SAIGE_GPU_C2(b, j);
+                    if (differ) {
+                        W.scr.GMu2.set_size(Bblk, nBin);
+                        for (int b = 0; b < nBin; b++)
+                            for (int j = 0; j < Bblk; j++) W.scr.GMu2(j, b) = SAIGE_GPU_C(oGM + b, j);
+                    }
                 }
                 for (int t = 0; t < P; t++)
                     for (int j = 0; j < Bblk; j++) W.scr.GR(j, t) = SAIGE_GPU_C(oR + t, j);
@@ -3101,17 +3402,22 @@ bool mainMarkerMTGpu(
                     if (nLo > 0)
                         SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, W.scr, W.res);
                 }
-                if (anyBin && nHi > 0)
-                    SAIGE::scoreTestBatchMTBinPre(ctx, binTraits, 0, nHi, S.VR, W.scr, W.res);
+                if (anyBin && nHi > 0) {
+                    if (differ)
+                        SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraits, 0, nHi, S.VR, S.adj, W.scr, W.res);
+                    else
+                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraits, 0, nHi, S.VR, W.scr, W.res);
+                }
+                if (differ && W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
 
                 for (int jj = jj0; jj < jj1; jj++) {
                     const int c = S.colOf[jj - jj0];
                     if (c < 0) continue;
                     const int i = chunkStart + jj;
-                    const double MAC = S.MACc[c];
-                    const double altFreq = S.AFc[c];
-                    const bool   flip = (S.flipc[c] != 0);
-                    const bool   hi = (S.isHi[c] != 0);
+                    const double MACcol = S.MACc[c];
+                    const double AFcol = S.AFc[c];
+                    const bool   flipCol = (S.flipc[c] != 0);
+                    const bool   hiCol = (S.isHi[c] != 0);
                     const double* fdc = &S.fdc[(std::size_t)c * 4];
                     const uint64_t* cntc = &S.cntc[(std::size_t)c * 4];
                     const std::size_t slot = slotBase + c;
@@ -3144,10 +3450,58 @@ bool mainMarkerMTGpu(
                         const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
                         MTTraitChunk& O = out[t];
 
-                        O.altFreq[jj]     = CM.altFreqVec[jj];
-                        O.altCounts[jj]   = CM.altCountsVec[jj];
-                        O.missingRate[jj] = CM.missingRateVec[jj];
-                        O.imputeInfo[jj]  = CM.imputationInfoVec[jj];
+                        // The pair's marker statistics: the column's, or with
+                        // different sample lists the trait's own (mainMarkerMT).
+                        const std::size_t kP = (std::size_t)c * (std::size_t)P + (std::size_t)t;
+                        if (differ && !S.qcP[kP]) continue;   // failed QC for this trait: row stays NA
+                        const bool own = differ && ownS[t];
+                        const double MAC = differ ? S.MACp(c, t) : MACcol;
+                        const double altFreq = differ ? S.AFp(c, t) : AFcol;
+                        const bool   flip = differ ? (S.flipP[kP] != 0) : flipCol;
+                        const bool   hi = differ ? (MAC > g_MACCutoffforER) : hiCol;
+                        const double* fdt = differ ? &S.fdP[kP * 4] : fdc;
+                        const uint64_t* cntt = differ ? &S.cntP[kP * 4] : cntc;
+                        const bool   affOK = !differ || (S.affP[kP] != 0);
+                        const double nT = differ ? (double)obj->m_n : (double)n;
+                        if (differ) {
+                            O.altFreq[jj]     = S.AFp(c, t);
+                            O.altCounts[jj]   = S.ACp(c, t);
+                            O.missingRate[jj] = S.MRp(c, t);
+                            O.imputeInfo[jj]  = S.IIp(c, t);
+                        } else {
+                            O.altFreq[jj]     = CM.altFreqVec[jj];
+                            O.altCounts[jj]   = CM.altCountsVec[jj];
+                            O.missingRate[jj] = CM.missingRateVec[jj];
+                            O.imputeInfo[jj]  = CM.imputationInfoVec[jj];
+                        }
+                        // The genotype vector a fallback hands getMarkerPval:
+                        // the column, or the trait's own vector over its
+                        // samples (mainMarkerMT's gOwn), built on demand.
+                        arma::vec gOwn;
+                        arma::vec*  gUse = &W.tmpG;
+                        arma::uvec* izUse = &W.idxZ;
+                        arma::uvec* inzUse = &W.idxNZ;
+                        auto prepG = [&]() {
+                            if (!own) { buildDense(); return; }
+                            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+                            const arma::uword nTs = (arma::uword)TS.n;
+                            double* g = W.gT.memptr();
+                            for (arma::uword k = 0; k < nTs; k++) {
+                                const arma::uword u = TS.pos[k];
+                                g[k] = fdt[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                            }
+                            gOwn = arma::vec(g, nTs, false, false);
+                            arma::uword cz = 0;
+                            for (arma::uword k = 0; k < nTs; k++) if (g[k] == 0.0) cz++;
+                            W.idxZt.set_size(cz);
+                            W.idxNZt.set_size(nTs - cz);
+                            arma::uword a = 0, b = 0;
+                            for (arma::uword k = 0; k < nTs; k++) {
+                                if (g[k] == 0.0) W.idxZt[a++] = k;
+                                else             W.idxNZt[b++] = k;
+                            }
+                            gUse = &gOwn; izUse = &W.idxZt; inzUse = &W.idxNZt;
+                        };
 
                         // Fast-test recompute context, exactly as mainMarkerMT
                         // computes it (main.cpp, "W1-1").
@@ -3176,7 +3530,7 @@ bool mainMarkerMTGpu(
                         // would have left the normal approximation.
                         bool useBatch = false;
                         bool needSPA = false, needFirth = false, needFast = false;
-                        if (hi || !isBin) {
+                        if ((hi || !isBin) && affOK) {
                             const double stdStat = W.res.StdStat(c, t);
                             const double pRaw    = W.res.pvalRaw(c, t);
                             const bool   isLog   = (W.res.pvalIsLog[t][c] != 0);
@@ -3197,7 +3551,7 @@ bool mainMarkerMTGpu(
                             }
                             useBatch = !needSPA && !needFirth && !needFast;
                         }
-                        if (hi || !isBin) O.gateP[jj] = W.res.pvalRaw(c, t);
+                        if ((hi || !isBin) && affOK) O.gateP[jj] = W.res.pvalRaw(c, t);
                         O.route[jj] = (unsigned char)((needSPA ? 1 : 0) | (needFirth ? 2 : 0) |
                                                       (needFast ? 4 : 0) | ((isBin && !hi) ? 8 : 0));
                         if (needSPA)   {
@@ -3246,8 +3600,10 @@ bool mainMarkerMTGpu(
                                 pd.pno = W.res.pvalRaw(c, t);
                                 pd.logp = (W.res.pvalIsLog[t][c] != 0) ? 1 : 0;
                                 uint64_t cz = 0;
-                                for (int k = 0; k < 4; k++) if (fdc[k] == 0.0) cz += cntc[k];
-                                pd.fast = ((double)cz / (double)n >= 0.5) ? 1 : 0;
+                                for (int k = 0; k < 4; k++) if (fdt[k] == 0.0) cz += cntt[k];
+                                pd.fast = ((double)cz / nT >= 0.5) ? 1 : 0;
+                                pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
+                                for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
                                 pend[omp_get_thread_num()].push_back(pd);
                             } else {
                                 if (toFirthOnly) {
@@ -3255,13 +3611,15 @@ bool mainMarkerMTGpu(
                                     pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
                                     pf.p = W.res.pvalRaw(c, t);
                                     pf.logp = (W.res.pvalIsLog[t][c] != 0) ? 1 : 0;
+                                    pf.flip = flip ? 1 : 0;
+                                    for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
                                     pendF[omp_get_thread_num()].push_back(pf);
                                 }
                                 #pragma omp atomic
                                 nBatched[t]++;
                             }
                         } else {
-                            buildDense();
+                            prepG();
                             arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
                             W.P2Vec.clear();
                             bool is_gtilde = false;
@@ -3277,7 +3635,7 @@ bool mainMarkerMTGpu(
                             const bool isER = (MAC <= g_MACCutoffforER && isBin);
 
                             obj->getMarkerPval(
-                                W.tmpG, W.idxNZ, W.idxZ,
+                                *gUse, *inzUse, *izUse,
                                 Beta, seBeta, pval, pval_noSPA,
                                 altFreq, Tstat, gy, varT,
                                 isSPAConverge, W.gtilde, is_gtilde,
@@ -3314,7 +3672,7 @@ bool mainMarkerMTGpu(
                                 }
                                 g_firthDefer = false;   // Firth runs once, here
                                 obj->getMarkerPval(
-                                    W.tmpG, W.idxNZ, W.idxZ,
+                                    *gUse, *inzUse, *izUse,
                                     Beta, seBeta, pval, pval_noSPA,
                                     altFreq, Tstat, gy, varT,
                                     isSPAConverge, W.gtilde, is_gtilde,
@@ -3365,11 +3723,11 @@ bool mainMarkerMTGpu(
                             uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
                             const uint32_t* dc = cntDev + (slot * (std::size_t)nBin + (std::size_t)b) * 4;
                             uint64_t nc[4], no[4];
-                            for (int k = 0; k < 4; k++) { nc[k] = dc[k]; no[k] = cntc[k] - nc[k]; }
+                            for (int k = 0; k < 4; k++) { nc[k] = dc[k]; no[k] = cntt[k] - nc[k]; }
                             const int pcPath = SAIGE::pcSumPairFromCounts(
                                 nc, no, reinterpret_cast<const uint64_t*>(pk),
                                 &caseMasks[(std::size_t)b * words], ctrlMask[b].data(), words,
-                                fdc, pcAsc[b] != 0, sum_case, sum_ctrl, t_isMoreOutput,
+                                fdt, pcAsc[b] != 0, sum_case, sum_ctrl, t_isMoreOutput,
                                 case_hom_cnt, case_het_cnt, ctrl_hom_cnt, ctrl_het_cnt);
                             if (pcPath == 1) {
                                 #pragma omp atomic
@@ -3382,10 +3740,30 @@ bool mainMarkerMTGpu(
                                 // as mainMarkerMT does it.
                                 #pragma omp atomic
                                 nPcGather[t]++;
-                                buildDense();
-                                const double* gp = W.tmpG.memptr();
                                 sum_case = sum_ctrl = 0.0;
                                 case_hom_cnt = case_het_cnt = ctrl_hom_cnt = ctrl_het_cnt = 0;
+                                if (own) {
+                                    // the trait's k-th case is union sample caseU[t][k]
+                                    auto dU = [&](arma::uword u) { return fdt[(pk[u >> 2] >> ((u & 3) * 2)) & 3u]; };
+                                    for (arma::uword k = 0; k < N_case; ++k) {
+                                        double d = dU(caseU[t][k]);
+                                        sum_case += d;
+                                        if (t_isMoreOutput) {
+                                            if (d >= 1.5 && d <= 2.0)      case_hom_cnt++;
+                                            else if (d >= 0.5 && d < 1.5)  case_het_cnt++;
+                                        }
+                                    }
+                                    for (arma::uword k = 0; k < N_ctrl; ++k) {
+                                        double d = dU(ctrlU[t][k]);
+                                        sum_ctrl += d;
+                                        if (t_isMoreOutput) {
+                                            if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
+                                            else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
+                                        }
+                                    }
+                                } else {
+                                buildDense();
+                                const double* gp = W.tmpG.memptr();
                                 for (arma::uword k = 0; k < N_case; ++k) {
                                     double d = gp[case_idx[k]];
                                     sum_case += d;
@@ -3401,6 +3779,7 @@ bool mainMarkerMTGpu(
                                         if (d >= 1.5 && d <= 2.0)      ctrl_hom_cnt++;
                                         else if (d >= 0.5 && d < 1.5)  ctrl_het_cnt++;
                                     }
+                                }
                                 }
                             }
                             double AF_case = (N_case > 0) ? sum_case / N_case / 2.0 : 0.0;
@@ -3422,7 +3801,7 @@ bool mainMarkerMTGpu(
                                 }
                             }
                         } else {
-                            O.N[jj] = n;
+                            O.N[jj] = differ ? obj->m_n : n;
                         }
                         (void)traitType;
                     }
@@ -3445,6 +3824,7 @@ bool mainMarkerMTGpu(
                 if (nPend > 0) {
                     saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
                     saige::spa_gpu::PairIn*   inl = SL ? saige::spa_gpu::in(SL) : nullptr;
+                    double* plut = SL ? saige::spa_gpu::pairLut(SL) : nullptr;   // gpuOwnSampleSets only
                     for (int k = 0; k < nPend; k++) {
                         const PendSpa& pd = all[k];
                         const int slot = (int)((std::size_t)pd.bi * Bblk + pd.c);
@@ -3457,6 +3837,7 @@ bool mainMarkerMTGpu(
                             inl[k].slot = slot; inl[k].trait = bt;
                             inl[k].fast = pd.fast; inl[k].logp = pd.logp;
                             inl[k].Tstat = pd.Tstat; inl[k].var1 = pd.var1; inl[k].var2 = pd.var2; inl[k].pno = pd.pno;
+                            if (plut) for (int q4 = 0; q4 < 4; q4++) plut[(std::size_t)k * 4 + q4] = pd.fd[q4];
                         }
                     }
                     bool okRun;
@@ -3496,10 +3877,11 @@ bool mainMarkerMTGpu(
                         const SAIGE::TraitMeta& M = ctx.meta[t];
                         MTTraitChunk& O = out[t];
                         const bool islog = (pd.logp != 0);
-                        const double MAC = S.MACc[c];
-                        const double altFreq = S.AFc[c];
-                        const bool flip = (S.flipc[c] != 0);
-                        const double* fdc = &S.fdc[(std::size_t)c * 4];
+                        const double MAC = pd.MAC;
+                        const double altFreq = pd.AF;
+                        const bool flip = (pd.flip != 0);
+                        const double* fdc = pd.fd;
+                        (void)S;
                         const unsigned char* pk = hPkS + ((std::size_t)pd.bi * Bblk + c) * bpv;
 
                         // ---- getMarkerPval's post-SPA rules, on the device's p ----
@@ -3549,6 +3931,32 @@ bool mainMarkerMTGpu(
                             wantFirth = islog ? (pvalFinal <= std::log(M.pCutoffforFirth))
                                               : (pvalFinal <= M.pCutoffforFirth);
                         if (wantFirth && !firthDev) {
+                            arma::vec gOwn;
+                            arma::vec*  gUse = &W.tmpG;
+                            arma::uvec* izUse = &W.idxZ;
+                            arma::uvec* inzUse = &W.idxNZ;
+                            if (differ && ownS[t]) {
+                                // the trait's own vector over its samples (mainMarkerMT's gOwn)
+                                const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+                                const arma::uword nTs = (arma::uword)TS.n;
+                                if (W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
+                                double* g = W.gT.memptr();
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                    const arma::uword u = TS.pos[k2];
+                                    g[k2] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                                }
+                                gOwn = arma::vec(g, nTs, false, false);
+                                arma::uword cz = 0;
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) if (g[k2] == 0.0) cz++;
+                                W.idxZt.set_size(cz);
+                                W.idxNZt.set_size(nTs - cz);
+                                arma::uword a = 0, b = 0;
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                    if (g[k2] == 0.0) W.idxZt[a++] = k2;
+                                    else              W.idxNZt[b++] = k2;
+                                }
+                                gUse = &gOwn; izUse = &W.idxZt; inzUse = &W.idxNZt;
+                            } else {
                             double* g = W.tmpG.memptr();
                             for (int u = 0; u < n; u++)
                                 g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
@@ -3560,6 +3968,7 @@ bool mainMarkerMTGpu(
                             for (int u = 0; u < n; u++) {
                                 if (g[u] == 0.0) W.idxZ[a++] = (arma::uword)u;
                                 else             W.idxNZ[b++] = (arma::uword)u;
+                            }
                             }
                             const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
                             const bool noadjCur  = obj->m_isnoadjCov;
@@ -3593,7 +4002,7 @@ bool mainMarkerMTGpu(
                             ctx_first.varRatioVal       = S.VR(c, t);
                             g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
                             obj->getMarkerPval(
-                                W.tmpG, W.idxNZ, W.idxZ,
+                                *gUse, *inzUse, *izUse,
                                 Beta, seB, pval, pval_noSPA,
                                 altFreq, Tstat, gy, varT,
                                 isSPAConverge, W.gtilde, is_gtilde,
@@ -3628,7 +4037,7 @@ bool mainMarkerMTGpu(
                                 }
                                 g_firthDefer = false;
                                 obj->getMarkerPval(
-                                    W.tmpG, W.idxNZ, W.idxZ,
+                                    *gUse, *inzUse, *izUse,
                                     Beta, seB, pval, pval_noSPA,
                                     altFreq, Tstat, gy, varT,
                                     isSPAConverge, W.gtilde, is_gtilde,
@@ -3674,6 +4083,8 @@ bool mainMarkerMTGpu(
                                 PendFirth pf;
                                 pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
                                 pf.p = pvalFinal; pf.logp = islog ? 1 : 0;
+                                pf.flip = pd.flip;
+                                for (int q4 = 0; q4 < 4; q4++) pf.fd[q4] = pd.fd[q4];
                                 pendF[omp_get_thread_num()].push_back(pf);
                             }
                         }
@@ -3693,9 +4104,11 @@ bool mainMarkerMTGpu(
                 const int nF = (int)allF.size();
                 if (nF > 0) {
                     saige::gpu2::FirthPairIn* fin = saige::gpu2::firthIn(FP);
+                    double* fplut = saige::gpu2::firthPairLut(FP);   // gpuOwnSampleSets only
                     for (int k = 0; k < nF; k++) {
                         fin[k].slot  = (int)((std::size_t)allF[k].bi * Bblk + allF[k].c);
                         fin[k].trait = ctx.meta[allF[k].t].binIdx;
+                        if (fplut) for (int q4 = 0; q4 < 4; q4++) fplut[(std::size_t)k * 4 + q4] = allF[k].fd[q4];
                     }
                     if (!saige::gpu2::firthRun(FP, R, nF)) {
                         saige::gpu2::firthDestroy(FP);
@@ -3713,10 +4126,9 @@ bool mainMarkerMTGpu(
                     for (int k = 0; k < nF; k++) {
                         const PendFirth& pf = allF[k];
                         const saige::gpu2::FirthPairOut& o = fo[k];
-                        GpuBlk& S = blksS[pf.bi];
                         const int t = pf.t, jj = pf.jj;
                         MTTraitChunk& O = out[t];
-                        const bool flip = (S.flipc[pf.c] != 0);
+                        const bool flip = (pf.flip != 0);
                         // getMarkerPval after fast_logistf_fit_simple: the fit's
                         // beta (for the flipped allele when flipped), seBeta
                         // back-calculated from the p-value, which Firth leaves alone.
@@ -7209,6 +7621,10 @@ int main(int argc, char* argv[])
             std::cerr << "  gpuFirth:          true/false (default: false). With gpuSpa, the Firth fit of a" << std::endl;
             std::cerr << "                     pair whose p-value asks for it runs on the device." << std::endl;
             std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
+            std::cerr << "  gpuOwnSampleSets:  true/false (default: false). Run models whose sample lists" << std::endl;
+            std::cerr << "                     differ (missing phenotypes) on the GPU path too: union read," << std::endl;
+            std::cerr << "                     per-trait masks on the device. Binary traits only for the" << std::endl;
+            std::cerr << "                     traits with their own list." << std::endl;
             std::cerr << "  gpuPrefetch:       true/false (default: false). Read + QC + stage the next" << std::endl;
             std::cerr << "                     superblock on a reader thread while the current one" << std::endl;
             std::cerr << "                     computes; same results in the same order." << std::endl;
@@ -7450,6 +7866,7 @@ int main(int argc, char* argv[])
             g_gpuSpa = false;
         }
         g_gpuFirth = config["gpuFirth"] ? config["gpuFirth"].as<bool>() : false;
+        g_gpuOwnSampleSets = config["gpuOwnSampleSets"] ? config["gpuOwnSampleSets"].as<bool>() : false;
         if (config["gpuFirthMaxStep"]) g_gpuFirthMaxStep = config["gpuFirthMaxStep"].as<double>();
         if (g_gpuFirth && !(g_gpuFirthMaxStep > 0)) throw std::runtime_error("gpuFirthMaxStep must be > 0");
         if (g_gpuFirth && !g_gpuSpa) {

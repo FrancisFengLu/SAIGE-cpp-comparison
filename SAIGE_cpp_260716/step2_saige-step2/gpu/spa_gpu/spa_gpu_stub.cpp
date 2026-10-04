@@ -9,6 +9,7 @@ Spa* create(const CreateArgs&) { return nullptr; }
 void destroy(Spa*) {}
 PairIn*  in(Spa*)  { return nullptr; }
 PairOut* out(Spa*) { return nullptr; }
+double*  pairLut(Spa*) { return nullptr; }
 bool run(Spa*, const Geno&, int) { return false; }
 bool uploadPacked(Spa*, const unsigned char*, std::size_t, const double*, int, Geno*) { return false; }
 bool uploadDense(Spa*, const double*, int, Geno*) { return false; }

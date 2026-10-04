@@ -60,6 +60,11 @@ struct FirthTraitArgs {
     const double* XV       = nullptr;   // p x N column-major
     const double* XXVX_inv = nullptr;   // N x p column-major
     int p = 0;                          // covariate count incl. intercept, <= FIRTH_PMAX
+    // FirthCreateArgs::ownSamples only: the trait's samples among the N (1 bit
+    // per sample, bit i of word i >> 6); nullptr = all. y / offset / XV /
+    // XXVX_inv are embedded at N with zeros outside; a sample outside the
+    // mask has dosage 0 and is left out of the fit's sums.
+    const uint64_t* mask   = nullptr;
 };
 
 constexpr int FIRTH_PMAX = 8;
@@ -75,6 +80,9 @@ struct FirthCreateArgs {
     double xconv   = 1e-5;
     double gconv   = 1e-5;
     int blocks = 256;                         // resident blocks; scratch is blocks x N doubles
+    // Per-trait sample sets (default off): masks per trait, and pair k's own
+    // 4-entry dosage table in firthPairLut() at 4k instead of the slot's.
+    int ownSamples = 0;
 };
 
 struct FirthPairIn {
@@ -99,6 +107,8 @@ void   firthDestroy(Firth* t_f);
 // Pinned tables of maxPairs entries, owned here.
 FirthPairIn*  firthIn(Firth* t_f);
 FirthPairOut* firthOut(Firth* t_f);
+// ownSamples: pinned maxPairs x 4 doubles (pair k's table at 4k); else nullptr.
+double*       firthPairLut(Firth* t_f);
 
 // Fit pairs [0, t_nPairs) of firthIn() against the reducer's last reduce();
 // results in firthOut(). Synchronous. false on a CUDA error (results undefined).

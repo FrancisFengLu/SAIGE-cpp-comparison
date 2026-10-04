@@ -10,6 +10,7 @@ Firth*        firthCreate(const FirthCreateArgs&)              { return nullptr;
 void          firthDestroy(Firth*)                             {}
 FirthPairIn*  firthIn(Firth*)                                  { return nullptr; }
 FirthPairOut* firthOut(Firth*)                                 { return nullptr; }
+double*       firthPairLut(Firth*)                             { return nullptr; }
 bool          firthRun(Firth*, const Reducer*, int)            { return false; }
 void          firthTimings(const Firth*, double*, long long*)  {}
 std::size_t   firthDeviceBytes(const Firth*)                   { return 0; }

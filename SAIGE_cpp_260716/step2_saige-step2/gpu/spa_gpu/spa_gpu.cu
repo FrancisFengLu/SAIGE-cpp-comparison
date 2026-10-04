@@ -146,14 +146,24 @@ struct KParams {
     double tol; int maxiter; int erfcMode;
     PairOut* out;
     int* counter;                // dynamicPairs: next pair index (zeroed per run)
+    // ownSamples only (spaBody<.., OWN = true>): pair k's dosage table at
+    // plut + 4k instead of the slot's, and trait t's sample mask (1 bit per
+    // sample, bit i of word i >> 6) at masks + t * maskWords; a sample outside
+    // the mask has dosage 0.
+    const double*   plut;
+    const uint64_t* masks;
+    int             maskWords;
 };
 
 struct GenoCol {
     const unsigned char* col;    // packed row, or nullptr
     double4 L;                   // its dosage table
     const double* dcol;          // dense column, or nullptr
+    const uint64_t* mk;          // OWN: the trait's sample mask
+    template <bool OWN>
     __device__ __forceinline__ double dose(int i) const
     {
+        if (OWN && !((mk[i >> 6] >> (i & 63)) & 1ull)) return 0.0;
         if (dcol) return dcol[i];
         const unsigned c = (col[i >> 2] >> (2 * (i & 3))) & 3u;
         return (c & 2u) ? ((c & 1u) ? L.w : L.z) : ((c & 1u) ? L.y : L.x);
@@ -456,7 +466,7 @@ __device__ void saddle2(const Ctx& C, double z1, double q1, double z2, double q2
     *p2 = saddleTail(z2, q2, k1b, k2b, logp, erfcMode, s2);
 }
 
-template <bool FUSED, bool DYN>
+template <bool FUSED, bool DYN, bool OWN>
 __device__ __forceinline__ void spaBody(const KParams& P)
 {
     __shared__ double sh[NACC][NWARP];
@@ -485,11 +495,13 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         } else {
             G.dcol = nullptr;
             G.col = P.packed + (std::size_t)pin.slot * P.bpv;
-            const double2* d = reinterpret_cast<const double2*>(P.lut) + 2 * (std::size_t)pin.slot;
+            const double2* d = reinterpret_cast<const double2*>(OWN ? P.plut : P.lut) +
+                               2 * (std::size_t)(OWN ? k : pin.slot);
             const double2 a = d[0], b = d[1];
             G.L = make_double4(a.x, a.y, b.x, b.y);
         }
         const int t = pin.trait;
+        G.mk = OWN ? P.masks + (std::size_t)t * P.maskWords : nullptr;
         const int p = P.pOfTrait[t];
         const double* mu = P.MU + (std::size_t)t * N;
         const double* xv = P.XV + (std::size_t)t * P.traitStride;
@@ -500,7 +512,7 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         #pragma unroll
         for (int j = 0; j < NACC; ++j) acc[j] = 0.0;
         for (int i = segLo + lane; i < segHi; i += 32) {
-            const double g = G.dose(i);
+            const double g = G.template dose<OWN>(i);
             if (g != 0.0) {
                 const double* x = xv + (std::size_t)i * p;
                 #pragma unroll
@@ -546,7 +558,7 @@ __device__ __forceinline__ void spaBody(const KParams& P)
             const bool valid = i < segHi;
             double g = 0.0, v = 0.0, m = 0.0;
             if (valid) {
-                g = G.dose(i);
+                g = G.template dose<OWN>(i);
                 double proj = 0.0;
                 #pragma unroll
                 for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx[(std::size_t)j * N + i] * b[j];
@@ -629,26 +641,32 @@ __device__ __forceinline__ void spaBody(const KParams& P)
 // 1..4: __launch_bounds__(NT, MINB). An explicit 1 is NOT the same as no hint:
 // ptxas then takes 162 registers for the unfused kernel (1 block per SM).
 // 2 / 3 / 4 cap the registers at 128 / 80 / 64 and spill the rest.
-template <bool FUSED, bool DYN>
-__global__ void __launch_bounds__(NT) spaKernel0(const KParams P) { spaBody<FUSED, DYN>(P); }
-template <bool FUSED, bool DYN, int MINB>
-__global__ void __launch_bounds__(NT, MINB) spaKernel(const KParams P) { spaBody<FUSED, DYN>(P); }
+template <bool FUSED, bool DYN, bool OWN>
+__global__ void __launch_bounds__(NT) spaKernel0(const KParams P) { spaBody<FUSED, DYN, OWN>(P); }
+template <bool FUSED, bool DYN, int MINB, bool OWN>
+__global__ void __launch_bounds__(NT, MINB) spaKernel(const KParams P) { spaBody<FUSED, DYN, OWN>(P); }
 
-template <bool F, bool D>
+template <bool F, bool D, bool O>
 void launchSpaM(int minb, int grid, cudaStream_t st, const KParams& P)
 {
     switch (minb) {
-        case 1:  spaKernel<F, D, 1><<<grid, NT, 0, st>>>(P); break;
-        case 2:  spaKernel<F, D, 2><<<grid, NT, 0, st>>>(P); break;
-        case 3:  spaKernel<F, D, 3><<<grid, NT, 0, st>>>(P); break;
-        case 4:  spaKernel<F, D, 4><<<grid, NT, 0, st>>>(P); break;
-        default: spaKernel0<F, D><<<grid, NT, 0, st>>>(P); break;
+        case 1:  spaKernel<F, D, 1, O><<<grid, NT, 0, st>>>(P); break;
+        case 2:  spaKernel<F, D, 2, O><<<grid, NT, 0, st>>>(P); break;
+        case 3:  spaKernel<F, D, 3, O><<<grid, NT, 0, st>>>(P); break;
+        case 4:  spaKernel<F, D, 4, O><<<grid, NT, 0, st>>>(P); break;
+        default: spaKernel0<F, D, O><<<grid, NT, 0, st>>>(P); break;
     }
 }
-void launchSpa(int fused, int dyn, int minb, int grid, cudaStream_t st, const KParams& P)
+template <bool O>
+void launchSpaO(int fused, int dyn, int minb, int grid, cudaStream_t st, const KParams& P)
 {
-    if (fused) { if (dyn) launchSpaM<true, true>(minb, grid, st, P);  else launchSpaM<true, false>(minb, grid, st, P); }
-    else       { if (dyn) launchSpaM<false, true>(minb, grid, st, P); else launchSpaM<false, false>(minb, grid, st, P); }
+    if (fused) { if (dyn) launchSpaM<true, true, O>(minb, grid, st, P);  else launchSpaM<true, false, O>(minb, grid, st, P); }
+    else       { if (dyn) launchSpaM<false, true, O>(minb, grid, st, P); else launchSpaM<false, false, O>(minb, grid, st, P); }
+}
+void launchSpa(int fused, int dyn, int minb, int own, int grid, cudaStream_t st, const KParams& P)
+{
+    if (own) launchSpaO<true>(fused, dyn, minb, grid, st, P);
+    else     launchSpaO<false>(fused, dyn, minb, grid, st, P);
 }
 
 __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, double* c)
@@ -668,6 +686,11 @@ struct Spa {
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxiter = 1000, erfcMode = 1;
     int fused = 0, dyn = 0, minb = 0;
     int* dCounter = nullptr;
+    // ownSamples: per-pair dosage tables (pinned + device) and per-trait masks
+    int own = 0, maskWords = 0;
+    double*   hPLut = nullptr;
+    double*   dPLut = nullptr;
+    uint64_t* dMask = nullptr;
     double tol = 0.0;
     std::size_t traitStride = 0;
     PairIn*  hIn  = nullptr;
@@ -731,6 +754,19 @@ Spa* create(const CreateArgs& a)
     if (!dev((void**)&s->dP,  (std::size_t)a.nTraits * sizeof(int))) return fail("");
     if (!dev((void**)&s->dScratch, (std::size_t)s->blocks * 2 * a.N * sizeof(double))) return fail("");
     if (!dev((void**)&s->dCounter, sizeof(int))) return fail("");
+    if (a.ownSamples) {
+        s->own = 1;
+        s->maskWords = (a.N + 63) / 64;
+        if (cudaHostAlloc((void**)&s->hPLut, (std::size_t)a.maxPairs * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail("cudaHostAlloc pair luts");
+        if (!dev((void**)&s->dPLut, (std::size_t)a.maxPairs * 4 * sizeof(double))) return fail("");
+        if (!dev((void**)&s->dMask, (std::size_t)a.nTraits * s->maskWords * sizeof(uint64_t))) return fail("");
+        std::vector<uint64_t> all((std::size_t)s->maskWords, ~0ull);
+        for (int t = 0; t < a.nTraits; ++t) {
+            const uint64_t* m = a.traits[t].mask ? a.traits[t].mask : all.data();
+            if (cudaMemcpy(s->dMask + (std::size_t)t * s->maskWords, m, (std::size_t)s->maskWords * sizeof(uint64_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy mask");
+        }
+    }
     s->devBytes = db;
     std::vector<int> pv(a.nTraits);
     for (int t = 0; t < a.nTraits; ++t) {
@@ -759,6 +795,9 @@ void destroy(Spa* s)
     if (s->dP) cudaFree(s->dP);
     if (s->dScratch) cudaFree(s->dScratch);
     if (s->dCounter) cudaFree(s->dCounter);
+    if (s->dPLut) cudaFree(s->dPLut);
+    if (s->dMask) cudaFree(s->dMask);
+    if (s->hPLut) cudaFreeHost(s->hPLut);
     if (s->dGPk) cudaFree(s->dGPk);
     if (s->dGLut) cudaFree(s->dGLut);
     if (s->dGDense) cudaFree(s->dGDense);
@@ -769,6 +808,7 @@ void destroy(Spa* s)
 
 PairIn*  in(Spa* s)  { return s ? s->hIn : nullptr; }
 PairOut* out(Spa* s) { return s ? s->hOut : nullptr; }
+double*  pairLut(Spa* s) { return (s && s->own) ? s->hPLut : nullptr; }
 std::size_t deviceBytes(const Spa* s) { return s ? s->devBytes : 0; }
 const char* lastError() { return g_lastErr.c_str(); }
 
@@ -831,13 +871,15 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     P.in = s->dIn; P.nPairs = nPairs; P.scratch = s->dScratch;
     P.tol = s->tol; P.maxiter = s->maxiter; P.erfcMode = s->erfcMode; P.out = s->dOut;
     P.counter = s->dCounter;
+    P.plut = s->dPLut; P.masks = s->dMask; P.maskWords = s->maskWords;
 
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CK(cudaEventRecord(s->ev[0], s->st));
     CK(cudaMemcpyAsync(s->dIn, s->hIn, (std::size_t)nPairs * sizeof(PairIn), cudaMemcpyHostToDevice, s->st));
     if (s->dyn) CK(cudaMemsetAsync(s->dCounter, 0, sizeof(int), s->st));
+    if (s->own) CK(cudaMemcpyAsync(s->dPLut, s->hPLut, (std::size_t)nPairs * 4 * sizeof(double), cudaMemcpyHostToDevice, s->st));
     CK(cudaEventRecord(s->ev[1], s->st));
-    launchSpa(s->fused, s->dyn, s->minb, grid, s->st, P);
+    launchSpa(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
     CK(cudaGetLastError());
     CK(cudaEventRecord(s->ev[2], s->st));
     CK(cudaMemcpyAsync(s->hOut, s->dOut, (std::size_t)nPairs * sizeof(PairOut), cudaMemcpyDeviceToHost, s->st));

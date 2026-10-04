@@ -79,6 +79,11 @@ struct TraitArgs {
     const double* XV       = nullptr;   // p x N column-major: sample i's p values at XV + i*p
     const double* XXVX_inv = nullptr;   // N x p column-major: XXVX_inv + j*N + i
     int p = 0;                          // 1..PMAX
+    // CreateArgs::ownSamples only: the trait's samples among the N, 1 bit per
+    // sample (bit i of word i >> 6, (N + 63) / 64 words); nullptr = all N.
+    // A sample outside it has dosage 0, and the caller embeds mu / XV /
+    // XXVX_inv with exact zeros there, so it adds exact zeros to every sum.
+    const uint64_t* mask   = nullptr;
 };
 
 struct CreateArgs {
@@ -119,6 +124,12 @@ struct CreateArgs {
     // 2 / 3 / 4 cap the registers at 128 / 80 / 64 and spill the rest to local
     // memory for 16 / 24 / 32 resident warps. Arithmetic unchanged.
     int minBlocksPerSM = 0;
+    // Per-trait sample sets (default off). The N samples are the union of the
+    // traits' sample lists; each trait carries a mask (TraitArgs::mask) and
+    // each pair its own 4-entry dosage table, filled by the caller in
+    // pairLut() next to in() (a trait's imputed value and flip can differ from
+    // the union column's). Off: the slot's table, every sample counts.
+    int ownSamples = 0;
 };
 
 // Device-resident genotype source for the slots PairIn::slot names. Exactly
@@ -187,6 +198,9 @@ void destroy(Spa* t_s);
 // read out().
 PairIn*  in(Spa* t_s);
 PairOut* out(Spa* t_s);
+// ownSamples: pinned maxPairs x 4 doubles, pair k's dosage table at 4k.
+// nullptr without ownSamples.
+double*  pairLut(Spa* t_s);
 
 // Solve pairs [0, t_nPairs) of in() against t_geno; results in out().
 // Synchronous. false on a CUDA error (results undefined; lastError()).

@@ -432,6 +432,22 @@ void scoreTestBatchMTBinPre(const MTContext& t_ctx,
                             MTScratch& t_scr,
                             MTBlockResult& t_out);
 
+// scoreTestBatchMTBinPre for a run whose traits do not share one sample list
+// (the GPU path with gpuOwnSampleSets): a trait whose list is the union's takes
+// exactly the arithmetic above; a trait with its own list takes
+// scoreTestBatchMT's adjusted branch (MTBlockAdj, design 4.7) term for term.
+// Besides the inputs above, t_scr.GMu2 (Bblk x nBin, G^T MU2bin) must be
+// prefilled for the whole block; the missing-cell row sums (MissA / MissWbin /
+// MissR / MissMu2) are formed here from t_adj.miss exactly as scoreTestBatchMT
+// forms them.
+void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
+                               const std::vector<int>& t_traitSet,
+                               int t_j0, int t_j1,
+                               const arma::mat& t_VR,
+                               const MTBlockAdj& t_adj,
+                               MTScratch& t_scr,
+                               MTBlockResult& t_out);
+
 
 #ifdef MTFOLD_PROF
 // Defined in saige_mt.cpp; see the MTF_TIC/MTF_TOC block there. cpu-seconds

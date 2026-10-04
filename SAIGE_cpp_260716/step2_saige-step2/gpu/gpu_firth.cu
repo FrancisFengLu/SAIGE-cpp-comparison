@@ -100,8 +100,13 @@ __device__ __forceinline__ bool inv2x2(double s0, double s1, double s2, double& 
     return true;
 }
 
+// OWN (FirthCreateArgs::ownSamples): pair k's dosage table at plut + 4k, and
+// a sample outside the trait's mask has dosage 0 and is left out of every
+// Newton-step sum (its y / offset are embedded as zeros but never read there).
+template <bool OWN>
 __global__ void __launch_bounds__(NT)
 firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const double* __restrict__ lut, int N,
+            const double* __restrict__ plut, const uint64_t* __restrict__ masks, int maskWords,
             const double* __restrict__ Y, const double* __restrict__ OFF,
             const double* __restrict__ XV, const double* __restrict__ XX,
             const int* __restrict__ pOfTrait, std::size_t traitStride,
@@ -117,11 +122,14 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
         const unsigned char* col = packed + (std::size_t)pin.slot * bpv;
         double4 L;
         {
-            const double2* d = reinterpret_cast<const double2*>(lut) + 2 * (std::size_t)pin.slot;
+            const double2* d = reinterpret_cast<const double2*>(OWN ? plut : lut) +
+                               2 * (std::size_t)(OWN ? k : pin.slot);
             const double2 a = d[0], b = d[1];
             L = make_double4(a.x, a.y, b.x, b.y);
         }
         const int t = pin.trait;
+        const uint64_t* mk = OWN ? masks + (std::size_t)t * maskWords : nullptr;
+        auto in = [&](int i) -> bool { return !OWN || ((mk[i >> 6] >> (i & 63)) & 1ull); };
         const int p = pOfTrait[t];
         const double* y   = Y   + (std::size_t)t * N;
         const double* off = OFF + (std::size_t)t * N;
@@ -132,7 +140,7 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
         double a[FIRTH_PMAX];
         for (int j = 0; j < FIRTH_PMAX; ++j) a[j] = 0.0;
         for (int i = threadIdx.x; i < N; i += NT) {
-            const double g = dose(col, L, i);
+            const double g = in(i) ? dose(col, L, i) : 0.0;
             if (g == 0.0) continue;
             const double* x = xv + (std::size_t)i * p;
             for (int j = 0; j < p; ++j) a[j] += x[j] * g;
@@ -144,7 +152,7 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
         __syncthreads();
         // pass B: g~ = g - XXVX_inv b
         for (int i = threadIdx.x; i < N; i += NT) {
-            const double g = dose(col, L, i);
+            const double g = in(i) ? dose(col, L, i) : 0.0;
             double proj = 0.0;
             for (int j = 0; j < p; ++j) proj += xx[(std::size_t)j * N + i] * bsh[j];
             gt[i] = g - proj;
@@ -158,6 +166,7 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
             double acc[NACC];
             for (int q = 0; q < NACC; q++) acc[q] = 0.0;
             for (int i = threadIdx.x; i < N; i += NT) {
+                if (!in(i)) continue;
                 const double g = gt[i];
                 // legacy: pi = 1 / (exp(-x*beta - offset) + 1)
                 const double pi = 1.0 / (exp(-(alpha + beta * g) - off[i]) + 1.0);
@@ -208,6 +217,8 @@ struct Firth {
     double* dY = nullptr; double* dOff = nullptr; double* dXV = nullptr; double* dXX = nullptr;
     int*    dP  = nullptr;
     double* dScratch = nullptr;
+    int own = 0, maskWords = 0;
+    double* hPLut = nullptr; double* dPLut = nullptr; uint64_t* dMask = nullptr;
     cudaStream_t st = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     double tKernel = 0.0;
@@ -247,6 +258,19 @@ Firth* firthCreate(const FirthCreateArgs& a)
     if (!dev((void**)&s->dXX, (std::size_t)a.nTraits * s->traitStride * sizeof(double))) return fail();
     if (!dev((void**)&s->dP,  (std::size_t)a.nTraits * sizeof(int))) return fail();
     if (!dev((void**)&s->dScratch, (std::size_t)s->blocks * a.N * sizeof(double))) return fail();
+    if (a.ownSamples) {
+        s->own = 1;
+        s->maskWords = (a.N + 63) / 64;
+        if (cudaHostAlloc((void**)&s->hPLut, (std::size_t)a.maxPairs * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
+        if (!dev((void**)&s->dPLut, (std::size_t)a.maxPairs * 4 * sizeof(double))) return fail();
+        if (!dev((void**)&s->dMask, (std::size_t)a.nTraits * s->maskWords * sizeof(uint64_t))) return fail();
+        std::vector<uint64_t> all((std::size_t)s->maskWords, ~0ull);
+        for (int t = 0; t < a.nTraits; ++t) {
+            const uint64_t* m = a.traits[t].mask ? a.traits[t].mask : all.data();
+            if (cudaMemcpy(s->dMask + (std::size_t)t * s->maskWords, m, (std::size_t)s->maskWords * sizeof(uint64_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+        }
+    }
     s->devBytes = db;
     std::vector<int> pv(a.nTraits);
     for (int t = 0; t < a.nTraits; ++t) {
@@ -277,6 +301,9 @@ void firthDestroy(Firth* s)
     if (s->dXX) cudaFree(s->dXX);
     if (s->dP) cudaFree(s->dP);
     if (s->dScratch) cudaFree(s->dScratch);
+    if (s->dPLut) cudaFree(s->dPLut);
+    if (s->dMask) cudaFree(s->dMask);
+    if (s->hPLut) cudaFreeHost(s->hPLut);
     if (s->hIn) cudaFreeHost(s->hIn);
     if (s->hOut) cudaFreeHost(s->hOut);
     delete s;
@@ -284,6 +311,7 @@ void firthDestroy(Firth* s)
 
 FirthPairIn*  firthIn(Firth* s)  { return s ? s->hIn : nullptr; }
 FirthPairOut* firthOut(Firth* s) { return s ? s->hOut : nullptr; }
+double*       firthPairLut(Firth* s) { return (s && s->own) ? s->hPLut : nullptr; }
 std::size_t firthDeviceBytes(const Firth* s) { return s ? s->devBytes : 0; }
 const char* firthLastError() { return lastErrFirth.c_str(); }
 void firthTimings(const Firth* s, double* t_kernel, long long* t_pairs)
@@ -304,11 +332,19 @@ bool firthRun(Firth* s, const Reducer* r, int nPairs)
     // The reducer's last reduce() is complete (it synchronises before
     // returning), so its resident rows are safe to read on our own stream.
     CKF(cudaMemcpyAsync(s->dIn, s->hIn, (std::size_t)nPairs * sizeof(FirthPairIn), cudaMemcpyHostToDevice, s->st));
+    if (s->own) CKF(cudaMemcpyAsync(s->dPLut, s->hPLut, (std::size_t)nPairs * 4 * sizeof(double), cudaMemcpyHostToDevice, s->st));
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CKF(cudaEventRecord(s->e0, s->st));
-    firth_pairs<<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dY, s->dOff, s->dXV, s->dXX, s->dP,
-                                        s->traitStride, s->dIn, nPairs, s->dScratch,
-                                        s->maxit, s->maxstep, s->xconv, s->gconv, s->dOut);
+    if (s->own)
+        firth_pairs<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dPLut, s->dMask, s->maskWords,
+                                            s->dY, s->dOff, s->dXV, s->dXX, s->dP,
+                                            s->traitStride, s->dIn, nPairs, s->dScratch,
+                                            s->maxit, s->maxstep, s->xconv, s->gconv, s->dOut);
+    else
+        firth_pairs<false><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, nullptr, nullptr, 0,
+                                             s->dY, s->dOff, s->dXV, s->dXX, s->dP,
+                                             s->traitStride, s->dIn, nPairs, s->dScratch,
+                                             s->maxit, s->maxstep, s->xconv, s->gconv, s->dOut);
     CKF(cudaGetLastError());
     CKF(cudaEventRecord(s->e1, s->st));
     CKF(cudaMemcpyAsync(s->hOut, s->dOut, (std::size_t)nPairs * sizeof(FirthPairOut), cudaMemcpyDeviceToHost, s->st));
