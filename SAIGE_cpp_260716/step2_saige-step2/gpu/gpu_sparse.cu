@@ -85,6 +85,72 @@ spq_kernel(const unsigned char* __restrict__ pk, std::size_t bpv,
     }
 }
 
+// gpuOwnSampleSets: as spq_kernel, but every trait decodes the slot's codes
+// through its own 4-entry table (tl, nSlots x nTr x 4). The codes of a pair
+// are read once; a pair is skipped when no trait of the pass gives it a
+// nonzero product. Per trait the sum is (L_t[ci] * L_t[cj]) * w, in the same
+// (thread, pair) order and tree as spq_kernel.
+__global__ void __launch_bounds__(NT)
+spq_kernel_own(const unsigned char* __restrict__ pk, std::size_t bpv,
+               const double* __restrict__ tl,
+               long long nPairs, const int* __restrict__ pi, const int* __restrict__ pj,
+               const double* __restrict__ w, int nTr, int useShared,
+               double* __restrict__ out)
+{
+    extern __shared__ unsigned char shCol[];
+    __shared__ double L[TR][4];
+    __shared__ unsigned char nz[16];
+    __shared__ double part[TR][NT / 32];
+    const int s = blockIdx.x;
+    const unsigned char* gcol = pk + (std::size_t)s * bpv;
+    const unsigned char* col = gcol;
+    if (useShared) {
+        for (std::size_t b = threadIdx.x; b < bpv; b += NT) shCol[b] = gcol[b];
+        col = shCol;
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int t0 = 0; t0 < nTr; t0 += TR) {
+        const int nt = (nTr - t0 < TR) ? (nTr - t0) : TR;
+        if (threadIdx.x < TR * 4) {
+            const int k = threadIdx.x >> 2, c = threadIdx.x & 3;
+            L[k][c] = (k < nt) ? tl[((std::size_t)s * nTr + t0 + k) * 4 + c] : 0.0;
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            const int ci = threadIdx.x >> 2, cj = threadIdx.x & 3;
+            unsigned char any = 0;
+            for (int k = 0; k < nt; k++) if (L[k][ci] * L[k][cj] != 0.0) any = 1;
+            nz[threadIdx.x] = any;
+        }
+        __syncthreads();
+        double acc[TR];
+        #pragma unroll
+        for (int k = 0; k < TR; k++) acc[k] = 0.0;
+        for (long long p = threadIdx.x; p < nPairs; p += NT) {
+            const int i = pi[p], j = pj[p];
+            const unsigned ci = (col[i >> 2] >> ((i & 3) * 2)) & 3u;
+            const unsigned cj = (col[j >> 2] >> ((j & 3) * 2)) & 3u;
+            if (!nz[ci * 4 + cj]) continue;
+            const double* wp = w + (std::size_t)t0 * nPairs + p;
+            #pragma unroll
+            for (int k = 0; k < TR; k++)
+                if (k < nt) acc[k] += (L[k][ci] * L[k][cj]) * wp[(std::size_t)k * nPairs];
+        }
+        #pragma unroll
+        for (int k = 0; k < TR; k++) {
+            const double v = warpSum(acc[k]);
+            if (lane == 0) part[k][wid] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < nt) {
+            double v = 0.0;
+            for (int q = 0; q < NT / 32; q++) v += part[threadIdx.x][q];
+            out[(std::size_t)s * nTr + t0 + threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 struct SpQuad {
@@ -92,6 +158,7 @@ struct SpQuad {
     long long nPairs = 0;
     int* dI = nullptr; int* dJ = nullptr; double* dW = nullptr;
     double* dOut = nullptr; double* hOut = nullptr;
+    double* dTl = nullptr;                 // spqRunOwn: nSlots x nTr x 4, allocated on first use
     cudaStream_t st = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     double tKernel = 0.0;
@@ -141,6 +208,7 @@ void spqDestroy(SpQuad* q)
     if (q->dJ) cudaFree(q->dJ);
     if (q->dW) cudaFree(q->dW);
     if (q->dOut) cudaFree(q->dOut);
+    if (q->dTl) cudaFree(q->dTl);
     if (q->hOut) cudaFreeHost(q->hOut);
     delete q;
 }
@@ -175,6 +243,39 @@ bool spqRun(SpQuad* q, const Reducer* r, int nSlots)
     CKQ(cudaEventRecord(q->e0, q->st));
     spq_kernel<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, dLut, q->nPairs, q->dI, q->dJ, q->dW,
                                                           q->nTr, useShared, q->dOut);
+    CKQ(cudaGetLastError());
+    CKQ(cudaEventRecord(q->e1, q->st));
+    CKQ(cudaMemcpyAsync(q->hOut, q->dOut, nOut * sizeof(double), cudaMemcpyDeviceToHost, q->st));
+    CKQ(cudaStreamSynchronize(q->st));
+    float ms = 0;
+    if (cudaEventElapsedTime(&ms, q->e0, q->e1) == cudaSuccess) q->tKernel += ms * 1e-3;
+    q->nSlotsDone += nSlots;
+    return true;
+}
+
+bool spqRunOwn(SpQuad* q, const Reducer* r, int nSlots, const double* tlut)
+{
+    if (!q || !r || !tlut) return false;
+    if (nSlots <= 0) return true;
+    if (nSlots > q->maxSlots) { lastErrSpq = "nSlots > maxSlots"; return false; }
+    const std::size_t nOut = (std::size_t)nSlots * q->nTr;
+    if (q->nPairs == 0) {
+        std::memset(q->hOut, 0, nOut * sizeof(double));
+        return true;
+    }
+    const unsigned char* dPk = (const unsigned char*)devicePacked(r);
+    if (!dPk) { lastErrSpq = "reducer has no resident packed rows"; return false; }
+    if (!q->dTl) {
+        const std::size_t nb = (std::size_t)q->maxSlots * q->nTr * 4 * sizeof(double);
+        CKQ(cudaMalloc((void**)&q->dTl, nb));
+        q->devBytes += nb;
+    }
+    const std::size_t bpv = bytesPerSlot(r);
+    const int useShared = (bpv <= SHMAX) ? 1 : 0;
+    CKQ(cudaMemcpyAsync(q->dTl, tlut, nOut * 4 * sizeof(double), cudaMemcpyHostToDevice, q->st));
+    CKQ(cudaEventRecord(q->e0, q->st));
+    spq_kernel_own<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, q->dTl, q->nPairs, q->dI, q->dJ,
+                                                              q->dW, q->nTr, useShared, q->dOut);
     CKQ(cudaGetLastError());
     CKQ(cudaEventRecord(q->e1, q->st));
     CKQ(cudaMemcpyAsync(q->hOut, q->dOut, nOut * sizeof(double), cudaMemcpyDeviceToHost, q->st));

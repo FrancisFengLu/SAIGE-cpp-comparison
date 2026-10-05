@@ -50,6 +50,14 @@ struct Plan {
     std::vector<double> w;         // nBin x nPairs, trait-major, 2 B_ij (0 where absent)
     long long nPairs = 0;
     int nBlocksMax = 0, maxBlock = 0, nOn = 0;
+    // Different sample lists (gpuOwnSampleSets) only. Every per-sample array
+    // above is union-length with exact zeros outside the trait's samples, and
+    // pi / pj are union indices. A trait with its own list is scored on its
+    // own genotype vector g_t = a g + b 1_t + d m (MTBlockAdj), so its tail
+    // also needs the sums of its columns over its samples:
+    std::vector<arma::vec> sumXV;  // [P] p: XV 1_t
+    std::vector<arma::vec> sumBY;  // [P] p: (B XXVX_inv)' 1_t
+    std::vector<double>    trB;    // [P] sum_i B_ii
     double secs = 0.0;
 };
 
@@ -58,7 +66,9 @@ struct Plan {
 // (the caller then refuses or keeps the CPU path). refreshBudget_s is the
 // block inverse's one-refresh cost gate (blockSparseSigmaRefreshBudget_s).
 // maxPairs caps the within-block pair count (the device kernel's cost is
-// pairs x markers).
+// pairs x markers). With different sample lists (ctx.sampleSetsDiffer) each
+// trait's Sigma is over its own samples; its blocks are mapped onto union
+// indices through ctx.samp[t].pos.
 std::string build(const SAIGE::MTContext& ctx,
                   const std::vector<SAIGE::SAIGEClass*>& objs,
                   double refreshBudget_s, long long maxPairs, Plan& out);

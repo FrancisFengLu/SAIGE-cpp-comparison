@@ -61,6 +61,14 @@ void    spqDestroy(SpQuad* t_q);
 // [0, t_nSlots) of the reducer's last reduce(). Synchronous; the result is in
 // pinned host memory (spqOut) until the next call. false on a CUDA error.
 bool          spqRun(SpQuad* t_q, const Reducer* t_r, int t_nSlots);
+
+// Different sample lists (gpuOwnSampleSets): the same sums on each trait's OWN
+// genotype vector, g_t[i] = t_lut[(slot * nTraits + t) * 4 + code_i] -- the
+// trait's code -> dosage table (its own imputation and flip). The pair list is
+// over union indices and a trait's weights are zero on pairs outside its
+// samples, so samples outside the trait contribute nothing. t_lut is host
+// memory, nSlots x nTraits x 4, copied in by the call.
+bool          spqRunOwn(SpQuad* t_q, const Reducer* t_r, int t_nSlots, const double* t_lut);
 const double* spqOut(const SpQuad* t_q);
 
 // Cumulative device seconds in the kernel, and slots processed.

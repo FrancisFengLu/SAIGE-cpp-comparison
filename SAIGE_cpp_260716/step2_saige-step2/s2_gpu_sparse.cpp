@@ -20,6 +20,9 @@ std::string build(const SAIGE::MTContext& ctx,
     out.on.assign(std::max(nBin, 1), 0);
     out.YBY.assign(P, arma::mat());
     out.Yres.assign(P, arma::vec());
+    out.sumXV.assign(P, arma::vec());
+    out.sumBY.assign(P, arma::vec());
+    out.trB.assign(P, 0.0);
     if (nBin <= 0) return "no binary traits";
     out.XVt.zeros(N, ctx.sumPbin);
     out.BY.zeros(N, ctx.sumPbin);
@@ -36,14 +39,20 @@ std::string build(const SAIGE::MTContext& ctx,
         if (!obj->m_flagSparseGRM) continue;
         const int b = M.binIdx;
         const arma::sp_mat& S = obj->m_spSigmaMat;
-        if ((int)S.n_rows != N || (int)S.n_cols != N)
-            return "trait '" + M.name + "': sparse Sigma is not N x N";
+        // own: the trait's sample list differs from the union's; its Sigma,
+        // XV, XXVX_inv are over its own nt samples, and own index k sits at
+        // union index U[k].
+        const bool own = !ctx.samp.empty() && !ctx.samp[t].sameAsUnion;
+        const int nt = own ? ctx.samp[t].n : N;
+        if (own && (int)ctx.samp[t].pos.size() != nt)
+            return "trait '" + M.name + "': sample positions do not match its sample count";
+        auto U = [&](int k) -> int { return own ? (int)ctx.samp[t].pos[(size_t)k] : k; };
+        if ((int)S.n_rows != nt || (int)S.n_cols != nt)
+            return "trait '" + M.name + "': sparse Sigma is not n x n";
         if (M.p > 64) return "trait '" + M.name + "' has more than 64 covariates";
         if (obj->m_isVarPsadj)
             return "trait '" + M.name + "': the model carries Sigma_iXXSigma_iX (variance P-adjustment), "
                    "which the device sparse variance does not implement";
-        if (!ctx.samp.empty() && !ctx.samp[t].sameAsUnion)
-            return "trait '" + M.name + "' has its own sample list";
 
         // Sigma exactly as SAIGEClass holds it.
         arma::umat loc(2, S.n_nonzero);
@@ -54,20 +63,20 @@ std::string build(const SAIGE::MTContext& ctx,
                 loc(0, k) = it.row(); loc(1, k) = it.col(); val(k) = *it;
             }
         }
-        std::vector<char> hasDiag((size_t)N, 0);
+        std::vector<char> hasDiag((size_t)nt, 0);
         for (arma::uword k = 0; k < loc.n_cols; k++)
             if (loc(0, k) == loc(1, k)) hasDiag[(size_t)loc(0, k)] = 1;
-        for (int i = 0; i < N; i++)
+        for (int i = 0; i < nt; i++)
             if (!hasDiag[(size_t)i])
                 return "trait '" + M.name + "': a sample has no diagonal entry in the sparse Sigma";
 
         blocksigma::BlockSigma bs;
         bs.setRefreshBudget(refreshBudget_s);
-        if (!bs.build(loc, val, N))
+        if (!bs.build(loc, val, nt))
             return "trait '" + M.name + "': block inverse refused by the cost gate "
                    "(blockSparseSigmaRefreshBudget_s)";
         // tau = (0, 1), w = 1: refresh() inverts the given matrix itself (s2_block_solve.cpp).
-        arma::fvec wv((arma::uword)N, arma::fill::ones);
+        arma::fvec wv((arma::uword)nt, arma::fill::ones);
         arma::fvec tau(2); tau(0) = 0.0f; tau(1) = 1.0f;
         bs.refresh(wv, tau);
         if (bs.flooredDiagonals() > 0 || !bs.ready())
@@ -81,10 +90,10 @@ std::string build(const SAIGE::MTContext& ctx,
             const int s = Pt.size[(size_t)blk];
             const int* m = &Pt.member[(size_t)Pt.start[(size_t)blk]];
             const double* A = bs.blockInverse(blk);       // s x s column-major
-            for (int r = 0; r < s; r++) bd[m[r]] = A[(size_t)r * s + r];
+            for (int r = 0; r < s; r++) bd[U(m[r])] = A[(size_t)r * s + r];
             for (int r = 0; r < s; r++)
                 for (int c = r + 1; c < s; c++) {
-                    int i = m[r], j = m[c];
+                    int i = U(m[r]), j = U(m[c]);
                     if (i > j) std::swap(i, j);
                     const uint64_t key = ((uint64_t)(uint32_t)i << 32) | (uint32_t)j;
                     auto ins = pairIdx.emplace(key, (long long)pairIdx.size());
@@ -101,13 +110,20 @@ std::string build(const SAIGE::MTContext& ctx,
         const arma::mat& Y  = obj->m_XXVX_inv;     // N x p
         const arma::mat& XV = obj->m_XV;           // p x N
         const int p = M.p;
-        if ((int)Y.n_rows != N || (int)Y.n_cols != p || (int)XV.n_rows != p || (int)XV.n_cols != N)
+        if ((int)Y.n_rows != nt || (int)Y.n_cols != p || (int)XV.n_rows != p || (int)XV.n_cols != nt)
             return "trait '" + M.name + "': XV / XXVX_inv have unexpected shapes";
         const arma::uword w0 = (arma::uword)M.binOff;
+        arma::mat BYo;                              // own: B XXVX_inv over the trait's samples
+        if (own) BYo.zeros((arma::uword)nt, (arma::uword)p);
         for (int c = 0; c < p; c++) {
-            out.XVt.col(w0 + c) = XV.row((arma::uword)c).t();
+            if (own) {
+                double* xv = out.XVt.colptr(w0 + c);
+                for (int k = 0; k < nt; k++) xv[U(k)] = XV((arma::uword)c, (arma::uword)k);
+            } else {
+                out.XVt.col(w0 + c) = XV.row((arma::uword)c).t();
+            }
             const double* x = Y.colptr((arma::uword)c);
-            double* y = out.BY.colptr(w0 + c);
+            double* y = own ? BYo.colptr((arma::uword)c) : out.BY.colptr(w0 + c);
             for (int blk = 0; blk < Pt.nblocks; blk++) {
                 const int s = Pt.size[(size_t)blk];
                 const int* m = &Pt.member[(size_t)Pt.start[(size_t)blk]];
@@ -119,8 +135,35 @@ std::string build(const SAIGE::MTContext& ctx,
                 }
             }
         }
-        out.YBY[t]  = Y.t() * out.BY.cols(w0, w0 + p - 1);
-        out.Yres[t] = Y.t() * ctx.RES.col((arma::uword)t);
+        if (own) {
+            double* yb = nullptr;
+            for (int c = 0; c < p; c++) {
+                yb = out.BY.colptr(w0 + c);
+                const double* yo = BYo.colptr((arma::uword)c);
+                for (int k = 0; k < nt; k++) yb[U(k)] = yo[k];
+            }
+            arma::vec reso((arma::uword)nt);
+            for (int k = 0; k < nt; k++) reso[(arma::uword)k] = ctx.RES((arma::uword)U(k), (arma::uword)t);
+            out.YBY[t]  = Y.t() * BYo;
+            out.Yres[t] = Y.t() * reso;
+            // sums over the trait's samples, in union order (as ctx.sumA)
+            out.sumXV[t].zeros((arma::uword)p);
+            out.sumBY[t].zeros((arma::uword)p);
+            for (int c = 0; c < p; c++) {
+                const double* xv = out.XVt.colptr(w0 + c);
+                const double* by = out.BY.colptr(w0 + c);
+                double sx = 0.0, sb = 0.0;
+                for (int u = 0; u < N; u++) { sx += xv[u]; sb += by[u]; }
+                out.sumXV[t][(arma::uword)c] = sx;
+                out.sumBY[t][(arma::uword)c] = sb;
+            }
+            double tr = 0.0;
+            for (int u = 0; u < N; u++) tr += bd[u];
+            out.trB[t] = tr;
+        } else {
+            out.YBY[t]  = Y.t() * out.BY.cols(w0, w0 + p - 1);
+            out.Yres[t] = Y.t() * ctx.RES.col((arma::uword)t);
+        }
         out.on[b] = 1;
         out.nOn++;
     }

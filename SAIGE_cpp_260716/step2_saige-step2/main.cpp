@@ -335,6 +335,9 @@ bool g_gpuOwnSampleSets = false;
 // pair's first pass takes the sparse variance in the batch tail. ER pairs keep
 // the CPU scalar path but are handed the device variance. gpuSparseMaxPairs
 // caps the within-block pair count (the kernel costs pairs x markers).
+// With gpuOwnSampleSets each trait's blocks live on its own samples, mapped
+// onto union indices; a trait with its own list takes the affine map for the
+// GEMM terms and its own dosages in the cross-term kernel.
 bool g_gpuSparse = false;
 long long g_gpuSparseMaxPairs = 50000000LL;
 // Config key gpuDevice: which CUDA device (default 0).
@@ -2601,7 +2604,6 @@ bool mainMarkerMTGpu(
         if (g_gpuSparse && anyBin) {
             std::string spWhy;
             if (!g_gpuFp64) spWhy = "gpuPrecision is fp32; the sparse variance is fp64 only";
-            else if (differ) spWhy = "the models do not share one sample list (not implemented with gpuOwnSampleSets)";
             else spWhy = s2gs::build(ctx, g_saigeObjs, s2blk::config().refreshBudgetS,
                                      g_gpuSparseMaxPairs, spPlan);
             if (spWhy.empty()) {
@@ -2633,7 +2635,10 @@ bool mainMarkerMTGpu(
     }
     const int oXV = K1;                          // first XV' column in C1 (spDev)
     const int oBY = K1 + sumPbin;                // first B XXVX_inv column in C1 (spDev)
-    const int K1x = spDev ? K1 + 2 * sumPbin : K1;
+    // differ: G' diag(B) too (the flip correction of the diagonal term of a
+    // trait with its own list, as G' MU2bin for the dense variance), nBin more.
+    const int oGB = K1 + 2 * sumPbin;            // first diag(B) column in C1 (spDev && differ)
+    const int K1x = spDev ? K1 + 2 * sumPbin + (differ ? nBin : 0) : K1;
     const int K2x = spDev ? K2 + nBin : K2;
     int Bblk = g_mtBlockSize;
     if (Bblk <= 0) {
@@ -2713,6 +2718,9 @@ bool mainMarkerMTGpu(
                         (std::size_t)n * sumPbin * sizeof(double));
             std::memcpy(Bf.data() + (std::size_t)n * oBY, spPlan.BY.memptr(),
                         (std::size_t)n * sumPbin * sizeof(double));
+            if (differ)
+                std::memcpy(Bf.data() + (std::size_t)n * oGB, spPlan.Bdiag.memptr(),
+                            (std::size_t)n * nBin * sizeof(double));
             B2x.resize((std::size_t)n * K2x);
             std::memcpy(B2x.data(), ctx.MU2bin.memptr(), (std::size_t)n * nBin * sizeof(double));
             std::memcpy(B2x.data() + (std::size_t)n * nBin, spPlan.Bdiag.memptr(),
@@ -2778,6 +2786,15 @@ bool mainMarkerMTGpu(
                       << K2 << ", " << K2x << "), " << spPlan.nPairs << " cross-term pairs x " << nBin
                       << " traits resident (" << (saige::gpu2::spqDeviceBytes(SQ) >> 20) << " MiB)" << std::endl;
         }
+    }
+    // gpuSparse + gpuOwnSampleSets: per (slot, binary trait) code -> dosage
+    // tables for the cross-term kernel, filled before each superblock's call.
+    std::vector<double> spTl;
+    if (spDev && differ) {
+        spTl.assign((std::size_t)slots * nBin * 4, 0.0);
+        std::cout << "  gpuSparse: per-trait sample lists -- Sigma^-1 blocks mapped onto union indices, "
+                     "G' diag(Sigma^-1) in C1 columns [" << oGB << ", " << oGB + nBin
+                  << "), cross terms on each trait's own dosages" << std::endl;
     }
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
@@ -2968,6 +2985,14 @@ bool mainMarkerMTGpu(
     //   S    = (g'res - z'(XXVX_inv' res)) / tau0
     //   var2 = z'(Y'BY)z + g'Bg - 2 z'(BY)'g        (Y = XXVX_inv, B = Sigma^-1)
     // var2 in the order the batch tail forms its dense var2.
+    // Different sample lists (gpuOwnSampleSets): a trait with its own list is
+    // scored on g_t = a g + b 1_t + d m (MTBlockAdj of the slot's block), the
+    // map scoreTestBatchMTBinPreAdj applies to the dense columns:
+    //   z    = a XV g + b XV 1_t + d XV m
+    //   (BY)'g_t, g_t'res  likewise
+    //   sum_i B_ii g_t,i^2 = G2B + 2ab G'diag(B) + b^2 tr B + q sum_m B_ii
+    // and the cross terms come from the kernel on g_t itself (spqRunOwn).
+    std::vector<GpuBlk>* spBlks = nullptr;   // the superblock in phase 3 / 4
     auto spStats = [&](std::size_t slot, int t, double& S, double& var2) {
         const SAIGE::TraitMeta& M = ctx.meta[t];
         const double* Cd1 = saige::gpu2::outCd(R);
@@ -2979,6 +3004,43 @@ bool mainMarkerMTGpu(
             z[r]  = Cd1[(std::size_t)(oXV + M.binOff + r) * ldc + slot];
             gw[r] = Cd1[(std::size_t)(oBY + M.binOff + r) * ldc + slot];
         }
+        double Rg = Cd1[(std::size_t)(oR + t) * ldc + slot];
+        double Qd = Cd2[(std::size_t)(K2 + b) * ldc + slot];
+        if (differ && ownS[t]) {
+            const GpuBlk& Sb = (*spBlks)[slot / (std::size_t)Bblk];
+            const int c = (int)(slot % (std::size_t)Bblk);
+            const double a = Sb.adj.a(c, t), bb = Sb.adj.b(c, t);
+            const double d = Sb.adj.d(c, t), q = Sb.adj.q(c, t);
+            const bool flip = (a < 0.0), shift = (bb != 0.0);
+            const bool miss = (Sb.adj.nMiss(c, t) > 0);
+            const arma::vec& sX = spPlan.sumXV[t];
+            const arma::vec& sB = spPlan.sumBY[t];
+            double mX[64], mB[64], mR = 0.0, mD = 0.0;
+            if (miss) {
+                const std::vector<arma::uword>& mv = Sb.adj.miss[c];
+                const arma::uword w0 = (arma::uword)M.binOff;
+                for (int r = 0; r < p; r++) {
+                    const double* xv = spPlan.XVt.colptr(w0 + r);
+                    const double* by = spPlan.BY.colptr(w0 + r);
+                    double sx = 0.0, sb = 0.0;
+                    for (arma::uword u : mv) { sx += xv[u]; sb += by[u]; }
+                    mX[r] = sx; mB[r] = sb;
+                }
+                const double* rc = ctx.RES.colptr((arma::uword)t);
+                const double* bd = spPlan.Bdiag.colptr((arma::uword)b);
+                for (arma::uword u : mv) { mR += rc[u]; mD += bd[u]; }
+            }
+            for (int r = 0; r < p; r++) {
+                if (flip)  { z[r] = -z[r]; gw[r] = -gw[r]; }
+                if (shift) { z[r] += bb * sX[r]; gw[r] += bb * sB[r]; }
+                if (miss)  { z[r] += d * mX[r]; gw[r] += d * mB[r]; }
+            }
+            if (flip)  Rg = -Rg;
+            if (shift) Rg += bb * ctx.sumR[t];
+            if (miss)  Rg += d * mR;
+            if (shift) Qd += 2.0 * a * bb * Cd1[(std::size_t)(oGB + b) * ldc + slot] + bb * bb * spPlan.trB[t];
+            if (miss)  Qd += q * mD;
+        }
         const arma::mat& X = spPlan.YBY[t];
         const arma::vec& yr = spPlan.Yres[t];
         double zxz = 0.0, gwz = 0.0, zyr = 0.0;
@@ -2989,10 +3051,9 @@ bool mainMarkerMTGpu(
             gwz += gw[r] * z[r];
             zyr += z[r] * yr[r];
         }
-        const double Q = Cd2[(std::size_t)(K2 + b) * ldc + slot] +
-                         saige::gpu2::spqOut(SQ)[slot * (std::size_t)nBin + b];
+        const double Q = Qd + saige::gpu2::spqOut(SQ)[slot * (std::size_t)nBin + b];
         var2 = zxz + Q - 2.0 * gwz;
-        S = (Cd1[(std::size_t)(oR + t) * ldc + slot] - zyr) / M.tau0;
+        S = (Rg - zyr) / M.tau0;
     };
     auto var2sp = [&](std::size_t slot, int t) -> double {
         double S, v2; spStats(slot, t, S, v2); return v2;
@@ -3474,6 +3535,7 @@ bool mainMarkerMTGpu(
             const int s = kSb % nSets;
             std::vector<GpuBlk>& blksS = blks[s];
             unsigned char* hPkS = hPkSet[s];
+            spBlks = &blksS;
 
             // ---------------- phase 1: read + QC + stage ----------------
             double t0 = omp_get_wtime();
@@ -3505,7 +3567,26 @@ bool mainMarkerMTGpu(
                     "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
                     "without useGPU (or with useGPU: false) to finish on the CPU.");
             }
-            if (spDev && !saige::gpu2::spqRun(SQ, R, nSlotsThis)) {
+            if (spDev && differ) {
+                // each trait's own code -> dosage table per slot (zeros where
+                // the pair failed QC or the slot is unused)
+                std::fill(spTl.begin(), spTl.begin() + (std::size_t)nSlotsThis * nBin * 4, 0.0);
+                for (int bi = 0; bi < nb; bi++) {
+                    const GpuBlk& Sb = blksS[bi];
+                    for (int c = 0; c < Bblk; c++) {
+                        const std::size_t slot = (std::size_t)bi * Bblk + c;
+                        for (int t : binTraits) {
+                            const std::size_t kP = (std::size_t)c * P + t;
+                            if (Sb.qcP.size() <= kP || !Sb.qcP[kP]) continue;
+                            const double* src = ownS[t] ? &Sb.fdP[kP * 4] : &Sb.fdc[(std::size_t)c * 4];
+                            double* dst = &spTl[(slot * nBin + ctx.meta[t].binIdx) * 4];
+                            for (int k = 0; k < 4; k++) dst[k] = src[k];
+                        }
+                    }
+                }
+            }
+            if (spDev && !(differ ? saige::gpu2::spqRunOwn(SQ, R, nSlotsThis, spTl.data())
+                                  : saige::gpu2::spqRun(SQ, R, nSlotsThis))) {
                 saige::gpu2::spqDestroy(SQ);
                 saige::gpu2::destroy(R);
                 throw std::runtime_error(
@@ -3589,8 +3670,12 @@ bool mainMarkerMTGpu(
                     // isFastTest=false sparse traits: the first pass IS the
                     // sparse score test, formed from the device's columns and
                     // emitted exactly as the batch tail emits (emitBlockResults).
-                    if (!binTraitsDense.empty())
-                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, W.scr, W.res);
+                    if (!binTraitsDense.empty()) {
+                        if (differ)
+                            SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraitsDense, 0, nHi, S.VR, S.adj, W.scr, W.res);
+                        else
+                            SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, W.scr, W.res);
+                    }
                     for (int t : binTraits) {
                         if (!spFirst[t]) continue;
                         for (int j = 0; j < nHi; j++) {
@@ -3918,7 +4003,7 @@ bool mainMarkerMTGpu(
                             ctx_first.isnoadjCov_cur    = noadjCur;
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
                             ctx_first.varRatioVal       = S.VR(c, t);
-                            if (spT && sparseCur) {   // gpuSparse: the device variance, no CPU solve
+                            if (spT && sparseCur && affOK) {   // gpuSparse: the device variance, no CPU solve
                                 ctx_first.presetVar2 = var2sp(slotBase + c, t);
                                 #pragma omp atomic
                                 nSpPreset[t]++;
@@ -3965,7 +4050,7 @@ bool mainMarkerMTGpu(
                                               ctx_fast.isnoadjCov_cur, dummyHas);
                                 }
                                 g_firthDefer = false;   // Firth runs once, here
-                                if (spT && ctx_fast.flagSparseGRM_cur) {
+                                if (spT && ctx_fast.flagSparseGRM_cur && affOK) {
                                     ctx_fast.presetVar2 = var2sp(slotBase + c, t);
                                     #pragma omp atomic
                                     nSpPreset[t]++;
@@ -8030,6 +8115,7 @@ int main(int argc, char* argv[])
             std::cerr << "  gpuSparse:         true/false (default: false). With gpuBinary, sparse-GRM" << std::endl;
             std::cerr << "                     binary traits get g~'Sigma^-1 g~ on the device from the" << std::endl;
             std::cerr << "                     block-diagonal inverse; isFastTest=false traits become batchable." << std::endl;
+            std::cerr << "                     Works with gpuOwnSampleSets (per-trait sample lists)." << std::endl;
             std::cerr << "  gpuSparseMaxPairs: cap on within-block sample pairs (default 5e7)." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;

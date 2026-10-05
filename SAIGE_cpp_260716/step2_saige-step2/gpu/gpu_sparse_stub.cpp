@@ -9,6 +9,7 @@ namespace gpu2 {
 SpQuad*       spqCreate(const SpQuadCreateArgs&)                   { return nullptr; }
 void          spqDestroy(SpQuad*)                                  {}
 bool          spqRun(SpQuad*, const Reducer*, int)                 { return false; }
+bool          spqRunOwn(SpQuad*, const Reducer*, int, const double*) { return false; }
 const double* spqOut(const SpQuad*)                                { return nullptr; }
 void          spqTimings(const SpQuad*, double*, long long*)       {}
 std::size_t   spqDeviceBytes(const SpQuad*)                        { return 0; }
