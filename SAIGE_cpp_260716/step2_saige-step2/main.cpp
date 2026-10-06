@@ -207,12 +207,13 @@ bool g_mtBatch = true;
 double g_mtMemBudgetGB = 1.5;
 // Config key mtFoldQuantProj: collapse the per-trait covariate projection of
 // the quantitative traits into one shared p-column GEMM (see MTContext::
-// foldQuant). Default off -- it changes the last digits of the quantitative
-// output, so it has to be asked for. Binary traits keep the wide path.
+// foldQuant). Default ON since 2026-10-06 (S2_DEFAULTS.md); it changes the
+// last digits of some quantitative rows, so `mtFoldQuantProj: false` restores
+// the unfolded path. Binary traits keep the wide path.
 bool g_mtFoldQuantProj = false;
 // Config key mtFuseGemm: with the fold on, stream each marker block through
 // memory once against [Xref | RES] instead of once for Z0 = Xref' G and again
-// for GR = G' RES (see MTContext::fuseGemm). Default off. Needs mtFoldQuantProj;
+// for GR = G' RES (see MTContext::fuseGemm). Default on. Needs mtFoldQuantProj;
 // without it there is no p-column covariate GEMM to stack. Every element it
 // produces is the same dot product; only BLAS's tiling of the wider result can
 // move a last bit, so it is asked for rather than assumed.
@@ -222,19 +223,19 @@ bool g_mtFuseGemm = false;
 // 2-bit column ANDed with a per-trait mask instead of two index gathers over
 // the dosage vector (popcount_af.hpp). Exact: integer counts where the sum is
 // an integer, an exact replay of the sequential floating-point sum where a
-// mean-imputed missing genotype makes it not one. Default off. PLINK input
+// mean-imputed missing genotype makes it not one. Default on. PLINK input
 // with the fused decode only; any other column keeps the gather.
 bool g_mtPopcountAF = false;
 // Config key mtPopcountCtrlFromTotal (needs mtPopcountAF): the control-group
 // code counts are the marker's total counts minus the case counts instead of
 // a second popcount pass over the column -- integers either way, so the same
 // sums. Only for a trait whose cases and controls partition the column's
-// samples; otherwise that pair keeps the two-pass form. Default off.
+// samples; otherwise that pair keeps the two-pass form. Default on.
 bool g_mtPopcountCtrlFromTotal = false;
 // Config key mtVecQuantStats: run a quantitative trait's per-(marker, trait)
 // tail one marker block at a time -- a vectorised chi-square(1) upper tail and
 // std::to_chars instead of boost's cdf and sprintf (see score_vec.hpp).
-// Default off. Pairs with p < 1e-5 and every degenerate pair still go through
+// Default on. Pairs with p < 1e-5 and every degenerate pair still go through
 // format_score_result itself, so the tail is bit-identical; above 1e-5 the two
 // p-values agree to 4.2e-15 relative. Binary traits are never touched.
 bool g_mtVecQuantStats = false;
@@ -265,14 +266,14 @@ bool g_outputFormatSgs = false;
 // has the counts). Only touches the file, never the numbers the run computed or
 // the text a text run writes.
 bool g_sgsF32 = false;
-// Config key gpuBinary (default false): let useGPU take runs with binary
+// Config key gpuBinary (default: true with useGPU, else false): let useGPU take runs with binary
 // traits. OFF keeps the previous behaviour exactly -- a binary trait makes the
 // GPU path refuse and the CPU multi-trait loop runs. ON: the six sample-space
 // reductions, the per-pair gate and the case / control allele counts run on
 // the device; flagged pairs take the CPU scalar path (or the device SPA, see
 // gpuSpa). S2_BINARY_GPU.md.
 bool g_gpuBinary = false;
-// Config key gpuSpa (default false; needs gpuBinary): pairs the gate flags for
+// Config key gpuSpa (default: true with useGPU; needs gpuBinary): pairs the gate flags for
 // SPA alone (no Firth, no fast-test recompute, MAC above the ER cutoff) take
 // the device saddlepoint kernel (gpu/gpu_spa.hpp) instead of getMarkerPval.
 bool g_gpuSpa = false;
@@ -283,9 +284,10 @@ bool g_gpuSpa = false;
 // inputs, same host post-rules; kept side by side for the comparison in
 // S2_BINARY_GPU.md.
 std::string g_gpuSpaImpl = "lib";
-// Three device-SPA tuning keys (all default off; S2_KERNEL_ROOFLINE.md). None
+// Three device-SPA tuning keys (default on with useGPU since 2026-10-06, off
+// without it; S2_KERNEL_ROOFLINE.md, S2_DEFAULTS.md). None
 // changes a pair's arithmetic, so the outputs are bit-identical either way.
-//   gpuSpaOrder: marker (default) | trait -- the superblock's flagged pairs
+//   gpuSpaOrder: marker | trait (default with useGPU) -- the superblock's flagged pairs
 //     go to the device sorted by trait (stable, marker order kept within a
 //     trait), so the blocks in flight share a trait's XXVX_inv and mu in L2
 //     instead of each pulling a different trait's 1.6 MB from HBM.
@@ -298,7 +300,7 @@ std::string g_gpuSpaImpl = "lib";
 bool g_gpuSpaTraitMajor = false;
 bool g_gpuSpaFused = false;
 bool g_gpuSpaDynamic = false;
-//   gpuSpaMinBlocks: 0 (default, no hint) .. 4 -- the SPA kernel's __launch_bounds__
+//   gpuSpaMinBlocks: 0 (no hint) .. 4; default 3 with useGPU, else 0 -- the SPA kernel's __launch_bounds__
 //     minimum blocks per SM (spa_gpu.hpp minBlocksPerSM); 2 keeps the fused
 //     kernel at two resident blocks per SM like the unfused one.
 //   gpuDecodeX2: the fp64 decode stores lane-contiguous 16-byte pairs instead
@@ -306,7 +308,7 @@ bool g_gpuSpaDynamic = false;
 //     dosages, same positions.
 int  g_gpuSpaMinBlocks = 0;
 bool g_gpuDecodeX2 = false;
-// Config key gpuFirth (needs gpuSpa): the Firth fit of a pair whose final
+// Config key gpuFirth (default: true with useGPU; needs gpuSpa): the Firth fit of a pair whose final
 // p-value asks for it runs on the device (gpu/gpu_firth.cu) instead of the pair
 // going back to the CPU scalar path whole, and the gate's Firth pre-screen no
 // longer keeps such a pair away from the device SPA. gpuFirthMaxStep is
@@ -314,7 +316,7 @@ bool g_gpuDecodeX2 = false;
 // cutoff) and pairs that need the fast-test recompute stay on the CPU.
 bool g_gpuFirth = false;
 double g_gpuFirthMaxStep = 15.0;
-// Config key gpuOwnSampleSets (default false; S2_GPU_MISSING.md): the GPU path
+// Config key gpuOwnSampleSets (default: true with useGPU; S2_GPU_MISSING.md): the GPU path
 // also takes a multi-trait set whose models do not share one sample list
 // (missing phenotypes), as mainMarkerMT does it: the reader and the device work
 // on the union of the lists, every per-sample vector of a trait with its own
@@ -328,7 +330,7 @@ double g_gpuFirthMaxStep = 15.0;
 // is the sparse variance (isFastTest=false) is still refused -- gpuSparse is
 // binary only. Off: such a set is refused and runs on the CPU, as before.
 bool g_gpuOwnSampleSets = false;
-// Config key gpuSparse (needs gpuBinary, fp64): binary traits whose model
+// Config key gpuSparse (default: true with useGPU; needs gpuBinary, fp64): binary traits whose model
 // carries a sparse GRM get their exact variance g~' Sigma^-1 g~ on the device
 // from the explicit block-diagonal inverse (s2_gpu_sparse.hpp,
 // gpu/gpu_sparse.hpp) instead of a per-marker CPU solve. Fast test on: the
@@ -353,7 +355,7 @@ int  g_gpuBlockSize = 16384;
 // GEMM. fp64 costs about 40% more GEMM time on a V100 -- a few percent of a
 // real run -- and agrees with the CPU path near 1e-15 rather than near 1e-6.
 bool g_gpuFp64    = true;
-// Config key gpuPrefetch (default false): on the GPU path, read + QC + stage
+// Config key gpuPrefetch (default: true with useGPU): on the GPU path, read + QC + stage
 // superblock k+1 on a reader thread while the device call, the host tail and
 // the device SPA / Firth of superblock k run. The pinned staging buffers and
 // the per-block state are a ring of gpuPrefetchSets sets (default 3: with
@@ -368,7 +370,7 @@ bool g_gpuFp64    = true;
 bool g_gpuPrefetch        = false;
 int  g_gpuPrefetchSets    = 3;
 int  g_gpuPrefetchThreads = 4;
-// Config key parallelModelLoad (default false): load the P null models of a
+// Config key parallelModelLoad (default true): load the P null models of a
 // multi-trait run concurrently (min(P, nThreads) threads) instead of one after
 // another. Each model's loader log goes to its own buffer and is printed in
 // config order afterwards, so stdout is unchanged; the loaded objects are the
@@ -8080,7 +8082,7 @@ int main(int argc, char* argv[])
             std::cerr << "  chrom:             chromosome being tested, e.g. \"1\" (required when LOCO=true)" << std::endl;
             std::cerr << std::endl;
             std::cerr << "Sparse-GRM variance solve (only reached with a sparse GRM in the model):" << std::endl;
-            std::cerr << "  blockSparseSigma:  true/false (default: false). Solve Sigma^-1 gtilde" << std::endl;
+            std::cerr << "  blockSparseSigma:  true/false (default: true). Solve Sigma^-1 gtilde" << std::endl;
             std::cerr << "                     with an explicit block-diagonal inverse (one dense" << std::endl;
             std::cerr << "                     inverse per connected component of the GRM) instead" << std::endl;
             std::cerr << "                     of the per-marker PCG. Direct, so more accurate than" << std::endl;
@@ -8096,50 +8098,58 @@ int main(int argc, char* argv[])
             std::cerr << "                     faster than one PCG on a probe, timed at start-up," << std::endl;
             std::cerr << "                     or PCG is kept (default: 2; 0 disables the check)" << std::endl;
             std::cerr << std::endl;
-            std::cerr << "GPU (single-variant, quantitative traits only):" << std::endl;
+            std::cerr << "GPU (single-variant multi-trait path). With useGPU: true, gpuBinary, gpuSpa, gpuFirth,\n"
+                         "gpuSparse, gpuOwnSampleSets, gpuPrefetch, gpuSpaFused and gpuSpaDynamic default to\n"
+                         "true, gpuSpaOrder to trait and gpuSpaMinBlocks to 3; write false / marker / 0 to undo:" << std::endl;
             std::cerr << "  useGPU:            true/false (default: false). Puts the sample-space" << std::endl;
             std::cerr << "                     reductions on a CUDA device. Falls back to the CPU," << std::endl;
             std::cerr << "                     printing why, for anything outside that case." << std::endl;
             std::cerr << "  gpuDevice:         CUDA device index (default: 0)" << std::endl;
             std::cerr << "  gpuBlockSize:      markers per device batch (default: 16384)" << std::endl;
-            std::cerr << "  spaScratch:        true/false (default: false). SPA root bounds once per" << std::endl;
+            std::cerr << "  spaScratch:        true/false (default: true). SPA root bounds once per" << std::endl;
             std::cerr << "                     pair and thread_local scratch; output byte-identical." << std::endl;
-            std::cerr << "  mtPopcountCtrlFromTotal: true/false (default: false). With mtPopcountAF," << std::endl;
+            std::cerr << "  mtPopcountCtrlFromTotal: true/false (default: true). With mtPopcountAF," << std::endl;
             std::cerr << "                     control code counts = marker counts - case counts." << std::endl;
             std::cerr << "  gpuPrecision:      fp64 (default) or fp32" << std::endl;
-            std::cerr << "  gpuBinary:         true/false (default: false). With useGPU, run binary" << std::endl;
+            std::cerr << "  gpuBinary:         true/false (default: = useGPU). With useGPU, run binary" << std::endl;
             std::cerr << "                     traits on the device too (gate + AF counts included)." << std::endl;
-            std::cerr << "  gpuSpa:            true/false (default: false). With gpuBinary, SPA-flagged" << std::endl;
+            std::cerr << "  gpuSpa:            true/false (default: = useGPU). With gpuBinary, SPA-flagged" << std::endl;
             std::cerr << "                     pairs take the device saddlepoint kernel." << std::endl;
             std::cerr << "  gpuSpaImpl:        lib (default) or own: the SPA GPU library (gpu/spa_gpu)" << std::endl;
             std::cerr << "                     or the integrator's kernel (gpu/gpu_spa.cu)." << std::endl;
-            std::cerr << "  gpuSpaOrder:       marker (default) or trait: order of the flagged pairs sent" << std::endl;
+            std::cerr << "  gpuSpaOrder:       marker or trait (default with useGPU): order of the flagged pairs sent" << std::endl;
             std::cerr << "                     to the device SPA (trait keeps a trait's constants in L2)." << std::endl;
-            std::cerr << "  gpuSpaFused:       true/false (default: false). One pass per Newton step for" << std::endl;
+            std::cerr << "  gpuSpaFused:       true/false (default: = useGPU). One pass per Newton step for" << std::endl;
             std::cerr << "                     both roots of a pair, one for both tails (lib only)." << std::endl;
-            std::cerr << "  gpuSpaDynamic:     true/false (default: false). Blocks take pairs from a" << std::endl;
+            std::cerr << "  gpuSpaDynamic:     true/false (default: = useGPU). Blocks take pairs from a" << std::endl;
             std::cerr << "                     device counter instead of a fixed stride (lib only)." << std::endl;
-            std::cerr << "  gpuSpaMinBlocks:   0 (default, no hint) .. 4: the SPA kernel's minimum resident blocks" << std::endl;
+            std::cerr << "  gpuSpaMinBlocks:   0 (no hint) .. 4, default 3 with useGPU: the SPA kernel's minimum resident blocks" << std::endl;
             std::cerr << "                     per SM (register cap 128 / 85 / 64 for 2 / 3 / 4; lib only)." << std::endl;
             std::cerr << "  gpuDecodeX2:       true/false (default: false). fp64 decode with lane-contiguous" << std::endl;
             std::cerr << "                     16-byte stores (no half-written sectors on ECC HBM2)." << std::endl;
             std::cerr << "                     All five leave every output bit-identical." << std::endl;
-            std::cerr << "  gpuFirth:          true/false (default: false). With gpuSpa, the Firth fit of a" << std::endl;
+            std::cerr << "  gpuFirth:          true/false (default: = useGPU). With gpuSpa, the Firth fit of a" << std::endl;
             std::cerr << "                     pair whose p-value asks for it runs on the device." << std::endl;
             std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
-            std::cerr << "  gpuOwnSampleSets:  true/false (default: false). Run models whose sample lists" << std::endl;
+            std::cerr << "  gpuOwnSampleSets:  true/false (default: = useGPU). Run models whose sample lists" << std::endl;
             std::cerr << "                     differ (missing phenotypes) on the GPU path too: union read," << std::endl;
             std::cerr << "                     per-trait masks on the device. Binary and quantitative" << std::endl;
             std::cerr << "                     traits (not a quantitative sparse-GRM first pass)." << std::endl;
-            std::cerr << "  gpuPrefetch:       true/false (default: false). Read + QC + stage the next" << std::endl;
+            std::cerr << "  gpuPrefetch:       true/false (default: = useGPU). Read + QC + stage the next" << std::endl;
             std::cerr << "                     superblock on a reader thread while the current one" << std::endl;
             std::cerr << "                     computes; same results in the same order." << std::endl;
             std::cerr << "  gpuPrefetchSets:   staging sets in the ring (default 3, >= 2)" << std::endl;
             std::cerr << "  gpuPrefetchThreads: OpenMP threads of the reader (default 4)" << std::endl;
-            std::cerr << "  parallelModelLoad: true/false (default: false). Load the null models" << std::endl;
+            std::cerr << "  parallelModelLoad: true/false (default: true). Load the null models" << std::endl;
             std::cerr << "                     of a multi-trait run concurrently (min(P, nThreads)" << std::endl;
             std::cerr << "                     threads); same objects, same log, in config order." << std::endl;
-            std::cerr << "  gpuSparse:         true/false (default: false). With gpuBinary, sparse-GRM" << std::endl;
+            std::cerr << "Multi-trait CPU batch kernel (default true; write false to turn one off):" << std::endl;
+            std::cerr << "  mtPopcountAF:      binary case/control allele sums from 2-bit popcounts (exact)." << std::endl;
+            std::cerr << "  mtFoldQuantProj:   one shared covariate GEMM for the quantitative traits that share" << std::endl;
+            std::cerr << "                     the union's samples; last printed digit of some rows moves." << std::endl;
+            std::cerr << "  mtFuseGemm:        with mtFoldQuantProj, one [Xref | RES]' G GEMM per block." << std::endl;
+            std::cerr << "  mtVecQuantStats:   quantitative per-pair tail one block at a time (p >= 1e-5)." << std::endl;
+            std::cerr << "  gpuSparse:         true/false (default: = useGPU). With gpuBinary, sparse-GRM" << std::endl;
             std::cerr << "                     binary traits get g~'Sigma^-1 g~ on the device from the" << std::endl;
             std::cerr << "                     block-diagonal inverse; isFastTest=false traits become batchable." << std::endl;
             std::cerr << "                     Works with gpuOwnSampleSets (per-trait sample lists)." << std::endl;
@@ -8323,10 +8333,21 @@ int main(int argc, char* argv[])
         // why, unless every trait is quantitative and batchable, the input is
         // PLINK, the models share one sample list, and a device is present.
         g_gpuStep2 = config["useGPU"] ? config["useGPU"].as<bool>() : false;
-        // spaScratch (default false): the SPA block allocates nothing per call
+        // Defaults (S2_DEFAULTS.md, 2026-10-06): the CPU switches below default
+        // ON; the GPU switches default ON when useGPU is true (useGPU itself
+        // stays off). Every one can still be written false, and writing all of
+        // them false reproduces the earlier defaults byte for byte. A
+        // dependency message ("ignored, it needs ...") is printed only for a
+        // switch the config wrote explicitly, not for one that was defaulted.
+        auto cfgBool = [&](const char* k, bool def) -> bool {
+            return config[k] ? config[k].as<bool>() : def;
+        };
+        auto cfgSet = [&](const char* k) -> bool { return (bool)config[k]; };
+        const bool gpuDef = g_gpuStep2;
+        // spaScratch (default true): the SPA block allocates nothing per call
         // and computes its root bounds once per pair; byte-identical output
         // (spa_binary.hpp). Any path that reaches SPA honours it.
-        g_spaScratch = config["spaScratch"] ? config["spaScratch"].as<bool>() : false;
+        g_spaScratch = cfgBool("spaScratch", true);
         if (g_spaScratch)
             std::cout << "  spaScratch: on -- gpos/gneg once per pair, thread_local SPA buffers"
                       << std::endl;
@@ -8349,45 +8370,48 @@ int main(int argc, char* argv[])
                     "formats the doubles the run computed");
         }
         if (config["gpuDevice"]) g_gpuDevice = config["gpuDevice"].as<int>();
-        g_gpuBinary = config["gpuBinary"] ? config["gpuBinary"].as<bool>() : false;
-        g_gpuSpa    = config["gpuSpa"]    ? config["gpuSpa"].as<bool>()    : false;
+        g_gpuBinary = cfgBool("gpuBinary", gpuDef);
+        g_gpuSpa    = cfgBool("gpuSpa", gpuDef);
         if (config["gpuSpaImpl"]) {
             g_gpuSpaImpl = config["gpuSpaImpl"].as<std::string>();
             if (g_gpuSpaImpl != "lib" && g_gpuSpaImpl != "own")
                 throw std::runtime_error("gpuSpaImpl must be lib or own, not '" + g_gpuSpaImpl + "'");
         }
+        g_gpuSpaTraitMajor = gpuDef;   // default with useGPU: trait (S2_KERNEL_ROOFLINE.md)
         if (config["gpuSpaOrder"]) {
             const std::string so = config["gpuSpaOrder"].as<std::string>();
             if      (so == "marker") g_gpuSpaTraitMajor = false;
             else if (so == "trait")  g_gpuSpaTraitMajor = true;
             else throw std::runtime_error("gpuSpaOrder must be marker or trait, not '" + so + "'");
         }
-        g_gpuSpaFused   = config["gpuSpaFused"]   ? config["gpuSpaFused"].as<bool>()   : false;
-        g_gpuSpaDynamic = config["gpuSpaDynamic"] ? config["gpuSpaDynamic"].as<bool>() : false;
+        g_gpuSpaFused   = cfgBool("gpuSpaFused", gpuDef);
+        g_gpuSpaDynamic = cfgBool("gpuSpaDynamic", gpuDef);
+        g_gpuSpaMinBlocks = gpuDef ? 3 : 0;   // default with useGPU: 3 (S2_KERNEL_ROOFLINE.md)
         if (config["gpuSpaMinBlocks"]) {
             g_gpuSpaMinBlocks = config["gpuSpaMinBlocks"].as<int>();
             if (g_gpuSpaMinBlocks < 0 || g_gpuSpaMinBlocks > 4)
                 throw std::runtime_error("gpuSpaMinBlocks must be 0..4 (0 = no hint)");
         }
         g_gpuDecodeX2 = config["gpuDecodeX2"] ? config["gpuDecodeX2"].as<bool>() : false;
-        if ((g_gpuSpaFused || g_gpuSpaDynamic) && g_gpuSpaImpl != "lib")
+        if ((g_gpuSpaFused || g_gpuSpaDynamic) && g_gpuSpaImpl != "lib" &&
+            (cfgSet("gpuSpaFused") || cfgSet("gpuSpaDynamic")))
             std::cout << "  gpuSpaFused / gpuSpaDynamic: ignored, they need gpuSpaImpl: lib" << std::endl;
         if (g_gpuSpa && !g_gpuBinary) {
-            std::cout << "  gpuSpa: ignored, it needs gpuBinary: true" << std::endl;
+            if (cfgSet("gpuSpa")) std::cout << "  gpuSpa: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSpa = false;
         }
-        g_gpuFirth = config["gpuFirth"] ? config["gpuFirth"].as<bool>() : false;
-        g_gpuOwnSampleSets = config["gpuOwnSampleSets"] ? config["gpuOwnSampleSets"].as<bool>() : false;
+        g_gpuFirth = cfgBool("gpuFirth", gpuDef);
+        g_gpuOwnSampleSets = cfgBool("gpuOwnSampleSets", gpuDef);
         if (config["gpuFirthMaxStep"]) g_gpuFirthMaxStep = config["gpuFirthMaxStep"].as<double>();
         if (g_gpuFirth && !(g_gpuFirthMaxStep > 0)) throw std::runtime_error("gpuFirthMaxStep must be > 0");
         if (g_gpuFirth && !g_gpuSpa) {
-            std::cout << "  gpuFirth: ignored, it needs gpuSpa: true" << std::endl;
+            if (cfgSet("gpuFirth")) std::cout << "  gpuFirth: ignored, it needs gpuSpa: true" << std::endl;
             g_gpuFirth = false;
         }
-        g_gpuSparse = config["gpuSparse"] ? config["gpuSparse"].as<bool>() : false;
+        g_gpuSparse = cfgBool("gpuSparse", gpuDef);
         if (config["gpuSparseMaxPairs"]) g_gpuSparseMaxPairs = config["gpuSparseMaxPairs"].as<long long>();
         if (g_gpuSparse && !g_gpuBinary) {
-            std::cout << "  gpuSparse: ignored, it needs gpuBinary: true" << std::endl;
+            if (cfgSet("gpuSparse")) std::cout << "  gpuSparse: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSparse = false;
         }
         if ((g_gpuBinary || g_gpuSpa) && !g_gpuStep2)
@@ -8403,7 +8427,7 @@ int main(int argc, char* argv[])
             else if (gp == "fp32") g_gpuFp64 = false;
             else throw std::runtime_error("gpuPrecision must be fp64 or fp32, not '" + gp + "'");
         }
-        g_gpuPrefetch = config["gpuPrefetch"] ? config["gpuPrefetch"].as<bool>() : false;
+        g_gpuPrefetch = cfgBool("gpuPrefetch", gpuDef);
         if (config["gpuPrefetchSets"]) {
             g_gpuPrefetchSets = config["gpuPrefetchSets"].as<int>();
             if (g_gpuPrefetchSets < 2) throw std::runtime_error("gpuPrefetchSets must be >= 2");
@@ -8418,7 +8442,7 @@ int main(int argc, char* argv[])
             std::cout << "  gpuPrefetch: on -- the next superblock is read while the current one "
                          "computes (" << g_gpuPrefetchSets << " staging sets, "
                       << g_gpuPrefetchThreads << " reader thread(s))" << std::endl;
-        g_parallelModelLoad = config["parallelModelLoad"] ? config["parallelModelLoad"].as<bool>() : false;
+        g_parallelModelLoad = cfgBool("parallelModelLoad", true);
         if (g_parallelModelLoad)
             std::cout << "  parallelModelLoad: on -- the null models are loaded concurrently"
                       << std::endl;
@@ -8440,13 +8464,13 @@ int main(int argc, char* argv[])
         // R step 2 --relatednessCutoff (default 0): sparse GRM entries below it
         // are dropped before Sigma is built (null_model_loader.cpp).
         double relatednessCutoff = config["relatednessCutoff"] ? config["relatednessCutoff"].as<double>() : 0.0;
-        // blockSparseSigma (default off): on the sparse-GRM variance path,
+        // blockSparseSigma (default on since 2026-10-06; false = per-marker PCG): on the sparse-GRM variance path,
         // solve Sigma^-1 gtilde with the explicit block-diagonal inverse of
         // s2_block_solve.hpp instead of the per-marker PCG. Read before the
         // SAIGEClass instances are built, which is where the inverse is formed.
         {
             s2blk::Config blk;
-            blk.enabled = config["blockSparseSigma"] ? config["blockSparseSigma"].as<bool>() : false;
+            blk.enabled = config["blockSparseSigma"] ? config["blockSparseSigma"].as<bool>() : true;
             blk.verify  = config["blockSparseSigmaVerify"] ? config["blockSparseSigmaVerify"].as<bool>() : false;
             blk.refreshBudgetS = config["blockSparseSigmaRefreshBudget_s"]
                                      ? config["blockSparseSigmaRefreshBudget_s"].as<double>() : 0.25;
@@ -9017,28 +9041,29 @@ int main(int argc, char* argv[])
             // needs the loaded models, which are still alive here; nothing
             // reads nms after this point.
             g_mtBatch     = config["mtBatch"] ? config["mtBatch"].as<bool>() : true;
-            g_mtFoldQuantProj = config["mtFoldQuantProj"]
-                                    ? config["mtFoldQuantProj"].as<bool>() : false;
+            g_mtFoldQuantProj = cfgBool("mtFoldQuantProj", true);
             if (g_mtFoldQuantProj && g_gpuStep2) {
                 // The GPU path prefills Zall / GWqnt itself (scoreTestBatchMTQuantPre);
                 // nothing there consults the fold, so say so instead of pretending.
-                std::cout << "  mtFoldQuantProj: ignored, the GPU multi-trait path "
-                             "computes its own covariate projection" << std::endl;
+                if (cfgSet("mtFoldQuantProj"))
+                    std::cout << "  mtFoldQuantProj: ignored, the GPU multi-trait path "
+                                 "computes its own covariate projection" << std::endl;
                 g_mtFoldQuantProj = false;
             }
-            g_mtFuseGemm = config["mtFuseGemm"] ? config["mtFuseGemm"].as<bool>() : false;
+            g_mtFuseGemm = cfgBool("mtFuseGemm", true);
             if (g_mtFuseGemm && !g_mtFoldQuantProj) {
-                std::cout << "  mtFuseGemm: ignored, it needs mtFoldQuantProj: true "
-                             "(the fold is what makes the covariate side p columns wide)"
-                          << std::endl;
+                if (cfgSet("mtFuseGemm"))
+                    std::cout << "  mtFuseGemm: ignored, it needs mtFoldQuantProj: true "
+                                 "(the fold is what makes the covariate side p columns wide)"
+                              << std::endl;
                 g_mtFuseGemm = false;
             }
-            g_mtPopcountAF = config["mtPopcountAF"] ? config["mtPopcountAF"].as<bool>() : false;
-            g_mtPopcountCtrlFromTotal = config["mtPopcountCtrlFromTotal"]
-                                            ? config["mtPopcountCtrlFromTotal"].as<bool>() : false;
+            g_mtPopcountAF = cfgBool("mtPopcountAF", true);
+            g_mtPopcountCtrlFromTotal = cfgBool("mtPopcountCtrlFromTotal", true);
             if (g_mtPopcountCtrlFromTotal && !g_mtPopcountAF) {
-                std::cout << "  mtPopcountCtrlFromTotal: ignored, it needs mtPopcountAF: true"
-                          << std::endl;
+                if (cfgSet("mtPopcountCtrlFromTotal"))
+                    std::cout << "  mtPopcountCtrlFromTotal: ignored, it needs mtPopcountAF: true"
+                              << std::endl;
                 g_mtPopcountCtrlFromTotal = false;
             }
             g_mtBlockSize = config["mtBlockSize"] ? config["mtBlockSize"].as<int>() : 0;
@@ -9106,8 +9131,7 @@ int main(int argc, char* argv[])
                                  "pair keeps the gather";
                 std::cout << std::endl;
             }
-            g_mtVecQuantStats = config["mtVecQuantStats"]
-                                    ? config["mtVecQuantStats"].as<bool>() : false;
+            g_mtVecQuantStats = cfgBool("mtVecQuantStats", true);
             g_mtctx.vecQuantStats = g_mtVecQuantStats;
             if (g_mtVecQuantStats) {
                 std::ostringstream os;
