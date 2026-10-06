@@ -15,6 +15,7 @@ SAIGE_cpp_260716/step2_saige-step2/saige-step2
 SAIGE_cpp_260716/step2_saige-step2/saige-step2.cuda
 SAIGE_cpp_260716/step2_saige-step2/tools/sgs2txt
 SAIGE_cpp_260716/step2_saige-step2/tools/spa_gpu_check
+SAIGE_cpp_260716/step2_saige-step2/tools/er_gpu_check
 SAIGE_cpp_260716/step2_saige-step2/tools/spa_gpos_test
 SAIGE_cpp_260716/step2_saige-step2/tools/sgs_fidelity
 SAIGE_cpp_260716/step2_saige-step2/tools/out_fieldcmp
