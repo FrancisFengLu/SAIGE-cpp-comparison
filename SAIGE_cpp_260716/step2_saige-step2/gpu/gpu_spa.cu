@@ -352,13 +352,13 @@ void spaTimings(const Spa* s, double* t_kernel, long long* t_pairs)
     if (t_pairs)  *t_pairs = s->nPairsDone;
 }
 
-bool spaRun(Spa* s, const Reducer* r, int nPairs)
+bool spaRun(Spa* s, const Reducer* r, int nPairs, int t_devSet)
 {
     if (!s || !r) return false;
     if (nPairs <= 0) return true;
     if (nPairs > s->maxPairs) { lastErrSpa = "nPairs > maxPairs"; return false; }
-    const unsigned char* dPk = (const unsigned char*)devicePacked(r);
-    const double* dLut = (const double*)deviceLut(r);
+    const unsigned char* dPk = (const unsigned char*)devicePacked(r, t_devSet);
+    const double* dLut = (const double*)deviceLut(r, t_devSet);
     if (!dPk || !dLut) { lastErrSpa = "reducer has no resident packed rows"; return false; }
     // The reducer's last reduce() is complete (it synchronises before
     // returning), so its resident rows are safe to read on our own stream.

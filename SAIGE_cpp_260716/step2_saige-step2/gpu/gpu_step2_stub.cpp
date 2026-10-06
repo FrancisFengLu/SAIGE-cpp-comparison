@@ -28,19 +28,22 @@ unsigned char*  packed(Reducer*, int)         { return nullptr; }
 double*         lut(Reducer*, int)            { return nullptr; }
 std::size_t     bytesPerSlot(const Reducer*)  { return 0; }
 int             stagingSets(const Reducer*)   { return 0; }
-bool            reduce(Reducer*, int, int)    { return false; }
+bool            reduce(Reducer*, int, int, int) { return false; }
 bool            isFp64(const Reducer*)        { return false; }
-const float*    outCf(const Reducer*)         { return nullptr; }
-const double*   outCd(const Reducer*)         { return nullptr; }
-const float*    outC2f(const Reducer*)        { return nullptr; }
-const double*   outC2d(const Reducer*)        { return nullptr; }
+const float*    outCf(const Reducer*, int)    { return nullptr; }
+const double*   outCd(const Reducer*, int)    { return nullptr; }
+const float*    outC2f(const Reducer*, int)   { return nullptr; }
+const double*   outC2d(const Reducer*, int)   { return nullptr; }
 std::size_t     ldC(const Reducer*)           { return 0; }
-const uint32_t* outCounts(const Reducer*)     { return nullptr; }
+const uint32_t* outCounts(const Reducer*, int) { return nullptr; }
 std::size_t     deviceBytes(const Reducer*)   { return 0; }
 void            timings(const Reducer*, double*, double*, double*, double*, double*) {}
-const void*     devicePacked(const Reducer*)  { return nullptr; }
-const void*     deviceLut(const Reducer*)     { return nullptr; }
+const void*     devicePacked(const Reducer*, int) { return nullptr; }
+const void*     deviceLut(const Reducer*, int) { return nullptr; }
 void*           deviceStream(const Reducer*)  { return nullptr; }
+int             deviceSets(const Reducer*)    { return 0; }
+bool            bindDevice(int)               { return false; }
+std::string     setBlockingSync(int)          { return "built without CUDA"; }
 
 }  // namespace gpu2
 }  // namespace saige

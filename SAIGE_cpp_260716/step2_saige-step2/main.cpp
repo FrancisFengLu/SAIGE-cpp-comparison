@@ -28,6 +28,8 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <exception>
 #include <omp.h>
 #include "phase_timing.hpp"
@@ -370,6 +372,24 @@ bool g_gpuFp64    = true;
 bool g_gpuPrefetch        = false;
 int  g_gpuPrefetchSets    = 3;
 int  g_gpuPrefetchThreads = 4;
+// Config key gpuOverlap (default false): on the GPU path, run the three stages
+// that follow the read -- the device scan (decode + GEMMs + popcounts), the
+// host tail (per-pair statistics, gates, routing) and the device SPA / Firth
+// with their host post-rules -- on different superblocks at once: a scan
+// worker thread reduces superblock k+1 (and further, up to the ring) while the
+// main thread runs the host tail of superblock k and an SPA worker solves the
+// flagged pairs of an earlier superblock. The staging, device and result
+// buffers are a ring of gpuOverlapSets sets (default 6); the main thread posts
+// (SPA post-rules, Firth, chunk write) a superblock as soon as its SPA is done,
+// and at the latest once gpuOverlapLag superblocks (default 3) are waiting.
+// Every superblock is still reduced with the same slots and launch shapes,
+// every pair is finalized by the same code on the same numbers, and chunks are
+// written in input order: the output does not change. With gpuPrefetch the
+// reader thread feeds the scan worker; without it the scan worker reads.
+// OFF: the loop as before. S2_OVERLAP.md.
+bool g_gpuOverlap     = false;
+int  g_gpuOverlapSets = 6;
+int  g_gpuOverlapLag  = 3;
 // Config key parallelModelLoad (default true): load the P null models of a
 // multi-trait run concurrently (min(P, nThreads) threads) instead of one after
 // another. Each model's loader log goes to its own buffer and is printed in
@@ -2705,7 +2725,12 @@ bool mainMarkerMTGpu(
     // state) so the reader can fill one while the device and the host tail
     // work on another. 1 without it.
     const bool prefetch = g_gpuPrefetch;
-    const int  nSets    = prefetch ? std::max(2, g_gpuPrefetchSets) : 1;
+    // gpuOverlap: one ring of nSets sets for everything a superblock holds
+    // from its read to its post -- staging, device rows, host results, block
+    // state, parked pairs (S2_OVERLAP.md).
+    const bool overlap  = g_gpuOverlap;
+    const int  nSets    = overlap ? std::max(3, g_gpuOverlapSets)
+                                  : (prefetch ? std::max(2, g_gpuPrefetchSets) : 1);
     saige::gpu2::Reducer* R = nullptr;
     {
         std::vector<double> Bf((std::size_t)n * K1);
@@ -2743,6 +2768,7 @@ bool mainMarkerMTGpu(
         a.maxSlots = slots; a.fp64 = g_gpuFp64; a.stagingSets = nSets;
         a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
         a.decodeX2 = g_gpuDecodeX2;
+        a.deviceSets = overlap ? nSets : 1;
         R = saige::gpu2::create(a);
     }
     if (R == nullptr) {
@@ -2773,6 +2799,12 @@ bool mainMarkerMTGpu(
         std::cout << "  gpuPrefetch: " << nSets << " staging sets of " << slots << " markers ("
                   << ((std::size_t)nSets * slots * (bpv + 4 * sizeof(double)) >> 20)
                   << " MiB pinned), " << g_gpuPrefetchThreads << " reader thread(s)" << std::endl;
+    if (overlap)
+        std::cout << "  gpuOverlap: " << nSets << " buffer sets (staging, device rows, results) of "
+                  << slots << " markers; SPA may lag the tail by up to "
+                  << std::min(g_gpuOverlapLag, nSets - 1) << " superblock(s); "
+                  << (prefetch ? "the reader thread feeds the scan worker" : "the scan worker reads")
+                  << std::endl;
     // ---- gpuSparse: the within-block cross terms ----
     saige::gpu2::SpQuad* SQ = nullptr;
     if (spDev) {
@@ -2780,6 +2812,7 @@ bool mainMarkerMTGpu(
         qa.device = g_gpuDevice; qa.N = n; qa.nTraits = nBin; qa.nPairs = spPlan.nPairs;
         qa.pi = spPlan.pi.data(); qa.pj = spPlan.pj.data(); qa.w = spPlan.w.data();
         qa.maxSlots = slots;
+        qa.outSets = overlap ? nSets : 1;
         SQ = saige::gpu2::spqCreate(qa);
         if (SQ == nullptr) {
             bool needFirst = false;
@@ -2977,16 +3010,25 @@ bool mainMarkerMTGpu(
     std::vector<long> nBatched(P, 0), nFallback(P, 0), nPcCounts(P, 0), nPcReplay(P, 0), nPcGather(P, 0);
     std::vector<long> nGateSPA(P, 0), nGateFirth(P, 0), nGateFast(P, 0), nGateER(P, 0);
     std::vector<long> nDevSpa(P, 0), nDevSpaFirth(P, 0);
-    std::vector<std::vector<PendSpa>> pend(std::max(1, omp_get_max_threads()));
+    // one per ring set (gpuOverlap parks superblock k's pairs while an
+    // earlier superblock's are being posted); one set without it
+    std::vector<std::vector<std::vector<PendSpa>>> pendR(nSets,
+        std::vector<std::vector<PendSpa>>(std::max(1, omp_get_max_threads())));
     double tSpa = 0;
     // Pairs whose p-value asked for Firth, fitted on the device after the SPA
     // pass (gpuFirth): the batch / device-SPA result stands, only Beta / seBeta
     // and the Firth flags change.
     struct PendFirth { int bi, jj, c, t; double p; char logp; char flip; double fd[4]; };
-    std::vector<std::vector<PendFirth>> pendF(std::max(1, omp_get_max_threads()));
+    std::vector<std::vector<std::vector<PendFirth>>> pendFR(nSets,
+        std::vector<std::vector<PendFirth>>(std::max(1, omp_get_max_threads())));
     std::vector<long> nDevFirth(P, 0);
     double tFirth = 0;
-    std::vector<MTTraitChunk> out(P);
+    // gpuOverlap: up to nOut chunks have rows in flight (tailed, not yet
+    // written); without it the one chunk's rows.
+    const int ovLag = overlap ? std::min(g_gpuOverlapLag, nSets - 1) : 0;
+    const int nOut  = overlap ? std::max(2, ovLag) : 1;
+    std::vector<MTTraitChunk> outMain(overlap ? 0 : P);
+    std::vector<std::vector<MTTraitChunk>> outR(overlap ? nOut : 0, std::vector<MTTraitChunk>(P));
     long nSlotsUsed = 0, nSlotsTotal = 0;
 
     // ---- gpuSparse helpers ----
@@ -3003,10 +3045,11 @@ bool mainMarkerMTGpu(
     //   sum_i B_ii g_t,i^2 = G2B + 2ab G'diag(B) + b^2 tr B + q sum_m B_ii
     // and the cross terms come from the kernel on g_t itself (spqRunOwn).
     std::vector<GpuBlk>* spBlks = nullptr;   // the superblock in phase 3 / 4
+    int spSet = 0;                            // its device / result set
     auto spStats = [&](std::size_t slot, int t, double& S, double& var2) {
         const SAIGE::TraitMeta& M = ctx.meta[t];
-        const double* Cd1 = saige::gpu2::outCd(R);
-        const double* Cd2 = saige::gpu2::outC2d(R);
+        const double* Cd1 = saige::gpu2::outCd(R, spSet);
+        const double* Cd2 = saige::gpu2::outC2d(R, spSet);
         const std::size_t ldc = saige::gpu2::ldC(R);
         const int p = M.p, b = M.binIdx;
         double z[64], gw[64];
@@ -3061,7 +3104,7 @@ bool mainMarkerMTGpu(
             gwz += gw[r] * z[r];
             zyr += z[r] * yr[r];
         }
-        const double Q = Qd + saige::gpu2::spqOut(SQ)[slot * (std::size_t)nBin + b];
+        const double Q = Qd + saige::gpu2::spqOut(SQ, spSet)[slot * (std::size_t)nBin + b];
         var2 = zxz + Q - 2.0 * gwz;
         S = (Rg - zyr) / M.tau0;
     };
@@ -3523,60 +3566,128 @@ bool mainMarkerMTGpu(
     }
     double tWait = 0;                  // consumer time spent waiting for the reader
     bool readerEnded = false;
-    const double tLoop0 = omp_get_wtime();
-
-    int kSb = 0;                       // superblock counter, = index into sched
-    for (int chunkStart = 0, ci = 0; chunkStart < q; chunkStart += chunkSize, ci++) {
-        const int chunkEnd = std::min(chunkStart + chunkSize, q);
-        const int qc = chunkEnd - chunkStart;
-        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
-
-        // The chunk's marker columns; reset by whoever reads the chunk's first
-        // superblock (readSuperblock), on this thread or on the reader's.
-        ChunkMeta& CM = meta[ci % nSets];
-        for (int t = 0; t < P; t++) out[t].reset(qc);
-
-        const int nBlocks = (qc + Bblk - 1) / Bblk;
-
-        for (int sb = 0; sb < nBlocks; sb += nSub, kSb++) {
-            const int sbEnd = std::min(sb + nSub, nBlocks);
-            const int nb = sbEnd - sb;
-            const SbDesc& d = sched[kSb];
-            const int s = kSb % nSets;
+    // ---------------- gpuOverlap: worker state ----------------
+    // The scan worker (thA) runs phases 1 (without gpuPrefetch) and 2 for
+    // superblocks 0, 1, ... into ring set k % nSets, waiting until that set
+    // has been posted and released; the SPA worker (thB) runs the first
+    // device SPA round of each superblock the main thread has tailed. All
+    // fields below ov.m except the per-set job vectors, which are handed over
+    // through jobState.
+    struct SpaRes {
+        std::vector<saige::gpu2::SpaPairOut> so;
+        std::vector<saige::spa_gpu::PairOut> lo;
+    };
+    struct OvState {
+        std::mutex m;
+        std::condition_variable cv;
+        int  scanned = 0;              // superblocks [0, scanned) reduced
+        bool scanDone = false;         // the scan worker has stopped
+        int  posted = 0;               // superblocks [0, posted) posted, written, their sets free
+        std::atomic<bool> stop{false};
+        int  errCode = 0;              // phase 2's failure code, 0 = none
+        std::string errMsg;
+        std::exception_ptr err;
+        std::deque<int> jobQ;          // superblocks waiting for the SPA worker
+        std::vector<char> jobState;    // per set: 0 idle, 1 queued, 2 done, 3 failed
+        std::vector<std::vector<PendSpa>> jobAll;
+        std::vector<SpaRes> jobRes;
+        // The writer (thW): after its post, a superblock's set is released --
+        // and, when it is its chunk's last, the chunk written first -- by the
+        // writer, in superblock order, so the chunk write overlaps the next
+        // tails and sets / chunk slots still come free in input order.
+        struct WJob { int j, s, ci, chunkStart; bool write; };
+        std::deque<WJob> wq;
+        std::exception_ptr werr;
+        double tWriter = 0, tWaitWriter = 0;
+        std::thread thA, thB, thW;
+        double tWaitScan = 0, tWaitSpa = 0, tScanWall = 0, tScanReadWait = 0, tSpaWall = 0, tPost = 0;
+        ~OvState() {
+            stop = true;
+            { std::lock_guard<std::mutex> lk(m); }
+            cv.notify_all();
+            if (thA.joinable()) thA.join();
+            if (thB.joinable()) thB.join();
+            if (thW.joinable()) thW.join();
+        }
+    } ov;
+    // Stop every helper thread (reader, scan and SPA workers) before the
+    // reducer they use is destroyed.
+    auto haltAll = [&]() {
+        ov.stop = true;
+        { std::lock_guard<std::mutex> lk(ov.m); }
+        ov.cv.notify_all();
+        rd.halt();
+        rd.cvFill.notify_all();
+        if (ov.thA.joinable()) ov.thA.join();
+        if (ov.thB.joinable()) ov.thB.join();
+        if (ov.thW.joinable()) ov.thW.join();
+    };
+    // One device SPA round on `all` (sorted first under gpuSpaOrder: trait,
+    // as before), against device set ds; the results copied out of the
+    // library's pinned table into res. spaMu: the SPA worker and a post's
+    // later rounds (gpuSparse stage 2) share SP / SL.
+    std::mutex spaMu;
+    // Host wall intervals of every device call (reduce, SPA round, Firth),
+    // from whichever thread made it; their union is the time the device had
+    // work, comparable with and without gpuOverlap.
+    std::mutex busyMu;
+    std::vector<std::pair<double, double>> busyIv;
+    auto busyAdd = [&](double a, double b) { std::lock_guard<std::mutex> lk(busyMu); busyIv.emplace_back(a, b); };
+    auto spaRound = [&](std::vector<PendSpa>& all, int ds, SpaRes& res) -> bool {
+                std::lock_guard<std::mutex> lkSpa(spaMu);
+                // gpuSpaOrder: trait -- the blocks in flight then share one
+                // trait's XXVX_inv / mu in L2. Stable, so a trait's pairs keep
+                // their marker order; results are indexed by jj, not by k.
+                if (g_gpuSpaTraitMajor)
+                    std::stable_sort(all.begin(), all.end(),
+                                     [](const PendSpa& x, const PendSpa& y) { return x.t < y.t; });
+                const int nPend = (int)all.size();
+                    saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
+                    saige::spa_gpu::PairIn*   inl = SL ? saige::spa_gpu::in(SL) : nullptr;
+                    double* plut = SL ? saige::spa_gpu::pairLut(SL) : nullptr;   // gpuOwnSampleSets only
+                    for (int k = 0; k < nPend; k++) {
+                        const PendSpa& pd = all[k];
+                        const int slot = (int)((std::size_t)pd.bi * Bblk + pd.c);
+                        const int bt = ctx.meta[pd.t].binIdx;
+                        if (in) {
+                            in[k].slot = slot; in[k].trait = bt;
+                            in[k].fast = pd.fast; in[k].logp = pd.logp;
+                            in[k].Tstat = pd.Tstat; in[k].var1 = pd.var1; in[k].var2 = pd.var2; in[k].pno = pd.pno;
+                        } else {
+                            inl[k].slot = slot; inl[k].trait = bt;
+                            inl[k].fast = pd.fast; inl[k].logp = pd.logp;
+                            inl[k].Tstat = pd.Tstat; inl[k].var1 = pd.var1; inl[k].var2 = pd.var2; inl[k].pno = pd.pno;
+                            if (plut) for (int q4 = 0; q4 < 4; q4++) plut[(std::size_t)k * 4 + q4] = pd.fd[q4];
+                        }
+                    }
+                    bool okRun;
+                    const double tb0 = omp_get_wtime();
+                    if (SP) {
+                        okRun = saige::gpu2::spaRun(SP, R, nPend, ds);
+                    } else {
+                        saige::spa_gpu::Geno geno;
+                        geno.packed = (const unsigned char*)saige::gpu2::devicePacked(R, ds);
+                        geno.bpv    = saige::gpu2::bytesPerSlot(R);
+                        geno.lut    = (const double*)saige::gpu2::deviceLut(R, ds);
+                        okRun = saige::spa_gpu::run(SL, geno, nPend);
+                    }
+                    busyAdd(tb0, omp_get_wtime());
+                    if (!okRun) return false;
+                    if (SP) { const saige::gpu2::SpaPairOut* o = saige::gpu2::spaOut(SP); res.so.assign(o, o + nPend); }
+                    else    { const saige::spa_gpu::PairOut* o = saige::spa_gpu::out(SL);  res.lo.assign(o, o + nPend); }
+                    return true;
+    };
+    // ---------------- phase 2: the device ----------------
+    // One superblock's reduce() (+ the gpuSparse cross terms) into device /
+    // result set ds. 0 = done; 1 = the reduction failed; 2 = the cross terms
+    // failed (message in *t_err). Called by this thread, or with gpuOverlap by
+    // the scan worker; failPhase2 below turns a failure into the exception.
+    auto phase2 = [&](const SbDesc& d, int s, int ds, std::string* t_err) -> int {
+            const int nb = d.nb;
             std::vector<GpuBlk>& blksS = blks[s];
-            unsigned char* hPkS = hPkSet[s];
-            spBlks = &blksS;
-
-            // ---------------- phase 1: read + QC + stage ----------------
             double t0 = omp_get_wtime();
-            if (prefetch) {
-                std::unique_lock<std::mutex> lk(rd.m);
-                rd.cvFill.wait(lk, [&]{ return rd.filled[s] || rd.err || rd.done; });
-                if (rd.err) {
-                    std::exception_ptr e = rd.err;
-                    lk.unlock();
-                    rd.halt();
-                    saige::gpu2::destroy(R);
-                    std::rethrow_exception(e);
-                }
-                if (!rd.filled[s]) { readerEnded = true; break; }   // the reader stopped at this chunk's start
-                lk.unlock();
-                tWait += omp_get_wtime() - t0;
-            } else {
-                readSuperblock(d, s, nThreadsHere);
-                tRead += omp_get_wtime() - t0;
-            }
-
-            // ---------------- phase 2: the device ----------------
-            t0 = omp_get_wtime();
             const int nSlotsThis = nb * Bblk;
-            if (!saige::gpu2::reduce(R, nSlotsThis, s)) {
-                rd.halt();
-                saige::gpu2::destroy(R);
-                throw std::runtime_error(
-                    "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
-                    "without useGPU (or with useGPU: false) to finish on the CPU.");
-            }
+            if (!saige::gpu2::reduce(R, nSlotsThis, s, ds)) return 1;
             if (spDev && differ) {
                 // each trait's own code -> dosage table per slot (zeros where
                 // the pair failed QC or the slot is unused)
@@ -3595,26 +3706,828 @@ bool mainMarkerMTGpu(
                     }
                 }
             }
-            if (spDev && !(differ ? saige::gpu2::spqRunOwn(SQ, R, nSlotsThis, spTl.data())
-                                  : saige::gpu2::spqRun(SQ, R, nSlotsThis))) {
-                saige::gpu2::spqDestroy(SQ);
-                saige::gpu2::destroy(R);
-                throw std::runtime_error(
-                    std::string("mainMarkerMTGpu: the device sparse variance failed mid-run (") +
-                    saige::gpu2::spqLastError() + "). Rerun without gpuSparse.");
+            if (spDev && !(differ ? saige::gpu2::spqRunOwn(SQ, R, nSlotsThis, spTl.data(), ds)
+                                  : saige::gpu2::spqRun(SQ, R, nSlotsThis, ds))) {
+                if (t_err) *t_err = saige::gpu2::spqLastError();
+                return 2;
             }
             tGpu += omp_get_wtime() - t0;
+            busyAdd(t0, omp_get_wtime());
             for (int bi = 0; bi < nb; bi++) nSlotsUsed += blksS[bi].nHi + blksS[bi].nLo;
             nSlotsTotal += nSlotsThis;
+            return 0;
+    };
+    auto failPhase2 = [&](int rc, const std::string& err) {
+        if (rc == 1) {
+            haltAll();
+            saige::gpu2::destroy(R);
+            throw std::runtime_error(
+                "mainMarkerMTGpu: the GPU reduction failed mid-run. Rerun "
+                "without useGPU (or with useGPU: false) to finish on the CPU.");
+        }
+        haltAll();
+        saige::gpu2::spqDestroy(SQ);
+        saige::gpu2::destroy(R);
+        throw std::runtime_error(
+            std::string("mainMarkerMTGpu: the device sparse variance failed mid-run (") +
+            err + "). Rerun without gpuSparse.");
+    };
+    // ---------------- phase 4: device SPA on the parked pairs ----------------
+    // Superblock d (ring set s, device set ds), its pairs in `all` (gathered
+    // from pendR[s] by the caller). `first`: the first round's results when
+    // the SPA worker already ran it (gpuOverlap); nullptr = run it here.
+    auto phase4 = [&](const SbDesc& d, int s, int ds, std::vector<MTTraitChunk>& out,
+                      std::vector<PendSpa>& all, SpaRes* first) {
+            const int chunkStart = d.chunkStart;
+            std::vector<GpuBlk>& blksS = blks[s];
+            unsigned char* hPkS = hPkSet[s];
+            auto& pendF = pendFR[s];
+            spBlks = &blksS; spSet = ds;
+            double t0;
+            if (spaDev) {
+                t0 = omp_get_wtime();
+                // gpuSparse: a first-pass SPA (stage 1) can ask for the
+                // recompute's own SPA (stage 2), so the device SPA runs again on
+                // what the post-rules parked in pend2 until nothing is left.
+                while (!all.empty()) {
+                SpaRes resLocal;
+                SpaRes* res = first;
+                first = nullptr;
+                if (res == nullptr) {
+                    if (!spaRound(all, ds, resLocal)) {
+                        saige::gpu2::spaDestroy(SP);
+                        saige::spa_gpu::destroy(SL);
+                        haltAll();
+                        saige::gpu2::destroy(R);
+                        throw std::runtime_error(
+                            std::string("mainMarkerMTGpu: the device SPA failed mid-run (") +
+                            (SL ? saige::spa_gpu::lastError() : "gpu_spa") +
+                            "). Rerun without gpuSpa to keep SPA on the CPU.");
+                    }
+                    res = &resLocal;
+                }
+                const int nPend = (int)all.size();
+                {
+                    const saige::gpu2::SpaPairOut* so = SP ? res->so.data() : nullptr;
+                    const saige::spa_gpu::PairOut* lo = SL ? res->lo.data() : nullptr;
+                    #pragma omp parallel for schedule(dynamic, 64)
+                    for (int k = 0; k < nPend; k++) {
+                        const PendSpa& pd = all[k];
+                        saige::gpu2::SpaPairOut o;
+                        if (so) { o = so[k]; }
+                        else { o.pval = lo[k].pval; o.conv = lo[k].conv; o.s1 = lo[k].s1; o.s2 = lo[k].s2;
+                               o.niter1 = lo[k].niter1; o.niter2 = lo[k].niter2; o.root1 = lo[k].root1; o.root2 = lo[k].root2; o.m1 = lo[k].m1; }
+                        MTBlockWork& W = work[omp_get_thread_num()];
+                        GpuBlk& S = blksS[pd.bi];
+                        const int t = pd.t, c = pd.c, jj = pd.jj;
+                        const int i = chunkStart + jj;
+                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                        const SAIGE::TraitMeta& M = ctx.meta[t];
+                        MTTraitChunk& O = out[t];
+                        const bool islog = (pd.logp != 0);
+                        const double MAC = pd.MAC;
+                        const double altFreq = pd.AF;
+                        const bool flip = (pd.flip != 0);
+                        const double* fdc = pd.fd;
+                        (void)S;
+                        const unsigned char* pk = hPkS + ((std::size_t)pd.bi * Bblk + c) * bpv;
+
+                        // ---- getMarkerPval's post-SPA rules, on the device's p ----
+                        double spaP = o.pval;
+                        bool conv = (o.conv != 0);
+                        double seBeta = O.seBeta[jj];
+                        const double BetaAbs = std::fabs(O.Beta[jj]);
+                        if (conv) {
+                            boost::math::normal ns;
+                            double qv;
+                            try {
+                                if (islog) {
+                                    const double half = std::exp(spaP / 2.0);
+                                    if (half > 0 && half < 1) qv = boost::math::quantile(complement(ns, half));
+                                    else { qv = std::numeric_limits<double>::infinity(); conv = false; }
+                                } else {
+                                    qv = boost::math::quantile(complement(ns, spaP / 2));
+                                }
+                                qv = std::fabs(qv);
+                                seBeta = BetaAbs / qv;
+                            } catch (const std::overflow_error&) {
+                                conv = false;
+                            }
+                        }
+                        if (!islog && spaP == 0) conv = false;
+                        std::string pvalStr;
+                        double pvalFinal;
+                        if (conv) {
+                            char buf[100];
+                            if (!islog) {
+                                std::snprintf(buf, sizeof(buf), "%.6E", spaP);
+                            } else {
+                                const double l10 = spaP / std::log(10.0);
+                                int ex = (int)std::floor(l10);
+                                double fr = std::pow(10.0, l10 - ex);
+                                if (fr >= 9.95) { fr = 1; ex++; }
+                                std::snprintf(buf, sizeof(buf), "%.1fE%d", fr, ex);
+                            }
+                            pvalStr = buf; pvalFinal = spaP;
+                        } else {
+                            pvalStr = O.pvalNA[jj]; pvalFinal = pd.pno;
+                        }
+                        bool forceCpu = false;
+                        if (pd.stage == 1) {
+                            // The dense first pass of a fast-test pair is done.
+                            // The scalar path recomputes when its printed p is
+                            // below the cutoff; Firth was deferred to that call.
+                            double pnum;
+                            try { pnum = std::stod(pvalStr); }
+                            catch (const std::invalid_argument&) { pnum = 0; }
+                            catch (const std::out_of_range&)     { pnum = 0; }
+                            if (!(pnum < obj->m_pval_cutoff_for_fastTest)) {
+                                O.pval[jj]   = pvalStr;
+                                O.seBeta[jj] = seBeta;
+                                O.isSPAConverge[jj] = conv ? 1 : 0;
+                                O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
+                                #pragma omp atomic
+                                nDevFast[t]++;
+                                continue;
+                            }
+                            const SpRc rc = spRecompute((std::size_t)pd.bi * Bblk + c, t, pd.vrFast);
+                            bool wantF = false;
+                            if (!rc.spa && M.is_Firth_beta)
+                                wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
+                                                 : (rc.pno <= M.pCutoffforFirth);
+                            if (!rc.spa && wantF && !firthDev) {
+                                forceCpu = true;          // the whole pair on the CPU, below
+                            } else {
+                                O.Beta[jj]   = rc.Beta * (1 - 2 * flip);
+                                O.seBeta[jj] = rc.seBeta;
+                                O.Tstat[jj]  = rc.Tstat * (1 - 2 * flip);
+                                O.varT[jj]   = rc.var1;
+                                O.pval[jj]   = rc.str;
+                                O.pvalNA[jj] = rc.str;
+                                O.isSPAConverge[jj] = 0;
+                                O.route[jj] = (unsigned char)(O.route[jj] & 0x0F);
+                                if (rc.spa) {
+                                    PendSpa p2 = pd;
+                                    p2.stage = 2; p2.fast = 0;
+                                    p2.Tstat = rc.Tstat; p2.var1 = rc.var1; p2.var2 = rc.var2;
+                                    p2.pno = rc.pno; p2.logp = rc.islog ? 1 : 0;
+                                    pend2[omp_get_thread_num()].push_back(p2);
+                                } else {
+                                    if (wantF) {
+                                        PendFirth pf;
+                                        pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                        pf.p = rc.pno; pf.logp = rc.islog ? 1 : 0;
+                                        pf.flip = pd.flip;
+                                        for (int k = 0; k < 4; k++) pf.fd[k] = pd.fd[k];
+                                        pendF[omp_get_thread_num()].push_back(pf);
+                                    }
+                                    #pragma omp atomic
+                                    nDevFast[t]++;
+                                }
+                                continue;
+                            }
+                        }
+                        // ---- Firth on the SPA p-value: the device fit (gpuFirth,
+                        // phase 5) or, without it, the whole pair back to the CPU ----
+                        bool wantFirth = false;
+                        if (M.is_Firth_beta)
+                            wantFirth = islog ? (pvalFinal <= std::log(M.pCutoffforFirth))
+                                              : (pvalFinal <= M.pCutoffforFirth);
+                        if ((wantFirth && !firthDev) || forceCpu) {
+                            arma::vec gOwn;
+                            arma::vec*  gUse = &W.tmpG;
+                            arma::uvec* izUse = &W.idxZ;
+                            arma::uvec* inzUse = &W.idxNZ;
+                            if (differ && ownS[t]) {
+                                // the trait's own vector over its samples (mainMarkerMT's gOwn)
+                                const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+                                const arma::uword nTs = (arma::uword)TS.n;
+                                if (W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
+                                double* g = W.gT.memptr();
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                    const arma::uword u = TS.pos[k2];
+                                    g[k2] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                                }
+                                gOwn = arma::vec(g, nTs, false, false);
+                                arma::uword cz = 0;
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) if (g[k2] == 0.0) cz++;
+                                W.idxZt.set_size(cz);
+                                W.idxNZt.set_size(nTs - cz);
+                                arma::uword a = 0, b = 0;
+                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                    if (g[k2] == 0.0) W.idxZt[a++] = k2;
+                                    else              W.idxNZt[b++] = k2;
+                                }
+                                gUse = &gOwn; izUse = &W.idxZt; inzUse = &W.idxNZt;
+                            } else {
+                            double* g = W.tmpG.memptr();
+                            for (int u = 0; u < n; u++)
+                                g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                            arma::uword cz = 0;
+                            for (int u = 0; u < n; u++) if (g[u] == 0.0) cz++;
+                            W.idxZ.set_size(cz);
+                            W.idxNZ.set_size((arma::uword)n - cz);
+                            arma::uword a = 0, b = 0;
+                            for (int u = 0; u < n; u++) {
+                                if (g[u] == 0.0) W.idxZ[a++] = (arma::uword)u;
+                                else             W.idxNZ[b++] = (arma::uword)u;
+                            }
+                            }
+                            const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+                            const bool noadjCur  = obj->m_isnoadjCov;
+                            const bool fastEligible = obj->m_isFastTest && MAC > g_MACCutoffforER;
+                            bool fastRecomputeSameCtx = false;
+                            if (fastEligible) {
+                                const bool probeSparse =
+                                    (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                        ? false : obj->m_flagSparseGRM;
+                                bool dummyHas2;
+                                const double probeVR = isSingleVR[t]
+                                    ? obj->computeSingleVarianceRatio(probeSparse, false)
+                                    : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
+                                fastRecomputeSameCtx = (probeSparse == sparseCur) &&
+                                                       (noadjCur == false) &&
+                                                       (probeVR == S.VR(c, t));
+                            }
+                            double Beta = arma::datum::nan, seB = arma::datum::nan;
+                            double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
+                            double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
+                            double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
+                            std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+                            bool isSPAConverge = false, is_Firth = false, is_FirthConverge = false;
+                            arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
+                            W.P2Vec.clear();
+                            bool is_gtilde = false;
+                            SAIGE::PerMarkerCtx ctx_first;
+                            ctx_first.flagSparseGRM_cur = sparseCur;
+                            ctx_first.isnoadjCov_cur    = noadjCur;
+                            ctx_first.erSeedStream      = (uint64_t)i + 1;
+                            ctx_first.varRatioVal       = S.VR(c, t);
+                            g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
+                            if (spDev && spPlan.on[M.binIdx] && sparseCur) {
+                                ctx_first.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
+                                #pragma omp atomic
+                                nSpPreset[t]++;
+                            }
+                            obj->getMarkerPval(
+                                *gUse, *inzUse, *izUse,
+                                Beta, seB, pval, pval_noSPA,
+                                altFreq, Tstat, gy, varT,
+                                isSPAConverge, W.gtilde, is_gtilde,
+                                /*is_region*/ false, W.P2Vec,
+                                /*isCondition*/ false,
+                                Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                                Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                                is_Firth, is_FirthConverge,
+                                /*isER*/ false,
+                                ctx_first.isnoadjCov_cur,
+                                ctx_first.flagSparseGRM_cur,
+                                ctx_first);
+                            double pval_num;
+                            try { pval_num = std::stod(pval); }
+                            catch (const std::invalid_argument&) { pval_num = 0; }
+                            catch (const std::out_of_range&)     { pval_num = 0; }
+                            if (fastEligible && !fastRecomputeSameCtx &&
+                                pval_num < obj->m_pval_cutoff_for_fastTest) {
+                                SAIGE::PerMarkerCtx ctx_fast;
+                                ctx_fast.flagSparseGRM_cur =
+                                    (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
+                                        ? false : obj->m_flagSparseGRM;
+                                ctx_fast.isnoadjCov_cur = false;
+                                {
+                                    bool dummyHas;
+                                    ctx_fast.varRatioVal = isSingleVR[t]
+                                        ? obj->computeSingleVarianceRatio(
+                                              ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur)
+                                        : obj->computeVarianceRatio(
+                                              MAC, ctx_fast.flagSparseGRM_cur,
+                                              ctx_fast.isnoadjCov_cur, dummyHas);
+                                }
+                                g_firthDefer = false;
+                                if (spDev && spPlan.on[M.binIdx] && ctx_fast.flagSparseGRM_cur) {
+                                    ctx_fast.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
+                                    #pragma omp atomic
+                                    nSpPreset[t]++;
+                                }
+                                obj->getMarkerPval(
+                                    *gUse, *inzUse, *izUse,
+                                    Beta, seB, pval, pval_noSPA,
+                                    altFreq, Tstat, gy, varT,
+                                    isSPAConverge, W.gtilde, is_gtilde,
+                                    /*is_region*/ false, W.P2Vec,
+                                    /*isCondition*/ false,
+                                    Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                                    Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                                    is_Firth, is_FirthConverge,
+                                    false,
+                                    ctx_fast.isnoadjCov_cur,
+                                    ctx_fast.flagSparseGRM_cur,
+                                    ctx_fast);
+                            }
+                            if (is_Firth) {
+                                #pragma omp atomic
+                                mFirth[t] += 1;
+                                if (is_FirthConverge) {
+                                    #pragma omp atomic
+                                    mFirthConverge[t] += 1;
+                                }
+                            }
+                            O.Beta[jj]   = Beta * (1 - 2 * flip);
+                            O.seBeta[jj] = seB;
+                            O.pval[jj]   = pval;
+                            O.pvalNA[jj] = pval_noSPA;
+                            O.Tstat[jj]  = Tstat * (1 - 2 * flip);
+                            O.varT[jj]   = varT;
+                            O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
+                            O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (isSPAConverge ? 16 : 0) |
+                                                          (is_Firth ? 32 : 0) | (is_FirthConverge ? 64 : 0));
+                            #pragma omp atomic
+                            nDevSpaFirth[t]++;
+                            #pragma omp atomic
+                            nFallback[t]++;
+                        } else {
+                            O.pval[jj]   = pvalStr;
+                            O.seBeta[jj] = seBeta;
+                            O.isSPAConverge[jj] = conv ? 1 : 0;
+                            O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
+                            if (pd.stage == 2) {
+                                #pragma omp atomic
+                                nDevFast[t]++;
+                            } else {
+                                #pragma omp atomic
+                                nDevSpa[t]++;
+                            }
+                            if (wantFirth) {   // firthDev: fitted in phase 5 on this p
+                                PendFirth pf;
+                                pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                pf.p = pvalFinal; pf.logp = islog ? 1 : 0;
+                                pf.flip = pd.flip;
+                                for (int q4 = 0; q4 < 4; q4++) pf.fd[q4] = pd.fd[q4];
+                                pendF[omp_get_thread_num()].push_back(pf);
+                            }
+                        }
+                    }
+                }
+                all.clear();
+                for (auto& v : pend2) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
+                }   // while: stage-2 SPA rounds
+                tSpa += omp_get_wtime() - t0;
+            }
+    };
+    // ---------------- phase 5: device Firth on the pairs whose p asked for it ----------------
+    // t_fail: on the SPA worker (gpuOverlap) a device failure is reported
+    // here and the caller unwinds; nullptr = clean up and throw, as before.
+    auto phase5 = [&](const SbDesc& d, int s, int ds, std::vector<MTTraitChunk>& out,
+                      std::string* t_fail = nullptr) {
+            (void)d;
+            auto& pendF = pendFR[s];
+            if (firthDev) {
+                const double tf0 = omp_get_wtime();
+                std::vector<PendFirth> allF;
+                for (auto& v : pendF) { allF.insert(allF.end(), v.begin(), v.end()); v.clear(); }
+                if (g_gpuSpaTraitMajor)
+                    std::stable_sort(allF.begin(), allF.end(),
+                                     [](const PendFirth& x, const PendFirth& y) { return x.t < y.t; });
+                const int nF = (int)allF.size();
+                if (nF > 0) {
+                    saige::gpu2::FirthPairIn* fin = saige::gpu2::firthIn(FP);
+                    double* fplut = saige::gpu2::firthPairLut(FP);   // gpuOwnSampleSets only
+                    for (int k = 0; k < nF; k++) {
+                        fin[k].slot  = (int)((std::size_t)allF[k].bi * Bblk + allF[k].c);
+                        fin[k].trait = ctx.meta[allF[k].t].binIdx;
+                        if (fplut) for (int q4 = 0; q4 < 4; q4++) fplut[(std::size_t)k * 4 + q4] = allF[k].fd[q4];
+                    }
+                    const double tb0 = omp_get_wtime();
+                    const bool okF = saige::gpu2::firthRun(FP, R, nF, ds);
+                    busyAdd(tb0, omp_get_wtime());
+                    if (!okF && t_fail) {
+                        *t_fail = std::string("mainMarkerMTGpu: the device Firth failed mid-run (") +
+                                  saige::gpu2::firthLastError() +
+                                  "). Rerun without gpuFirth to keep Firth on the CPU.";
+                        return;
+                    }
+                    if (!okF) {
+                        saige::gpu2::firthDestroy(FP);
+                        saige::gpu2::spaDestroy(SP);
+                        saige::spa_gpu::destroy(SL);
+                        haltAll();
+                        saige::gpu2::destroy(R);
+                        throw std::runtime_error(
+                            std::string("mainMarkerMTGpu: the device Firth failed mid-run (") +
+                            saige::gpu2::firthLastError() +
+                            "). Rerun without gpuFirth to keep Firth on the CPU.");
+                    }
+                    const saige::gpu2::FirthPairOut* fo = saige::gpu2::firthOut(FP);
+                    #pragma omp parallel for schedule(dynamic, 64)
+                    for (int k = 0; k < nF; k++) {
+                        const PendFirth& pf = allF[k];
+                        const saige::gpu2::FirthPairOut& o = fo[k];
+                        const int t = pf.t, jj = pf.jj;
+                        MTTraitChunk& O = out[t];
+                        const bool flip = (pf.flip != 0);
+                        // getMarkerPval after fast_logistf_fit_simple: the fit's
+                        // beta (for the flipped allele when flipped), seBeta
+                        // back-calculated from the p-value, which Firth leaves alone.
+                        double qv;
+                        boost::math::normal ns;
+                        try {
+                            if (pf.logp) {
+                                const double half = std::exp(pf.p / 2.0);
+                                qv = (half > 0 && half < 1) ? boost::math::quantile(complement(ns, half))
+                                                            : std::numeric_limits<double>::infinity();
+                            } else {
+                                qv = boost::math::quantile(complement(ns, pf.p / 2));
+                            }
+                        } catch (const std::overflow_error&) {
+                            qv = std::numeric_limits<double>::infinity();
+                        }
+                        O.Beta[jj]   = o.beta * (1 - 2 * flip);
+                        O.seBeta[jj] = std::fabs(o.beta) / std::fabs(qv);
+                        O.route[jj]  = (unsigned char)(O.route[jj] | 32 | (o.conv ? 64 : 0));
+                        #pragma omp atomic
+                        mFirth[t] += 1;
+                        if (o.conv) {
+                            #pragma omp atomic
+                            mFirthConverge[t] += 1;
+                        }
+                        #pragma omp atomic
+                        nDevFirth[t]++;
+                    }
+                }
+                tFirth += omp_get_wtime() - tf0;
+            }
+    };
+    // ---- write chunk ci's rows (chunkStart its first marker), one file per trait ----
+    auto writeChunk = [&](int ci, int chunkStart, std::vector<MTTraitChunk>& out) {
+        ChunkMeta& CM = meta[ci % nSets];
+        // ---- write this chunk's rows, one file per trait ----
+        // The traits are independent files, so they go out in parallel; at
+        // P=128 this stage used to be 84% of the whole run (out_fast.hpp).
+        const double tw = omp_get_wtime();
+        if (g_outputFormatSgs) {
+            SAIGE::outfast::MarkerCols MC;
+            MC.chr = &CM.chrVec; MC.pos = &CM.posVec; MC.mid = &CM.markerVec;
+            MC.ref = &CM.refVec; MC.alt = &CM.altVec;
+            std::vector<SAIGE::outfast::TraitCols> TC(P);
+            for (int t = 0; t < P; t++) {
+                MTTraitChunk& O = out[t];
+                SAIGE::outfast::TraitCols& C = TC[t];
+                C.altCounts = &O.altCounts; C.altFreq = &O.altFreq;
+                C.imputeInfo = &O.imputeInfo; C.missingRate = &O.missingRate;
+                C.Beta = &O.Beta; C.seBeta = &O.seBeta;
+                C.Tstat = &O.Tstat; C.varT = &O.varT;
+                C.pval = &O.pval; C.pvalNA = &O.pvalNA;
+                C.isSPAConverge = &O.isSPAConverge;
+                C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
+                C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
+                C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
+                C.AF_case = &O.AF_case; C.AF_ctrl = &O.AF_ctrl;
+                C.N_case = &O.N_case; C.N_ctrl = &O.N_ctrl;
+                C.N_case_hom = &O.N_case_hom; C.N_ctrl_het = &O.N_ctrl_het;
+                C.N_case_het = &O.N_case_het; C.N_ctrl_hom = &O.N_ctrl_hom;
+                C.N = &O.N;
+            }
+            std::vector<int> ntSgs;
+            std::string err;
+            if (!sgs.writeChunk(MC, TC, out[0].pval.size(), nWriteThreads,
+                                ntSgs, err))
+                throw std::runtime_error("outputFormat: sgs: " + err);
+            for (int t = 0; t < P; t++) numtestTotal[t] += ntSgs[t];
+        } else {
+            std::vector<int> ntChunk(P, 0);
+#pragma omp parallel for schedule(dynamic) num_threads(nWriteThreads)
+            for (int t = 0; t < P; t++) {
+                MTTraitChunk& O = out[t];
+                std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
+                int numtestChunk = 0;
+                writeOutfile_single(g_OutFiles_single[t],
+                                    g_traitMeta[t],
+                                    t_isImputation,
+                                    t_isFirth,
+                                    mFirth[t],
+                                    mFirthConverge[t],
+                                    CM.chrVec, CM.posVec, CM.markerVec, CM.refVec, CM.altVec,
+                                    O.altCounts, O.altFreq,
+                                    O.imputeInfo, O.missingRate,
+                                    O.Beta, O.seBeta, O.Tstat, O.varT,
+                                    O.pval, O.pvalNA, spa,
+                                    O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
+                                    O.pval_c, O.pvalNA_c,
+                                    O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
+                                    O.N_case_hom, O.N_ctrl_het,
+                                    O.N_case_het, O.N_ctrl_hom,
+                                    O.N,
+                                    /*printSummary*/ false,
+                                    &numtestChunk);
+                ntChunk[t] = numtestChunk;
+            }
+            for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
+            for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
+        }
+        dumpRoutes(out, chunkStart == 0);
+        tWrite += omp_get_wtime() - tw;
+    };
+    // ---------------- gpuOverlap: post one superblock ----------------
+    // Everything after the host tail, in input order: the device SPA's
+    // post-rules (and any later SPA round), the device Firth, the chunk's
+    // write when j is its last superblock; then ring set j % nSets is free.
+    int nextPost = 0;
+    auto postOne = [&](int j) {
+        const SbDesc& d = sched[j];
+        const int s = j % nSets;
+        std::vector<MTTraitChunk>& out = outR[d.ci % nOut];
+        const double tp0 = omp_get_wtime();
+        if (spaDev) {
+            int st;
+            {
+                std::unique_lock<std::mutex> lk(ov.m);
+                ov.cv.wait(lk, [&]{ return ov.jobState[s] >= 2; });
+                st = ov.jobState[s];
+            }
+            ov.tWaitSpa += omp_get_wtime() - tp0;
+            if (st == 3) {
+                saige::gpu2::spaDestroy(SP);
+                saige::spa_gpu::destroy(SL);
+                haltAll();
+                saige::gpu2::destroy(R);
+                throw std::runtime_error(
+                    std::string("mainMarkerMTGpu: the device SPA failed mid-run (") +
+                    (SL ? saige::spa_gpu::lastError() : "gpu_spa") +
+                    "). Rerun without gpuSpa to keep SPA on the CPU.");
+            }
+            phase4(d, s, s, out, ov.jobAll[s], &ov.jobRes[s]);
+            { std::lock_guard<std::mutex> lk(ov.m); ov.jobState[s] = 0; }
+        }
+        {
+            // With the device Firth, its run and post-rules for j go to the
+            // SPA worker (after the SPA rounds queued before it), which then
+            // hands j to the writer; otherwise straight to the writer.
+            std::lock_guard<std::mutex> lk(ov.m);
+            if (firthDev) ov.jobQ.push_back(-(j + 1));
+            else ov.wq.push_back({j, s, d.ci, d.chunkStart, j + 1 == K || sched[j + 1].first});
+        }
+        ov.cv.notify_all();
+        ov.tPost += omp_get_wtime() - tp0;
+    };
+    // Wait until the writer has released every superblock before `upto`.
+    auto waitWriter = [&](int upto) {
+        const double t0w = omp_get_wtime();
+        std::unique_lock<std::mutex> lk(ov.m);
+        ov.cv.wait(lk, [&]{ return ov.posted >= upto || ov.werr; });
+        if (ov.werr) {
+            std::exception_ptr e = ov.werr;
+            lk.unlock();
+            haltAll();
+            saige::gpu2::destroy(R);
+            std::rethrow_exception(e);
+        }
+        lk.unlock();
+        ov.tWaitWriter += omp_get_wtime() - t0w;
+    };
+    const double tLoop0 = omp_get_wtime();
+    // ---------------- gpuOverlap: start the scan and SPA workers ----------------
+    // Declared after everything the workers touch, so that on any exception
+    // leaving this function they are stopped and joined before those die.
+    struct OvGuard {
+        std::function<void()> f;
+        ~OvGuard() { if (f) f(); }
+    } ovGuard{ [&]() { haltAll(); } };
+    std::string ovBlocking;
+    if (overlap) {
+        ov.jobState.assign(nSets, 0);
+        ov.jobAll.resize(nSets);
+        ov.jobRes.resize(nSets);
+        // The workers wait on the device; let them sleep rather than spin on
+        // the cores the host tail runs on.
+        ovBlocking = saige::gpu2::setBlockingSync(g_gpuDevice);
+        ov.thA = std::thread([&]() {
+            const double ta0 = omp_get_wtime();
+            saige::gpu2::bindDevice(g_gpuDevice);
+            try {
+                for (int k = 0; k < K; k++) {
+                    const SbDesc& d = sched[k];
+                    const int s = k % nSets;
+                    // Set s must have been released by the post of superblock
+                    // k - nSets first: with gpuPrefetch its `filled` flag is
+                    // still that superblock's until then.
+                    {
+                        std::unique_lock<std::mutex> lk(ov.m);
+                        ov.cv.wait(lk, [&]{ return ov.stop || ov.posted >= k - nSets + 1; });
+                        if (ov.stop) break;
+                    }
+                    if (prefetch) {
+                        const double tw0 = omp_get_wtime();
+                        std::unique_lock<std::mutex> lk(rd.m);
+                        while (!rd.cvFill.wait_for(lk, std::chrono::milliseconds(50),
+                                                   [&]{ return rd.filled[s] || rd.err || rd.done || rd.stop; }))
+                            if (ov.stop) break;
+                        if (rd.err) {
+                            std::exception_ptr e = rd.err;
+                            lk.unlock();
+                            std::lock_guard<std::mutex> lk2(ov.m);
+                            ov.err = e;
+                            break;
+                        }
+                        if (ov.stop || !rd.filled[s]) break;   // stopped, or the input ended here
+                        lk.unlock();
+                        ov.tScanReadWait += omp_get_wtime() - tw0;
+                    } else {
+                        // the reader's end-of-input rule, at a chunk start
+                        if (d.first && d.chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
+                        const double tr0 = omp_get_wtime();
+                        readSuperblock(d, s, nThreadsHere);
+                        tRead += omp_get_wtime() - tr0;
+                    }
+                    std::string em;
+                    const int rc = phase2(d, s, s, &em);
+                    if (rc != 0) {
+                        std::lock_guard<std::mutex> lk(ov.m);
+                        ov.errCode = rc; ov.errMsg = em;
+                        break;
+                    }
+                    { std::lock_guard<std::mutex> lk(ov.m); ov.scanned = k + 1; }
+                    ov.cv.notify_all();
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(ov.m);
+                ov.err = std::current_exception();
+            }
+            { std::lock_guard<std::mutex> lk(ov.m); ov.scanDone = true; ov.tScanWall = omp_get_wtime() - ta0; }
+            ov.cv.notify_all();
+        });
+        ov.thW = std::thread([&]() {
+            for (;;) {
+                OvState::WJob w;
+                {
+                    std::unique_lock<std::mutex> lk(ov.m);
+                    ov.cv.wait(lk, [&]{ return ov.stop || !ov.wq.empty(); });
+                    if (ov.wq.empty()) break;            // stop, nothing left
+                    if (ov.stop && ov.werr) break;
+                    w = ov.wq.front();
+                }
+                const double tw0 = omp_get_wtime();
+                try {
+                    if (w.write) writeChunk(w.ci, w.chunkStart, outR[w.ci % nOut]);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(ov.m);
+                    ov.werr = std::current_exception();
+                    ov.wq.clear();
+                    ov.cv.notify_all();
+                    break;
+                }
+                if (prefetch) {
+                    { std::lock_guard<std::mutex> lk(rd.m); rd.filled[w.s] = 0; }
+                    rd.cvFree.notify_all();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(ov.m);
+                    ov.wq.pop_front();
+                    ov.posted = w.j + 1;
+                    ov.tWriter += omp_get_wtime() - tw0;
+                }
+                ov.cv.notify_all();
+            }
+        });
+        if (spaDev)
+            ov.thB = std::thread([&]() {
+                saige::gpu2::bindDevice(g_gpuDevice);
+                for (;;) {
+                    int k;
+                    {
+                        std::unique_lock<std::mutex> lk(ov.m);
+                        ov.cv.wait(lk, [&]{ return ov.stop || !ov.jobQ.empty(); });
+                        if (ov.stop) break;
+                        k = ov.jobQ.front();
+                        ov.jobQ.pop_front();
+                    }
+                    if (k < 0) {   // device Firth of posted superblock j
+                        const int j = -k - 1;
+                        const SbDesc& dj = sched[j];
+                        const int sj = j % nSets;
+                        std::string fail;
+                        try {
+                            phase5(dj, sj, sj, outR[dj.ci % nOut], &fail);
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lk(ov.m);
+                            ov.werr = std::current_exception();
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(ov.m);
+                            if (!fail.empty() && !ov.werr)
+                                ov.werr = std::make_exception_ptr(std::runtime_error(fail));
+                            if (!ov.werr)
+                                ov.wq.push_back({j, sj, dj.ci, dj.chunkStart, j + 1 == K || sched[j + 1].first});
+                        }
+                        ov.cv.notify_all();
+                        continue;
+                    }
+                    const int s = k % nSets;
+                    const double tb0 = omp_get_wtime();
+                    bool ok = true;
+                    try {
+                        if (!ov.jobAll[s].empty()) ok = spaRound(ov.jobAll[s], s, ov.jobRes[s]);
+                    } catch (...) { ok = false; }
+                    {
+                        std::lock_guard<std::mutex> lk(ov.m);
+                        ov.tSpaWall += omp_get_wtime() - tb0;
+                        ov.jobState[s] = ok ? 2 : 3;
+                    }
+                    ov.cv.notify_all();
+                }
+            });
+    }
+
+    int kSb = 0;                       // superblock counter, = index into sched
+    for (int chunkStart = 0, ci = 0; chunkStart < q; chunkStart += chunkSize, ci++) {
+        const int chunkEnd = std::min(chunkStart + chunkSize, q);
+        const int qc = chunkEnd - chunkStart;
+        if (chunkStart >= firstEndIdx.load(std::memory_order_relaxed)) break;
+
+        // The chunk's marker columns; reset by whoever reads the chunk's first
+        // superblock (readSuperblock), on this thread or on the reader's.
+        ChunkMeta& CM = meta[ci % nSets];
+        // gpuOverlap: the chunk's rows live in their own ring slot until the
+        // post of its last superblock writes them; the slot comes free once
+        // every superblock of chunk ci - nOut is posted.
+        if (overlap) {
+            while (nextPost < kSb && sched[nextPost].ci <= ci - nOut) postOne(nextPost++);
+            // ... and written
+            int upto = 0;
+            while (upto < nextPost && sched[upto].ci <= ci - nOut) upto++;
+            if (upto > 0) waitWriter(upto);
+        }
+        std::vector<MTTraitChunk>& out = overlap ? outR[ci % nOut] : outMain;
+        for (int t = 0; t < P; t++) out[t].reset(qc);
+
+        const int nBlocks = (qc + Bblk - 1) / Bblk;
+
+        for (int sb = 0; sb < nBlocks; sb += nSub, kSb++) {
+            const int sbEnd = std::min(sb + nSub, nBlocks);
+            const int nb = sbEnd - sb;
+            const SbDesc& d = sched[kSb];
+            const int s = kSb % nSets;
+            std::vector<GpuBlk>& blksS = blks[s];
+            unsigned char* hPkS = hPkSet[s];
+            spBlks = &blksS;
+            const int ds = overlap ? s : 0;    // device / result set
+            auto& pend  = pendR[s];
+            auto& pendF = pendFR[s];
+            (void)pendF;
+
+            // ---------------- phase 1: read + QC + stage ----------------
+            // gpuOverlap: phases 1 and 2 ran on the reader / scan worker.
+            if (overlap) {
+                const double tw0 = omp_get_wtime();
+                std::unique_lock<std::mutex> lk(ov.m);
+                ov.cv.wait(lk, [&]{ return ov.scanned > kSb || ov.scanDone; });
+                if (ov.scanned <= kSb) {
+                    const int rc = ov.errCode;
+                    const std::string em = ov.errMsg;
+                    std::exception_ptr e = ov.err;
+                    lk.unlock();
+                    if (e) { haltAll(); saige::gpu2::destroy(R); std::rethrow_exception(e); }
+                    if (rc != 0) failPhase2(rc, em);
+                    readerEnded = true; break;      // the input ended at this chunk's start
+                }
+                lk.unlock();
+                ov.tWaitScan += omp_get_wtime() - tw0;
+            } else {
+            double t0 = omp_get_wtime();
+            if (prefetch) {
+                std::unique_lock<std::mutex> lk(rd.m);
+                rd.cvFill.wait(lk, [&]{ return rd.filled[s] || rd.err || rd.done; });
+                if (rd.err) {
+                    std::exception_ptr e = rd.err;
+                    lk.unlock();
+                    rd.halt();
+                    saige::gpu2::destroy(R);
+                    std::rethrow_exception(e);
+                }
+                if (!rd.filled[s]) { readerEnded = true; break; }   // the reader stopped at this chunk's start
+                lk.unlock();
+                tWait += omp_get_wtime() - t0;
+            } else {
+                readSuperblock(d, s, nThreadsHere);
+                tRead += omp_get_wtime() - t0;
+            }
+            }   // gpuOverlap: phases 1 and 2 ran on the reader / scan worker
+
+            // ---------------- phase 2: the device ----------------
+            if (!overlap) {
+                std::string spErr;
+                const int rc = phase2(d, s, ds, &spErr);
+                if (rc != 0) failPhase2(rc, spErr);
+            }
 
             // ---------------- phase 3: tail + finalize ----------------
-            t0 = omp_get_wtime();
+            spBlks = &blksS; spSet = ds;
+            double t0 = omp_get_wtime();
             const bool fp64 = saige::gpu2::isFp64(R);
-            const float*  Cf = saige::gpu2::outCf(R);
-            const double* Cd = saige::gpu2::outCd(R);
-            const float*  C2f = saige::gpu2::outC2f(R);
-            const double* C2d = saige::gpu2::outC2d(R);
-            const uint32_t* cntDev = saige::gpu2::outCounts(R);
+            const float*  Cf = saige::gpu2::outCf(R, ds);
+            const double* Cd = saige::gpu2::outCd(R, ds);
+            const float*  C2f = saige::gpu2::outC2f(R, ds);
+            const double* C2d = saige::gpu2::outC2d(R, ds);
+            const uint32_t* cntDev = saige::gpu2::outCounts(R, ds);
             const std::size_t ld = saige::gpu2::ldC(R);
 
             #pragma omp parallel for schedule(dynamic, 1)
@@ -4222,434 +5135,41 @@ bool mainMarkerMTGpu(
             }
             tFin += omp_get_wtime() - t0;
 
+            // gpuOverlap: park this superblock's pairs with the SPA worker and
+            // post what is ready (at the latest once gpuOverlapLag wait).
+            if (overlap) {
+                if (spaDev) {
+                    std::vector<PendSpa>& all = ov.jobAll[s];
+                    all.clear();
+                    for (auto& v : pend) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
+                    {
+                        std::lock_guard<std::mutex> lk(ov.m);
+                        ov.jobState[s] = 1;
+                        ov.jobQ.push_back(kSb);
+                    }
+                    ov.cv.notify_all();
+                }
+                while (nextPost <= kSb) {
+                    bool ready = true;
+                    if (spaDev) {
+                        std::lock_guard<std::mutex> lk(ov.m);
+                        ready = ov.jobState[nextPost % nSets] >= 2;
+                    }
+                    if (!ready && kSb - nextPost + 1 <= ovLag) break;
+                    postOne(nextPost++);
+                }
+                continue;
+            }
+
             // ---------------- phase 4: device SPA on the parked pairs ----------------
             if (spaDev) {
-                t0 = omp_get_wtime();
                 std::vector<PendSpa> all;
                 for (auto& v : pend) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
-                // gpuSparse: a first-pass SPA (stage 1) can ask for the
-                // recompute's own SPA (stage 2), so the device SPA runs again on
-                // what the post-rules parked in pend2 until nothing is left.
-                while (!all.empty()) {
-                // gpuSpaOrder: trait -- the blocks in flight then share one
-                // trait's XXVX_inv / mu in L2. Stable, so a trait's pairs keep
-                // their marker order; results are indexed by jj, not by k.
-                if (g_gpuSpaTraitMajor)
-                    std::stable_sort(all.begin(), all.end(),
-                                     [](const PendSpa& x, const PendSpa& y) { return x.t < y.t; });
-                const int nPend = (int)all.size();
-                {
-                    saige::gpu2::SpaPairIn*   in  = SP ? saige::gpu2::spaIn(SP) : nullptr;
-                    saige::spa_gpu::PairIn*   inl = SL ? saige::spa_gpu::in(SL) : nullptr;
-                    double* plut = SL ? saige::spa_gpu::pairLut(SL) : nullptr;   // gpuOwnSampleSets only
-                    for (int k = 0; k < nPend; k++) {
-                        const PendSpa& pd = all[k];
-                        const int slot = (int)((std::size_t)pd.bi * Bblk + pd.c);
-                        const int bt = ctx.meta[pd.t].binIdx;
-                        if (in) {
-                            in[k].slot = slot; in[k].trait = bt;
-                            in[k].fast = pd.fast; in[k].logp = pd.logp;
-                            in[k].Tstat = pd.Tstat; in[k].var1 = pd.var1; in[k].var2 = pd.var2; in[k].pno = pd.pno;
-                        } else {
-                            inl[k].slot = slot; inl[k].trait = bt;
-                            inl[k].fast = pd.fast; inl[k].logp = pd.logp;
-                            inl[k].Tstat = pd.Tstat; inl[k].var1 = pd.var1; inl[k].var2 = pd.var2; inl[k].pno = pd.pno;
-                            if (plut) for (int q4 = 0; q4 < 4; q4++) plut[(std::size_t)k * 4 + q4] = pd.fd[q4];
-                        }
-                    }
-                    bool okRun;
-                    if (SP) {
-                        okRun = saige::gpu2::spaRun(SP, R, nPend);
-                    } else {
-                        saige::spa_gpu::Geno geno;
-                        geno.packed = (const unsigned char*)saige::gpu2::devicePacked(R);
-                        geno.bpv    = saige::gpu2::bytesPerSlot(R);
-                        geno.lut    = (const double*)saige::gpu2::deviceLut(R);
-                        okRun = saige::spa_gpu::run(SL, geno, nPend);
-                    }
-                    if (!okRun) {
-                        saige::gpu2::spaDestroy(SP);
-                        saige::spa_gpu::destroy(SL);
-                        rd.halt();
-                        saige::gpu2::destroy(R);
-                        throw std::runtime_error(
-                            std::string("mainMarkerMTGpu: the device SPA failed mid-run (") +
-                            (SL ? saige::spa_gpu::lastError() : "gpu_spa") +
-                            "). Rerun without gpuSpa to keep SPA on the CPU.");
-                    }
-                    const saige::gpu2::SpaPairOut* so = SP ? saige::gpu2::spaOut(SP) : nullptr;
-                    const saige::spa_gpu::PairOut* lo = SL ? saige::spa_gpu::out(SL) : nullptr;
-                    #pragma omp parallel for schedule(dynamic, 64)
-                    for (int k = 0; k < nPend; k++) {
-                        const PendSpa& pd = all[k];
-                        saige::gpu2::SpaPairOut o;
-                        if (so) { o = so[k]; }
-                        else { o.pval = lo[k].pval; o.conv = lo[k].conv; o.s1 = lo[k].s1; o.s2 = lo[k].s2;
-                               o.niter1 = lo[k].niter1; o.niter2 = lo[k].niter2; o.root1 = lo[k].root1; o.root2 = lo[k].root2; o.m1 = lo[k].m1; }
-                        MTBlockWork& W = work[omp_get_thread_num()];
-                        GpuBlk& S = blksS[pd.bi];
-                        const int t = pd.t, c = pd.c, jj = pd.jj;
-                        const int i = chunkStart + jj;
-                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
-                        const SAIGE::TraitMeta& M = ctx.meta[t];
-                        MTTraitChunk& O = out[t];
-                        const bool islog = (pd.logp != 0);
-                        const double MAC = pd.MAC;
-                        const double altFreq = pd.AF;
-                        const bool flip = (pd.flip != 0);
-                        const double* fdc = pd.fd;
-                        (void)S;
-                        const unsigned char* pk = hPkS + ((std::size_t)pd.bi * Bblk + c) * bpv;
-
-                        // ---- getMarkerPval's post-SPA rules, on the device's p ----
-                        double spaP = o.pval;
-                        bool conv = (o.conv != 0);
-                        double seBeta = O.seBeta[jj];
-                        const double BetaAbs = std::fabs(O.Beta[jj]);
-                        if (conv) {
-                            boost::math::normal ns;
-                            double qv;
-                            try {
-                                if (islog) {
-                                    const double half = std::exp(spaP / 2.0);
-                                    if (half > 0 && half < 1) qv = boost::math::quantile(complement(ns, half));
-                                    else { qv = std::numeric_limits<double>::infinity(); conv = false; }
-                                } else {
-                                    qv = boost::math::quantile(complement(ns, spaP / 2));
-                                }
-                                qv = std::fabs(qv);
-                                seBeta = BetaAbs / qv;
-                            } catch (const std::overflow_error&) {
-                                conv = false;
-                            }
-                        }
-                        if (!islog && spaP == 0) conv = false;
-                        std::string pvalStr;
-                        double pvalFinal;
-                        if (conv) {
-                            char buf[100];
-                            if (!islog) {
-                                std::snprintf(buf, sizeof(buf), "%.6E", spaP);
-                            } else {
-                                const double l10 = spaP / std::log(10.0);
-                                int ex = (int)std::floor(l10);
-                                double fr = std::pow(10.0, l10 - ex);
-                                if (fr >= 9.95) { fr = 1; ex++; }
-                                std::snprintf(buf, sizeof(buf), "%.1fE%d", fr, ex);
-                            }
-                            pvalStr = buf; pvalFinal = spaP;
-                        } else {
-                            pvalStr = O.pvalNA[jj]; pvalFinal = pd.pno;
-                        }
-                        bool forceCpu = false;
-                        if (pd.stage == 1) {
-                            // The dense first pass of a fast-test pair is done.
-                            // The scalar path recomputes when its printed p is
-                            // below the cutoff; Firth was deferred to that call.
-                            double pnum;
-                            try { pnum = std::stod(pvalStr); }
-                            catch (const std::invalid_argument&) { pnum = 0; }
-                            catch (const std::out_of_range&)     { pnum = 0; }
-                            if (!(pnum < obj->m_pval_cutoff_for_fastTest)) {
-                                O.pval[jj]   = pvalStr;
-                                O.seBeta[jj] = seBeta;
-                                O.isSPAConverge[jj] = conv ? 1 : 0;
-                                O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
-                                #pragma omp atomic
-                                nDevFast[t]++;
-                                continue;
-                            }
-                            const SpRc rc = spRecompute((std::size_t)pd.bi * Bblk + c, t, pd.vrFast);
-                            bool wantF = false;
-                            if (!rc.spa && M.is_Firth_beta)
-                                wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
-                                                 : (rc.pno <= M.pCutoffforFirth);
-                            if (!rc.spa && wantF && !firthDev) {
-                                forceCpu = true;          // the whole pair on the CPU, below
-                            } else {
-                                O.Beta[jj]   = rc.Beta * (1 - 2 * flip);
-                                O.seBeta[jj] = rc.seBeta;
-                                O.Tstat[jj]  = rc.Tstat * (1 - 2 * flip);
-                                O.varT[jj]   = rc.var1;
-                                O.pval[jj]   = rc.str;
-                                O.pvalNA[jj] = rc.str;
-                                O.isSPAConverge[jj] = 0;
-                                O.route[jj] = (unsigned char)(O.route[jj] & 0x0F);
-                                if (rc.spa) {
-                                    PendSpa p2 = pd;
-                                    p2.stage = 2; p2.fast = 0;
-                                    p2.Tstat = rc.Tstat; p2.var1 = rc.var1; p2.var2 = rc.var2;
-                                    p2.pno = rc.pno; p2.logp = rc.islog ? 1 : 0;
-                                    pend2[omp_get_thread_num()].push_back(p2);
-                                } else {
-                                    if (wantF) {
-                                        PendFirth pf;
-                                        pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
-                                        pf.p = rc.pno; pf.logp = rc.islog ? 1 : 0;
-                                        pf.flip = pd.flip;
-                                        for (int k = 0; k < 4; k++) pf.fd[k] = pd.fd[k];
-                                        pendF[omp_get_thread_num()].push_back(pf);
-                                    }
-                                    #pragma omp atomic
-                                    nDevFast[t]++;
-                                }
-                                continue;
-                            }
-                        }
-                        // ---- Firth on the SPA p-value: the device fit (gpuFirth,
-                        // phase 5) or, without it, the whole pair back to the CPU ----
-                        bool wantFirth = false;
-                        if (M.is_Firth_beta)
-                            wantFirth = islog ? (pvalFinal <= std::log(M.pCutoffforFirth))
-                                              : (pvalFinal <= M.pCutoffforFirth);
-                        if ((wantFirth && !firthDev) || forceCpu) {
-                            arma::vec gOwn;
-                            arma::vec*  gUse = &W.tmpG;
-                            arma::uvec* izUse = &W.idxZ;
-                            arma::uvec* inzUse = &W.idxNZ;
-                            if (differ && ownS[t]) {
-                                // the trait's own vector over its samples (mainMarkerMT's gOwn)
-                                const SAIGE::MTTraitSamples& TS = ctx.samp[t];
-                                const arma::uword nTs = (arma::uword)TS.n;
-                                if (W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
-                                double* g = W.gT.memptr();
-                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
-                                    const arma::uword u = TS.pos[k2];
-                                    g[k2] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
-                                }
-                                gOwn = arma::vec(g, nTs, false, false);
-                                arma::uword cz = 0;
-                                for (arma::uword k2 = 0; k2 < nTs; k2++) if (g[k2] == 0.0) cz++;
-                                W.idxZt.set_size(cz);
-                                W.idxNZt.set_size(nTs - cz);
-                                arma::uword a = 0, b = 0;
-                                for (arma::uword k2 = 0; k2 < nTs; k2++) {
-                                    if (g[k2] == 0.0) W.idxZt[a++] = k2;
-                                    else              W.idxNZt[b++] = k2;
-                                }
-                                gUse = &gOwn; izUse = &W.idxZt; inzUse = &W.idxNZt;
-                            } else {
-                            double* g = W.tmpG.memptr();
-                            for (int u = 0; u < n; u++)
-                                g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
-                            arma::uword cz = 0;
-                            for (int u = 0; u < n; u++) if (g[u] == 0.0) cz++;
-                            W.idxZ.set_size(cz);
-                            W.idxNZ.set_size((arma::uword)n - cz);
-                            arma::uword a = 0, b = 0;
-                            for (int u = 0; u < n; u++) {
-                                if (g[u] == 0.0) W.idxZ[a++] = (arma::uword)u;
-                                else             W.idxNZ[b++] = (arma::uword)u;
-                            }
-                            }
-                            const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
-                            const bool noadjCur  = obj->m_isnoadjCov;
-                            const bool fastEligible = obj->m_isFastTest && MAC > g_MACCutoffforER;
-                            bool fastRecomputeSameCtx = false;
-                            if (fastEligible) {
-                                const bool probeSparse =
-                                    (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
-                                        ? false : obj->m_flagSparseGRM;
-                                bool dummyHas2;
-                                const double probeVR = isSingleVR[t]
-                                    ? obj->computeSingleVarianceRatio(probeSparse, false)
-                                    : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
-                                fastRecomputeSameCtx = (probeSparse == sparseCur) &&
-                                                       (noadjCur == false) &&
-                                                       (probeVR == S.VR(c, t));
-                            }
-                            double Beta = arma::datum::nan, seB = arma::datum::nan;
-                            double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
-                            double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
-                            double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
-                            std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
-                            bool isSPAConverge = false, is_Firth = false, is_FirthConverge = false;
-                            arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
-                            W.P2Vec.clear();
-                            bool is_gtilde = false;
-                            SAIGE::PerMarkerCtx ctx_first;
-                            ctx_first.flagSparseGRM_cur = sparseCur;
-                            ctx_first.isnoadjCov_cur    = noadjCur;
-                            ctx_first.erSeedStream      = (uint64_t)i + 1;
-                            ctx_first.varRatioVal       = S.VR(c, t);
-                            g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
-                            if (spDev && spPlan.on[M.binIdx] && sparseCur) {
-                                ctx_first.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
-                                #pragma omp atomic
-                                nSpPreset[t]++;
-                            }
-                            obj->getMarkerPval(
-                                *gUse, *inzUse, *izUse,
-                                Beta, seB, pval, pval_noSPA,
-                                altFreq, Tstat, gy, varT,
-                                isSPAConverge, W.gtilde, is_gtilde,
-                                /*is_region*/ false, W.P2Vec,
-                                /*isCondition*/ false,
-                                Beta_c, seBeta_c, pval_c, pval_noSPA_c,
-                                Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
-                                is_Firth, is_FirthConverge,
-                                /*isER*/ false,
-                                ctx_first.isnoadjCov_cur,
-                                ctx_first.flagSparseGRM_cur,
-                                ctx_first);
-                            double pval_num;
-                            try { pval_num = std::stod(pval); }
-                            catch (const std::invalid_argument&) { pval_num = 0; }
-                            catch (const std::out_of_range&)     { pval_num = 0; }
-                            if (fastEligible && !fastRecomputeSameCtx &&
-                                pval_num < obj->m_pval_cutoff_for_fastTest) {
-                                SAIGE::PerMarkerCtx ctx_fast;
-                                ctx_fast.flagSparseGRM_cur =
-                                    (MAC > obj->m_cateVarRatioMinMACVecExclude.back())
-                                        ? false : obj->m_flagSparseGRM;
-                                ctx_fast.isnoadjCov_cur = false;
-                                {
-                                    bool dummyHas;
-                                    ctx_fast.varRatioVal = isSingleVR[t]
-                                        ? obj->computeSingleVarianceRatio(
-                                              ctx_fast.flagSparseGRM_cur, ctx_fast.isnoadjCov_cur)
-                                        : obj->computeVarianceRatio(
-                                              MAC, ctx_fast.flagSparseGRM_cur,
-                                              ctx_fast.isnoadjCov_cur, dummyHas);
-                                }
-                                g_firthDefer = false;
-                                if (spDev && spPlan.on[M.binIdx] && ctx_fast.flagSparseGRM_cur) {
-                                    ctx_fast.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
-                                    #pragma omp atomic
-                                    nSpPreset[t]++;
-                                }
-                                obj->getMarkerPval(
-                                    *gUse, *inzUse, *izUse,
-                                    Beta, seB, pval, pval_noSPA,
-                                    altFreq, Tstat, gy, varT,
-                                    isSPAConverge, W.gtilde, is_gtilde,
-                                    /*is_region*/ false, W.P2Vec,
-                                    /*isCondition*/ false,
-                                    Beta_c, seBeta_c, pval_c, pval_noSPA_c,
-                                    Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
-                                    is_Firth, is_FirthConverge,
-                                    false,
-                                    ctx_fast.isnoadjCov_cur,
-                                    ctx_fast.flagSparseGRM_cur,
-                                    ctx_fast);
-                            }
-                            if (is_Firth) {
-                                #pragma omp atomic
-                                mFirth[t] += 1;
-                                if (is_FirthConverge) {
-                                    #pragma omp atomic
-                                    mFirthConverge[t] += 1;
-                                }
-                            }
-                            O.Beta[jj]   = Beta * (1 - 2 * flip);
-                            O.seBeta[jj] = seB;
-                            O.pval[jj]   = pval;
-                            O.pvalNA[jj] = pval_noSPA;
-                            O.Tstat[jj]  = Tstat * (1 - 2 * flip);
-                            O.varT[jj]   = varT;
-                            O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
-                            O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (isSPAConverge ? 16 : 0) |
-                                                          (is_Firth ? 32 : 0) | (is_FirthConverge ? 64 : 0));
-                            #pragma omp atomic
-                            nDevSpaFirth[t]++;
-                            #pragma omp atomic
-                            nFallback[t]++;
-                        } else {
-                            O.pval[jj]   = pvalStr;
-                            O.seBeta[jj] = seBeta;
-                            O.isSPAConverge[jj] = conv ? 1 : 0;
-                            O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
-                            if (pd.stage == 2) {
-                                #pragma omp atomic
-                                nDevFast[t]++;
-                            } else {
-                                #pragma omp atomic
-                                nDevSpa[t]++;
-                            }
-                            if (wantFirth) {   // firthDev: fitted in phase 5 on this p
-                                PendFirth pf;
-                                pf.bi = pd.bi; pf.jj = jj; pf.c = c; pf.t = t;
-                                pf.p = pvalFinal; pf.logp = islog ? 1 : 0;
-                                pf.flip = pd.flip;
-                                for (int q4 = 0; q4 < 4; q4++) pf.fd[q4] = pd.fd[q4];
-                                pendF[omp_get_thread_num()].push_back(pf);
-                            }
-                        }
-                    }
-                }
-                all.clear();
-                for (auto& v : pend2) { all.insert(all.end(), v.begin(), v.end()); v.clear(); }
-                }   // while: stage-2 SPA rounds
-                tSpa += omp_get_wtime() - t0;
+                phase4(d, s, ds, out, all, nullptr);
             }
 
             // ---------------- phase 5: device Firth on the pairs whose p asked for it ----------------
-            if (firthDev) {
-                const double tf0 = omp_get_wtime();
-                std::vector<PendFirth> allF;
-                for (auto& v : pendF) { allF.insert(allF.end(), v.begin(), v.end()); v.clear(); }
-                if (g_gpuSpaTraitMajor)
-                    std::stable_sort(allF.begin(), allF.end(),
-                                     [](const PendFirth& x, const PendFirth& y) { return x.t < y.t; });
-                const int nF = (int)allF.size();
-                if (nF > 0) {
-                    saige::gpu2::FirthPairIn* fin = saige::gpu2::firthIn(FP);
-                    double* fplut = saige::gpu2::firthPairLut(FP);   // gpuOwnSampleSets only
-                    for (int k = 0; k < nF; k++) {
-                        fin[k].slot  = (int)((std::size_t)allF[k].bi * Bblk + allF[k].c);
-                        fin[k].trait = ctx.meta[allF[k].t].binIdx;
-                        if (fplut) for (int q4 = 0; q4 < 4; q4++) fplut[(std::size_t)k * 4 + q4] = allF[k].fd[q4];
-                    }
-                    if (!saige::gpu2::firthRun(FP, R, nF)) {
-                        saige::gpu2::firthDestroy(FP);
-                        saige::gpu2::spaDestroy(SP);
-                        saige::spa_gpu::destroy(SL);
-                        rd.halt();
-                        saige::gpu2::destroy(R);
-                        throw std::runtime_error(
-                            std::string("mainMarkerMTGpu: the device Firth failed mid-run (") +
-                            saige::gpu2::firthLastError() +
-                            "). Rerun without gpuFirth to keep Firth on the CPU.");
-                    }
-                    const saige::gpu2::FirthPairOut* fo = saige::gpu2::firthOut(FP);
-                    #pragma omp parallel for schedule(dynamic, 64)
-                    for (int k = 0; k < nF; k++) {
-                        const PendFirth& pf = allF[k];
-                        const saige::gpu2::FirthPairOut& o = fo[k];
-                        const int t = pf.t, jj = pf.jj;
-                        MTTraitChunk& O = out[t];
-                        const bool flip = (pf.flip != 0);
-                        // getMarkerPval after fast_logistf_fit_simple: the fit's
-                        // beta (for the flipped allele when flipped), seBeta
-                        // back-calculated from the p-value, which Firth leaves alone.
-                        double qv;
-                        boost::math::normal ns;
-                        try {
-                            if (pf.logp) {
-                                const double half = std::exp(pf.p / 2.0);
-                                qv = (half > 0 && half < 1) ? boost::math::quantile(complement(ns, half))
-                                                            : std::numeric_limits<double>::infinity();
-                            } else {
-                                qv = boost::math::quantile(complement(ns, pf.p / 2));
-                            }
-                        } catch (const std::overflow_error&) {
-                            qv = std::numeric_limits<double>::infinity();
-                        }
-                        O.Beta[jj]   = o.beta * (1 - 2 * flip);
-                        O.seBeta[jj] = std::fabs(o.beta) / std::fabs(qv);
-                        O.route[jj]  = (unsigned char)(O.route[jj] | 32 | (o.conv ? 64 : 0));
-                        #pragma omp atomic
-                        mFirth[t] += 1;
-                        if (o.conv) {
-                            #pragma omp atomic
-                            mFirthConverge[t] += 1;
-                        }
-                        #pragma omp atomic
-                        nDevFirth[t]++;
-                    }
-                }
-                tFirth += omp_get_wtime() - tf0;
-            }
+            phase5(d, s, ds, out);
             if (prefetch) {
                 { std::lock_guard<std::mutex> lk(rd.m); rd.filled[s] = 0; }
                 rd.cvFree.notify_all();
@@ -4658,72 +5178,15 @@ bool mainMarkerMTGpu(
         if (readerEnded) break;
 
         // ---- write this chunk's rows, one file per trait ----
-        // The traits are independent files, so they go out in parallel; at
-        // P=128 this stage used to be 84% of the whole run (out_fast.hpp).
-        const double tw = omp_get_wtime();
-        if (g_outputFormatSgs) {
-            SAIGE::outfast::MarkerCols MC;
-            MC.chr = &CM.chrVec; MC.pos = &CM.posVec; MC.mid = &CM.markerVec;
-            MC.ref = &CM.refVec; MC.alt = &CM.altVec;
-            std::vector<SAIGE::outfast::TraitCols> TC(P);
-            for (int t = 0; t < P; t++) {
-                MTTraitChunk& O = out[t];
-                SAIGE::outfast::TraitCols& C = TC[t];
-                C.altCounts = &O.altCounts; C.altFreq = &O.altFreq;
-                C.imputeInfo = &O.imputeInfo; C.missingRate = &O.missingRate;
-                C.Beta = &O.Beta; C.seBeta = &O.seBeta;
-                C.Tstat = &O.Tstat; C.varT = &O.varT;
-                C.pval = &O.pval; C.pvalNA = &O.pvalNA;
-                C.isSPAConverge = &O.isSPAConverge;
-                C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
-                C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
-                C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
-                C.AF_case = &O.AF_case; C.AF_ctrl = &O.AF_ctrl;
-                C.N_case = &O.N_case; C.N_ctrl = &O.N_ctrl;
-                C.N_case_hom = &O.N_case_hom; C.N_ctrl_het = &O.N_ctrl_het;
-                C.N_case_het = &O.N_case_het; C.N_ctrl_hom = &O.N_ctrl_hom;
-                C.N = &O.N;
-            }
-            std::vector<int> ntSgs;
-            std::string err;
-            if (!sgs.writeChunk(MC, TC, out[0].pval.size(), nWriteThreads,
-                                ntSgs, err))
-                throw std::runtime_error("outputFormat: sgs: " + err);
-            for (int t = 0; t < P; t++) numtestTotal[t] += ntSgs[t];
-        } else {
-            std::vector<int> ntChunk(P, 0);
-#pragma omp parallel for schedule(dynamic) num_threads(nWriteThreads)
-            for (int t = 0; t < P; t++) {
-                MTTraitChunk& O = out[t];
-                std::vector<bool> spa(O.isSPAConverge.begin(), O.isSPAConverge.end());
-                int numtestChunk = 0;
-                writeOutfile_single(g_OutFiles_single[t],
-                                    g_traitMeta[t],
-                                    t_isImputation,
-                                    t_isFirth,
-                                    mFirth[t],
-                                    mFirthConverge[t],
-                                    CM.chrVec, CM.posVec, CM.markerVec, CM.refVec, CM.altVec,
-                                    O.altCounts, O.altFreq,
-                                    O.imputeInfo, O.missingRate,
-                                    O.Beta, O.seBeta, O.Tstat, O.varT,
-                                    O.pval, O.pvalNA, spa,
-                                    O.Beta_c, O.seBeta_c, O.Tstat_c, O.varT_c,
-                                    O.pval_c, O.pvalNA_c,
-                                    O.AF_case, O.AF_ctrl, O.N_case, O.N_ctrl,
-                                    O.N_case_hom, O.N_ctrl_het,
-                                    O.N_case_het, O.N_ctrl_hom,
-                                    O.N,
-                                    /*printSummary*/ false,
-                                    &numtestChunk);
-                ntChunk[t] = numtestChunk;
-            }
-            for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
-            for (int t = 0; t < P; t++) g_OutFiles_single[t].flush();
-        }
-        dumpRoutes(out, chunkStart == 0);
-        tWrite += omp_get_wtime() - tw;
+        if (!overlap) writeChunk(ci, chunkStart, out);
     }  // chunk
+    // gpuOverlap: post what is left, then stop the workers.
+    if (overlap) {
+        while (nextPost < kSb) postOne(nextPost++);
+        waitWriter(nextPost);
+        haltAll();
+        if (ov.err) { saige::gpu2::destroy(R); std::rethrow_exception(ov.err); }
+    }
     rd.halt();
     const double tLoop = omp_get_wtime() - tLoop0;
     if (prefetch) tRead = rd.tRead;
@@ -4836,8 +5299,34 @@ bool mainMarkerMTGpu(
               << (prefetch ? "on" : "off") << ", " << nSets << " staging set(s)";
     if (prefetch)
         std::cout << ", reader wall " << tRead << " s on " << g_gpuPrefetchThreads
-                  << " thread(s), consumer waited " << tWait << " s for it";
+                  << " thread(s), consumer waited " << (overlap ? ov.tScanReadWait : tWait) << " s for it";
     std::cout << std::endl;
+    // gpuOverlap: the device call above is the scan worker's own wall and the
+    // device SPA + post / Firth figures are the main thread's post (which
+    // includes its wait for the SPA worker); what the main thread lost to
+    // each worker is the wait.
+    {
+        std::sort(busyIv.begin(), busyIv.end());
+        double uni = 0, sum = 0, a = -1, b = -1;
+        for (const auto& iv : busyIv) {
+            sum += iv.second - iv.first;
+            if (iv.first > b) { if (b > a) uni += b - a; a = iv.first; b = iv.second; }
+            else if (iv.second > b) b = iv.second;
+        }
+        if (b > a) uni += b - a;
+        std::cout << "  [gpu busy] device calls " << busyIv.size() << ", union " << uni << " s, sum " << sum
+                  << " s, main loop " << tLoop << " s" << std::endl;
+    }
+    if (overlap)
+        std::cout << "  [gpu overlap] main loop " << tLoop << " s; scan worker wall " << ov.tScanWall
+                  << " s (reduce " << tGpu << " s, waited " << ov.tScanReadWait << " s for the reader)"
+                  << "; SPA worker: SPA rounds " << ov.tSpaWall << " s, device Firth + post " << tFirth
+                  << " s; main thread: tail " << tFin
+                  << " s, waited " << ov.tWaitScan << " s for the scan, post " << ov.tPost
+                  << " s (waited " << ov.tWaitSpa << " s for the SPA worker; SPA post-rules " << tSpa
+                  << " s); writer " << tWrite << " s writing (waited "
+                  << ov.tWaitWriter << " s for it); blocking sync "
+                  << (ovBlocking.empty() ? "on" : "not set (" + ovBlocking + ")") << std::endl;
 
     timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
     return true;
@@ -8140,6 +8629,11 @@ int main(int argc, char* argv[])
             std::cerr << "                     computes; same results in the same order." << std::endl;
             std::cerr << "  gpuPrefetchSets:   staging sets in the ring (default 3, >= 2)" << std::endl;
             std::cerr << "  gpuPrefetchThreads: OpenMP threads of the reader (default 4)" << std::endl;
+            std::cerr << "  gpuOverlap:        true/false (default: false). Run the device scan of the" << std::endl;
+            std::cerr << "                     next superblocks and the device SPA / Firth of earlier ones" << std::endl;
+            std::cerr << "                     while the host tail of the current one runs; same output." << std::endl;
+            std::cerr << "  gpuOverlapSets:    buffer sets in the overlap ring (default 6, >= 3)" << std::endl;
+            std::cerr << "  gpuOverlapLag:     superblocks whose SPA may still be pending (default 3, >= 1)" << std::endl;
             std::cerr << "  parallelModelLoad: true/false (default: true). Load the null models" << std::endl;
             std::cerr << "                     of a multi-trait run concurrently (min(P, nThreads)" << std::endl;
             std::cerr << "                     threads); same objects, same log, in config order." << std::endl;
@@ -8442,6 +8936,21 @@ int main(int argc, char* argv[])
             std::cout << "  gpuPrefetch: on -- the next superblock is read while the current one "
                          "computes (" << g_gpuPrefetchSets << " staging sets, "
                       << g_gpuPrefetchThreads << " reader thread(s))" << std::endl;
+        g_gpuOverlap = config["gpuOverlap"] ? config["gpuOverlap"].as<bool>() : false;
+        if (config["gpuOverlapSets"]) {
+            g_gpuOverlapSets = config["gpuOverlapSets"].as<int>();
+            if (g_gpuOverlapSets < 3) throw std::runtime_error("gpuOverlapSets must be >= 3");
+        }
+        if (config["gpuOverlapLag"]) {
+            g_gpuOverlapLag = config["gpuOverlapLag"].as<int>();
+            if (g_gpuOverlapLag < 1) throw std::runtime_error("gpuOverlapLag must be >= 1");
+        }
+        if (g_gpuOverlap && !g_gpuStep2)
+            std::cout << "  gpuOverlap: ignored, useGPU is false" << std::endl;
+        else if (g_gpuOverlap)
+            std::cout << "  gpuOverlap: on -- device scan, host tail and device SPA / Firth of different "
+                         "superblocks run at once (" << g_gpuOverlapSets << " buffer sets, lag "
+                      << g_gpuOverlapLag << ")" << std::endl;
         g_parallelModelLoad = cfgBool("parallelModelLoad", true);
         if (g_parallelModelLoad)
             std::cout << "  parallelModelLoad: on -- the null models are loaded concurrently"

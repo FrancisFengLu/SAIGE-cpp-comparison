@@ -112,7 +112,7 @@ double*       firthPairLut(Firth* t_f);
 
 // Fit pairs [0, t_nPairs) of firthIn() against the reducer's last reduce();
 // results in firthOut(). Synchronous. false on a CUDA error (results undefined).
-bool firthRun(Firth* t_f, const Reducer* t_r, int t_nPairs);
+bool firthRun(Firth* t_f, const Reducer* t_r, int t_nPairs, int t_devSet = -1);  // t_devSet: the reducer's device set (-1 = last reduce())
 
 // Cumulative device seconds in the kernel, and pairs fitted, since firthCreate().
 void firthTimings(const Firth* t_f, double* t_kernel, long long* t_pairs);

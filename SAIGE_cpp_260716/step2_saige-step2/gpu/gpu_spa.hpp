@@ -105,7 +105,7 @@ SpaPairOut* spaOut(Spa* t_s);
 
 // Solve pairs [0, t_nPairs) of spaIn() against the reducer's last reduce();
 // results in spaOut(). Synchronous. false on a CUDA error (results undefined).
-bool spaRun(Spa* t_s, const Reducer* t_r, int t_nPairs);
+bool spaRun(Spa* t_s, const Reducer* t_r, int t_nPairs, int t_devSet = -1);  // t_devSet: the reducer's device set (-1 = last reduce())
 
 // Cumulative device seconds in the kernel, and pairs solved, since spaCreate().
 void spaTimings(const Spa* t_s, double* t_kernel, long long* t_pairs);

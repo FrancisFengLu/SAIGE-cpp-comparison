@@ -11,7 +11,7 @@ void          firthDestroy(Firth*)                             {}
 FirthPairIn*  firthIn(Firth*)                                  { return nullptr; }
 FirthPairOut* firthOut(Firth*)                                 { return nullptr; }
 double*       firthPairLut(Firth*)                             { return nullptr; }
-bool          firthRun(Firth*, const Reducer*, int)            { return false; }
+bool          firthRun(Firth*, const Reducer*, int, int)            { return false; }
 void          firthTimings(const Firth*, double*, long long*)  {}
 std::size_t   firthDeviceBytes(const Firth*)                   { return 0; }
 const char*   firthLastError()                                 { return "no CUDA build"; }
