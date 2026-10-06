@@ -52,6 +52,8 @@ extern "C" void openblas_set_num_threads(int);
 #include <unordered_map>
 #include <numeric>
 #include <algorithm>
+#include <limits>
+#include <random>
 #include <malloc.h>  // mallopt() — glibc heap-hoarding mitigation
 #include <cstdlib>   // getenv (W2 fused-decode rollback switch)
 
@@ -310,7 +312,8 @@ bool g_gpuSpaDynamic = false;
 //     kernel at two resident blocks per SM like the unfused one.
 //   gpuDecodeX2: the fp64 decode stores lane-contiguous 16-byte pairs instead
 //     of two 16-byte halves 32 bytes apart (gpu_step2.hpp decodeX2); same
-//     dosages, same positions.
+//     dosages, same positions. Default on with useGPU (since the s2-overlap /
+//     s2-er-gpu merge).
 int  g_gpuSpaMinBlocks = 0;
 bool g_gpuDecodeX2 = false;
 // Config key gpuFirth (default: true with useGPU; needs gpuSpa): the Firth fit of a pair whose final
@@ -358,7 +361,11 @@ long long g_gpuSparseMaxPairs = 50000000LL;
 // with the same statements (SAIGE::erFinish). Bit-identical p-values. Pairs
 // with more than 20 carriers (resampling) or a resout vector keep the CPU ER.
 // A Firth fit the ER p asks for runs on the device with gpuFirth, else the pair
-// is redone on the CPU scalar path.
+// is redone on the CPU scalar path. Default: = useGPU. Bit-identity holds
+// only with the host's libm and the build's FMA contraction as on the machine
+// it was verified on, so every run that enables it first runs a ~0.1 s
+// self-check (device exp / log and 24 exact tests against the host) and keeps
+// ER on the CPU if any bit differs.
 bool g_gpuER = false;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
@@ -399,7 +406,7 @@ int  g_gpuPrefetchThreads = 4;
 // every pair is finalized by the same code on the same numbers, and chunks are
 // written in input order: the output does not change. With gpuPrefetch the
 // reader thread feeds the scan worker; without it the scan worker reads.
-// OFF: the loop as before. S2_OVERLAP.md.
+// OFF: the loop as before. Default: = useGPU. S2_OVERLAP.md.
 bool g_gpuOverlap     = false;
 int  g_gpuOverlapSets = 6;
 int  g_gpuOverlapLag  = 3;
@@ -2517,6 +2524,91 @@ struct GpuBlk {
 
 }  // namespace
 
+// gpuER startup self-check. The device ER is bit-identical to er_binary.cpp
+// only where the host's exp / log are glibc 2.35's FMA variants and the build
+// contracted the same five a*b+c of er_binary.cpp (S2_ER_GPU.md §2). Before a
+// run uses it: (1) device exp / log against the host's on 65,536 + edge inputs,
+// (2) 24 exact tests (1..20 carriers) on trait 0's own mu against
+// SKATExactBin_Work. Any differing bit -> false, and the caller keeps ER on
+// the CPU. ~0.1 s.
+static bool gpuErSelfCheck(saige::gpu2::Er* EP, int device, const arma::vec& mu, int ncase,
+                           std::string& why)
+{
+    auto sameBits = [](double a, double b) {
+        return (std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, sizeof(double)) == 0;
+    };
+    // (1) exp / log
+    std::vector<double> x;
+    const double ed[] = {0.0, 1.0, -1.0, 0.5, 2.0, 1e-300, 5e-324, 709.78, -708.39, -745.13, 1.0 - 0x1p-4,
+                         1.0 + 0x1.09p-4, std::numeric_limits<double>::min(), std::numeric_limits<double>::max()};
+    for (double d : ed) { x.push_back(d); x.push_back(std::nextafter(d, 1e308)); x.push_back(std::nextafter(d, -1e308)); }
+    std::mt19937_64 rng(20261006);
+    std::uniform_real_distribution<double> uE(-60.0, 5.0), uN(1.0 - 0.0625, 1.0 + 0.0647), uW(-25.0, 25.0);
+    for (int i = 0; i < 65536; i++) {
+        switch (i % 4) {
+        case 0: x.push_back(uE(rng)); break;
+        case 1: x.push_back(uN(rng)); break;
+        case 2: x.push_back(std::exp(uW(rng))); break;
+        default: { uint64_t u = rng(); double d; std::memcpy(&d, &u, 8); x.push_back(d); }
+        }
+    }
+    const long long nx = (long long)x.size();
+    std::vector<double> de(nx), dl(nx);
+    if (!saige::gpu2::erMathCheck(device, x.data(), nx, de.data(), dl.data())) {
+        why = std::string("exp / log check did not run: ") + saige::gpu2::erLastError();
+        return false;
+    }
+    long long bad = 0;
+    for (long long i = 0; i < nx; i++)
+        if (!sameBits(std::exp(x[i]), de[i]) || !sameBits(std::log(x[i]), dl[i])) bad++;
+    if (bad > 0) { why = std::to_string(bad) + " of " + std::to_string(nx) + " exp / log inputs differ from the host's libm"; return false; }
+    // (2) exact tests on trait 0
+    const int n = (int)mu.n_elem;
+    if (n < 64) return true;
+    const int ks[] = {1, 2, 3, 4, 4, 3, 2, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+    const int nP = (int)(sizeof(ks) / sizeof(ks[0]));
+    std::vector<saige::gpu2::ErPairIn> in(nP);
+    std::vector<uint32_t> cI; std::vector<double> cG; std::vector<unsigned char> cC;
+    std::vector<double> cpu(nP);
+    for (int q = 0; q < nP; q++) {
+        const int k = ks[q];
+        std::vector<uint32_t> pos;
+        while ((int)pos.size() < k) {
+            const uint32_t u = (uint32_t)(rng() % (uint64_t)n);
+            if (std::find(pos.begin(), pos.end(), u) == pos.end()) pos.push_back(u);
+        }
+        std::sort(pos.begin(), pos.end());
+        arma::mat Z(n, 1, arma::fill::zeros);
+        arma::vec res(n, arma::fill::zeros);
+        arma::uvec iI(k), iC(n - k);
+        in[q].trait = 0; in[q].k = k; in[q].off = (long long)cI.size();
+        for (int i = 0; i < k; i++) {
+            const double g = (rng() % 4 == 0) ? 2.0 : 1.0;
+            // carriers all cases every third pair (small p), else mixed
+            const bool cs = (q % 3 == 0) ? true : (rng() % 2 == 0);
+            Z(pos[i], 0) = g; res(pos[i]) = cs ? 1.0 : -1.0; iI(i) = pos[i];
+            cI.push_back(pos[i]); cG.push_back(g); cC.push_back(cs ? 1 : 0);
+        }
+        for (int u = 0, a = 0, i = 0; u < n; u++) {
+            if (i < k && (int)pos[i] == u) { i++; continue; }
+            iC(a++) = (arma::uword)u;
+        }
+        arma::vec pi1 = mu;
+        arma::mat ro;
+        ER::SL_set_stream((uint64_t)q + 1);
+        cpu[q] = ER::SKATExactBin_Work(Z, res, pi1, (uint32_t)ncase, iI, iC, ro, 2e+6, 1e+4, 1e-6, 1);
+    }
+    std::vector<saige::gpu2::ErPairOut> out(nP);
+    if (!saige::gpu2::erRun(EP, in.data(), nP, cI.data(), cG.data(), cC.data(), (long long)cI.size(), out.data())) {
+        why = std::string("exact-test check did not run: ") + saige::gpu2::erLastError();
+        return false;
+    }
+    bad = 0;
+    for (int q = 0; q < nP; q++) if (!sameBits(cpu[q], out[q].pval)) bad++;
+    if (bad > 0) { why = std::to_string(bad) + " of " + std::to_string(nP) + " exact-test p-values differ from er_binary.cpp"; return false; }
+    return true;
+}
+
 bool mainMarkerMTGpu(
     std::string & t_genoType,
     std::vector<std::string> & t_genoIndex,
@@ -3012,6 +3104,7 @@ bool mainMarkerMTGpu(
     // ---- device ER (gpuER): per-trait mu resident, log(0..maxN) table ----
     saige::gpu2::Er* EP = nullptr;
     std::vector<int> erTraitOf(P, -1);
+    double gEr0 = 0; long long gErPairs0 = 0;
     if (anyBin && g_gpuER) {
         std::vector<saige::gpu2::ErTraitArgs> ea;
         int maxN = 0;
@@ -3039,10 +3132,19 @@ bool mainMarkerMTGpu(
             std::fill(erTraitOf.begin(), erTraitOf.end(), -1);
             std::cout << "  gpuER: device setup failed (" << (ok ? saige::gpu2::erLastError() : "a model's mu is not n long")
                       << "); ER stays on the CPU scalar path" << std::endl;
+        } else if (std::string why; !gpuErSelfCheck(EP, g_gpuDevice, ea.empty() ? arma::vec() :
+                                                    g_saigeObjs[binTraits[0]]->muRef(),
+                                                    ea.empty() ? 0 : ea[0].ncase, why)) {
+            saige::gpu2::erDestroy(EP);
+            EP = nullptr;
+            std::fill(erTraitOf.begin(), erTraitOf.end(), -1);
+            std::cout << "  gpuER: startup self-check failed (" << why
+                      << "); ER stays on the CPU scalar path" << std::endl;
         } else {
+            saige::gpu2::erTimings(EP, &gEr0, &gErPairs0);   // the check's pairs, not counted below
             std::cout << "  gpuER: " << ea.size() << " binary traits' mu resident; the exact test of pairs with "
                          "MAC <= " << g_MACCutoffforER << " and at most " << saige::gpu2::kErMaxCarriers
-                      << " carriers runs on the device" << std::endl;
+                      << " carriers runs on the device (startup self-check passed)" << std::endl;
         }
     }
     const bool erDev = (EP != nullptr);
@@ -5506,6 +5608,7 @@ bool mainMarkerMTGpu(
     if (SQ) saige::gpu2::spqTimings(SQ, &gSpq, &gSpqSlots);
     double gEr = 0; long long gErPairs = 0;
     if (EP) saige::gpu2::erTimings(EP, &gEr, &gErPairs);
+    gEr -= gEr0; gErPairs -= gErPairs0;
     saige::gpu2::erDestroy(EP);
     saige::gpu2::spqDestroy(SQ);
     saige::gpu2::firthDestroy(FP);
@@ -8935,7 +9038,7 @@ int main(int argc, char* argv[])
             std::cerr << "                     device counter instead of a fixed stride (lib only)." << std::endl;
             std::cerr << "  gpuSpaMinBlocks:   0 (no hint) .. 4, default 3 with useGPU: the SPA kernel's minimum resident blocks" << std::endl;
             std::cerr << "                     per SM (register cap 128 / 85 / 64 for 2 / 3 / 4; lib only)." << std::endl;
-            std::cerr << "  gpuDecodeX2:       true/false (default: false). fp64 decode with lane-contiguous" << std::endl;
+            std::cerr << "  gpuDecodeX2:       true/false (default: = useGPU). fp64 decode with lane-contiguous" << std::endl;
             std::cerr << "                     16-byte stores (no half-written sectors on ECC HBM2)." << std::endl;
             std::cerr << "                     All five leave every output bit-identical." << std::endl;
             std::cerr << "  gpuFirth:          true/false (default: = useGPU). With gpuSpa, the Firth fit of a" << std::endl;
@@ -8950,7 +9053,7 @@ int main(int argc, char* argv[])
             std::cerr << "                     computes; same results in the same order." << std::endl;
             std::cerr << "  gpuPrefetchSets:   staging sets in the ring (default 3, >= 2)" << std::endl;
             std::cerr << "  gpuPrefetchThreads: OpenMP threads of the reader (default 4)" << std::endl;
-            std::cerr << "  gpuOverlap:        true/false (default: false). Run the device scan of the" << std::endl;
+            std::cerr << "  gpuOverlap:        true/false (default: = useGPU). Run the device scan of the" << std::endl;
             std::cerr << "                     next superblocks and the device SPA / Firth of earlier ones" << std::endl;
             std::cerr << "                     while the host tail of the current one runs; same output." << std::endl;
             std::cerr << "  gpuOverlapSets:    buffer sets in the overlap ring (default 6, >= 3)" << std::endl;
@@ -8969,9 +9072,10 @@ int main(int argc, char* argv[])
             std::cerr << "                     block-diagonal inverse; isFastTest=false traits become batchable." << std::endl;
             std::cerr << "                     Works with gpuOwnSampleSets (per-trait sample lists)." << std::endl;
             std::cerr << "  gpuSparseMaxPairs: cap on within-block sample pairs (default 5e7)." << std::endl;
-            std::cerr << "  gpuER:             true/false (default: false). With gpuBinary, the exact test" << std::endl;
+            std::cerr << "  gpuER:             true/false (default: = useGPU). With gpuBinary, the exact test" << std::endl;
             std::cerr << "                     (ER) of binary pairs with MAC <= MACCutoffforER runs on the" << std::endl;
-            std::cerr << "                     device; same p-values bit for bit." << std::endl;
+            std::cerr << "                     device; same p-values bit for bit. A startup self-check against" << std::endl;
+            std::cerr << "                     the host's exp / log and exact test keeps ER on the CPU if it fails." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -9210,7 +9314,7 @@ int main(int argc, char* argv[])
             if (g_gpuSpaMinBlocks < 0 || g_gpuSpaMinBlocks > 4)
                 throw std::runtime_error("gpuSpaMinBlocks must be 0..4 (0 = no hint)");
         }
-        g_gpuDecodeX2 = config["gpuDecodeX2"] ? config["gpuDecodeX2"].as<bool>() : false;
+        g_gpuDecodeX2 = cfgBool("gpuDecodeX2", gpuDef);   // default with useGPU (bit-identical, S2_KERNEL_ROOFLINE.md)
         if ((g_gpuSpaFused || g_gpuSpaDynamic) && g_gpuSpaImpl != "lib" &&
             (cfgSet("gpuSpaFused") || cfgSet("gpuSpaDynamic")))
             std::cout << "  gpuSpaFused / gpuSpaDynamic: ignored, they need gpuSpaImpl: lib" << std::endl;
@@ -9232,9 +9336,9 @@ int main(int argc, char* argv[])
             if (cfgSet("gpuSparse")) std::cout << "  gpuSparse: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSparse = false;
         }
-        g_gpuER = config["gpuER"] ? config["gpuER"].as<bool>() : false;
+        g_gpuER = cfgBool("gpuER", gpuDef);   // default with useGPU; startup self-check (S2_ER_GPU.md)
         if (g_gpuER && !g_gpuBinary) {
-            std::cout << "  gpuER: ignored, it needs gpuBinary: true" << std::endl;
+            if (cfgSet("gpuER")) std::cout << "  gpuER: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuER = false;
         }
         if ((g_gpuBinary || g_gpuSpa) && !g_gpuStep2)
@@ -9265,7 +9369,7 @@ int main(int argc, char* argv[])
             std::cout << "  gpuPrefetch: on -- the next superblock is read while the current one "
                          "computes (" << g_gpuPrefetchSets << " staging sets, "
                       << g_gpuPrefetchThreads << " reader thread(s))" << std::endl;
-        g_gpuOverlap = config["gpuOverlap"] ? config["gpuOverlap"].as<bool>() : false;
+        g_gpuOverlap = cfgBool("gpuOverlap", gpuDef);   // default with useGPU (S2_OVERLAP.md)
         if (config["gpuOverlapSets"]) {
             g_gpuOverlapSets = config["gpuOverlapSets"].as<int>();
             if (g_gpuOverlapSets < 3) throw std::runtime_error("gpuOverlapSets must be >= 3");

@@ -72,7 +72,9 @@ mtMemBudgetGB: 1.5
 # useGPU stays false. With useGPU: true these default ON as well (write false to
 # turn one off): gpuBinary, gpuSpa (gpuSpaImpl: lib), gpuFirth, gpuSparse,
 # gpuOwnSampleSets, gpuPrefetch (gpuPrefetchThreads: 4), gpuSpaOrder: trait,
-# gpuSpaDynamic, gpuSpaFused, gpuSpaMinBlocks: 3. gpuDecodeX2 stays false.
+# gpuSpaDynamic, gpuSpaFused, gpuSpaMinBlocks: 3, gpuDecodeX2, gpuOverlap
+# (S2_OVERLAP.md), gpuER (S2_ER_GPU.md; a startup self-check keeps ER on the CPU
+# when the device cannot match the host's exp / log bit for bit).
 # useGPU: true
 # mtRequireSameSamples: true   # the only accepted value; false is refused
 #                              # rather than silently ignored
