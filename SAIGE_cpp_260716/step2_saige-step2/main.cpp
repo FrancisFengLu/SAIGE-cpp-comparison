@@ -322,8 +322,11 @@ double g_gpuFirthMaxStep = 15.0;
 // context already holds the stacks that way), each (marker, trait) pair takes
 // the trait's own QC / impute / flip and the exact affine map onto the union
 // column (MTBlockAdj), and the device case counts, SPA and Firth take per-trait
-// sample masks. Binary traits only among the traits with their own list. Off:
-// such a set is refused and runs on the CPU, as before.
+// sample masks. Quantitative traits with their own list take the same map in
+// the batch tail, with g_t'g_t from the trait's own code counts
+// (S2_GPU_QUANT_MISSING.md); a quantitative sparse-GRM trait whose first pass
+// is the sparse variance (isFastTest=false) is still refused -- gpuSparse is
+// binary only. Off: such a set is refused and runs on the CPU, as before.
 bool g_gpuOwnSampleSets = false;
 // Config key gpuSparse (needs gpuBinary, fp64): binary traits whose model
 // carries a sparse GRM get their exact variance g~' Sigma^-1 g~ on the device
@@ -2270,6 +2273,7 @@ struct MTBlockWork {
     std::vector<arma::uword> tnMiss;
     arma::vec gT;                     // a trait's own genotype vector (fallback)
     arma::uvec idxZt, idxNZt;
+    arma::mat Qown;                   // GPU path: B x P, g_t'g_t of a quantitative trait with its own list
 
     // ---- mtPopcountAF only ----
     // The marker's 2-bit codes as the .bed row holds them, in analysis order,
@@ -2513,17 +2517,18 @@ bool mainMarkerMTGpu(
             // Whether the device data could actually be built is checked below.
             const bool sparseFirstOK = g_gpuSparse && M.kind == SAIGE::TraitKind::Binary &&
                                        M.flagSparseGRM && !M.isFastTest && !M.isCondition && !M.isnoadjCov;
-            if (!M.batchable && !sparseFirstOK)
-                                { why = "trait '" + M.name + "': " + SAIGE::batchableReason(M); break; }
+            if (!M.batchable && !sparseFirstOK) {
+                why = "trait '" + M.name + "': " + SAIGE::batchableReason(M);
+                if (M.kind == SAIGE::TraitKind::Quantitative && M.flagSparseGRM && !M.isFastTest &&
+                    !M.isCondition && !M.isnoadjCov)
+                    why += " (gpuSparse covers binary traits only)";
+                break;
+            }
             if (M.isCondition)  { why = "trait '" + M.name + "' runs conditional analysis"; break; }
             if (!ctx.sampleSetsDiffer && g_saigeObjs[t]->m_n != g_saigeObjs[0]->m_n) { why = "models disagree on n"; break; }
             if (ctx.sampleSetsDiffer) {
                 // as mainMarkerMT requires: m_n is the trait's sample count
                 if (g_saigeObjs[t]->m_n != ctx.samp[t].n) { why = "trait '" + M.name + "': rows in y != sample IDs"; break; }
-                if (!ctx.samp[t].sameAsUnion && M.kind != SAIGE::TraitKind::Binary) {
-                    why = "trait '" + M.name + "' is quantitative with its own sample list (gpuOwnSampleSets covers binary traits)";
-                    break;
-                }
             }
             if (M.kind == SAIGE::TraitKind::Binary && (M.binOff < 0 || M.binIdx < 0)) {
                 why = "trait '" + M.name + "' has no binary stack block"; break;
@@ -2680,6 +2685,9 @@ bool mainMarkerMTGpu(
             for (arma::uword k = 0; k < oi.n_elem; k++) ctrlU[t][k] = S.pos.at(oi[k]);
         }
     }
+    // a quantitative trait with its own list: its tail is the adjusted one
+    bool qntOwn = false;
+    for (int t : ctx.batchQuantTraits) if (ownS[t]) qntOwn = true;
     for (int t : binTraits) {
         const int b = ctx.meta[t].binIdx;
         const arma::uvec& ci = ownS[t] ? caseU[t] : g_saigeObjs[t]->m_case_indices;
@@ -3660,7 +3668,26 @@ bool mainMarkerMTGpu(
                 #undef SAIGE_GPU_C2
                 for (int j = 0; j < Bblk; j++) W.scr.Gsq[j] = S.ssc[j];
 
-                if (anyQnt) {
+                if (anyQnt && qntOwn) {
+                    // Different sample lists, some quantitative trait has its
+                    // own: g_t'g_t per (slot, trait) from the trait's own code
+                    // counts and table (exact in double, as Gsq above).
+                    W.Qown.set_size(Bblk, P);
+                    for (int t : ctx.batchQuantTraits) {
+                        if (!ownS[t]) continue;
+                        for (int j = 0; j < Bblk; j++) {
+                            const std::size_t k = (std::size_t)j * (std::size_t)P + (std::size_t)t;
+                            double ss = 0.0;
+                            for (int c4 = 0; c4 < 4; c4++)
+                                ss += S.fdP[k * 4 + c4] * S.fdP[k * 4 + c4] * (double)S.cntP[k * 4 + c4];
+                            W.Qown(j, t) = ss;
+                        }
+                    }
+                    if (nHi > 0)
+                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.adj, W.Qown, W.scr, W.res);
+                    if (nLo > 0)
+                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.adj, W.Qown, W.scr, W.res);
+                } else if (anyQnt) {
                     if (nHi > 0)
                         SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, W.scr, W.res);
                     if (nLo > 0)
@@ -8102,8 +8129,8 @@ int main(int argc, char* argv[])
             std::cerr << "  gpuFirthMaxStep:   that fit's Newton step cap (default 15, SAIGE's)." << std::endl;
             std::cerr << "  gpuOwnSampleSets:  true/false (default: false). Run models whose sample lists" << std::endl;
             std::cerr << "                     differ (missing phenotypes) on the GPU path too: union read," << std::endl;
-            std::cerr << "                     per-trait masks on the device. Binary traits only for the" << std::endl;
-            std::cerr << "                     traits with their own list." << std::endl;
+            std::cerr << "                     per-trait masks on the device. Binary and quantitative" << std::endl;
+            std::cerr << "                     traits (not a quantitative sparse-GRM first pass)." << std::endl;
             std::cerr << "  gpuPrefetch:       true/false (default: false). Read + QC + stage the next" << std::endl;
             std::cerr << "                     superblock on a reader thread while the current one" << std::endl;
             std::cerr << "                     computes; same results in the same order." << std::endl;

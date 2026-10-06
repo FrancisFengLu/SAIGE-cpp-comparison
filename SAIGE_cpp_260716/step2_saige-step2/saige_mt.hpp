@@ -448,6 +448,26 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
                                MTScratch& t_scr,
                                MTBlockResult& t_out);
 
+// scoreTestBatchMTQuantPre for a run whose traits do not share one sample list
+// (the GPU path with gpuOwnSampleSets): a trait whose list is the union's takes
+// exactly scoreTestBatchMTQuantPre's arithmetic; a trait with its own list takes
+// scoreTestBatchMT's adjusted branch (quantitative) term for term, except for
+// the one quadratic term: g_t'g_t over the trait's samples is read from t_Qown
+// (Bblk x P, the caller's sum_c count_t[c] * dosage_t[c]^2 from the trait's own
+// code counts and table, exact in double) instead of being assembled from
+// GMask2 / GMask1 / MissMask. The two are algebraically equal (a^2 = 1); they
+// differ only in rounding, as the column's Gsq already does on this path. The
+// missing-cell row sums (MissA / MissWqnt / MissR) are formed here from
+// t_adj.miss exactly as scoreTestBatchMT forms them.
+void scoreTestBatchMTQuantPreAdj(const MTContext& t_ctx,
+                                 const std::vector<int>& t_traitSet,
+                                 int t_j0, int t_j1,
+                                 const arma::mat& t_VR,
+                                 const MTBlockAdj& t_adj,
+                                 const arma::mat& t_Qown,
+                                 MTScratch& t_scr,
+                                 MTBlockResult& t_out);
+
 
 #ifdef MTFOLD_PROF
 // Defined in saige_mt.cpp; see the MTF_TIC/MTF_TOC block there. cpu-seconds

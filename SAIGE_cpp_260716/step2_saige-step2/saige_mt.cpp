@@ -1372,4 +1372,103 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
     }
 }
 
+void scoreTestBatchMTQuantPreAdj(const MTContext& t_ctx,
+                                 const std::vector<int>& t_traitSet,
+                                 int t_j0, int t_j1,
+                                 const arma::mat& t_VR,
+                                 const MTBlockAdj& t_adj,
+                                 const arma::mat& t_Qown,
+                                 MTScratch& t_scr,
+                                 MTBlockResult& t_out)
+{
+    if (t_traitSet.empty() || t_j1 <= t_j0) return;
+    bool anyAdj = false;
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        if (M.kind != TraitKind::Quantitative)
+            throw std::runtime_error("scoreTestBatchMTQuantPreAdj: non-quantitative trait");
+        if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion) anyAdj = true;
+    }
+    preCheckWidth(t_scr, t_ctx, t_j1, false, "scoreTestBatchMTQuantPreAdj");
+    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    if (anyAdj) {
+        if (t_Qown.n_rows < static_cast<arma::uword>(t_j1) || t_Qown.n_cols != (arma::uword)t_ctx.P)
+            throw std::runtime_error("scoreTestBatchMTQuantPreAdj: t_Qown has the wrong shape");
+        if (t_adj.a.n_rows < static_cast<arma::uword>(t_j1) || t_adj.miss.size() < static_cast<size_t>(t_j1))
+            throw std::runtime_error("scoreTestBatchMTQuantPreAdj: t_adj is narrower than the block");
+        // Rows summed over each column's missing cells (row j - j0 / column
+        // j - j0 here), full stacks: row r is stack column r. Rows outside a
+        // trait are zero in its stack columns, so the union column's missing
+        // cells collect exactly the trait's own.
+        t_scr.MissA.zeros(static_cast<arma::uword>(t_ctx.sumP), B);
+        t_scr.MissR.zeros(B, t_ctx.RES.n_cols);
+        t_scr.MissWqnt.zeros(static_cast<arma::uword>(t_ctx.sumP), B);
+        for (arma::uword j = 0; j < B; ++j) {
+            const std::vector<arma::uword>& mv = t_adj.miss[static_cast<arma::uword>(t_j0) + j];
+            if (mv.empty()) continue;
+            sumRowsIntoCol(t_ctx.Astack, 0, t_ctx.sumP, mv, t_scr.MissA, j);
+            sumRowsIntoRow(t_ctx.RES, mv, t_scr.MissR, j);
+            sumRowsIntoCol(t_ctx.Xstack, 0, t_ctx.sumP, mv, t_scr.MissWqnt, j);
+        }
+    }
+    const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
+    const arma::vec Gsq = t_scr.Gsq.subvec(c0, c1);
+
+    for (int t : t_traitSet) {
+        const TraitMeta& M = t_ctx.meta[t];
+        const arma::uword r0 = static_cast<arma::uword>(M.colOff);
+        const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
+        const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (!adj) {
+            // scoreTestBatchMTQuantPre's expressions, unchanged
+            const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
+            const arma::mat W_t = t_scr.GWqnt.submat(r0, c0, r1, c1);       // p x B
+            arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+            arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+            arma::rowvec gwz = arma::sum(W_t % Z_t, 0);
+            arma::vec S    = (t_scr.GR.submat(c0, (arma::uword)t, c1, (arma::uword)t) - saz.t()) / M.tau0;
+            arma::vec var2 = zxz.t() * M.tau0 + Gsq - 2.0 * gwz.t();
+            emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+            continue;
+        }
+        // scoreTestBatchMT's adjusted branch (quantitative), on the block's columns
+        const arma::uword p = static_cast<arma::uword>(M.p);
+        const arma::vec& sA = t_ctx.sumA[t];
+        const arma::vec& sW = t_ctx.sumW[t];
+        t_scr.Zc.set_size(p, B);
+        t_scr.Wc.set_size(p, B);
+        t_scr.Rc.set_size(B);
+        t_scr.Qc.set_size(B);
+        for (arma::uword j = 0; j < B; ++j) {
+            const arma::uword jo = c0 + j;
+            const double a = t_adj.a(jo, t), b = t_adj.b(jo, t);
+            const double d = t_adj.d(jo, t);
+            const bool flip = (a < 0.0), shift = (b != 0.0);
+            const bool miss = (t_adj.nMiss(jo, t) > 0);
+            for (arma::uword r = 0; r < p; ++r) {
+                double z = t_scr.Zall(r0 + r, jo);
+                double w = t_scr.GWqnt(r0 + r, jo);
+                if (flip)  { z = -z; w = -w; }
+                if (shift) { z += b * sA[r]; w += b * sW[r]; }
+                if (miss)  { z += d * t_scr.MissA(r0 + r, j); w += d * t_scr.MissWqnt(r0 + r, j); }
+                t_scr.Zc(r, j) = z;
+                t_scr.Wc(r, j) = w;
+            }
+            double R = t_scr.GR(jo, t);
+            if (flip)  R = -R;
+            if (shift) R += b * t_ctx.sumR[t];
+            if (miss)  R += d * t_scr.MissR(j, t);
+            t_scr.Rc[j] = R;
+            t_scr.Qc[j] = t_Qown(jo, t);
+        }
+        const arma::mat& Z_t = t_scr.Zc;
+        arma::rowvec zxz = arma::sum(Z_t % (t_ctx.XVX[t] * Z_t), 0);
+        arma::rowvec saz = t_ctx.S_a[t].t() * Z_t;
+        arma::rowvec gwz = arma::sum(t_scr.Wc % Z_t, 0);
+        arma::vec S    = (t_scr.Rc - saz.t()) / M.tau0;
+        arma::vec var2 = zxz.t() * M.tau0 + t_scr.Qc - 2.0 * gwz.t();
+        emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+    }
+}
+
 }  // namespace SAIGE
