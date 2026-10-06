@@ -241,7 +241,7 @@ gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_gl
 # the host's bit by bit (USE_CUDA=1 only).
 #   make USE_CUDA=1 SM=70 tools/er_gpu_check
 tools/er_gpu_check: tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
 
 # The SPA GPU library (gpu/spa_gpu/, from branch spa-gpu-lib, SPA_GPU_LIB.md):
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,

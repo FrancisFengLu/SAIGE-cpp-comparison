@@ -37,6 +37,7 @@
 extern "C" void openblas_set_num_threads(int);
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <sstream>
@@ -70,6 +71,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "gpu_firth.hpp"          // Firth on the device (gpuFirth)
 #include "gpu_sparse.hpp"         // sparse-GRM variance on the device (gpuSparse)
 #include "gpu_er.hpp"             // the exact test (ER) on the device (gpuER)
+#include "er_binary.hpp"
 #include "s2_gpu_sparse.hpp"
 #include "score_format.hpp"
 #include "UTIL.hpp"
@@ -3052,6 +3054,11 @@ bool mainMarkerMTGpu(
     std::vector<std::vector<PendEr>> pendE(std::max(1, omp_get_max_threads()));
     std::vector<long> nDevEr(P, 0), nErRedo(P, 0);
     double tEr = 0;
+    // SAIGE_GPU_ER_VERIFY=1: also run er_binary.cpp on every device pair's
+    // inputs and count p-values that differ in any bit (a check, not a mode).
+    const bool erVerify = erDev && std::getenv("SAIGE_GPU_ER_VERIFY") != nullptr &&
+                          std::string(std::getenv("SAIGE_GPU_ER_VERIFY")) == "1";
+    long long erVerN = 0, erVerBad = 0;
     std::vector<MTTraitChunk> out(P);
     long nSlotsUsed = 0, nSlotsTotal = 0;
 
@@ -4712,6 +4719,43 @@ bool mainMarkerMTGpu(
                         std::string pvalStr;
                         double pvalNum = 0.0, seB = 0.0, qvER = 0.0;
                         bool conv = false;
+                        if (erVerify) {
+                            // SKATExactBin_Work reads res only for n and res(idx) > 0,
+                            // so a res of +-1 at the carriers is the call the scalar
+                            // path makes.
+                            const arma::vec& mu = obj->muRef();
+                            const arma::uword nT = mu.n_elem;
+                            arma::mat Zv(nT, 1, arma::fill::zeros);
+                            arma::vec resv(nT, arma::fill::zeros);
+                            arma::uvec iI(pe.k), iC(nT - pe.k);
+                            for (int q = 0; q < pe.k; q++) {
+                                Zv(pe.idx[q], 0) = pe.g[q];
+                                resv(pe.idx[q]) = pe.cs[q] ? 1.0 : -1.0;
+                                iI(q) = pe.idx[q];
+                            }
+                            for (arma::uword u = 0, a2 = 0, q = 0; u < nT; u++) {
+                                if (q < (arma::uword)pe.k && pe.idx[q] == u) { q++; continue; }
+                                iC(a2++) = u;
+                            }
+                            arma::vec pi1 = mu;
+                            arma::mat ro;
+                            ER::SL_set_stream(pe.ctx.erSeedStream);
+                            const double pc = ER::SKATExactBin_Work(Zv, resv, pi1, (uint32_t)obj->m_n_case, iI, iC, ro,
+                                                                    2e+6, 1e+4, 1e-6, 1);
+                            const double pd = eout[k].pval;
+                            const bool sameBits = (std::isnan(pc) && std::isnan(pd)) ||
+                                                  std::memcmp(&pc, &pd, sizeof(double)) == 0;
+                            #pragma omp atomic
+                            erVerN++;
+                            if (!sameBits) {
+                                #pragma omp atomic
+                                erVerBad++;
+                                #pragma omp critical(erVerifyPrint)
+                                std::cout << "  device ER verify: differs, trait " << g_traitMeta[t].name << " row " << jj
+                                          << " k " << pe.k << " cpu " << std::setprecision(17) << pc << " device " << pd
+                                          << std::setprecision(6) << std::endl;
+                            }
+                        }
                         SAIGE::erFinish(eout[k].pval, O.Beta[jj], pvalStr, pvalNum, seB, conv, qvER);
                         const bool wantFirth = obj->m_is_Firth_beta && pvalNum <= obj->m_pCutoffforFirth;
                         if (!wantFirth || firthDev) {
@@ -5042,6 +5086,9 @@ bool mainMarkerMTGpu(
                       << (gErPairs > 0 ? gEr / (double)gErPairs * 1e6 : 0.0) << " us/pair); "
                       << d << " finished on the device, " << r
                       << " asked for Firth without gpuFirth and were redone on the CPU scalar path" << std::endl;
+            if (erVerify)
+                std::cout << "  device ER verify (SAIGE_GPU_ER_VERIFY): " << erVerN << " pairs against er_binary.cpp, "
+                          << erVerBad << " p-values differ in any bit" << std::endl;
         }
         std::cout << "  AF_case/AF_ctrl: " << (a + b + g) << " pairs -- device counts "
                   << a << ", exact replay " << b << ", gather (no replay for the trait) " << g
@@ -5077,6 +5124,9 @@ bool mainMarkerMTGpu(
                   << " bytes (" << (double)sgs.bytesWritten() / 1e9 << " GB)"
                   << std::endl;
     }
+    // PHASE_TIMING=1 builds only (a no-op otherwise): the scalar calls' inner
+    // stages (score / SPA / ER / Firth thread-seconds) of this path too.
+    PT_REPORT(tWrite, omp_get_max_threads());
     std::cout << "  [gpu breakdown] read+QC+stage " << tRead << " s, device call "
               << tGpu << " s, tail+finalize " << tFin << " s, device SPA + post " << tSpa << " s, device Firth + post " << tFirth
               << (erDev ? " s, device ER + post " + std::to_string(tEr) : std::string())

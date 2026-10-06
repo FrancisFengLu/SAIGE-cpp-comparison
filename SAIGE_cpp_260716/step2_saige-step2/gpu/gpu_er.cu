@@ -2,10 +2,13 @@
 // trait) pair. Contract and provenance: gpu_er.hpp. Reference: er_binary.cpp
 // (SKATExactBin_Work -> SKATExactBin_ComputProb_New -> HyperGeo; SKAT_Exact ->
 // ComputeExact::Init / Run). Every floating-point statement below is the CPU's,
-// in the CPU's order; compiled with --fmad=false so a*b+c rounds twice, as the
-// CPU build (-std=c++17, no contraction) does. The only fused operations are
-// the explicit fma() calls of the glibc exp / log ports (gpu_er_glibc.cuh),
-// which are the fused operations of the CPU's libm.
+// in the CPU's order. Compiled with --fmad=false, so nothing is fused unless
+// written as fma(): the CPU build (g++ -O3 -march=native, whose default for C++
+// is -ffp-contract=fast even with -std=c++17) fused exactly five expressions in
+// er_binary.o -- lch + lweight*j (both HyperGeo tables), stat += one*one
+// (CalTestStat / _INV) and pval - pval_same/2 -- and those five are fma() here,
+// read off the disassembly (S2_ER_GPU.md §2). The other fma() calls are the
+// glibc exp / log ports' (gpu_er_glibc.cuh), the fused operations of the CPU's libm.
 
 #include "gpu_er.hpp"
 #include "gpu_er_glibc.cuh"
@@ -36,46 +39,49 @@ constexpr int NBIN = 10;            // SKATExactBin_ComputeProb_Group's ngroup1
 // WANT_STAT. Strata j <= k/2 + 1 enumerate the j-subsets of the cases, the
 // others the (k-j)-subsets of the controls, both lexicographically -- the
 // order SKAT_Exact_Recurse / SKAT_Exact_Recurse_INV visit them in.
+// The CPU folds each subset left to right from 1 (pprod) and from the
+// all-control (all-case) statistic; consecutive subsets in lexicographic order
+// share a prefix, and the folded value of a prefix does not depend on what
+// follows it, so pr[q] / ts[q] (the folds over a[0..q-1]) are kept and only the
+// changed suffix is refolded -- the same operations on the same operands.
 template <bool WANT_STAT, typename F>
 __device__ __forceinline__ void forEachConfig(int k, const double* Z0, const double* Z1, const double* odds,
                                               double tsZ0, double tsZ1, double pprod, F f)
 {
     int a[KM];
+    double pr[KM + 1], ts[KM + 1];
     for (int j = 0; j <= k; j++) {
         const bool inv = !(j <= k / 2 + 1);
         const int r = inv ? (k - j) : j;
         for (int q = 0; q < r; q++) a[q] = q;
+        pr[0] = inv ? pprod : 1.0;
+        ts[0] = inv ? tsZ1 : tsZ0;
+        int from = 0;   // pr / ts are valid up to index `from`
         while (true) {
-            double raw, stat = 0.0;
-            if (!inv) {
-                raw = 1.0;
-                for (int q = 0; q < r; q++) raw = raw * odds[a[q]];
-                if (WANT_STAT) {
-                    double t = tsZ0;
-                    for (int q = 0; q < r; q++) t = t + (Z1[a[q]] - Z0[a[q]]);
-                    stat = 0.0 + t * t;
-                }
-            } else {
-                raw = pprod;
-                for (int q = 0; q < r; q++) raw = raw / odds[a[q]];
-                if (WANT_STAT) {
-                    double t = tsZ1;
-                    for (int q = 0; q < r; q++) t = t + (Z0[a[q]] - Z1[a[q]]);
-                    stat = 0.0 + t * t;
+            for (int q = from; q < r; q++) {
+                const int l = a[q];
+                if (!inv) {
+                    pr[q + 1] = pr[q] * odds[l];
+                    if (WANT_STAT) ts[q + 1] = ts[q] + (Z1[l] - Z0[l]);
+                } else {
+                    pr[q + 1] = pr[q] / odds[l];
+                    if (WANT_STAT) ts[q + 1] = ts[q] + (Z0[l] - Z1[l]);
                 }
             }
-            f(j, raw, stat);
+            const double stat = WANT_STAT ? fma(ts[r], ts[r], 0.0) : 0.0;   // stat += one*one, contracted
+            f(j, pr[r], stat);
             // next r-subset of [0, k) in lexicographic order
             int q = r - 1;
             while (q >= 0 && a[q] == k - r + q) q--;
             if (q < 0) break;
             a[q]++;
             for (int u = q + 1; u < r; u++) a[u] = a[u - 1] + 1;
+            from = q;
         }
     }
 }
 
-__global__ void __launch_bounds__(64)
+__global__ void __launch_bounds__(32)
 er_pairs(const double* __restrict__ mu, const long long* __restrict__ muOff,
          const int* __restrict__ nOf, const int* __restrict__ ncaseOf,
          const double* __restrict__ LT,
@@ -162,7 +168,7 @@ er_pairs(const double* __restrict__ mu, const long long* __restrict__ muOff,
                         int nn = group[i];
                         for (int d = 1; d <= j; ++d) { lch = lch + LT[nn--]; lch = lch - LT[d]; }
                     }
-                    tabC[o + j] = lch + lw[i] * j;
+                    tabC[o + j] = fma((double)j, lw[i], lch);   // gcc contracted lch + lweight*j
                 }
                 o += group[i] + 1;
             }
@@ -186,7 +192,7 @@ er_pairs(const double* __restrict__ mu, const long long* __restrict__ muOff,
                 if (j >= 0 && j <= k) lch[j] = r;
             }
             for (int j = 0; j <= k; j++) {
-                tabL[j] = lch[j] + lw[ngroup - 1] * ((double)ncase - j);
+                tabL[j] = fma((double)ncase - j, lw[ngroup - 1], lch[j]);   // contracted, as above
                 mref = (tabL[j] > mref) ? tabL[j] : mref;
             }
         }
@@ -239,7 +245,7 @@ er_pairs(const double* __restrict__ mu, const long long* __restrict__ muOff,
         {
             double tq = tsZ0;
             for (int i = 0; i < k; i++) if (cs[i]) tq = tq + (Z1[i] - Z0[i]);
-            Q = 0.0 + tq * tq;
+            Q = fma(tq, tq, 0.0);
         }
         double denomi[KM + 1];
         for (int j = 0; j <= k; j++) denomi[j] = 0.0;
@@ -260,7 +266,7 @@ er_pairs(const double* __restrict__ mu, const long long* __restrict__ muOff,
                                     if (temp1 == 0) n_same = n_same + f;
                                 }
                             });
-        out[pq].pval = n_num - n_same / 2;
+        out[pq].pval = fma(-n_same, 0.5, n_num);   // pval - pval_same / 2: gcc emits vfnmadd with 0.5
     }
 }
 
@@ -376,7 +382,7 @@ bool erRun(Er* s, const ErPairIn* in, int nPairs, const uint32_t* carIdx, const 
     CKE(cudaMemcpyAsync(s->dG, carG, (std::size_t)nCar * sizeof(double), cudaMemcpyHostToDevice, s->st));
     CKE(cudaMemcpyAsync(s->dCase, carCase, (std::size_t)nCar, cudaMemcpyHostToDevice, s->st));
     CKE(cudaEventRecord(s->e0, s->st));
-    const int nt = 64;
+    const int nt = 32;   // few pairs per call: spread them over the SMs
     const int nb = (nPairs + nt - 1) / nt;
     er_pairs<<<nb, nt, 0, s->st>>>(s->dMu, s->dMuOff, s->dN, s->dNcase, s->dLT, s->dIn, nPairs,
                                    s->dIdx, s->dG, s->dCase, s->dOut);
