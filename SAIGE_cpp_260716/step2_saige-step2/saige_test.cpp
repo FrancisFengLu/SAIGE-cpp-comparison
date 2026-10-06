@@ -29,6 +29,41 @@ std::atomic<std::uint64_t> g_firthFitCalls{0};
 
 namespace SAIGE {
 
+// getMarkerPval's ER branch after SKATExactBin_Work, moved here verbatim so the
+// device ER (gpuER) finishes a pair with the same statements (saige_test.hpp).
+void erFinish(double pval_ER, double t_Beta, std::string& t_pval, double& pval,
+              double& t_seBeta, bool& t_isSPAConverge, double& t_qval_ER)
+{
+    // P2 fix (2026-05-09): ER can return NaN/inf on degenerate ultra-rare configs
+    // (e.g. all carriers in same case/control group → variance 0 in resampling).
+    // Without this guard, the NaN propagates into boost::math::quantile which
+    // throws an uncaught domain_error (the existing catch only handles
+    // overflow_error).
+    if (!std::isfinite(pval_ER) || pval_ER < 0.0 || pval_ER > 1.0) {
+        pval_ER = 1.0;  // treat as non-significant; let caller re-route to score-test
+    }
+    char pValueBuf_ER[100];
+    sprintf(pValueBuf_ER, "%.6E", pval_ER);
+    std::string buffAsStdStr_ER = pValueBuf_ER;
+    t_pval = pValueBuf_ER;
+
+    pval = pval_ER;
+    boost::math::normal ns;
+    try{
+      t_qval_ER = boost::math::quantile(ns, pval_ER/2);
+      t_qval_ER = fabs(t_qval_ER);
+      if (t_qval_ER == 0.0 || !std::isfinite(t_qval_ER)) {
+          t_seBeta = 0;
+      } else {
+          t_seBeta = fabs(t_Beta)/t_qval_ER;
+      }
+      t_isSPAConverge = true;
+    }catch (const std::exception&) {  // widen catch beyond overflow_error
+      t_qval_ER = std::numeric_limits<double>::infinity();
+      t_seBeta = 0;
+    }
+}
+
 // log_chisq1_uppertail moved verbatim to score_format.hpp (2026-09-13) so the
 // multi-trait batch kernel can share it. Same namespace (SAIGE), same body;
 // only `static inline` -> `inline`.
@@ -1197,6 +1232,23 @@ if(!t_isER){
 	pval = pval_noadj;
    }
 
+}else if(ctx.erDefer != nullptr && m_resout.n_elem == 0 &&
+         iIndex.n_elem >= 1 && iIndex.n_elem <= (arma::uword)ER::kDeviceMaxCarriers){
+    // gpuER: hand the exact test to the device (ErDeferOut, saige_test.hpp).
+    // Nothing below this branch reads pval / t_pval for an ER pair except the
+    // Firth decision, which the caller takes after erFinish().
+    ErDeferOut& D = *ctx.erDefer;
+    D.hit = true;
+    const arma::uword k = iIndex.n_elem;
+    D.idx.resize(k); D.g.resize(k); D.isCase.resize(k);
+    for (arma::uword q = 0; q < k; q++) {
+        const arma::uword s = iIndex(q);
+        D.idx[q] = (uint32_t)s;
+        D.g[q] = t_GVec(s);
+        D.isCase[q] = (m_res(s) > 0) ? 1 : 0;
+    }
+    t_pval.clear();
+    pval = std::numeric_limits<double>::quiet_NaN();
 }else{ //if(!t_isER){
     PT_SCOPE(S_ER);
 
@@ -1213,35 +1265,8 @@ if(!t_isER){
     // result does not depend on which thread the marker landed on.
     ER::SL_set_stream(ctx.erSeedStream);
     double pval_ER = ER::SKATExactBin_Work(Z_er, res_er, pi1_er, m_n_case, iIndex, iIndexComVec, resout_er, 2e+6, 1e+4, 1e-6, 1);
-    // P2 fix (2026-05-09): ER can return NaN/inf on degenerate ultra-rare configs
-    // (e.g. all carriers in same case/control group → variance 0 in resampling).
-    // Without this guard, the NaN propagates into boost::math::quantile which
-    // throws an uncaught domain_error (the existing catch only handles
-    // overflow_error).
-    if (!std::isfinite(pval_ER) || pval_ER < 0.0 || pval_ER > 1.0) {
-        pval_ER = 1.0;  // treat as non-significant; let caller re-route to score-test
-    }
-    char pValueBuf_ER[100];
-    sprintf(pValueBuf_ER, "%.6E", pval_ER);
-    std::string buffAsStdStr_ER = pValueBuf_ER;
-    t_pval = pValueBuf_ER;
-
-    pval = pval_ER;
-    boost::math::normal ns;
     double t_qval_ER;
-    try{
-      t_qval_ER = boost::math::quantile(ns, pval_ER/2);
-      t_qval_ER = fabs(t_qval_ER);
-      if (t_qval_ER == 0.0 || !std::isfinite(t_qval_ER)) {
-          t_seBeta = 0;
-      } else {
-          t_seBeta = fabs(t_Beta)/t_qval_ER;
-      }
-      t_isSPAConverge = true;
-    }catch (const std::exception&) {  // widen catch beyond overflow_error
-      t_qval_ER = std::numeric_limits<double>::infinity();
-      t_seBeta = 0;
-    }
+    erFinish(pval_ER, t_Beta, t_pval, pval, t_seBeta, t_isSPAConverge, t_qval_ER);
 
     if(m_is_Firth_beta && pval <= m_pCutoffforFirth){
 	t_isFirth = true;

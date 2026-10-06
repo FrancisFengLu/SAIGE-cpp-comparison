@@ -26,6 +26,14 @@
 // ============================================================
 namespace ER {
 
+// gpuER (gpu/gpu_er.hpp): the largest carrier count k the device takes. The
+// production call (saige_test.cpp) passes NResampling = 2e6, ExactMax = 1e4; the
+// enumeration has sum_i C(k, i) = 2^k configurations, so for k <= 20 (2^20 =
+// 1,048,576 <= 2e6) every stratum is enumerated exactly (Is_ExactP, all
+// IsExact = 1) and the random-number stream is never drawn from. k >= 21 goes to
+// resampling and stays on the CPU.
+constexpr int kDeviceMaxCarriers = 20;
+
 void * SL_calloc(size_t num, size_t size);
 void   SL_free(void * ptr);
 double SL_runif_double();

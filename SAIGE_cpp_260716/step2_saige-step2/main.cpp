@@ -69,6 +69,7 @@ extern "C" void openblas_set_num_threads(int);
 #include "spa_gpu/spa_gpu.hpp"   // the SPA GPU library (gpuSpaImpl: lib)
 #include "gpu_firth.hpp"          // Firth on the device (gpuFirth)
 #include "gpu_sparse.hpp"         // sparse-GRM variance on the device (gpuSparse)
+#include "gpu_er.hpp"             // the exact test (ER) on the device (gpuER)
 #include "s2_gpu_sparse.hpp"
 #include "score_format.hpp"
 #include "UTIL.hpp"
@@ -345,6 +346,16 @@ bool g_gpuOwnSampleSets = false;
 // GEMM terms and its own dosages in the cross-term kernel.
 bool g_gpuSparse = false;
 long long g_gpuSparseMaxPairs = 50000000LL;
+// Config key gpuER (needs gpuBinary; S2_ER_GPU.md): the exact test (ER, MAC <=
+// MACCutoffforER and |StdStat| above the SPA cutoff) of a binary pair runs on
+// the device (gpu/gpu_er.cu) instead of inside the CPU scalar call: the score
+// test that decides it stays on the CPU, the call records the carriers, the
+// device enumerates the 2^k carrier assignments, the host finishes the pair
+// with the same statements (SAIGE::erFinish). Bit-identical p-values. Pairs
+// with more than 20 carriers (resampling) or a resout vector keep the CPU ER.
+// A Firth fit the ER p asks for runs on the device with gpuFirth, else the pair
+// is redone on the CPU scalar path.
+bool g_gpuER = false;
 // Config key gpuDevice: which CUDA device (default 0).
 int  g_gpuDevice  = 0;
 // Config key gpuBlockSize: markers per device batch, rounded DOWN to a multiple
@@ -2963,6 +2974,44 @@ bool mainMarkerMTGpu(
     }
     const bool firthDev = (FP != nullptr);
 
+    // ---- device ER (gpuER): per-trait mu resident, log(0..maxN) table ----
+    saige::gpu2::Er* EP = nullptr;
+    std::vector<int> erTraitOf(P, -1);
+    if (anyBin && g_gpuER) {
+        std::vector<saige::gpu2::ErTraitArgs> ea;
+        int maxN = 0;
+        bool ok = true;
+        for (int t : binTraits) {
+            SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+            const arma::vec& mu = obj->muRef();
+            if (obj->m_n <= 0 || (int)mu.n_elem != obj->m_n) { ok = false; break; }
+            saige::gpu2::ErTraitArgs a;
+            a.mu = mu.memptr(); a.n = obj->m_n; a.ncase = obj->m_n_case;
+            erTraitOf[t] = (int)ea.size();
+            ea.push_back(a);
+            maxN = std::max(maxN, obj->m_n);
+        }
+        if (ok) {
+            // log of an integer exactly as lCombinations takes it (er_binary.cpp)
+            std::vector<double> lt((std::size_t)maxN + 1);
+            for (int i = 0; i <= maxN; i++) lt[i] = std::log((double)i);
+            saige::gpu2::ErCreateArgs ec;
+            ec.device = g_gpuDevice; ec.nTraits = (int)ea.size(); ec.traits = ea.data();
+            ec.logTable = lt.data(); ec.maxN = maxN;
+            EP = saige::gpu2::erCreate(ec);
+        }
+        if (EP == nullptr) {
+            std::fill(erTraitOf.begin(), erTraitOf.end(), -1);
+            std::cout << "  gpuER: device setup failed (" << (ok ? saige::gpu2::erLastError() : "a model's mu is not n long")
+                      << "); ER stays on the CPU scalar path" << std::endl;
+        } else {
+            std::cout << "  gpuER: " << ea.size() << " binary traits' mu resident; the exact test of pairs with "
+                         "MAC <= " << g_MACCutoffforER << " and at most " << saige::gpu2::kErMaxCarriers
+                      << " carriers runs on the device" << std::endl;
+        }
+    }
+    const bool erDev = (EP != nullptr);
+
     // ---------------- per-trait one-time setup (as mainMarkerMT) ----------------
     std::vector<char> isSingleVR(P, 0);
     for (int t = 0; t < P; t++) {
@@ -2986,6 +3035,23 @@ bool mainMarkerMTGpu(
     std::vector<std::vector<PendFirth>> pendF(std::max(1, omp_get_max_threads()));
     std::vector<long> nDevFirth(P, 0);
     double tFirth = 0;
+    // gpuER: pairs whose scalar call stopped at the ER branch (the score test is
+    // done and in the output columns; p-value, seBeta, Is.SPA and Firth wait for
+    // the device). ctx is the call's PerMarkerCtx, kept for the CPU redo of a
+    // pair whose ER p asks for Firth without gpuFirth.
+    struct PendEr {
+        int bi, jj, c, t, k;
+        char flip;
+        double fd[4];
+        double MAC, AF;
+        SAIGE::PerMarkerCtx ctx;
+        uint32_t idx[saige::gpu2::kErMaxCarriers];
+        double g[saige::gpu2::kErMaxCarriers];
+        unsigned char cs[saige::gpu2::kErMaxCarriers];
+    };
+    std::vector<std::vector<PendEr>> pendE(std::max(1, omp_get_max_threads()));
+    std::vector<long> nDevEr(P, 0), nErRedo(P, 0);
+    double tEr = 0;
     std::vector<MTTraitChunk> out(P);
     long nSlotsUsed = 0, nSlotsTotal = 0;
 
@@ -4041,6 +4107,11 @@ bool mainMarkerMTGpu(
                             g_firthDefer = (obj->m_isFastTest && isBin &&
                                             MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
                             const bool isER = (MAC <= g_MACCutoffforER && isBin);
+                            // gpuER: the call stops at the ER branch and records
+                            // the carriers; the device finishes the p-value.
+                            thread_local SAIGE::ErDeferOut tlErDefer;
+                            const bool erHook = erDev && isER && erTraitOf[t] >= 0;
+                            if (erHook) { tlErDefer.hit = false; ctx_first.erDefer = &tlErDefer; }
 
                             obj->getMarkerPval(
                                 *gUse, *inzUse, *izUse,
@@ -4056,6 +4127,22 @@ bool mainMarkerMTGpu(
                                 ctx_first.isnoadjCov_cur,
                                 ctx_first.flagSparseGRM_cur,
                                 ctx_first);
+                            if (erHook && tlErDefer.hit) {
+                                PendEr pe;
+                                pe.bi = bi; pe.jj = jj; pe.c = c; pe.t = t;
+                                pe.k = (int)tlErDefer.idx.size();
+                                pe.flip = flip ? 1 : 0;
+                                for (int q4 = 0; q4 < 4; q4++) pe.fd[q4] = fdt[q4];
+                                pe.MAC = MAC; pe.AF = altFreq;
+                                pe.ctx = ctx_first;
+                                pe.ctx.erDefer = nullptr;
+                                for (int q = 0; q < pe.k; q++) {
+                                    pe.idx[q] = tlErDefer.idx[q];
+                                    pe.g[q] = tlErDefer.g[q];
+                                    pe.cs[q] = tlErDefer.isCase[q];
+                                }
+                                pendE[omp_get_thread_num()].push_back(pe);
+                            }
 
                             double pval_num;
                             try { pval_num = std::stod(pval); }
@@ -4583,6 +4670,162 @@ bool mainMarkerMTGpu(
                 tSpa += omp_get_wtime() - t0;
             }
 
+            // ---------------- phase 4b: device ER on the parked pairs (gpuER) ----------------
+            if (erDev) {
+                const double te0 = omp_get_wtime();
+                std::vector<PendEr> allE;
+                for (auto& v : pendE) { allE.insert(allE.end(), v.begin(), v.end()); v.clear(); }
+                const int nE = (int)allE.size();
+                if (nE > 0) {
+                    std::vector<saige::gpu2::ErPairIn> ein(nE);
+                    std::vector<saige::gpu2::ErPairOut> eout(nE);
+                    std::vector<uint32_t> cI; std::vector<double> cG; std::vector<unsigned char> cC;
+                    for (int k = 0; k < nE; k++) {
+                        const PendEr& pe = allE[k];
+                        ein[k].trait = erTraitOf[pe.t]; ein[k].k = pe.k; ein[k].off = (long long)cI.size();
+                        cI.insert(cI.end(), pe.idx, pe.idx + pe.k);
+                        cG.insert(cG.end(), pe.g, pe.g + pe.k);
+                        cC.insert(cC.end(), pe.cs, pe.cs + pe.k);
+                    }
+                    if (!saige::gpu2::erRun(EP, ein.data(), nE, cI.data(), cG.data(), cC.data(),
+                                            (long long)cI.size(), eout.data())) {
+                        saige::gpu2::erDestroy(EP);
+                        saige::gpu2::firthDestroy(FP);
+                        saige::gpu2::spaDestroy(SP);
+                        saige::spa_gpu::destroy(SL);
+                        rd.halt();
+                        saige::gpu2::destroy(R);
+                        throw std::runtime_error(
+                            std::string("mainMarkerMTGpu: the device ER failed mid-run (") +
+                            saige::gpu2::erLastError() + "). Rerun without gpuER.");
+                    }
+                    #pragma omp parallel for schedule(dynamic, 16)
+                    for (int k = 0; k < nE; k++) {
+                        const PendEr& pe = allE[k];
+                        const int t = pe.t, jj = pe.jj, c = pe.c;
+                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+                        MTTraitChunk& O = out[t];
+                        const bool flip = (pe.flip != 0);
+                        // getMarkerPval's ER branch from SKATExactBin_Work on;
+                        // O.Beta is the score Beta (sign flipped when flipped,
+                        // which |Beta| does not see).
+                        std::string pvalStr;
+                        double pvalNum = 0.0, seB = 0.0, qvER = 0.0;
+                        bool conv = false;
+                        SAIGE::erFinish(eout[k].pval, O.Beta[jj], pvalStr, pvalNum, seB, conv, qvER);
+                        const bool wantFirth = obj->m_is_Firth_beta && pvalNum <= obj->m_pCutoffforFirth;
+                        if (!wantFirth || firthDev) {
+                            O.pval[jj]   = pvalStr;
+                            O.seBeta[jj] = seB;
+                            O.isSPAConverge[jj] = conv ? 1 : 0;
+                            O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
+                            if (wantFirth) {
+                                // phase 5: seBeta = |beta| / |qnorm(p/2)|, the
+                                // t_qval_Firth = t_qval_ER of the scalar path
+                                PendFirth pf;
+                                pf.bi = pe.bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                pf.p = pvalNum; pf.logp = 0;
+                                pf.flip = pe.flip;
+                                for (int q4 = 0; q4 < 4; q4++) pf.fd[q4] = pe.fd[q4];
+                                pendF[omp_get_thread_num()].push_back(pf);
+                            }
+                            #pragma omp atomic
+                            nDevEr[t]++;
+                            continue;
+                        }
+                        // Firth without the device Firth: the whole pair once more
+                        // on the CPU scalar path, ER included, as before gpuER.
+                        MTBlockWork& W = work[omp_get_thread_num()];
+                        const unsigned char* pk = hPkS + ((std::size_t)pe.bi * Bblk + c) * bpv;
+                        const double* fdc = pe.fd;
+                        arma::vec gOwn;
+                        arma::vec*  gUse = &W.tmpG;
+                        arma::uvec* izUse = &W.idxZ;
+                        arma::uvec* inzUse = &W.idxNZ;
+                        if (differ && ownS[t]) {
+                            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+                            const arma::uword nTs = (arma::uword)TS.n;
+                            if (W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
+                            double* g = W.gT.memptr();
+                            for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                const arma::uword u = TS.pos[k2];
+                                g[k2] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                            }
+                            gOwn = arma::vec(g, nTs, false, false);
+                            arma::uword cz = 0;
+                            for (arma::uword k2 = 0; k2 < nTs; k2++) if (g[k2] == 0.0) cz++;
+                            W.idxZt.set_size(cz);
+                            W.idxNZt.set_size(nTs - cz);
+                            arma::uword a = 0, b = 0;
+                            for (arma::uword k2 = 0; k2 < nTs; k2++) {
+                                if (g[k2] == 0.0) W.idxZt[a++] = k2;
+                                else              W.idxNZt[b++] = k2;
+                            }
+                            gUse = &gOwn; izUse = &W.idxZt; inzUse = &W.idxNZt;
+                        } else {
+                            if (W.tmpG.n_elem != (arma::uword)n) { W.tmpG.set_size(n); W.gtilde.set_size(n); }
+                            double* g = W.tmpG.memptr();
+                            for (int u = 0; u < n; u++)
+                                g[u] = fdc[(pk[u >> 2] >> ((u & 3) * 2)) & 3u];
+                            arma::uword cz = 0;
+                            for (int u = 0; u < n; u++) if (g[u] == 0.0) cz++;
+                            W.idxZ.set_size(cz);
+                            W.idxNZ.set_size((arma::uword)n - cz);
+                            arma::uword a = 0, b = 0;
+                            for (int u = 0; u < n; u++) {
+                                if (g[u] == 0.0) W.idxZ[a++] = (arma::uword)u;
+                                else             W.idxNZ[b++] = (arma::uword)u;
+                            }
+                        }
+                        double Beta = arma::datum::nan, seBr = arma::datum::nan;
+                        double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
+                        double Beta_c = arma::datum::nan, seBeta_c = arma::datum::nan;
+                        double Tstat_c = arma::datum::nan, varT_c = arma::datum::nan;
+                        std::string pval, pval_noSPA, pval_c, pval_noSPA_c;
+                        bool isSPAConverge = false, is_Firth = false, is_FirthConverge = false;
+                        arma::rowvec G1tilde_P_G2tilde_Vec(obj->m_numMarker_cond);
+                        W.P2Vec.clear();
+                        bool is_gtilde = false;
+                        SAIGE::PerMarkerCtx cx = pe.ctx;
+                        g_firthDefer = false;   // as phase 3 set it for an ER pair (MAC <= the ER cutoff)
+                        obj->getMarkerPval(
+                            *gUse, *inzUse, *izUse,
+                            Beta, seBr, pval, pval_noSPA,
+                            pe.AF, Tstat, gy, varT,
+                            isSPAConverge, W.gtilde, is_gtilde,
+                            /*is_region*/ false, W.P2Vec,
+                            /*isCondition*/ false,
+                            Beta_c, seBeta_c, pval_c, pval_noSPA_c,
+                            Tstat_c, varT_c, G1tilde_P_G2tilde_Vec,
+                            is_Firth, is_FirthConverge,
+                            /*isER*/ true,
+                            cx.isnoadjCov_cur,
+                            cx.flagSparseGRM_cur,
+                            cx);
+                        if (is_Firth) {
+                            #pragma omp atomic
+                            mFirth[t] += 1;
+                            if (is_FirthConverge) {
+                                #pragma omp atomic
+                                mFirthConverge[t] += 1;
+                            }
+                        }
+                        O.Beta[jj]   = Beta * (1 - 2 * flip);
+                        O.seBeta[jj] = seBr;
+                        O.pval[jj]   = pval;
+                        O.pvalNA[jj] = pval_noSPA;
+                        O.Tstat[jj]  = Tstat * (1 - 2 * flip);
+                        O.varT[jj]   = varT;
+                        O.isSPAConverge[jj] = isSPAConverge ? 1 : 0;
+                        O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (isSPAConverge ? 16 : 0) |
+                                                      (is_Firth ? 32 : 0) | (is_FirthConverge ? 64 : 0));
+                        #pragma omp atomic
+                        nErRedo[t]++;
+                    }
+                }
+                tEr += omp_get_wtime() - te0;
+            }
+
             // ---------------- phase 5: device Firth on the pairs whose p asked for it ----------------
             if (firthDev) {
                 const double tf0 = omp_get_wtime();
@@ -4738,6 +4981,9 @@ bool mainMarkerMTGpu(
     if (FP) saige::gpu2::firthTimings(FP, &gFirth, &gFirthPairs);
     double gSpq = 0; long long gSpqSlots = 0;
     if (SQ) saige::gpu2::spqTimings(SQ, &gSpq, &gSpqSlots);
+    double gEr = 0; long long gErPairs = 0;
+    if (EP) saige::gpu2::erTimings(EP, &gEr, &gErPairs);
+    saige::gpu2::erDestroy(EP);
     saige::gpu2::spqDestroy(SQ);
     saige::gpu2::firthDestroy(FP);
     saige::gpu2::spaDestroy(SP);
@@ -4789,6 +5035,14 @@ bool mainMarkerMTGpu(
                       << d << " of the " << mf << " Firth fits (" << mc << " converged) ran on the device, "
                       << (mf - d) << " on the CPU (ER / fast-test pairs)" << std::endl;
         }
+        if (erDev) {
+            long d = 0, r = 0;
+            for (int t = 0; t < P; t++) { d += nDevEr[t]; r += nErRedo[t]; }
+            std::cout << "  device ER: " << gErPairs << " pairs in " << gEr << " s of kernel time ("
+                      << (gErPairs > 0 ? gEr / (double)gErPairs * 1e6 : 0.0) << " us/pair); "
+                      << d << " finished on the device, " << r
+                      << " asked for Firth without gpuFirth and were redone on the CPU scalar path" << std::endl;
+        }
         std::cout << "  AF_case/AF_ctrl: " << (a + b + g) << " pairs -- device counts "
                   << a << ", exact replay " << b << ", gather (no replay for the trait) " << g
                   << std::endl;
@@ -4825,6 +5079,7 @@ bool mainMarkerMTGpu(
     }
     std::cout << "  [gpu breakdown] read+QC+stage " << tRead << " s, device call "
               << tGpu << " s, tail+finalize " << tFin << " s, device SPA + post " << tSpa << " s, device Firth + post " << tFirth
+              << (erDev ? " s, device ER + post " + std::to_string(tEr) : std::string())
               << " s, output write " << tWrite << " s" << std::endl;
     std::cout << "  [gpu device time] H2D " << gH2D << " s, decode " << gDec
               << " s, GEMM " << gGemm << " s, popcount " << gPopc << " s, D2H " << gD2H << " s"
@@ -8154,6 +8409,9 @@ int main(int argc, char* argv[])
             std::cerr << "                     block-diagonal inverse; isFastTest=false traits become batchable." << std::endl;
             std::cerr << "                     Works with gpuOwnSampleSets (per-trait sample lists)." << std::endl;
             std::cerr << "  gpuSparseMaxPairs: cap on within-block sample pairs (default 5e7)." << std::endl;
+            std::cerr << "  gpuER:             true/false (default: false). With gpuBinary, the exact test" << std::endl;
+            std::cerr << "                     (ER) of binary pairs with MAC <= MACCutoffforER runs on the" << std::endl;
+            std::cerr << "                     device; same p-values bit for bit." << std::endl;
             std::cerr << "  outputFormat:      text (default) or sgs. sgs is the binary" << std::endl;
             std::cerr << "                     columnar format of sgs_format.hpp: the per-marker" << std::endl;
             std::cerr << "                     columns stored once instead of once per trait and" << std::endl;
@@ -8413,6 +8671,11 @@ int main(int argc, char* argv[])
         if (g_gpuSparse && !g_gpuBinary) {
             if (cfgSet("gpuSparse")) std::cout << "  gpuSparse: ignored, it needs gpuBinary: true" << std::endl;
             g_gpuSparse = false;
+        }
+        g_gpuER = config["gpuER"] ? config["gpuER"].as<bool>() : false;
+        if (g_gpuER && !g_gpuBinary) {
+            std::cout << "  gpuER: ignored, it needs gpuBinary: true" << std::endl;
+            g_gpuER = false;
         }
         if ((g_gpuBinary || g_gpuSpa) && !g_gpuStep2)
             std::cout << "  gpuBinary / gpuSpa: ignored, useGPU is false" << std::endl;

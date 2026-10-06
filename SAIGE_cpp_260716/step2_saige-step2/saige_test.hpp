@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "s2_block_solve.hpp"
 
@@ -23,6 +25,28 @@ extern std::atomic<std::uint64_t> g_firthFitCalls;
 
 
 namespace SAIGE{
+
+// gpuER (main.cpp mainMarkerMTGpu, gpu/gpu_er.hpp): when a PerMarkerCtx carries
+// one of these, the ER branch of getMarkerPval records its inputs here instead
+// of computing the exact p-value -- the carriers (positions in the trait's
+// vector, ascending, as iIndex holds them), their dosages and whether each is a
+// case (m_res > 0, what Get_Res_Arrays tests) -- and returns with t_pval empty.
+// The caller computes the p-value on the device and finishes the pair with
+// erFinish(). Only pairs the device reproduces exactly are recorded (1 <= k <=
+// ER::kDeviceMaxCarriers, no resout); the rest run the CPU ER as before.
+struct ErDeferOut {
+    bool hit = false;
+    std::vector<uint32_t>      idx;
+    std::vector<double>        g;
+    std::vector<unsigned char> isCase;
+};
+
+// The statements of getMarkerPval's ER branch that turn the exact p-value into
+// the output fields: the [0, 1] guard, the "%.6E" string, seBeta = |Beta| /
+// |qnorm(p / 2)| and Is.SPA = true when that quantile exists. t_qval_ER is what
+// the branch hands to Firth. t_isSPAConverge is only ever set to true here.
+void erFinish(double pval_ER, double t_Beta, std::string& t_pval, double& pval,
+              double& t_seBeta, bool& t_isSPAConverge, double& t_qval_ER);
 
 // Per-marker context (Phase A of step2 parallelism plan).
 // Holds the small set of per-marker scalars that were previously mutated on
@@ -42,6 +66,8 @@ struct PerMarkerCtx {
     // flagSparseGRM_cur is set, scoreTest uses it instead of solving Sigma for
     // this marker. NaN (the default) everywhere else, so no other caller moves.
     double presetVar2 = std::numeric_limits<double>::quiet_NaN();
+    // gpuER: non-null => the ER branch records into it (see ErDeferOut).
+    ErDeferOut* erDefer = nullptr;
 };
 
 // Fused-kernel mode + A/B validation accumulators (Pillar 1).
@@ -82,6 +108,9 @@ class SAIGEClass
       std::mt19937 m_rng_engine;
 
     public:
+      // gpuER: the device ER keeps a copy of mu (gpu/gpu_er.hpp)
+      const arma::vec& muRef() const { return m_mu; }
+      bool hasResout() const { return m_resout.n_elem > 0; }
       std::vector<uint32_t> m_condition_genoIndex;
            std::string m_traitType;
       arma::mat m_XXVX_inv;
