@@ -220,17 +220,20 @@ struct Reducer {
     std::vector<unsigned char*> hPacked;
     std::vector<double*>        hLut;
     double*        hLut2   = nullptr;  // squared table, filled in reduce()
-    void*          hC1     = nullptr;
-    void*          hC2     = nullptr;
-    uint32_t*      hCnt    = nullptr;
+    // pinned host results, one per device set
+    int            nDev    = 1;
+    int            lastDev = 0;       // the device set of the last reduce()
+    std::vector<void*>     hC1;
+    std::vector<void*>     hC2;
+    std::vector<uint32_t*> hCnt;
 
     // device
     void*          dB1  = nullptr;      // N x K1
     void*          dB2  = nullptr;      // N x K2
     void*          dC1  = nullptr;      // maxSlots x K1
     void*          dC2  = nullptr;      // maxSlots x K2
-    unsigned char* dPk  = nullptr;      // maxSlots x bpv, resident for the superblock
-    double*        dLut = nullptr;      // maxSlots x 4
+    std::vector<unsigned char*> dPk;    // per device set: maxSlots x bpv, resident for the superblock
+    std::vector<double*>        dLut;   // per device set: maxSlots x 4
     double*        dLut2 = nullptr;     // maxSlots x 4
     uint64_t*      dMask = nullptr;     // nMask x words
     uint32_t*      dMaskPop = nullptr;  // nMask
@@ -335,9 +338,17 @@ Reducer* create(const CreateArgs& a)
         if (cudaHostAlloc((void**)&r->hLut[s], nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
     }
     if (cudaHostAlloc((void**)&r->hLut2, nSlots * 4 * sizeof(double), cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (cudaHostAlloc(&r->hC1, nSlots * a.K1 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (a.K2 > 0 && cudaHostAlloc(&r->hC2, nSlots * a.K2 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
-    if (a.nMask > 0 && cudaHostAlloc((void**)&r->hCnt, nSlots * a.nMask * 4 * sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess) return fail();
+    r->nDev = a.deviceSets < 1 ? 1 : a.deviceSets;
+    r->hC1.assign((std::size_t)r->nDev, nullptr);
+    r->hC2.assign((std::size_t)r->nDev, nullptr);
+    r->hCnt.assign((std::size_t)r->nDev, nullptr);
+    r->dPk.assign((std::size_t)r->nDev, nullptr);
+    r->dLut.assign((std::size_t)r->nDev, nullptr);
+    for (int d = 0; d < r->nDev; ++d) {
+        if (cudaHostAlloc(&r->hC1[d], nSlots * a.K1 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
+        if (a.K2 > 0 && cudaHostAlloc(&r->hC2[d], nSlots * a.K2 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
+        if (a.nMask > 0 && cudaHostAlloc((void**)&r->hCnt[d], nSlots * a.nMask * 4 * sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess) return fail();
+    }
 
     std::size_t db = 0;
     auto dev = [&](void** p, std::size_t n) {
@@ -350,8 +361,10 @@ Reducer* create(const CreateArgs& a)
         if (!dev(&r->dB2, (std::size_t)a.N * a.K2 * r->esz)) return fail();
         if (!dev(&r->dC2, nSlots * a.K2 * r->esz)) return fail();
     }
-    if (!dev((void**)&r->dPk,   nSlots * r->bpv)) return fail();
-    if (!dev((void**)&r->dLut,  nSlots * 4 * sizeof(double))) return fail();
+    for (int d = 0; d < r->nDev; ++d) {
+        if (!dev((void**)&r->dPk[d],  nSlots * r->bpv)) return fail();
+        if (!dev((void**)&r->dLut[d], nSlots * 4 * sizeof(double))) return fail();
+    }
     if (!dev((void**)&r->dLut2, nSlots * 4 * sizeof(double))) return fail();
     for (int b = 0; b < 2; ++b)
         if (!dev(&r->dG[b], (std::size_t)r->slotsPerPass * a.N * r->esz)) return fail();
@@ -409,8 +422,8 @@ void destroy(Reducer* r)
     if (r->dB2) cudaFree(r->dB2);
     if (r->dC1) cudaFree(r->dC1);
     if (r->dC2) cudaFree(r->dC2);
-    if (r->dPk) cudaFree(r->dPk);
-    if (r->dLut) cudaFree(r->dLut);
+    for (unsigned char* p : r->dPk) if (p) cudaFree(p);
+    for (double* p : r->dLut) if (p) cudaFree(p);
     if (r->dLut2) cudaFree(r->dLut2);
     if (r->dMask) cudaFree(r->dMask);
     if (r->dMaskPop) cudaFree(r->dMaskPop);
@@ -418,9 +431,9 @@ void destroy(Reducer* r)
     for (unsigned char* p : r->hPacked) if (p) cudaFreeHost(p);
     for (double* p : r->hLut) if (p) cudaFreeHost(p);
     if (r->hLut2)   cudaFreeHost(r->hLut2);
-    if (r->hC1)     cudaFreeHost(r->hC1);
-    if (r->hC2)     cudaFreeHost(r->hC2);
-    if (r->hCnt)    cudaFreeHost(r->hCnt);
+    for (void* p : r->hC1) if (p) cudaFreeHost(p);
+    for (void* p : r->hC2) if (p) cudaFreeHost(p);
+    for (uint32_t* p : r->hCnt) if (p) cudaFreeHost(p);
     delete r;
 }
 
@@ -429,16 +442,33 @@ double*         lut(Reducer* r, int s)         { return (r && s >= 0 && s < r->n
 std::size_t     bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
 int             stagingSets(const Reducer* r)  { return r ? r->nSets : 0; }
 bool            isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
-const float*    outCf(const Reducer* r)        { return (r && !r->fp64) ? (const float*)r->hC1 : nullptr; }
-const double*   outCd(const Reducer* r)        { return (r &&  r->fp64) ? (const double*)r->hC1 : nullptr; }
-const float*    outC2f(const Reducer* r)       { return (r && !r->fp64 && r->K2 > 0) ? (const float*)r->hC2 : nullptr; }
-const double*   outC2d(const Reducer* r)       { return (r &&  r->fp64 && r->K2 > 0) ? (const double*)r->hC2 : nullptr; }
+namespace {
+// -1 = the set of the last reduce(); out of range -> -1 (callers get nullptr)
+inline int devSetOf(const Reducer* r, int d) {
+    if (d < 0) return r->lastDev;
+    return d < r->nDev ? d : -1;
+}
+}  // namespace
+const float*    outCf(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->fp64) ? (const float*)r->hC1[k] : nullptr; }
+const double*   outCd(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->fp64) ? (const double*)r->hC1[k] : nullptr; }
+const float*    outC2f(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->fp64 && r->K2 > 0) ? (const float*)r->hC2[k] : nullptr; }
+const double*   outC2d(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->fp64 && r->K2 > 0) ? (const double*)r->hC2[k] : nullptr; }
 std::size_t     ldC(const Reducer* r)          { return r ? (std::size_t)r->maxSlots : 0; }
-const uint32_t* outCounts(const Reducer* r)    { return (r && r->nMask > 0) ? r->hCnt : nullptr; }
+const uint32_t* outCounts(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && r->nMask > 0) ? r->hCnt[k] : nullptr; }
 std::size_t     deviceBytes(const Reducer* r)  { return r ? r->devBytes : 0; }
-const void*     devicePacked(const Reducer* r) { return r ? r->dPk : nullptr; }
-const void*     deviceLut(const Reducer* r)    { return r ? r->dLut : nullptr; }
+const void*     devicePacked(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return k >= 0 ? (const void*)r->dPk[k] : nullptr; }
+const void*     deviceLut(const Reducer* r, int d)    { const int k = r ? devSetOf(r, d) : -1; return k >= 0 ? (const void*)r->dLut[k] : nullptr; }
 void*           deviceStream(const Reducer* r) { return r ? (void*)r->st[0] : nullptr; }
+int             deviceSets(const Reducer* r)   { return r ? r->nDev : 0; }
+
+bool bindDevice(int t_device) { return cudaSetDevice(t_device) == cudaSuccess; }
+
+std::string setBlockingSync(int t_device)
+{
+    cudaError_t e = cudaSetDevice(t_device);
+    if (e == cudaSuccess) e = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    return e == cudaSuccess ? std::string() : std::string(cudaGetErrorString(e));
+}
 
 void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d2h, double* popc)
 {
@@ -450,14 +480,22 @@ void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d
     if (popc) *popc = r->tPopc;
 }
 
-bool reduce(Reducer* r, int t_nSlots, int t_set)
+bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
 {
     if (!r) return false;
     if (t_nSlots <= 0) return true;
     if (t_nSlots > r->maxSlots) { lastErr = "nSlots > maxSlots"; return false; }
     if (t_set < 0 || t_set >= r->nSets) { lastErr = "staging set out of range"; return false; }
+    if (t_devSet < 0) t_devSet = 0;
+    if (t_devSet >= r->nDev) { lastErr = "device set out of range"; return false; }
     const unsigned char* hPk = r->hPacked[(std::size_t)t_set];
     const double*        hLu = r->hLut[(std::size_t)t_set];
+    unsigned char* const dPk  = r->dPk[(std::size_t)t_devSet];
+    double* const        dLut = r->dLut[(std::size_t)t_devSet];
+    void* const          hC1  = r->hC1[(std::size_t)t_devSet];
+    void* const          hC2  = r->hC2[(std::size_t)t_devSet];
+    uint32_t* const      hCnt = r->hCnt[(std::size_t)t_devSet];
+    r->lastDev = t_devSet;
 
     const float  onef = 1.f, zerof = 0.f;
     const double oned = 1.0, zerod = 0.0;
@@ -474,8 +512,8 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
     cudaEvent_t a0 = nullptr, a1 = nullptr;
     const bool timed = (cudaEventCreate(&a0) == cudaSuccess) && (cudaEventCreate(&a1) == cudaSuccess);
     if (timed) cudaEventRecord(a0, r->st[0]);
-    CKR(cudaMemcpyAsync(r->dPk, hPk, nS * r->bpv, cudaMemcpyHostToDevice, r->st[0]));
-    CKR(cudaMemcpyAsync(r->dLut, hLu, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaMemcpyAsync(dPk, hPk, nS * r->bpv, cudaMemcpyHostToDevice, r->st[0]));
+    CKR(cudaMemcpyAsync(dLut, hLu, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
     if (r->K2 > 0)
         CKR(cudaMemcpyAsync(r->dLut2, r->hLut2, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
     CKR(cudaEventRecord(r->evUp, r->st[0]));
@@ -487,11 +525,11 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
     if (r->nMask > 0) {
         CKR(cudaStreamWaitEvent(r->st[1], r->evUp, 0));
         if (timed) { cudaEventCreate(&p0); cudaEventCreate(&p1); cudaEventRecord(p0, r->st[1]); }
-        count_codes<<<t_nSlots, 256, 0, r->st[1]>>>(r->dPk, r->bpv, r->words, r->dMask,
+        count_codes<<<t_nSlots, 256, 0, r->st[1]>>>(dPk, r->bpv, r->words, r->dMask,
                                                     r->dMaskPop, r->nMask, r->dCnt);
         CKR(cudaGetLastError());
         if (timed) cudaEventRecord(p1, r->st[1]);
-        CKR(cudaMemcpyAsync(r->hCnt, r->dCnt, nS * r->nMask * 4 * sizeof(uint32_t),
+        CKR(cudaMemcpyAsync(hCnt, r->dCnt, nS * r->nMask * 4 * sizeof(uint32_t),
                             cudaMemcpyDeviceToHost, r->st[1]));
     }
 
@@ -507,8 +545,8 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
         harvest(r, b);
         CKR(cudaStreamWaitEvent(s, r->evUp, 0));
 
-        const unsigned char* pk = r->dPk + (std::size_t)s0 * r->bpv;
-        const double* lu  = r->dLut  + (std::size_t)s0 * 4;
+        const unsigned char* pk = dPk + (std::size_t)s0 * r->bpv;
+        const double* lu  = dLut  + (std::size_t)s0 * 4;
         const double* lu2 = r->dLut2 + (std::size_t)s0 * 4;
 
         CKR(cudaEventRecord(r->ev[b][0], s));
@@ -582,12 +620,12 @@ bool reduce(Reducer* r, int t_nSlots, int t_set)
     const bool timed2 = timed && (cudaEventCreate(&z0) == cudaSuccess) && (cudaEventCreate(&z1) == cudaSuccess);
     if (timed2) cudaEventRecord(z0, r->st[0]);
     // Only the first t_nSlots rows of each of the K columns are live.
-    CKR(cudaMemcpy2DAsync(r->hC1, (std::size_t)r->maxSlots * r->esz,
+    CKR(cudaMemcpy2DAsync(hC1, (std::size_t)r->maxSlots * r->esz,
                           r->dC1, (std::size_t)r->maxSlots * r->esz,
                           nS * r->esz, (std::size_t)r->K1,
                           cudaMemcpyDeviceToHost, r->st[0]));
     if (r->K2 > 0)
-        CKR(cudaMemcpy2DAsync(r->hC2, (std::size_t)r->maxSlots * r->esz,
+        CKR(cudaMemcpy2DAsync(hC2, (std::size_t)r->maxSlots * r->esz,
                               r->dC2, (std::size_t)r->maxSlots * r->esz,
                               nS * r->esz, (std::size_t)r->K2,
                               cudaMemcpyDeviceToHost, r->st[0]));

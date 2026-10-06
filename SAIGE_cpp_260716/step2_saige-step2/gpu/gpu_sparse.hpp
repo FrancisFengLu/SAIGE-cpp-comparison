@@ -51,6 +51,9 @@ struct SpQuadCreateArgs {
     const int* pj = nullptr;         // nPairs sample indices
     const double* w = nullptr;       // nTraits x nPairs, trait-major: w[t*nPairs + k]
     int maxSlots = 0;                // per spqRun() call
+    // Pinned result sets (gpuOverlap): spqRun(..., t_set) writes set t_set and
+    // reads the reducer's device set t_set. 1 = the original single buffer.
+    int outSets = 1;
 };
 
 // nullptr on any failure; the caller then keeps the sparse variance on the CPU.
@@ -60,7 +63,7 @@ void    spqDestroy(SpQuad* t_q);
 // out[slot * nTraits + t] = sum_k w[t][k] g_slot[pi[k]] g_slot[pj[k]] for slots
 // [0, t_nSlots) of the reducer's last reduce(). Synchronous; the result is in
 // pinned host memory (spqOut) until the next call. false on a CUDA error.
-bool          spqRun(SpQuad* t_q, const Reducer* t_r, int t_nSlots);
+bool          spqRun(SpQuad* t_q, const Reducer* t_r, int t_nSlots, int t_set = -1);
 
 // Different sample lists (gpuOwnSampleSets): the same sums on each trait's OWN
 // genotype vector, g_t[i] = t_lut[(slot * nTraits + t) * 4 + code_i] -- the
@@ -68,8 +71,9 @@ bool          spqRun(SpQuad* t_q, const Reducer* t_r, int t_nSlots);
 // over union indices and a trait's weights are zero on pairs outside its
 // samples, so samples outside the trait contribute nothing. t_lut is host
 // memory, nSlots x nTraits x 4, copied in by the call.
-bool          spqRunOwn(SpQuad* t_q, const Reducer* t_r, int t_nSlots, const double* t_lut);
-const double* spqOut(const SpQuad* t_q);
+bool          spqRunOwn(SpQuad* t_q, const Reducer* t_r, int t_nSlots, const double* t_lut, int t_set = -1);
+// t_set -1 = the set of the last call.
+const double* spqOut(const SpQuad* t_q, int t_set = -1);
 
 // Cumulative device seconds in the kernel, and slots processed.
 void        spqTimings(const SpQuad* t_q, double* t_kernel, long long* t_slots);

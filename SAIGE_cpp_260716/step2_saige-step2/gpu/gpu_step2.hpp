@@ -120,6 +120,15 @@ struct CreateArgs {
     // removes the read-modify-write that half-written sectors cost on ECC'd
     // HBM2 (S2_KERNEL_ROOFLINE.md).
     bool decodeX2 = false;
+    // Device sets: resident packed rows + tables on the device, and pinned
+    // host result buffers (C1, C2, counts), each maxSlots wide. 1 is the
+    // original single set. More than one lets the caller keep superblock k's
+    // device rows (for the device SPA / Firth) and host results (for the host
+    // tail) alive while reduce() of a later superblock runs into another set
+    // (config key gpuOverlap, S2_OVERLAP.md). The GEMM operands, the decode
+    // buffers, the launch shapes and the cuBLAS calls are the same whichever
+    // set is used, so the numbers are too.
+    int deviceSets = 1;
 };
 
 // Returns nullptr on ANY failure (no device, allocation refused, ...). The
@@ -156,23 +165,27 @@ int            stagingSets(const Reducer* t_r);
 // error, in which case the results are undefined and the caller must fall
 // back for this batch. Synchronous: on return the host result buffers are
 // filled and staging set t_set is no longer read by the device.
-bool reduce(Reducer* t_r, int t_nSlots, int t_set = 0);
+// t_devSet: the device set (0 .. deviceSets-1) the rows are uploaded into and
+// the results come back into; -1 = 0. Only one thread may call reduce() at a
+// time; the accessors below may be read from another thread for a set no
+// reduce() in flight is writing.
+bool reduce(Reducer* t_r, int t_nSlots, int t_set = 0, int t_devSet = -1);
 
 // Results of the last reduce(): C1 is t_maxSlots x K1 column-major, so element
 // (slot, k) sits at index (std::size_t)k * ldC() + slot; C2 likewise with K2
 // columns. Pinned, owned here. Exactly one of each pair of accessors is
 // non-null, per isFp64().
 bool          isFp64(const Reducer* t_r);
-const float*  outCf(const Reducer* t_r);
-const double* outCd(const Reducer* t_r);
-const float*  outC2f(const Reducer* t_r);
-const double* outC2d(const Reducer* t_r);
+const float*  outCf(const Reducer* t_r, int t_devSet = -1);
+const double* outCd(const Reducer* t_r, int t_devSet = -1);
+const float*  outC2f(const Reducer* t_r, int t_devSet = -1);
+const double* outC2d(const Reducer* t_r, int t_devSet = -1);
 std::size_t   ldC(const Reducer* t_r);         // == maxSlots
 // Code counts of the last reduce(): for slot s and mask m, the four values at
 // outCounts()[((std::size_t)s * nMask + m) * 4 + c] are the number of masked
 // samples whose 2-bit code is c (c indexes PLINK codes 0..3, so c = 1 is the
 // missing call). nullptr when nMask was 0.
-const uint32_t* outCounts(const Reducer* t_r);
+const uint32_t* outCounts(const Reducer* t_r, int t_devSet = -1);
 
 // Cumulative device-side timings in seconds since create(), for the end-to-end
 // breakdown. Measured with events on the compute stream, so they are the GPU's
@@ -186,9 +199,19 @@ std::size_t deviceBytes(const Reducer* t_r);
 // For gpu_spa.hpp: the device address of the resident packed rows and tables
 // of the last reduce() (row stride bytesPerSlot()), and the stream they were
 // written on. Opaque pointers; only the SPA module dereferences them.
-const void* devicePacked(const Reducer* t_r);
-const void* deviceLut(const Reducer* t_r);
+// t_devSet -1 = the set of the last reduce().
+const void* devicePacked(const Reducer* t_r, int t_devSet = -1);
+const void* deviceLut(const Reducer* t_r, int t_devSet = -1);
 void*       deviceStream(const Reducer* t_r);
+int         deviceSets(const Reducer* t_r);
+
+// cudaSetDevice for a host thread other than the one that called create()
+// (the gpuOverlap workers). false without CUDA or on error.
+bool bindDevice(int t_device);
+// Ask the driver to block, not spin, a host thread waiting on the device
+// (cudaDeviceScheduleBlockingSync), so the gpuOverlap workers' waits leave
+// their cores to the host tail. Returns the CUDA status as text ("" = ok).
+std::string setBlockingSync(int t_device);
 
 }  // namespace gpu2
 }  // namespace saige

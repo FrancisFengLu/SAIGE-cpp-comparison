@@ -10,7 +10,7 @@ Spa*        spaCreate(const SpaCreateArgs&)              { return nullptr; }
 void        spaDestroy(Spa*)                             {}
 SpaPairIn*  spaIn(Spa*)                                  { return nullptr; }
 SpaPairOut* spaOut(Spa*)                                 { return nullptr; }
-bool        spaRun(Spa*, const Reducer*, int)            { return false; }
+bool        spaRun(Spa*, const Reducer*, int, int)            { return false; }
 void        spaTimings(const Spa*, double*, long long*)  {}
 std::size_t spaDeviceBytes(const Spa*)                   { return 0; }
 
