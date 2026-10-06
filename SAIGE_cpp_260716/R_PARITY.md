@@ -198,11 +198,14 @@ Now a mode-dependent `m_genoCode[4]` lookup set once in the header reader. The
 unsupported-mode message also fed a *decimal* `std::to_string` into an `0x`
 prefix, so a mode 0x10 file was reported as "0x16"; fixed.
 
-**Remaining capability gap (not fixed):** `plink2 --make-pgen` writes mode 0x10,
-which this reader refuses outright while R reads it through real pgenlib.
-Refusing is the honest behaviour and is left as is — supporting it needs
-pgenlib. In practice the C++ pgen path is usable only for `.bed`-equivalent
-files today.
+**Remaining capability gap (closed 2026-10-06):** `plink2 --make-pgen` writes mode 0x10,
+which this reader used to refuse outright while R reads it through real pgenlib.
+Since S2_GPU_PGEN the reader links pgenlib (`third_party/pgenlib`, `pgen_lib.cpp`)
+and decodes every mode other than 0x01 / 0x02 the way R's `PGEN.cpp` does
+(`PgrGet1D` allele 1 + `Dosage16ToDoubles`, dosages included); modes 0x01 / 0x02
+keep the standalone decode above. Hard-call files are byte-identical to the
+`.bed` they were made from on bingpu_test and g200k; dosage files against R are
+not compared yet.
 
 ### A7 · Conditional SPA read uninitialised variables (R's defect, inherited)
 

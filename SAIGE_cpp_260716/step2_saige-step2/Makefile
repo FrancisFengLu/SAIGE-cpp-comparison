@@ -169,7 +169,17 @@ MAKEFLAGS += --no-builtin-rules
 
 SOURCES := $(wildcard *.cpp)
 OBJECTS := $(SOURCES:.cpp=.o)
-DEPS    := $(OBJECTS:.o=.d)
+
+# pgenlib (plink-ng, LGPL v3; third_party/pgenlib/SOURCE.txt): the read side
+# only, used by pgen_lib.cpp for .pgen modes 0x10 / 0x11 (LD-compressed,
+# dosages) and for the packed hard-call rows of the GPU / popcount paths
+# (S2_GPU_PGEN). Built with its own flags: none of the armadillo / OpenMP
+# defines apply to it.
+PGENLIB_SRC      := $(wildcard third_party/pgenlib/*.cc)
+PGENLIB_OBJ      := $(PGENLIB_SRC:.cc=.o)
+PGENLIB_CXXFLAGS := -std=c++17 -O2 -march=native -DNDEBUG -MMD -MP
+
+DEPS    := $(OBJECTS:.o=.d) $(PGENLIB_OBJ:.o=.d)
 
 TARGET  ?= saige-step2
 
@@ -199,18 +209,21 @@ tools/out_fieldcmp: tools/out_fieldcmp.cpp
 # The device saddlepoint kernel against the production CPU SPA, pair by pair
 # (USE_CUDA=1 only; links every step-2 object but main.o plus the CUDA objects).
 #   make USE_CUDA=1 SM=70 tools/spa_gpu_check
-tools/spa_gpu_check: tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(GPU_OBJ)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(GPU_OBJ) $(LIBS) -o $@
+tools/spa_gpu_check: tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -o $@
 
 # Accuracy + cost of score_vec.hpp's chi-square(1) tail against boost's.
 tools/mtvec_tail_accuracy: tools/mtvec_tail_accuracy.cpp score_vec.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/mtvec_tail_accuracy.cpp $(filter -lmvec,$(LIBS)) -o $@
 
-$(TARGET): $(OBJECTS) $(GPU_OBJ)
-	$(CXX) $(CXXFLAGS) $(OBJECTS) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
+$(TARGET): $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -fopenmp -pthread -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+third_party/pgenlib/%.o: third_party/pgenlib/%.cc
+	$(CXX) $(PGENLIB_CXXFLAGS) -c $< -o $@
 
 gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
@@ -251,7 +264,7 @@ gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 clean:
-	rm -f $(OBJECTS) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
+	rm -f $(OBJECTS) $(PGENLIB_OBJ) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
 	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check
 
 test_region: $(TARGET)

@@ -19,6 +19,9 @@
 #include <atomic>
 #include <map>
 #include <queue>
+#include <functional>
+
+#include "pgen_lib.hpp"
 
 // Forward-declare htslib types to avoid including htslib headers in the header
 struct htsFile;
@@ -78,6 +81,15 @@ private:
     // pipeline: OneMarkerG4 --> bufferG4 --> bufferG1 --> OneMarkerG1
     std::vector<unsigned char> m_OneMarkerG4;
 
+    // S2_GPU_PGEN: a packed view of a hard-call .pgen (makePgenPackedView).
+    // When set, the fused Stage A takes the marker's row from here instead of
+    // fread()ing the .bed: (m_N0+3)/4 bytes of PLINK-1 codes, all file
+    // samples, ALT = A1 -- exactly the row `plink2 --make-bed` would write.
+    // Everything downstream of Stage A (counts, packed copies, Stage C) only
+    // ever sees that row, so it is unchanged. Only the fused (_ts Stage A/B/C
+    // and copy*) functions are valid on a view; the legacy readers are not.
+    std::function<bool(uint64_t, unsigned char*)> m_rowSource;
+
     void readBimFile();
     void readFamFile();
 
@@ -92,6 +104,20 @@ public:
                std::string t_famFile,
                std::string t_bedFile,
                std::string t_AlleleOrder);
+
+    // A packed view over another genotype source (S2_GPU_PGEN): variant
+    // metadata and sample IIDs as given, alt-first (t_alt is A1, the counted
+    // allele), rows from t_rowSource (see m_rowSource). Call
+    // setPosSampleInPlink() afterwards, as for a .bed.
+    PlinkClass(const std::string& t_label,
+               const std::vector<std::string>& t_chr,
+               const std::vector<std::string>& t_id,
+               const std::vector<uint32_t>& t_pd,
+               const std::vector<std::string>& t_ref,
+               const std::vector<std::string>& t_alt,
+               const std::vector<std::string>& t_sampleIID,
+               std::function<bool(uint64_t, unsigned char*)> t_rowSource);
+    bool isView() const { return (bool)m_rowSource; }
 
     // setup PlinkClass
     void setPlinkobj(std::string t_bimFile,
@@ -816,14 +842,16 @@ private:
 
 
 // ============================================================
-// PGEN namespace: PGEN v2 reader (mode 0x02 basic variant-major)
-// Standalone implementation that reads .pgen + .pvar + .psam files
-// Ported from SAIGE/src/PGEN.hpp and PGEN.cpp without pgenlib dependency
+// PGEN namespace: PGEN reader (.pgen + .pvar + .psam)
+// Ported from SAIGE/src/PGEN.hpp and PGEN.cpp.
 //
-// Supports mode 0x02 (basic variant-major, hard-calls only):
-//   00 = hom ref, 01 = het, 10 = hom alt, 11 = missing
-// This is the most common output of `plink2 --make-pgen` for hard-call data.
-// For dosage data (mode 0x03/0x04/0x10/0x11), the full pgenlib would be needed.
+// Modes 0x01 (the .bed layout) and 0x02 (fixed-width, `--make-pgen
+// format=2`) are decoded by the standalone code below. Every other mode --
+// in particular 0x10, what plain `plink2 --make-pgen` writes (variable-width
+// records, LD-compressed difflists, optional dosages) -- goes through pgenlib
+// (third_party/pgenlib via pgen_lib.hpp), the library upstream SAIGE reads
+// it with. pgenlib also produces the packed hard-call rows of the GPU path and
+// the popcount path (S2_GPU_PGEN, readBedRow_ts / makePgenPackedView).
 // ============================================================
 namespace PGEN {
 
@@ -881,6 +909,29 @@ private:
     // error.  Set once in readPgenHeader().
     static const uint8_t PGEN_MISSING = 3;
     uint8_t m_genoCode[4] = {0, 1, 2, PGEN_MISSING};
+
+    // pgenlib (third_party/pgenlib, pgen_lib.hpp). Opened for every mode:
+    //   - modes other than 0x01 / 0x02 (what `plink2 --make-pgen` writes:
+    //     0x10, variable-width records, LD-compressed difflists, optional
+    //     dosages) are decoded ONLY through it: m_cpuViaPgenlib, and
+    //     getOneMarker / getOneMarker_ts read the ALT dosage exactly as
+    //     upstream SAIGE's PGEN.cpp does (PgrGet1D + Dosage16ToDoubles);
+    //   - modes 0x01 / 0x02 keep the fixed-width decode above for the CPU
+    //     dosage path; pgenlib only serves the packed rows.
+    // m_pl == nullptr if pgenlib could not open a 0x01 / 0x02 file (then there
+    // are no packed rows and m_plWhy says why).
+    pgenlib_glue::File* m_pl = nullptr;
+    pgenlib_glue::FileFacts m_plFacts;
+    bool m_cpuViaPgenlib = false;
+    std::string m_plWhy;
+    uint64_t m_instanceId = 0;          // keys the per-thread pgenlib readers
+    std::atomic<uint64_t> m_rowNs{0}, m_rowCt{0};
+    pgenlib_glue::Reader* tlsReader();   // this thread's reader on m_pl
+    void decodeViaPgenlib(uint64_t t_gIndex, double& t_altFreq, double& t_altCounts,
+                          double& t_missingRate, double& t_imputeInfo,
+                          bool t_isOutputIndexForMissing, std::vector<uint>& t_indexForMissing,
+                          bool t_isOnlyOutputNonZero, std::vector<uint>& t_indexForNonZero,
+                          arma::vec& OneMarkerG1);
 
     // Internal parsers
     void readPvarFile();
@@ -994,6 +1045,27 @@ public:
     uint32_t getM()  { return m_M; }
 
     std::vector<std::string> getChrVec() { return m_chr; }
+
+    // ---- packed hard-call rows (S2_GPU_PGEN) ----
+    // True iff every record is a biallelic hard call (no dosage, no
+    // multiallelic variant), so a 2-bit row holds all of it; otherwise
+    // notHardCallReason() says what is in the way.
+    bool hardCallOnly() const;
+    std::string notHardCallReason() const;
+    const pgenlib_glue::FileFacts& facts() const { return m_plFacts; }
+    // Variant t_gIndex's hard calls for all .psam samples as a PLINK-1 row
+    // with ALT = A1 (pgen_lib.hpp readBedRow). Thread-safe (per-thread
+    // pgenlib reader). Requires hardCallOnly(). Times itself (rowDecode*).
+    bool readBedRow_ts(uint64_t t_gIndex, unsigned char* t_out);
+    double   rowDecodeSeconds() const { return 1e-9 * (double)m_rowNs.load(); }
+    uint64_t rowsDecoded() const { return m_rowCt.load(); }
+    const std::vector<std::string>& sampleIIDs() const { return m_SampleInPgen; }
+    const std::vector<std::string>& chrs() const { return m_chr; }
+    const std::vector<std::string>& ids() const { return m_variantId; }
+    const std::vector<uint32_t>& positions() const { return m_position; }
+    const std::vector<std::string>& refs() const { return m_ref; }
+    const std::vector<std::string>& alts() const { return m_alt; }
+    uint8_t mode() const { return m_mode; }
 
     // Build a map from "chr:pos:ref:alt" (and "chr:pos:alt:ref") to marker index
     std::unordered_map<std::string, uint32_t> getMarkerIDToIndex() {
@@ -1117,6 +1189,13 @@ void setBGENobjInCPP(const std::string& t_bgenFileName,
                       const std::vector<std::string>& t_SampleInBgen,
                       std::vector<std::string>& t_SampleInModel,
                       const std::string& t_AlleleOrder);
+
+// S2_GPU_PGEN: a PLINK::PlinkClass whose fused Stage A reads t_pg's hard
+// calls (PgenClass::readBedRow_ts) instead of a .bed, over the samples in
+// t_SampleInModel (as setPosSampleInPlink). nullptr if !t_pg->hardCallOnly().
+// The caller owns the object; t_pg must outlive it.
+PLINK::PlinkClass* makePgenPackedView(PGEN::PgenClass* t_pg,
+                                      std::vector<std::string>& t_SampleInModel);
 
 // Helper: set up PGEN object (mirrors SAIGE Main.cpp::setPGENobjInCPP)
 void setPGENobjInCPP(const std::string& t_pgenFile,

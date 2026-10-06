@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <filesystem>
 #include <iomanip>
+#include <chrono>
 
 // htslib headers for VCF reading
 #include <htslib/hts.h>
@@ -99,6 +100,33 @@ PlinkClass::PlinkClass(std::string t_bimFile,
 {
     setPlinkobj(t_bimFile, t_famFile, t_bedFile);
     m_AlleleOrder = t_AlleleOrder;
+}
+
+// S2_GPU_PGEN packed view (see the header). No file is opened: m_fin stays
+// null and Stage A takes its rows from t_rowSource.
+PlinkClass::PlinkClass(const std::string& t_label,
+                       const std::vector<std::string>& t_chr,
+                       const std::vector<std::string>& t_id,
+                       const std::vector<uint32_t>& t_pd,
+                       const std::vector<std::string>& t_ref,
+                       const std::vector<std::string>& t_alt,
+                       const std::vector<std::string>& t_sampleIID,
+                       std::function<bool(uint64_t, unsigned char*)> t_rowSource)
+{
+    m_AlleleOrder = "alt-first";
+    m_bedFile = t_label;
+    m_fin = nullptr;
+    m_chr = t_chr;
+    m_MarkerInPlink = t_id;
+    m_pd = t_pd;
+    m_gd.assign(t_chr.size(), 0.0f);
+    m_ref = t_ref;
+    m_alt = t_alt;
+    m_M0 = m_M = (uint32_t)t_chr.size();
+    m_SampleInPlink = t_sampleIID;
+    m_N0 = m_N = (uint32_t)t_sampleIID.size();
+    m_numBytesofEachMarker0 = m_numBytesofEachMarker = (m_N0 + 3) / 4;
+    m_rowSource = std::move(t_rowSource);
 }
 
 // ============================================================
@@ -540,24 +568,30 @@ namespace {
 bool PlinkClass::getOneMarkerFusedStats_ts(uint64_t t_gIndex,
                                            FusedMarkerStats& fs)
 {
-    if (tlsFusedFin == nullptr) {
-        tlsFusedFin = fopen(m_bedFile.c_str(), "rb");
-        if (!tlsFusedFin) {
-            throw std::runtime_error(
-                "PlinkClass::getOneMarkerFusedStats_ts: cannot open .bed file: "
-                + m_bedFile);
-        }
-    }
     if (tlsFusedBuf.size() < m_numBytesofEachMarker0) {
         tlsFusedBuf.resize(m_numBytesofEachMarker0);
     }
     tlsFusedValid = false;
 
-    uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
-    fseek(tlsFusedFin, posSeek, SEEK_SET);
-    if (fread((char*)tlsFusedBuf.data(), 1, m_numBytesofEachMarker0, tlsFusedFin)
-        != m_numBytesofEachMarker0) {
-        return false;
+    if (m_rowSource) {
+        // packed view (S2_GPU_PGEN): the row comes decoded, in .bed codes
+        if (t_gIndex >= m_M0) return false;
+        if (!m_rowSource(t_gIndex, tlsFusedBuf.data())) return false;
+    } else {
+        if (tlsFusedFin == nullptr) {
+            tlsFusedFin = fopen(m_bedFile.c_str(), "rb");
+            if (!tlsFusedFin) {
+                throw std::runtime_error(
+                    "PlinkClass::getOneMarkerFusedStats_ts: cannot open .bed file: "
+                    + m_bedFile);
+            }
+        }
+        uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
+        fseek(tlsFusedFin, posSeek, SEEK_SET);
+        if (fread((char*)tlsFusedBuf.data(), 1, m_numBytesofEachMarker0, tlsFusedFin)
+            != m_numBytesofEachMarker0) {
+            return false;
+        }
     }
 
     fs = FusedMarkerStats();
@@ -2705,6 +2739,9 @@ PgenClass::PgenClass(const std::string& t_pgenFile,
     std::cout << "psamFile: " << t_psamFile << std::endl;
     std::cout << "pvarFile: " << t_pvarFile << std::endl;
 
+    static std::atomic<uint64_t> s_nextInstance{1};
+    m_instanceId = s_nextInstance.fetch_add(1);
+
     readPvarFile();
     readPsamFile();
     readPgenHeader();
@@ -2811,14 +2848,48 @@ void PgenClass::readPgenHeader()
         std::cout << "  Header control:     0x" << std::hex << (int)headerCtrl << std::dec << std::endl;
         std::cout << "  Data offset:        " << m_dataOffset << std::endl;
     } else {
+        // Every other mode (0x10 / 0x11: variable-width records, LD
+        // compression, dosages, multiallelic variants) is pgenlib's; it is
+        // opened below and the counts come from its header.
+        m_cpuViaPgenlib = true;
+        m_dataOffset = 0;
+    }
+
+    // ---- pgenlib: every mode (see the header) ----
+    {
+        std::string err;
+        const uint32_t psamN = (uint32_t)m_SampleInPgen.size();
+        m_pl = pgenlib_glue::openFile(m_pgenFile, psamN, m_M, m_plFacts, err);
         char modeHex[8];
         snprintf(modeHex, sizeof(modeHex), "0x%02x", (unsigned)m_mode);
-        throw std::runtime_error(
-            std::string("Unsupported PGEN mode ") + modeHex +
-            ". This standalone reader only supports mode 0x01 (PLINK 1) and 0x02 (basic variant-major). "
-            "For mode 0x10/0x11 (variable-type records with LD compression or dosage), "
-            "the full pgenlib library would be required.");
+        if (m_pl != nullptr &&
+            (m_plFacts.rawSampleCt != psamN || m_plFacts.rawVariantCt != m_M)) {
+            err = "the .pgen header has " + std::to_string(m_plFacts.rawVariantCt) + " variants x " +
+                  std::to_string(m_plFacts.rawSampleCt) + " samples, the .pvar / .psam " +
+                  std::to_string(m_M) + " x " + std::to_string(psamN);
+            pgenlib_glue::closeFile(m_pl);
+            m_pl = nullptr;
+        }
+        if (m_pl == nullptr) {
+            if (m_cpuViaPgenlib)
+                throw std::runtime_error(std::string("Cannot read PGEN mode ") + modeHex +
+                                         " file " + m_pgenFile + " with pgenlib: " + err);
+            m_plWhy = "pgenlib could not open it: " + err;
+            std::cout << "  pgenlib: " << m_plWhy << " (no packed rows; the CPU decode is unaffected)" << std::endl;
+        } else {
+            if (m_cpuViaPgenlib) {
+                m_M0 = m_plFacts.rawVariantCt;
+                m_N0 = m_plFacts.rawSampleCt;
+            }
+            std::cout << "PGEN mode " << modeHex << (m_cpuViaPgenlib ? " (pgenlib)" : "") << std::endl;
+            std::cout << "  Variants: " << m_plFacts.rawVariantCt << ", samples: " << m_plFacts.rawSampleCt
+                      << "; LD compression " << (m_plFacts.ldCompression ? "yes" : "no")
+                      << ", dosages " << (m_plFacts.dosage ? "yes" : "no")
+                      << ", multiallelic " << (m_plFacts.multiallelic ? "yes" : "no")
+                      << ", hard-call phase " << (m_plFacts.hardcallPhase ? "yes" : "no") << std::endl;
+        }
     }
+    if (m_cpuViaPgenlib) return;   // no fixed-width record layout to set up
 
     // Validate consistency with .pvar
     if (m_M0 != m_M) {
@@ -3103,6 +3174,13 @@ void PgenClass::getOneMarker(
     t_alt = m_alt[t_gIndex];
     t_marker = m_variantId[t_gIndex];
 
+    if (m_cpuViaPgenlib) {
+        decodeViaPgenlib(t_gIndex, t_altFreq, t_altCounts, t_missingRate, t_imputeInfo,
+                         t_isOutputIndexForMissing, t_indexForMissing,
+                         t_isOnlyOutputNonZero, t_indexForNonZero, OneMarkerG1);
+        return;
+    }
+
     // Seek to the variant record in .pgen
     uint64_t filePos = m_dataOffset + m_bytesPerVariant * t_gIndex;
     fseek(m_fin, filePos, SEEK_SET);
@@ -3175,6 +3253,112 @@ void PgenClass::closegenofile()
         fclose(m_fin);
         m_fin = nullptr;
     }
+    if (m_pl) {
+        pgenlib_glue::closeFile(m_pl);
+        m_pl = nullptr;
+    }
+}
+
+// ============================================================
+// pgenlib-backed decode (modes other than 0x01 / 0x02) and packed rows
+// ============================================================
+namespace {
+// One pgenlib reader per thread, for the PgenClass instance `owner`; replaced
+// when another instance asks. Freed at thread exit (it needs nothing from the
+// pgenlib File, which may be closed first).
+struct PgenTls {
+    uint64_t owner = 0;
+    pgenlib_glue::Reader* r = nullptr;
+    std::vector<double> dbuf;
+    ~PgenTls() { pgenlib_glue::freeReader(r); }
+};
+thread_local PgenTls tlsPgen;
+}
+
+pgenlib_glue::Reader* PgenClass::tlsReader()
+{
+    if (tlsPgen.owner != m_instanceId || tlsPgen.r == nullptr) {
+        pgenlib_glue::freeReader(tlsPgen.r);
+        tlsPgen.r = nullptr;
+        tlsPgen.owner = 0;
+        if (m_pl == nullptr)
+            throw std::runtime_error("PgenClass: pgenlib is not open on " + m_pgenFile +
+                                     (m_plWhy.empty() ? std::string() : " (" + m_plWhy + ")"));
+        std::string err;
+        tlsPgen.r = pgenlib_glue::newReader(m_pl, err);
+        if (tlsPgen.r == nullptr) throw std::runtime_error("PgenClass: " + err);
+        tlsPgen.owner = m_instanceId;
+    }
+    return tlsPgen.r;
+}
+
+// The body of upstream SAIGE's PgenClass::getOneMarker (PGEN.cpp): read the
+// ALT dosage of every file sample, then gather the analysis samples.
+void PgenClass::decodeViaPgenlib(uint64_t t_gIndex, double& t_altFreq, double& t_altCounts,
+                                 double& t_missingRate, double& t_imputeInfo,
+                                 bool t_isOutputIndexForMissing, std::vector<uint>& t_indexForMissing,
+                                 bool t_isOnlyOutputNonZero, std::vector<uint>& t_indexForNonZero,
+                                 arma::vec& OneMarkerG1)
+{
+    pgenlib_glue::Reader* r = tlsReader();
+    if (tlsPgen.dbuf.size() < m_plFacts.rawSampleCt) tlsPgen.dbuf.resize(m_plFacts.rawSampleCt);
+    std::string err;
+    if (!pgenlib_glue::readAltDosage(r, (uint32_t)t_gIndex, tlsPgen.dbuf.data(), err))
+        throw std::runtime_error("PgenClass: " + err + " in " + m_pgenFile);
+    const double* buf = tlsPgen.dbuf.data();
+
+    uint32_t numMissing = 0;
+    t_altCounts = 0;
+    uint j = 0;
+    for (uint32_t i = 0; i < m_N; i++) {
+        const double v = buf[m_posSampleInPgen[i]];
+        if (std::isnan(v)) {
+            numMissing++;
+            if (t_isOutputIndexForMissing) t_indexForMissing.push_back(i);
+        } else {
+            t_altCounts += v;
+        }
+        if (v > 0) t_indexForNonZero.push_back(i);
+        if (t_isOnlyOutputNonZero) {
+            if (v > 0) { OneMarkerG1[j] = v; j++; }
+        } else {
+            OneMarkerG1[i] = v;
+        }
+    }
+    const uint32_t count = m_N - numMissing;
+    t_missingRate = (double)numMissing / (double)m_N;
+    t_imputeInfo = 1.0;
+    t_altFreq = (count > 0) ? t_altCounts / (double)count / 2.0 : 0;
+    if (t_isOnlyOutputNonZero) OneMarkerG1.resize(j);
+}
+
+bool PgenClass::hardCallOnly() const
+{
+    return m_pl != nullptr && !m_plFacts.dosage && !m_plFacts.dosagePhase && !m_plFacts.multiallelic;
+}
+
+std::string PgenClass::notHardCallReason() const
+{
+    if (m_pl == nullptr) return m_plWhy.empty() ? std::string("pgenlib is not open") : m_plWhy;
+    std::string w;
+    if (m_plFacts.dosage || m_plFacts.dosagePhase) w = "it stores dosages, which 2-bit hard calls cannot represent";
+    if (m_plFacts.multiallelic) w += std::string(w.empty() ? "" : "; ") + "it has multiallelic variants";
+    return w;
+}
+
+bool PgenClass::readBedRow_ts(uint64_t t_gIndex, unsigned char* t_out)
+{
+    if (t_gIndex >= m_plFacts.rawVariantCt) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    pgenlib_glue::Reader* r = tlsReader();
+    std::string err;
+    if (!pgenlib_glue::readBedRow(r, (uint32_t)t_gIndex, t_out, err))
+        throw std::runtime_error("PgenClass: " + err + " in " + m_pgenFile);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    m_rowNs.fetch_add((uint64_t)ns, std::memory_order_relaxed);
+    m_rowCt.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 // ============================================================
@@ -3213,6 +3397,13 @@ void PgenClass::getOneMarker_ts(uint64_t t_gIndex,
     t_ref    = m_ref[t_gIndex];
     t_alt    = m_alt[t_gIndex];
     t_marker = m_variantId[t_gIndex];
+
+    if (m_cpuViaPgenlib) {
+        decodeViaPgenlib(t_gIndex, t_altFreq, t_altCounts, t_missingRate, t_imputeInfo,
+                         t_isOutputIndexForMissing, t_indexForMissing,
+                         t_isOnlyOutputNonZero, t_indexForNonZero, OneMarkerG1);
+        return;
+    }
 
     thread_local FILE* tlsFin = nullptr;
     thread_local std::vector<unsigned char> tlsOneMarkerRaw;
@@ -3407,6 +3598,22 @@ void setBGENobjInCPP(const std::string& t_bgenFileName,
     }
 }
 
+
+// ============================================================
+// makePgenPackedView (S2_GPU_PGEN, see the header)
+// ============================================================
+PLINK::PlinkClass* makePgenPackedView(PGEN::PgenClass* t_pg,
+                                      std::vector<std::string>& t_SampleInModel)
+{
+    if (t_pg == nullptr || !t_pg->hardCallOnly()) return nullptr;
+    PLINK::PlinkClass* v = new PLINK::PlinkClass(
+        t_pg->getPgenFilePath() + " (pgenlib hard calls)",
+        t_pg->chrs(), t_pg->ids(), t_pg->positions(), t_pg->refs(), t_pg->alts(),
+        t_pg->sampleIIDs(),
+        [t_pg](uint64_t g, unsigned char* out) { return t_pg->readBedRow_ts(g, out); });
+    v->setPosSampleInPlink(t_SampleInModel);
+    return v;
+}
 
 // ============================================================
 // setPGENobjInCPP: create and configure the global PGEN object

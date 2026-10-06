@@ -74,7 +74,9 @@ mtMemBudgetGB: 1.5
 # gpuOwnSampleSets, gpuPrefetch (gpuPrefetchThreads: 4), gpuSpaOrder: trait,
 # gpuSpaDynamic, gpuSpaFused, gpuSpaMinBlocks: 3, gpuDecodeX2, gpuOverlap
 # (S2_OVERLAP.md), gpuER (S2_ER_GPU.md; a startup self-check keeps ER on the CPU
-# when the device cannot match the host's exp / log bit for bit).
+# when the device cannot match the host's exp / log bit for bit), gpuPgen
+# (S2_GPU_PGEN.md; genoType: pgen with hard calls only runs on the GPU path, a
+# .pgen with dosages stays on the CPU).
 # useGPU: true
 # mtRequireSameSamples: true   # the only accepted value; false is refused
 #                              # rather than silently ignored

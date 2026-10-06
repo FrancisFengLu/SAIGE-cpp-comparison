@@ -1,0 +1,3 @@
+pgenlib read side, copied unmodified from plink-ng (https://github.com/chrchang/plink-ng)
+commit 278e9df (2026-09-10), directory 2.0/include/.
+License: LGPL v3 or later (COPYING.LESSER, COPYING). Used by pgen_lib.cpp only.

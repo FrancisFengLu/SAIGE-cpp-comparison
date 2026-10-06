@@ -410,6 +410,21 @@ int  g_gpuPrefetchThreads = 4;
 bool g_gpuOverlap     = false;
 int  g_gpuOverlapSets = 6;
 int  g_gpuOverlapLag  = 3;
+// Config key gpuPgen (default: = useGPU): let the GPU path take genoType: pgen
+// when the .pgen holds hard calls only (no dosages, no multiallelic
+// variants). The host decodes each record with pgenlib (LD-compressed
+// difflists included) and re-encodes it as the .bed row the GPU path stages
+// (g_pgenPackedView), so everything after the read is the .bed path's.
+// A dosage .pgen is refused back to the CPU. false: pgen input stays on the
+// CPU, as before. S2_GPU_PGEN.md.
+bool g_gpuPgen        = false;
+// The packed hard-call view of the .pgen (makePgenPackedView): set after the
+// reader is built when genoType is pgen and the file is hard-call only.
+// Besides the GPU path, the CPU single-variant loops (multi-trait and P = 1)
+// read hard-call .pgen through it (fused decode, popcount AF, per-trait sample
+// sets), exactly as they read a .bed. The region loop keeps the per-sample
+// decode.
+PLINK::PlinkClass* g_pgenPackedView = nullptr;
 // Config key parallelModelLoad (default true): load the P null models of a
 // multi-trait run concurrently (min(P, nThreads) threads) instead of one after
 // another. Each model's loader log goes to its own buffer and is printed in
@@ -1673,12 +1688,16 @@ void mainMarkerInCPP(
             // VCF: htslib bcf_read is streaming and not thread-safe; the _ts
             //   dispatcher still falls back to the locked path internally, so
             //   we wrap in critical(genoread).
-            if (t_genoType == "plink" && g_fusedPlinkDecode) {
+            // a hard-call .pgen takes the same fused decode through its
+            // packed view (S2_GPU_PGEN.md), so it prints what the .bed prints
+            if ((t_genoType == "plink" || (t_genoType == "pgen" && g_pgenPackedView != nullptr)) &&
+                g_fusedPlinkDecode) {
                 // W2 fused path Stage A: packed-byte counts only; the dense
                 // decode is deferred (and fused with impute/flip) until after
                 // the pre-impute QC below.
                 usedFusedDecode = true;
-                isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+                isReadMarker = (t_genoType == "plink" ? ptr_gPLINKobj : g_pgenPackedView)
+                                   ->getOneMarkerFusedStats_ts(gIndex, fsFused);
                 if (isReadMarker) {
                     ref = std::move(fsFused.ref);
                     alt = std::move(fsFused.alt);
@@ -1804,7 +1823,7 @@ void mainMarkerInCPP(
                 if (usedFusedDecode) {
                     // W2 Stage C: single fused pass writes the final GVec and
                     // both index vectors (only for markers that survived QC).
-                    ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                    (t_genoType == "plink" ? ptr_gPLINKobj : g_pgenPackedView)->fillOneMarkerFusedDense_ts(
                         fsFused, t_GVec, indexZeroVec_arma, indexNonZeroVec_arma);
                 } else {
                 copy_index_uvec_reuse(indexZeroVec, indexZeroVec_arma);
@@ -2622,9 +2641,20 @@ bool mainMarkerMTGpu(
 
     // ---------------- gate ----------------
     std::string why;
+    // The reader whose packed .bed rows the path stages: the .bed itself, or
+    // the pgenlib view of a hard-call .pgen (gpuPgen, S2_GPU_PGEN.md).
+    PLINK::PlinkClass* const PR =
+        (t_genoType == "plink") ? ptr_gPLINKobj :
+        (t_genoType == "pgen" && g_gpuPgen) ? g_pgenPackedView : nullptr;
     if (P < 1)                                     why = "no models";
-    else if (t_genoType != "plink" || ptr_gPLINKobj == nullptr)
-                                                   why = "genoType is not plink";
+    else if (t_genoType == "pgen" && !g_gpuPgen)   why = "genoType is pgen and gpuPgen is false";
+    else if (t_genoType == "pgen" && PR == nullptr)
+        why = "genoType is pgen but the file is not hard-call only: " +
+              (ptr_gPGENobj ? ptr_gPGENobj->notHardCallReason() : std::string("no reader")) +
+              " (dosage PGEN runs on the CPU)";
+    else if (t_genoType != "plink" && t_genoType != "pgen")
+                                                   why = "genoType is not plink or pgen";
+    else if (PR == nullptr)                        why = "no genotype reader";
     else if (!g_fusedPlinkDecode)                  why = "SAIGE_STEP2_SCALAR_DECODE=1 is set";
     else if (!g_mtBatch)                           why = "mtBatch is false";
     else if (ctx.P != P || ctx.N <= 0)             why = "no multi-trait context (P == 1 needs `models:` with the GPU path)";
@@ -2662,7 +2692,7 @@ bool mainMarkerMTGpu(
             }
         }
     }
-    if (why.empty() && (int)ptr_gPLINKobj->getN() != (ctx.sampleSetsDiffer ? ctx.N : g_saigeObjs[0]->m_n))
+    if (why.empty() && (int)PR->getN() != (ctx.sampleSetsDiffer ? ctx.N : g_saigeObjs[0]->m_n))
         why = "the reader's sample count is not the models'";
     if (why.empty() && !saige::gpu2::available(g_gpuDevice, &why))
         { /* why already set by available() */ }
@@ -3442,7 +3472,7 @@ bool mainMarkerMTGpu(
                         // per-trait stats, statement for statement ----
                         const uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
                         PLINK::PlinkClass::FusedMarkerStats fsU;
-                        if (!ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsU)) {
+                        if (!PR->getOneMarkerFusedStats_ts(gIndex, fsU)) {
                             #pragma omp critical(endflag)
                             {
                                 if (i < firstEndIdx.load(std::memory_order_relaxed))
@@ -3457,14 +3487,14 @@ bool mainMarkerMTGpu(
                         CM.altVec[jj]    = fsU.alt;
                         CM.markerVec[jj] = fsU.marker;
                         const uint8_t* codes = codesU.data();
-                        ptr_gPLINKobj->copyFusedCodes_ts(fsU, codesU.data());
+                        PR->copyFusedCodes_ts(fsU, codesU.data());
 
                         // the union column's own table
                         PLINK::PlinkClass::FusedMarkerStats fu;
                         for (int c4 = 0; c4 < 4; c4++) { fu.counts[c4] = fsU.counts[c4]; fu.dmap[c4] = fsU.dmap[c4]; }
                         fu.N = (uint32_t)n;
                         fu.gIndex = gIndex;
-                        ptr_gPLINKobj->fusedPreStatsFromCounts(fu, (uint32_t)n);
+                        PR->fusedPreStatsFromCounts(fu, (uint32_t)n);
                         {
                             const double MAFu = std::min(fu.altFreq, 1 - fu.altFreq);
                             const double MACu = MAFu * n * (1 - fu.missingRate) * 2;
@@ -3491,7 +3521,7 @@ bool mainMarkerMTGpu(
                             }
                             ft.N = (uint32_t)TS.n;
                             ft.gIndex = gIndex;
-                            ptr_gPLINKobj->fusedPreStatsFromCounts(ft, (uint32_t)TS.n);
+                            PR->fusedPreStatsFromCounts(ft, (uint32_t)TS.n);
                             double altFreq = ft.altFreq;
                             const double missingRate = ft.missingRate;
                             const double imputeInfo = ft.imputeInfo;
@@ -3532,7 +3562,7 @@ bool mainMarkerMTGpu(
                             if (tq[t] && ctx.meta[t].kind == SAIGE::TraitKind::Binary &&
                                 tMAC[t] > g_MACCutoffforER) { hi = true; break; }
                         const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
-                        ptr_gPLINKobj->copyFusedPacked_ts(fsU, hPkS + (slotBase + c) * bpv);
+                        PR->copyFusedPacked_ts(fsU, hPkS + (slotBase + c) * bpv);
                         double ss = 0.0;
                         for (int k = 0; k < 4; k++) {
                             S.fdc[(std::size_t)c * 4 + k]  = fu.fd[k];
@@ -3601,7 +3631,7 @@ bool mainMarkerMTGpu(
                     const uint64_t gIndex =
                         std::strtoull(t_genoIndex.at(i).c_str(), &end, 10);
                     PLINK::PlinkClass::FusedMarkerStats fs;
-                    if (!ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fs)) {
+                    if (!PR->getOneMarkerFusedStats_ts(gIndex, fs)) {
                         #pragma omp critical(endflag)
                         {
                             if (i < firstEndIdx.load(std::memory_order_relaxed))
@@ -3653,7 +3683,7 @@ bool mainMarkerMTGpu(
                     // its block, so each tail call gets a contiguous range.
                     const bool hi = (MAC > g_MACCutoffforER);
                     const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
-                    ptr_gPLINKobj->copyFusedPacked_ts(fs, hPkS + (slotBase + c) * bpv);
+                    PR->copyFusedPacked_ts(fs, hPkS + (slotBase + c) * bpv);
                     double ss = 0.0;
                     for (int k = 0; k < 4; k++) {
                         S.fdc[(std::size_t)c * 4 + k]  = fs.fd[k];
@@ -5725,6 +5755,12 @@ bool mainMarkerMTGpu(
         std::cout << ", reader wall " << tRead << " s on " << g_gpuPrefetchThreads
                   << " thread(s), consumer waited " << (overlap ? ov.tScanReadWait : tWait) << " s for it";
     std::cout << std::endl;
+    // gpuPgen: the part of the read that is pgenlib's (read + decompress +
+    // re-encode to .bed codes), summed over the reader threads.
+    if (t_genoType == "pgen" && ptr_gPGENobj != nullptr)
+        std::cout << "  [gpu pgen] " << ptr_gPGENobj->rowsDecoded() << " records decoded by pgenlib in "
+                  << ptr_gPGENobj->rowDecodeSeconds() << " thread-s (read + decompress + re-encode)"
+                  << std::endl;
     // gpuOverlap: the device call above is the scan worker's own wall and the
     // device SPA + post / Firth figures are the main thread's post (which
     // includes its wait for the SPA worker); what the main thread lost to
@@ -5773,6 +5809,13 @@ void mainMarkerMT(
 
     const SAIGE::MTContext& ctx = g_mtctx;
     const int P = static_cast<int>(g_saigeObjs.size());
+    // The reader with packed .bed rows, if any: the .bed itself, or the
+    // pgenlib view of a hard-call .pgen (S2_GPU_PGEN.md). It feeds the fused
+    // decode, the popcount AF path and the per-trait sample-set path; any
+    // other input takes the per-sample gather below.
+    PLINK::PlinkClass* const PR =
+        (t_genoType == "plink") ? ptr_gPLINKobj :
+        (t_genoType == "pgen") ? g_pgenPackedView : nullptr;
     // Writing the P per-trait files is bounded by P: more threads than traits
     // only adds barriers. Same rule mainMarkerMTGpu uses.
     const int nWriteThreadsMT = std::max(1, std::min(P, omp_get_max_threads()));
@@ -5787,8 +5830,8 @@ void mainMarkerMT(
 
     if (differ) {
         // main() refuses the other readers and conditional analysis (design 4.7).
-        if (t_genoType != "plink" || ptr_gPLINKobj == nullptr)
-            throw std::runtime_error("mainMarkerMT: different sample sets need genoType plink");
+        if (PR == nullptr)
+            throw std::runtime_error("mainMarkerMT: different sample sets need genoType plink or a hard-call pgen");
         for (int t = 0; t < P; t++) {
             if (g_saigeObjs[t]->m_isCondition)
                 throw std::runtime_error("mainMarkerMT: conditional analysis with different sample sets");
@@ -5838,10 +5881,10 @@ void mainMarkerMT(
     // reports AF_case / AF_ctrl, over the analysis (union) sample positions
     // the packed column is in; and whether that trait's case and control
     // positions ascend, which the exact replay of a mean-imputed sum needs
-    // (popcount_af.hpp). Only PLINK input with the fused decode puts the
-    // 2-bit codes in the block; otherwise pcOn stays false and nothing here
-    // is built or read.
-    const bool pcOn = g_mtPopcountAF && t_genoType == "plink" && ptr_gPLINKobj != nullptr &&
+    // (popcount_af.hpp). Only PLINK input (or a hard-call .pgen through its
+    // packed view) with the fused decode puts the 2-bit codes in the block;
+    // otherwise pcOn stays false and nothing here is built or read.
+    const bool pcOn = g_mtPopcountAF && PR != nullptr &&
                       (differ || g_fusedPlinkDecode);
     const int pcWordsN = pcOn ? SAIGE::pcWords(n) : 0;
     std::vector<std::vector<uint64_t>> pcCase(P), pcCtrl(P);
@@ -5993,7 +6036,7 @@ void mainMarkerMT(
                     // ---- different sample sets: union read, per-trait stats ----
                     uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
                     PLINK::PlinkClass::FusedMarkerStats fsU;
-                    const bool isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsU);
+                    const bool isReadMarker = PR->getOneMarkerFusedStats_ts(gIndex, fsU);
                     if (!isReadMarker) {
                         #pragma omp critical(endflag)
                         {
@@ -6012,7 +6055,7 @@ void mainMarkerMT(
                     infoVec[jj] = fsU.chr + ":" + pds + ":" + fsU.ref + ":" + fsU.alt;
 
                     const uint8_t* codes = W.tmpCodes.data();
-                    ptr_gPLINKobj->copyFusedCodes_ts(fsU, W.tmpCodes.data());
+                    PR->copyFusedCodes_ts(fsU, W.tmpCodes.data());
 
                     // The union column's own imputation table: what a
                     // single-trait run on exactly the union samples would use.
@@ -6022,7 +6065,7 @@ void mainMarkerMT(
                     for (int c4 = 0; c4 < 4; c4++) { fu.counts[c4] = fsU.counts[c4]; fu.dmap[c4] = fsU.dmap[c4]; }
                     fu.N = (uint32_t)n;
                     fu.gIndex = gIndex;
-                    ptr_gPLINKobj->fusedPreStatsFromCounts(fu, (uint32_t)n);
+                    PR->fusedPreStatsFromCounts(fu, (uint32_t)n);
                     {
                         const double MAFu = std::min(fu.altFreq, 1 - fu.altFreq);
                         const double MACu = MAFu * n * (1 - fu.missingRate) * 2;
@@ -6053,7 +6096,7 @@ void mainMarkerMT(
                         ft.N = (uint32_t)S.n;
                         ft.gIndex = gIndex;
                         // Stage A's pre-impute expressions on the trait's counts.
-                        ptr_gPLINKobj->fusedPreStatsFromCounts(ft, (uint32_t)S.n);
+                        PR->fusedPreStatsFromCounts(ft, (uint32_t)S.n);
                         double altFreq = ft.altFreq;
                         const double missingRate = ft.missingRate;
                         const double imputeInfo = ft.imputeInfo;
@@ -6138,7 +6181,7 @@ void mainMarkerMT(
                     if (pcOn) {
                         uint64_t* pk = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
                         pk[pcWordsN - 1] = 0;   // bytes past (n+3)/4 stay zero
-                        ptr_gPLINKobj->copyFusedPacked_ts(fsU, reinterpret_cast<uint8_t*>(pk));
+                        PR->copyFusedPacked_ts(fsU, reinterpret_cast<uint8_t*>(pk));
                         for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fu.fd[c4];
                         for (int c4 = 0; c4 < 4; c4++) W.cntc[(std::size_t)c * 4 + c4] = fsU.counts[c4];
                         W.hasPacked[c] = 1;
@@ -6230,9 +6273,9 @@ void mainMarkerMT(
                     std::string t_genoIndex_str = t_genoIndex.at(i);
                     char* end;
                     uint64_t gIndex = std::strtoull(t_genoIndex_str.c_str(), &end, 10);
-                    if (t_genoType == "plink" && g_fusedPlinkDecode) {
+                    if (PR != nullptr && g_fusedPlinkDecode) {
                         usedFusedDecode = true;
-                        isReadMarker = ptr_gPLINKobj->getOneMarkerFusedStats_ts(gIndex, fsFused);
+                        isReadMarker = PR->getOneMarkerFusedStats_ts(gIndex, fsFused);
                         if (isReadMarker) {
                             ref = std::move(fsFused.ref);
                             alt = std::move(fsFused.alt);
@@ -6326,7 +6369,7 @@ void mainMarkerMT(
                 if (usedFusedDecode) {
                     // Stage C also emits the index vectors; they are rebuilt on
                     // demand below, so only the dense fill is wanted here.
-                    ptr_gPLINKobj->fillOneMarkerFusedDense_ts(
+                    PR->fillOneMarkerFusedDense_ts(
                         fsFused, W.tmpG, W.idxZ, W.idxNZ);
                 }
 
@@ -6355,7 +6398,7 @@ void mainMarkerMT(
                     // Stage A call replaces it.
                     uint64_t* pk = W.packed.data() + (std::size_t)c * (std::size_t)pcWordsN;
                     pk[pcWordsN - 1] = 0;
-                    ptr_gPLINKobj->copyFusedPacked_ts(fsFused, reinterpret_cast<uint8_t*>(pk));
+                    PR->copyFusedPacked_ts(fsFused, reinterpret_cast<uint8_t*>(pk));
                     for (int c4 = 0; c4 < 4; c4++) W.fdc[(std::size_t)c * 4 + c4] = fsFused.fd[c4];
                     for (int c4 = 0; c4 < 4; c4++) W.cntc[(std::size_t)c * 4 + c4] = fsFused.counts[c4];
                     W.hasPacked[c] = 1;
@@ -9058,6 +9101,11 @@ int main(int argc, char* argv[])
             std::cerr << "                     while the host tail of the current one runs; same output." << std::endl;
             std::cerr << "  gpuOverlapSets:    buffer sets in the overlap ring (default 6, >= 3)" << std::endl;
             std::cerr << "  gpuOverlapLag:     superblocks whose SPA may still be pending (default 3, >= 1)" << std::endl;
+            std::cerr << "  gpuPgen:           true/false (default: = useGPU). genoType: pgen with hard calls" << std::endl;
+            std::cerr << "                     only runs on the GPU path: pgenlib decodes each record on the" << std::endl;
+            std::cerr << "                     host (LD-compressed ones included) into the .bed row the path" << std::endl;
+            std::cerr << "                     stages. A .pgen with dosages or multiallelic variants is" << std::endl;
+            std::cerr << "                     refused back to the CPU. false: pgen stays on the CPU." << std::endl;
             std::cerr << "  parallelModelLoad: true/false (default: true). Load the null models" << std::endl;
             std::cerr << "                     of a multi-trait run concurrently (min(P, nThreads)" << std::endl;
             std::cerr << "                     threads); same objects, same log, in config order." << std::endl;
@@ -9384,6 +9432,13 @@ int main(int argc, char* argv[])
             std::cout << "  gpuOverlap: on -- device scan, host tail and device SPA / Firth of different "
                          "superblocks run at once (" << g_gpuOverlapSets << " buffer sets, lag "
                       << g_gpuOverlapLag << ")" << std::endl;
+        g_gpuPgen = cfgBool("gpuPgen", gpuDef);   // default with useGPU (S2_GPU_PGEN.md)
+        if (g_gpuPgen && !g_gpuStep2 && cfgSet("gpuPgen"))
+            std::cout << "  gpuPgen: ignored, useGPU is false" << std::endl;
+        else if (g_gpuPgen && g_gpuStep2 && genoType_early == "pgen")
+            std::cout << "  gpuPgen: on -- a hard-call .pgen runs on the GPU path (pgenlib decode "
+                         "on the host, re-encoded as .bed rows); a dosage .pgen stays on the CPU"
+                      << std::endl;
         g_parallelModelLoad = cfgBool("parallelModelLoad", true);
         if (g_parallelModelLoad)
             std::cout << "  parallelModelLoad: on -- the null models are loaded concurrently"
@@ -9781,11 +9836,14 @@ int main(int argc, char* argv[])
             // reader's sample list, and matching that per trait is not
             // implemented -- refuse rather than print numbers that differ from
             // a single-trait run.
-            if (genoType_early != "plink") {
+            // A hard-call .pgen is read through the same 2-bit codes
+            // (S2_GPU_PGEN.md); whether the file is hard-call only is known
+            // once the reader is open, and checked there.
+            if (genoType_early != "plink" && genoType_early != "pgen") {
                 throw std::runtime_error(
                     "The models were fitted on different sample sets; multi-trait "
                     "testing on different sample sets currently supports "
-                    "genoType: plink only (this config uses " + genoType_early +
+                    "genoType: plink or a hard-call pgen only (this config uses " + genoType_early +
                     "). Run one config per sample set.");
             }
             // assign_conditionMarkers_factors reads the conditioning markers
@@ -10067,10 +10125,12 @@ int main(int argc, char* argv[])
                     if (M.traitType == "binary" || M.traitType == "survival") nCC++;
                 std::cout << "  mtPopcountAF: on for " << nCC << " / " << g_mtctx.meta.size()
                           << " traits (the ones with case / control columns)";
-                if (genoType != "plink" || !g_fusedPlinkDecode)
-                    std::cout << " -- but the genotype input is not PLINK with the fused "
+                if ((genoType != "plink" && genoType != "pgen") || !g_fusedPlinkDecode)
+                    std::cout << " -- but the genotype input is not PLINK / PGEN with the fused "
                                  "decode, so no column carries its 2-bit codes and every "
                                  "pair keeps the gather";
+                else if (genoType == "pgen")
+                    std::cout << " (pgen: if the file is hard-call only)";
                 std::cout << std::endl;
             }
             g_mtVecQuantStats = cfgBool("mtVecQuantStats", true);
@@ -10151,8 +10211,27 @@ int main(int argc, char* argv[])
             setBGENobjInCPP(bgenFile, sampleInBgen, nullModel.sampleIDs, alleleOrder);
             numMarkers = ptr_gBGENobj->getM0();
         } else if (genoType == "pgen") {
-            setPGENobjInCPP(pgenFile, psamFile, pvarFile, nullModel.sampleIDs);
+            // readerSampleIDs == nullModel.sampleIDs unless the models'
+            // sample lists differ (then the union, as for plink).
+            setPGENobjInCPP(pgenFile, psamFile, pvarFile, readerSampleIDs);
             numMarkers = ptr_gPGENobj->getM();
+            // S2_GPU_PGEN: the packed hard-call view, for the GPU path and
+            // the CPU single-variant loops (fused decode, popcount AF,
+            // per-trait sample sets). The region loop keeps the per-sample
+            // decode and never touches it.
+            if (ptr_gPGENobj->hardCallOnly()) {
+                g_pgenPackedView = makePgenPackedView(ptr_gPGENobj, readerSampleIDs);
+                std::cout << "  pgen: hard calls only -- the single-variant loops read 2-bit rows "
+                             "decoded by pgenlib, as from a .bed" << std::endl;
+            } else {
+                std::cout << "  pgen: not hard-call only (" << ptr_gPGENobj->notHardCallReason()
+                          << "); per-sample dosage decode" << std::endl;
+            }
+            if (mtSampleSetsDiffer && g_pgenPackedView == nullptr)
+                throw std::runtime_error(
+                    "The models were fitted on different sample sets, which needs the 2-bit "
+                    "hard calls of the genotype file, but this .pgen is not hard-call only (" +
+                    ptr_gPGENobj->notHardCallReason() + "). Run one config per sample set.");
         }
 
         uint32_t numSamplesGeno = Unified_getSampleSizeinGeno(genoType);
