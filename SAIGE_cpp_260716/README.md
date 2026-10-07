@@ -1,5 +1,8 @@
 # SAIGE C++ standalone — snapshot `SAIGE_cpp_260716`
 
+> **How to build and run (CPU and GPU): see the user guide in [`docs/index.md`](docs/index.md).**
+> The build and run notes below are historical.
+
 Source-only snapshot of the standalone C++ port of SAIGE Step-1 (null-model
 fitting) and Step-2 (association testing, single-variant + SAIGE-GENE+ region).
 Prepared for collaborative work on **SAIGE-GENE+** — start with
