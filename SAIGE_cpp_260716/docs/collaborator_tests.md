@@ -155,7 +155,7 @@ bytes for any `nThreads`.
 
 ### Optional: rehearse the whole protocol on simulated data
 
-About 10 minutes (half of it R). This runs sections 5 to 7 on a simulated cohort
+A few minutes (about 3 on the reference machine). This runs sections 5 to 7 on a simulated cohort
 (4,000 samples, half in sibling pairs, 6,000 markers on two chromosomes, 30% of
 them rare, 8 binary traits) so you see every output before touching real data.
 Set `R_STEP2` and `RSCRIPT` as in [section 6](#6-run-the-test-matrix) first, or
