@@ -59,7 +59,7 @@ The config has three sections: `paths`, `design`, `fit`. Relative paths under
 
 - `trait` — `binary` or `quantitative`. Default `binary`.
 - `loco` — leave-one-chromosome-out models. Default **`true`**; switched off automatically (with a log line) when the `.bim` has fewer than 2 autosomes or the fit uses a sparse GRM.
-- `nthreads` — threads (default 1).
+- `nthreads` — threads (default 1). With more than one CPU thread, repeated runs can differ in the last printed digits (summation order changes between runs); use 1 thread when you need bit-identical reruns.
 - `use_gpu` — run the GRM products on the GPU (default `false`; [GPU](gpu.md)).
 - `inv_normalize` — rank-based inverse-normal transform of a quantitative trait (default `false`).
 - `min_maf_grm` — minimum MAF of the markers used for the full GRM (default 0.01); `max_miss_grm` — maximum missing rate (default 0.15).

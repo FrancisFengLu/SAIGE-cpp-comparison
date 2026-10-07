@@ -126,8 +126,9 @@ Not used — one line with the reason, then the run continues on the CPU:
 
 Also not a refusal, but worth knowing:
 `gpuSparse: not active (... refused by the cost gate ...)` means the sparse GRM
-has components too large for the block inverse; those variances are computed on
-the CPU and the rest of the run stays on the GPU.
+has components too large for the block inverse. With `isFastTest: true` the
+affected variances are computed on the CPU and the rest of the run stays on the
+GPU; with `isFastTest: false` the whole run falls back to the CPU.
 
 ### GPU memory (step 2)
 
