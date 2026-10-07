@@ -237,7 +237,7 @@ compare_pair() {   # label dirA dirB [--rows]
 
 cleanup_outputs() {   # dirs... : remove result files when every comparison involving them is done
   [ "$KEEP_OUTPUTS" = 1 ] && return 0
-  local d; for d in "$@"; do rm -f "$d"/out/*.txt; done
+  local d; for d in "$@"; do rm -f "$d"/out/*; done     # results and R's <output>.index files
 }
 
 # ---------- run ----------
