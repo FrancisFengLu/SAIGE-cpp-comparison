@@ -56,3 +56,5 @@ saige-null-*
 SAIGE_cpp_260716/step1_saige-null/tools/gpu_matvec/gpu_matvec_test
 SAIGE_cpp_260716/step2_saige-step2/tools/mtvec_tail_accuracy
 __pycache__/
+SAIGE_cpp_260716/step2_saige-step2/saige-step2.phase
+SAIGE_cpp_260716/collab_bin/
