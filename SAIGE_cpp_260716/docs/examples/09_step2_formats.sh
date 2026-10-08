@@ -4,52 +4,22 @@
 # PLINK and hard-call PGEN input support). Writes $WORK/formats/<format>/.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
-D=$WORK/data
-M=$WORK/step1_bin
-O=$WORK/formats
+cd "$WORK"
 
-run() {   # run <name> <genotype keys (YAML lines)>
-  local N=$1 G=$2
-  mkdir -p "$O/$N"
-  {
-    echo "$G"
-    cat <<YAML
-minMAC: 1
-nThreads: 8
-useGPU: true
-models:
-YAML
-    for t in b1 b2 b3; do
-      cat <<YAML
-  - traitName: $t
-    modelFile: $M/models/$t
-    varianceRatioFile: $M/vr_$t.varianceRatio.txt
-    outputFile: $O/$N/$t.txt
-YAML
-    done
-  } > "$O/$N/step2.yaml"
-  "$S2" "$O/$N/step2.yaml" > "$O/$N/step2.log" 2>&1
-  echo "== $N: $(grep -h -m1 -E 'useGPU: refused.*' "$O/$N/step2.log" || echo 'GPU path used')"
-  wc -l < "$O/$N/b1.txt"
+run() {   # run <name> <genotype flags...>
+  local N=$1; shift
+  $SAIGE step2 "$@" \
+    --step1Dir step1_bin \
+    --phenoCol b1,b2,b3 \
+    --minMAC 1 \
+    --nThreads 8 \
+    --useGPU \
+    --outDir formats/$N > formats_$N.log 2>&1
+  echo "== $N: $(grep -h -m1 -E 'useGPU: refused.*' formats_$N.log || echo 'GPU path used')"
+  wc -l < formats/$N/b1.txt
 }
 
-run pgen "genoType: pgen
-pgenFile: $D/geno.pgen
-pvarFile: $D/geno.pvar
-psamFile: $D/geno.psam
-AlleleOrder: ref-first"
-
-run pgen_dosage "genoType: pgen
-pgenFile: $D/dosage.pgen
-pvarFile: $D/dosage.pvar
-psamFile: $D/dosage.psam
-AlleleOrder: ref-first"
-
-run bgen "genoType: bgen
-bgenFile: $D/geno.bgen
-bgenSampleFile: $D/geno.sample
-AlleleOrder: ref-first"
-
-run vcf "genoType: vcf
-vcfFile: $D/geno.vcf.gz
-vcfField: DS"
+run pgen        --pgenPrefix data/geno                                   # .pgen/.pvar/.psam
+run pgen_dosage --pgenPrefix data/dosage
+run bgen        --bgenFile data/geno.bgen --sampleFile data/geno.sample
+run vcf         --vcfFile data/geno.vcf.gz --vcfField DS

@@ -19,7 +19,8 @@ conda activate "$CONDA_ENV"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-S1=${S1:-$SAIGE_HOME/step1_saige-null/saige-null}           # step 1 binary
-S2=${S2:-$SAIGE_HOME/step2_saige-step2/saige-step2}         # step 2 binary
-SGS2TXT=${SGS2TXT:-$SAIGE_HOME/step2_saige-step2/tools/sgs2txt}  # .sgs -> text converter
-PLINK2=${PLINK2:-plink2}                              # only the examples need plink2
+SAIGE=${SAIGE:-$SAIGE_HOME/bin/saige-gpu-cpp}     # the command-line program (step1, step2, sgs2txt)
+S1=${S1:-$SAIGE_HOME/bin/saige-null}              # step-1 engine (YAML config), run by $SAIGE step1
+S2=${S2:-$SAIGE_HOME/bin/saige-step2}             # step-2 engine (YAML config), run by $SAIGE step2
+SGS2TXT=${SGS2TXT:-$SAIGE_HOME/bin/sgs2txt}       # .sgs -> text converter ($SAIGE sgs2txt runs it)
+PLINK2=${PLINK2:-plink2}                          # only the examples need plink2

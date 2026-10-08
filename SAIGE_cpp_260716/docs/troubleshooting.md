@@ -11,27 +11,43 @@ run with `terminate called after throwing ... what(): <message>`; step 2 errors
 print `ERROR: <message>` and exit with status 1. Check the input before a long
 run with `saige-null -c step1.yaml --dry-run`.
 
+## Command line
+
+`saige-gpu-cpp` checks its flags before anything runs. A problem prints
+`saige-gpu-cpp: error: <message>` and exits with status 2; nothing is written.
+
+| Message | Cause / fix |
+|---|---|
+| `unknown flag --phenoColl for saige-gpu-cpp step1 (did you mean --phenoCol?); ...` | misspelt flag (names are case-sensitive, as in R) |
+| `--memoryChunk is an R SAIGE flag that saige-gpu-cpp step1 does not support: ...` | an R flag without an implementation here; the message says why or what to use instead (the full list: `--help`, end) |
+| ``--SPAcutoff is an R SAIGE flag that saige-gpu-cpp step2 does not support: it is stored in the model; give it to `saige-gpu-cpp step1` --SPAcutoff`` | same for `--is_fastTest`, `--impute_method`: set them in step 1 |
+| `missing --outDir ...`, `missing --phenoCol ...`, `missing genotypes: ...`, `missing models: ...` | a required flag is not given |
+| `--step1Dir DIR: no step-1 models found ...` | `DIR` is not the `--outDir` of a step-1 run, or step 1 failed |
+| `--phenoCol b9: no such trait in DIR (it has: b1, b2)` | step 2 `--phenoCol` names a trait step 1 did not fit |
+| `--LOCO expects TRUE or FALSE, got 'maybe'`, `--tol expects a number, ...` | value of the wrong type |
+| `engine not found: .../saige-null ...` | `saige-gpu-cpp` runs the engines in its own directory; run `make` (it installs all four programs in `bin/`) |
+
 ## Build
 
 | Symptom | Cause / fix |
 |---|---|
 | `activate-gcc_linux-64.sh: line 114: SYS_SYSROOT: unbound variable` | `conda activate` inside a script with `set -u`; activate before `set -u` (as `examples/env.sh` does) |
-| `USE_CUDA=1 but nvcc is not on PATH` | step 2 GPU build: add `$CUDA_HOME/bin` to `PATH` or pass `NVCC=/path/to/nvcc` |
-| step 1 built, but never prints `GPU tier=` | step 1's Makefile found no `nvcc` and built the CPU version; pass `NVCC=/path/to/nvcc` |
+| `USE_CUDA=1 but nvcc is not on PATH` | GPU build: pass `CUDA_HOME=/path/to/cuda` or `NVCC=/path/to/nvcc` to `make` |
+| step 1 never prints `GPU tier=` | CPU build (`make` without `USE_CUDA=1`), or no GPU visible |
 | `undefined reference to pcre2_*@PCRE2_10.47` (step 1 link) † | the environment's `pcre2` is older than R's; install `pcre2>=10.47` |
-| segfaults after changing branches or build type † | stale object files; `make clean` and rebuild |
+| segfaults after changing branches † | stale object files; `make clean` and rebuild (changing `ARCH`, `USE_CUDA` or `SM` cleans by itself) |
 | `nvcc warning : Support for offline compilation for architectures prior to ... _75 ...` | harmless for `SM=70` |
 
 ## Step 1
 
 | Message | Cause / fix |
 |---|---|
-| `IID in design not found in FAM: extra1` | the phenotype file has a sample that is not in the `.fam`. Add `design.whitelist_ids:` with the `.fam` IIDs (`cut -f2 geno.fam > ids.txt`) or remove the row |
+| `IID in design not found in FAM: extra1` | the phenotype file has a sample that is not in the `.fam`. Give `--SampleIDIncludeFile` (config `design.whitelist_ids`) with the `.fam` IIDs (`cut -f2 geno.fam > ids.txt`) or remove the row |
 | `ERROR: binary phenotype value must be 0 or 1, found: 2.000000 at sample per3` | recode cases/controls as 1/0 |
-| `ERROR: variance of the phenotype (0.000125) is much smaller than 1. Please consider setting inv_normalize: true in config.` | quantitative trait on a small scale; set `fit.inv_normalize: true` or rescale |
+| `ERROR: variance of the phenotype (0.000125) is much smaller than 1. Please consider setting inv_normalize: true in config.` | quantitative trait on a small scale; `--invNormalize=TRUE` (config `fit.inv_normalize: true`) or rescale |
 | `Covariate column not found: zz` | a name in `covar_cols` is not in the header (names are matched case-insensitively) |
 | `Design file: phenotype column 'nosuch' not found. ...` | set `design.y_col` / `y_cols` |
-| `Refusing to overwrite existing variance-ratio file: ... (set paths.overwrite_varratio=true to allow).` | output exists; change `out_prefix_vr` or set `paths.overwrite_varratio: true` |
+| `Refusing to overwrite existing variance-ratio file: ... (set paths.overwrite_varratio=true to allow).` | output exists; another `--outDir`, or `--IsOverwriteVarianceRatioFile=TRUE` (config `paths.overwrite_varratio: true`) |
 | `[design] dropped 10 row(s) with missing phenotype or covariates (complete.cases)` | information: rows with `NA`/empty trait or covariate are left out |
 | `Converged: NO` † | the fit hit `maxiter`; do not use the model. Check the trait (case count, scale) and covariates |
 | no `[parallelCrossProd] GPU tier=` line with `use_gpu: true` | step 1 ran on the CPU: CPU build, no visible GPU, or a sparse-GRM fit ([GPU](gpu.md#step-1)) |
@@ -44,7 +60,7 @@ Overrides with `-o` take scalars only (`-o fit.loco=false`,
 
 | Message | Cause / fix |
 |---|---|
-| `ERROR: Cannot open output file: .../out/b1.txt` | the output directory does not exist; `mkdir -p` it first |
+| `ERROR: Cannot open output file: .../out/b1.txt` | hand-written config: the output directory does not exist; `mkdir -p` it first (`saige-gpu-cpp step2` creates it) |
 | `ERROR: genotype is in bgen, please set AlleleOrder=ref-first ...` | BGEN and PGEN need `AlleleOrder: ref-first` (or leave the key out) |
 | `ERROR: The models were fitted on different sample sets; multi-trait testing on different sample sets currently supports genoType: plink or a hard-call pgen only (this config uses bgen). Run one config per sample set.` | BGEN / VCF / dosage PGEN with models on different samples: put the models with the same samples in one config each, or use PLINK / hard-call PGEN |
 | `ERROR: model 'b4' (models[3]) lists 4511 sample IDs but 'b1' lists 5000. mtRequireSameSamples: true requires identical sample IDs in identical order.` | `mtRequireSameSamples: true` is set; remove it to allow different sample sets |

@@ -12,26 +12,28 @@ runs on the CPU and says so in the log (step 2) or silently (step 1, see below).
 
 | | CPU | GPU |
 |---|---|---|
-| Build | `make` | `make USE_CUDA=1 SM=<compute capability>` (step 2), `GPU_SM=sm_<cc>` (step 1) |
-| Step 1 config | `fit.use_gpu: false` | `fit.use_gpu: true` |
-| Step 2 config | `useGPU: false` (default) | `useGPU: true` |
+| Build | `make` | `make USE_CUDA=1 SM=<compute capability>` |
+| Step 1 | no flag (config `fit.use_gpu: false`) | `saige-gpu-cpp step1 --useGPU` (config `fit.use_gpu: true`) |
+| Step 2 | no flag (config `useGPU: false`) | `saige-gpu-cpp step2 --useGPU` (config `useGPU: true`) |
 
-Nothing else in the configs changes, and the step-2 output is the same.
+Nothing else changes, and the step-2 output is the same.
 Recommended cards: V100, A30, A100, H100 (full-speed fp64); see the table in
 [Home, Build](index.md#3-build).
 
 ## Requirements
 
-- The GPU build ([Home, Build](index.md#3-build)): `01_build.sh gpu <SM>` with the
-  compute capability of your card (70 V100, 75 T4, 80 A100, 86 A10, 89 L4, 90 H100).
+- The GPU build ([Home, Build](index.md#3-build)): `make USE_CUDA=1 SM=<SM>` with the
+  compute capability of your card (70 V100, 75 T4, 80 A100, 86 A10, 89 L4, 90 H100),
+  or several at once (`SM="70 80 90"`).
 - CUDA 12.x runtime and an NVIDIA driver that supports it. Tested: CUDA 12.9,
   driver 580, Tesla V100-SXM2 16 GB.
-- One GPU per process. Step 2 uses device 0 unless `gpuDevice: N` is set;
+- One GPU per process. Both steps use device 0 unless `--gpuDevice N` is given
+  (step 2 config `gpuDevice: N`; step 1 environment `SAIGE_GPU_DEVICE=N`);
   `CUDA_VISIBLE_DEVICES` also works.
 
 ## Step 1
 
-Switch: `fit.use_gpu: true` in the config, or `--gpu` on the command line.
+Switch: `saige-gpu-cpp step1 --useGPU` (config `fit.use_gpu: true`, or `saige-null --gpu`).
 
 | Fit | Uses the GPU |
 |---|---|
@@ -58,8 +60,9 @@ can differ between a GPU and a CPU step 1.
 
 ## Step 2
 
-Switch: `useGPU: true`. With it, every sub-switch below defaults to on; write
-`false` to turn one off. Results are the same as on the CPU (the tutorial's text
+Switch: `saige-gpu-cpp step2 --useGPU` (config `useGPU: true`). With it, every
+sub-switch below defaults to on; turn one off with `--set <key>=false` (config
+`<key>: false`). Results are the same as on the CPU (the tutorial's text
 files are byte-identical with `useGPU: true` and `false`).
 
 | Key | Default with `useGPU: true` | What it moves to the GPU |
@@ -122,7 +125,7 @@ Not used — one line with the reason, then the run continues on the CPU:
 
 | Reason | Meaning / fix |
 |---|---|
-| `built without CUDA (rebuild with: make USE_CUDA=1)` | CPU build of `saige-step2`; rebuild with `01_build.sh gpu <SM>` |
+| `built without CUDA (rebuild with: make USE_CUDA=1)` | CPU build of `saige-step2`; rebuild with `make USE_CUDA=1 SM=<SM>` |
 | `cudaGetDeviceCount: no CUDA-capable device is detected` | no GPU visible (check `nvidia-smi`, `CUDA_VISIBLE_DEVICES`, the driver) |
 | `gpuDevice 3 out of range (1 device(s) present)` | `gpuDevice` names a GPU that does not exist |
 | `genoType is not plink or pgen` | BGEN / VCF input |

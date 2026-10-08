@@ -4,20 +4,28 @@
 # Writes $WORK/step2_sgs/.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
-O=$WORK/step2_sgs
-mkdir -p "$O/out"
-# same config as 04, different output paths and format
-sed -e "s#$WORK/step2_bin/out/#$O/out/#" -e "s#^outputFormat: text#outputFormat: sgs#" \
-    "$WORK/step2_bin/step2.yaml" > "$O/step2.yaml"
-"$S2" "$O/step2.yaml" > "$O/step2.log" 2>&1
-ls -l "$O/out"
+cd "$WORK"
+
+# same flags as 04, plus --outputFormat sgs
+$SAIGE step2 \
+  --step1Dir step1_bin \
+  --plinkFile data/geno \
+  --minMAF 0 \
+  --minMAC 1 \
+  --is_Firth_beta=TRUE \
+  --pCutoffforFirth 0.01 \
+  --nThreads 8 \
+  --useGPU \
+  --outputFormat sgs \
+  --outDir step2_sgs > step2_sgs.log 2>&1
+ls -l step2_sgs        # b1.txt.sgs ... b4.txt.sgs + the shared b1.txt.markers.sgs
 
 # Convert. The .sgs files and the shared markers file can be copied anywhere;
 # -m names the markers file, -o the text file to write.
-mkdir -p "$O/moved" "$O/text"
-cp "$O"/out/*.sgs "$O/moved/"
+mkdir -p step2_sgs/moved step2_sgs/text
+cp step2_sgs/*.sgs step2_sgs/moved/
 for t in b1 b2 b3 b4; do
-  "$SGS2TXT" -m "$O/moved/b1.txt.markers.sgs" -o "$O/text/$t.txt" "$O/moved/$t.txt.sgs"
+  $SAIGE sgs2txt -m step2_sgs/moved/b1.txt.markers.sgs -o step2_sgs/text/$t.txt step2_sgs/moved/$t.txt.sgs
 done
 # The text is identical to the text writer's output from 04_step2_binary.sh
-for t in b1 b2 b3 b4; do cmp "$O/text/$t.txt" "$WORK/step2_bin/out/$t.txt" && echo "$t identical"; done
+for t in b1 b2 b3 b4; do cmp step2_sgs/text/$t.txt step2_bin/$t.txt && echo "$t identical"; done

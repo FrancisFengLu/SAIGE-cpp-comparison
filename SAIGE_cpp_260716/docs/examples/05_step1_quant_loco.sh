@@ -3,29 +3,21 @@
 # chromosome out), full GRM, GPU on. Writes $WORK/step1_qt/.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
-D=$WORK/data
-O=$WORK/step1_qt
-mkdir -p "$O"
+cd "$WORK"
 
-cat > "$O/step1.yaml" <<YAML
-paths:
-  plinkFile: $D/geno
-  out_prefix: $O/models
-  out_prefix_vr: $O/vr
-  overwrite_varratio: true
-design:
-  csv: $D/pheno.txt
-  iid_col: IID
-  y_cols: [q1, q2]
-  covar_cols: [x1, x2]
-fit:
-  trait: quantitative
-  loco: true                         # needs >= 2 autosomes in the .bim
-  inv_normalize: false               # true: rank-normalise the phenotype first
-  nthreads: 8
-  use_gpu: true
-YAML
+$SAIGE step1 \
+  --plinkFile data/geno \
+  --phenoFile data/pheno.txt \
+  --phenoCol q1,q2 \
+  --covarColList x1,x2 \
+  --traitType quantitative \
+  --LOCO=TRUE \
+  --invNormalize=FALSE \
+  --nThreads 8 \
+  --useGPU \
+  --IsOverwriteVarianceRatioFile=TRUE \
+  --outDir step1_qt > step1_qt.log 2>&1
+# --LOCO=TRUE needs >= 2 autosomes in the .bim; --invNormalize=TRUE rank-normalises first
 
-"$S1" -c "$O/step1.yaml" > "$O/step1.log" 2>&1
-grep -E "^Converged|^LOCO|GPU tier" "$O/step1.log"
-ls "$O/models/q1"
+grep -E "^Converged|^LOCO|GPU tier" step1_qt.log
+ls step1_qt/models/q1

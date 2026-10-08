@@ -15,8 +15,8 @@ Pages:
 | Page | Contents |
 |---|---|
 | [Home](index.md) | workflow, installation, tutorial |
-| [Step 1: fit the null model](step1.md) | `saige-null` inputs, config keys, outputs |
-| [Step 2: test genetic variants](step2.md) | `saige-step2` inputs, config keys, outputs |
+| [Step 1: fit the null model](step1.md) | `saige-gpu-cpp step1`: flags, inputs, outputs; YAML config |
+| [Step 2: test genetic variants](step2.md) | `saige-gpu-cpp step2`: flags, inputs, outputs; YAML config |
 | [GPU](gpu.md) | GPU build, switches, what runs on the GPU, memory |
 | [HPC example](hpc_example.md) | one job per chromosome, concatenating results |
 | [Troubleshooting](troubleshooting.md) | error and log messages and what they mean |
@@ -28,12 +28,18 @@ Every command and config on these pages was run on simulated data
 
 ## Analysis workflow
 
-1. **Step 1** (`saige-null`, YAML config): fit one null model per trait from the
+1. **Step 1** (`saige-gpu-cpp step1`): fit one null model per trait from the
    phenotype/covariate table and the PLINK genotypes (full GRM) or a sparse GRM.
-   Output: one model directory and one variance-ratio file per trait.
-2. **Step 2** (`saige-step2`, YAML config): test every marker of a genotype file
+   Output: one directory with a model and a variance-ratio file per trait.
+2. **Step 2** (`saige-gpu-cpp step2`): test every marker of a genotype file
    (PLINK, PGEN, BGEN or VCF) against the step-1 models. Output: one result
    table per trait.
+
+The flags are R SAIGE's (`step1_fitNULLGLMM.R`, `step2_SPAtests.R`), with a few
+additions (several traits per run, `--useGPU`, `--outDir`, `--step1Dir`). Each
+run writes its settings as a YAML config into its output directory and runs the
+step's engine (`saige-null`, `saige-step2`) on it; the engines can also be run
+on a hand-written YAML config.
 
 ## Installation
 
@@ -41,8 +47,9 @@ No container image is published. Build from source.
 
 ### Requirements
 
-- Linux x86-64. The build uses `-march=native`, so build on the
-  machine type you will run on.
+- Linux x86-64. The build uses `-march=native` by default, so build on the
+  machine type you will run on, or build with `make ARCH=x86-64-v3` for a binary
+  that runs on any x86-64 CPU with AVX2 (Intel Haswell / AMD Zen and newer).
 - A conda environment with the libraries below (any other source of the same
   libraries works too). Neither program needs R.
 - For the GPU build only: CUDA toolkit 12.x (`nvcc`, cuBLAS) and an NVIDIA GPU
@@ -76,22 +83,40 @@ variables, each with a default you can override from the shell:
 
 ### 3. Build
 
+With the environment from step 1 active (`conda activate $HOME/miniforge3/envs/saige-build`):
+
 ```bash
-bash docs/examples/01_build.sh cpu        # CPU only, no CUDA needed
-bash docs/examples/01_build.sh gpu 70     # CUDA build for compute capability 7.0
+make                          # CPU only, no CUDA needed
+make USE_CUDA=1 SM=70         # CUDA build for compute capability 7.0
 ```
 
-The script runs, in each program's directory:
+`bash docs/examples/01_build.sh cpu` / `bash docs/examples/01_build.sh gpu 70` do
+the same after activating the environment named in `env.sh`. The result is one
+directory, `bin/`:
 
-| | CPU build | GPU build (`SM` = compute capability) |
+| Program | |
+|---|---|
+| `bin/saige-gpu-cpp` | the command line: `saige-gpu-cpp step1 ...`, `step2 ...`, `sgs2txt ...` |
+| `bin/saige-null` | step-1 engine (`saige-null -c step1.yaml`) |
+| `bin/saige-step2` | step-2 engine (`saige-step2 step2.yaml`) |
+| `bin/sgs2txt` | converter for the binary step-2 output |
+
+`saige-gpu-cpp` runs the engines in its own directory, so keep the four
+together (copy or link `bin/` anywhere; a symlink to `saige-gpu-cpp` works too).
+The programs find their libraries without `conda activate`. A GPU build also
+runs on machines without a GPU (it falls back to the CPU).
+
+Make variables:
+
+| Variable | Default | Meaning |
 |---|---|---|
-| step 1 (`step1_saige-null/`) | `make clean && make -j8 NVCC=none` | `make clean && make -j8 NVCC=$CUDA_HOME/bin/nvcc GPU_SM=sm_$SM` |
-| step 2 (`step2_saige-step2/`) | `make clean && make -j8` | `make clean && make -j8 USE_CUDA=1 SM=$SM NVCC=$CUDA_HOME/bin/nvcc` |
+| `USE_CUDA` | `0` | `1`: GPU build (needs `nvcc`, found as `$CUDA_HOME/bin/nvcc`, `CUDA_HOME` default `/usr/local/cuda`) |
+| `SM` | `70` | GPU compute capability; several as `SM="70 80 90"` |
+| `ARCH` | `native` | CPU instruction set (`-march`): `native` or e.g. `x86-64-v3` |
+| `PROGRAM` | `saige-gpu-cpp` | name of the command-line program |
+| `JOBS` | `8` | parallel compile jobs |
 
-Results: `step1_saige-null/saige-null`, `step2_saige-step2/saige-step2` and the
-converter `step2_saige-step2/tools/sgs2txt`. Always `make clean` before
-switching between the CPU and GPU builds. A GPU build also runs on machines
-without a GPU (it falls back to the CPU).
+Changing `ARCH`, `USE_CUDA` or `SM` rebuilds both engines from scratch.
 
 `SM` is the card's compute capability, a fixed number per GPU model (not a
 setting). Look it up on the machine you will run on:
@@ -100,31 +125,36 @@ setting). Look it up on the machine you will run on:
 nvidia-smi --query-gpu=name,compute_cap --format=csv    # e.g. "Tesla V100-SXM2-16GB, 7.0" -> SM=70
 ```
 
-The two Makefiles spell it differently: step 1 takes `GPU_SM=sm_XX`, step 2
-takes `SM=XX`. Compute capability 7.0 or newer is required.
+Compute capability 7.0 or newer is required.
 
-| GPU | step 1 | step 2 | fp64 speed (step 2 runs in fp64) |
-|---|---|---|---|
-| V100 | `GPU_SM=sm_70` (default) | `SM=70` (default) | full — **recommended, tested** |
-| T4 | `GPU_SM=sm_75` | `SM=75` | 1/32 of fp32 — slow |
-| A100, A30 | `GPU_SM=sm_80` | `SM=80` | full — recommended |
-| A10, A10G, RTX 30xx | `GPU_SM=sm_86` | `SM=86` | 1/64 of fp32 — slow |
-| L4, L40S, RTX 40xx | `GPU_SM=sm_89` | `SM=89` | 1/64 of fp32 — slow |
-| H100 | `GPU_SM=sm_90` | `SM=90` | full — recommended |
+| GPU | `SM` | fp64 speed (step 2 runs in fp64) |
+|---|---|---|
+| V100 | `70` (default) | full — **recommended, tested** |
+| T4 | `75` | 1/32 of fp32 — slow |
+| A100, A30 | `80` | full — recommended |
+| A10, A10G, RTX 30xx | `86` | 1/64 of fp32 — slow |
+| L4, L40S, RTX 40xx | `89` | 1/64 of fp32 — slow |
+| H100 | `90` | full — recommended |
 
 Step 2 computes in double precision (fp64) only, so it runs on every card above
 but is much slower on the cards marked slow. An fp32 version is not available yet.
 
-Only `sm_70` was built and run for this guide.
+One build for several GPU types: `make USE_CUDA=1 SM="70 80 90"` puts device
+code for each listed compute capability into the programs (plus PTX for the
+highest, which newer cards compile at start-up). Measured on this guide's
+machine: build 5.0 min instead of 3.3 min, `saige-step2` 25.3 MB instead of
+13.1 MB, `saige-null` 5.2 MB instead of 4.7 MB; results on the V100 identical.
 
-Step 1's Makefile finds `nvcc` under `/usr/local/cuda*/bin` on its own; if no
-`nvcc` is found it silently builds the CPU version. Step 2 builds the CPU
-version unless `USE_CUDA=1` is given.
+`make ARCH=x86-64-v3` gave byte-identical results and the same run times as the
+`native` build on this guide's machine (Intel Haswell-class CPU) for the
+tutorial and a 50,000-sample test (`tests/cli/arch_compare.sh`).
+
+Only `SM=70` was run for this guide.
 
 ## Tutorial
 
 Four binary traits, one run of each step, GPU on. From
-`SAIGE-cpp-comparison/SAIGE_cpp_260716`:
+`SAIGE-cpp-comparison/SAIGE_cpp_260716`, after the GPU build:
 
 ```bash
 export WORK=$PWD/saige_example            # every file below lands under here
@@ -132,6 +162,37 @@ bash docs/examples/02_simulate.sh         # genotypes + phenotypes
 bash docs/examples/03_step1_binary.sh     # step 1: 4 binary traits, full GRM
 bash docs/examples/04_step2_binary.sh     # step 2: all 5,000 markers x 4 traits
 ```
+
+The two steps, as the scripts run them in `$WORK`:
+
+```bash
+saige-gpu-cpp step1 \
+  --plinkFile data/geno \
+  --phenoFile data/pheno.txt \
+  --phenoCol b1,b2,b3,b4 \
+  --covarColList x1,x2 \
+  --traitType binary \
+  --LOCO=FALSE \
+  --nThreads 8 \
+  --useGPU \
+  --IsOverwriteVarianceRatioFile=TRUE \
+  --outDir step1_bin > step1_bin.log 2>&1
+
+saige-gpu-cpp step2 \
+  --step1Dir step1_bin \
+  --plinkFile data/geno \
+  --minMAF 0 \
+  --minMAC 1 \
+  --is_Firth_beta=TRUE \
+  --pCutoffforFirth 0.01 \
+  --nThreads 8 \
+  --useGPU \
+  --outDir step2_bin > step2_bin.log 2>&1
+```
+
+(`saige-gpu-cpp` is `bin/saige-gpu-cpp`; the scripts call it as `$SAIGE`.)
+Flags: [Step 1](step1.md#flags), [Step 2](step2.md#flags);
+`saige-gpu-cpp step1 --help` and `step2 --help` list them with their defaults.
 
 What each script writes:
 
@@ -144,16 +205,18 @@ $WORK/
 │   ├── geno.vcf.gz                 same genotypes, VCF with DS
 │   ├── dosage.pgen .pvar .psam     1,000 markers with fractional dosages
 │   └── pheno.txt                   IID b1 b2 b3 b4 q1 q2 x1 x2
+├── step1_bin.log                   step-1 log
 ├── step1_bin/
-│   ├── step1.yaml  step1.log
+│   ├── step1.yaml                  the settings of this run (YAML), written by step1
 │   ├── models/b1/ ... models/b4/   one null-model directory per trait
 │   └── vr_b1.varianceRatio.txt ... one variance-ratio file per trait
+├── step2_bin.log                   step-2 log
 └── step2_bin/
-    ├── step2.yaml  step2.log
-    └── out/b1.txt ... out/b4.txt   association results, one file per trait
+    ├── step2.yaml                  the settings of this run (YAML), written by step2
+    └── b1.txt ... b4.txt           association results, one file per trait
 ```
 
-The final results are `$WORK/step2_bin/out/<trait>.txt`, one row per marker
+The final results are `$WORK/step2_bin/<trait>.txt`, one row per marker
 (columns: [Step 2, results](step2.md#results)). The step-2 log reports
 whether the GPU was used:
 
@@ -164,6 +227,10 @@ whether the GPU was used:
 
 On a machine without a usable GPU the same run prints
 `useGPU: refused, running on the CPU (...)` and produces the same files.
+
+Each `stepN.yaml` repeats the run without the command line:
+`bin/saige-null -c step1_bin/step1.yaml` and `bin/saige-step2 step2_bin/step2.yaml`
+(the exact commands are in the file's header).
 
 More examples, each runnable after `02_simulate.sh`:
 
