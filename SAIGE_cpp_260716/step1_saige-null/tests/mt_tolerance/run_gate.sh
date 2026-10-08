@@ -17,7 +17,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ $# -lt 1 ]]; then sed -n '2,16p' "$0"; exit 2; fi
 if [[ -z "${R_HOME:-}" || -z "${CONDA_PREFIX:-}" ]]; then
-  # saige-null embeds R (RNG streams) and links the conda env's libraries
+  # saige-null links the conda env's libraries; R_HOME is only for reference
+  # binaries older than step1-rng, which embed R (current ones need no R)
   set +u
   source /home/francisfenglu4/miniforge3/etc/profile.d/conda.sh
   conda activate saige-build
