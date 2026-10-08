@@ -12,10 +12,6 @@ const static std::unordered_map<std::string,int> string_to_case{
    {"minor",3}
 };
 
-double getWeights(std::string t_kernel, 
-                  double t_freq, 
-                  arma::vec t_wBeta);
-
 void imputeGeno(arma::vec& GVec, 
                 double freq, 
                 std::vector<uint32_t> posMissingGeno);

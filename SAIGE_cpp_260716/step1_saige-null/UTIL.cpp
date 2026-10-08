@@ -2,32 +2,16 @@
 // [[Rcpp::depends(RcppArmadillo)]]
 #include <RcppArmadillo.h>
 #include "UTIL.hpp"
+#include "r_rng.hpp"
 #include <sys/time.h>
 
+// Rcpp::rbinom(n, 1, 0.5) via the C++ port of R's RNG (r_rng.cpp): same draws,
+// same continuous stream as set_seed(). (getWeights(), which used Rcpp::dbeta,
+// was removed: nothing in step 1 calls it.)
 arma::vec nb(unsigned int n){
-  return(Rcpp::rbinom(n,1,0.5));
-}
-
-
-
-double getWeights(std::string t_kernel, 
-                  double t_freq, 
-                  arma::vec t_wBeta)
-{
-  if(t_wBeta.size() != 2)
-    Rcpp::stop("The size of argument t_wBeta should be 2.");
-  
-  double weights;
-  if(t_kernel == "linear")
-    weights = 1;
-  
-  if(t_kernel == "linear.weighted"){
-    Rcpp::NumericVector freq = {t_freq};
-    Rcpp::NumericVector temp = Rcpp::dbeta(freq, t_wBeta(0), t_wBeta(1));
-    weights = temp(0);
-  }
-  
-  return weights;
+  arma::vec out(n);
+  for (unsigned int i = 0; i < n; ++i) out(i) = saige::rrng::rbinom(1.0, 0.5);
+  return out;
 }
 
 void imputeGeno(arma::vec& t_GVec, 

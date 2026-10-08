@@ -46,7 +46,6 @@
 #include <unordered_set>
 #include <vector>
 #include <RcppArmadillo.h>
-#include <Rembedded.h>
 #include <iomanip>
 #include <chrono>
 #include <cmath>
@@ -1079,19 +1078,6 @@ static void design_take_rows(Design& d, const std::vector<size_t>& keep) {
  
 // ------------------ main ------------------
 int main(int argc, char** argv) {
-  // Initialize R's embedded runtime so we can use R's RNG (Mersenne Twister)
-  // This makes set_seed() and Rf_rbinom() work in standalone mode
-  {
-    // R_HOME for the embedded R runtime. Honor an existing R_HOME; otherwise use
-    // SAIGE_R_HOME if provided (set it to your R install, e.g. $CONDA_PREFIX/lib/R).
-    if (!std::getenv("R_HOME")) { if (const char* rh = std::getenv("SAIGE_R_HOME")) setenv("R_HOME", rh, 0); }
-    char* r_argv[] = { (char*)"saige-null", (char*)"--vanilla", (char*)"--no-readline", (char*)"--silent", nullptr };
-    Rf_initialize_R(4, r_argv);
-    extern uintptr_t R_CStackLimit;
-    R_CStackLimit = (uintptr_t)-1;  // disable stack checking
-    setup_Rmainloop();
-    std::cout << "[R] Embedded R runtime initialized" << std::endl;
-  }
 
   cxxopts::Options opts("saige-null", "Null GLMM fitting with LOCO/VR (genoClass-integrated)");
   opts.add_options()

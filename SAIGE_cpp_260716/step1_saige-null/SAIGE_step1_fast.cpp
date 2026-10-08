@@ -20,6 +20,7 @@
 #include <random>  // for std::random_device, std::mt19937, std::bernoulli_distribution
 #include <boost/date_time.hpp> // for gettimeofday and timeval
 #include "getMem.hpp"
+#include "r_rng.hpp"  // R's set.seed / rbinom, ported (no embedded R)
 #include "UTIL.hpp"  // Substituted from src/UTIL.hpp for utility functions
 #include "SAIGE_step1_fast.hpp"
 #include "block_sigma.hpp"  // Included from src/Main.hpp for function declarations
@@ -3070,11 +3071,9 @@ double get_cpu_time(){
 }
 
 void set_seed(unsigned int seed) {
-	// Use R C API to call set.seed() - works in embedded mode without Rcpp dependency issues
-	SEXP seed_sexp = PROTECT(Rf_ScalarInteger(seed));
-	SEXP call = PROTECT(Rf_lang2(Rf_install("set.seed"), seed_sexp));
-	Rf_eval(call, R_BaseEnv);
-	UNPROTECT(2);
+	// R's set.seed(seed) (default Mersenne-Twister), ported to C++ in r_rng.cpp.
+	// Same cast as before: the unsigned seed reached R as Rf_ScalarInteger(int).
+	saige::rrng::set_seed((int)seed);
 }
 
 // Optional override for the AI-REML trace-estimator RNG seed. -1 (default) =>
@@ -8439,15 +8438,13 @@ static inline arma::fvec rademacher_vec(int n) {
     throw std::runtime_error("Preloaded vectors exhausted - cannot continue with matching R vectors");
   }
 
-  // Fall back to random generation using R's RNG (matches R's Rcpp::rbinom(n,1,0.5))
-  // Uses R C API directly to avoid Rcpp version mismatch in embedded mode
-  // R's embedded runtime must be initialized (Rf_initEmbeddedR in main)
-  // NOTE: GetRNGstate/PutRNGstate must NOT be called per-vector — R generates
-  // all vectors in one continuous stream. The caller (GetTrace_q) calls set_seed()
-  // which handles the RNG state. We just draw from the current state here.
+  // Fall back to random generation with R's RNG (matches R's rbinom(n,1,0.5)),
+  // ported to C++ in r_rng.cpp -- bit-identical draws, no R runtime.
+  // All vectors come from one continuous stream, as in R: the caller
+  // (GetTrace / GetTrace_q) calls set_seed() once; we draw from the current state.
   arma::fvec u(n);
   for (int i = 0; i < n; ++i) {
-    double binom_val = Rf_rbinom(1.0, 0.5);
+    double binom_val = saige::rrng::rbinom(1.0, 0.5);
     u(i) = static_cast<float>(binom_val * 2.0 - 1.0);  // 0→-1, 1→+1 (matches R's uVec*2-1)
   }
   return u;
@@ -8506,11 +8503,8 @@ float GetTrace(const arma::fmat& Sigma_iX,
                float tolPCG,
                float traceCVcutoff)
 {
-  // Before anything else, including set_seed()/GetRNGstate(): with exact traces
-  // there are no probes, so there is no reason to touch R's RNG. Placing this
-  // lower still called into the embedded R interpreter once per AI-REML round
-  // (six times on a binary fit) for probes that were then skipped -- and the R
-  // evaluator is what keeps this binary linked against libR at all.
+  // Before anything else, including set_seed(): with exact traces there are no
+  // probes, so there is no reason to touch the RNG.
   if (exactTraceAvailable(wVec, tauVec)) {
     const double tr = exactTraceMPsi(Sigma_iX, cov1, nullptr);
     std::cout << "GetTrace: exact tr(M*Psi) = " << tr
@@ -8551,13 +8545,12 @@ float GetTrace(const arma::fmat& Sigma_iX,
   // Reset vector index on each GetTrace call
   preloaded_vector_idx = 0;
 
-  // Set R's RNG seed (default 10, matches R's GetTrace; overridable via fit.trace_seed)
+  // Seed the R-compatible RNG (default 10, matches R's GetTrace; overridable via fit.trace_seed)
   if (!use_preloaded_vectors) {
     int seed = getTraceSeedOr(10);
     std::cout << "[GetTrace] trace RNG seed = " << seed
               << (g_trace_seed >= 0 ? " (config override)" : " (builtin default)") << std::endl;
     set_seed(seed);
-    GetRNGstate();
   }
 
   // --- Dimensions & sanity ---
@@ -8724,9 +8717,6 @@ float GetTrace(const arma::fmat& Sigma_iX,
     }
   }
 
-  if (!use_preloaded_vectors) {
-    PutRNGstate();
-  }
 
   return arma::mean(tempVec.rows(0, nrunEnd - 1));
 }
@@ -9449,14 +9439,12 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
   // Reset vector index on each GetTrace_q call
   preloaded_vector_idx = 0;
 
-  // Set R's RNG seed (default 200, matches R's GetTrace_q; overridable via fit.trace_seed)
-  // Then load RNG state so Rf_rbinom() draws from the seeded stream
+  // Seed the R-compatible RNG (default 200, matches R's GetTrace_q; overridable via fit.trace_seed)
   if (!use_preloaded_vectors) {
     int seed = getTraceSeedOr(200);
     std::cout << "[GetTrace_q] trace RNG seed = " << seed
               << (g_trace_seed >= 0 ? " (config override)" : " (builtin default)") << std::endl;
     set_seed(seed);
-    GetRNGstate();
   }
 
   const int n = Sigma_iX.n_rows;
@@ -9539,10 +9527,6 @@ arma::fvec GetTrace_q(arma::fmat Sigma_iX, arma::fmat& Xmat, arma::fvec& wVec, a
   arma::fvec traVec(2);
   traVec(1) = arma::mean(tempVec.rows(0, nrunEnd - 1));
   traVec(0) = arma::mean(tempVec0.rows(0, nrunEnd - 1));
-  // Restore R's RNG state after all vectors generated
-  if (!use_preloaded_vectors) {
-    PutRNGstate();
-  }
 
   std::cout << "GetTrace_q: Trace[0] (identity) = " << traVec(0)
             << ", Trace[1] (kinship) = " << traVec(1) << std::endl;
