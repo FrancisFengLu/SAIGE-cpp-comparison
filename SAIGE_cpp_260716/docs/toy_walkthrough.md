@@ -43,7 +43,6 @@ source ~/miniforge3/etc/profile.d/conda.sh
 conda activate saige-build
 export PATH=/usr/local/cuda/bin:$PATH
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
-export R_HOME=$CONDA_PREFIX/lib/R                       # step 1 运行时要用
 
 mkdir -p $ROOT/input $ROOT/step1 $ROOT/step2/out        # step 2 不会自己建 out/
 ```
@@ -262,7 +261,6 @@ CHR POS   MarkerID Allele1 Allele2 AC_Allele2 AF_Allele2 MissingRate BETA      S
 | 现象 | 原因 |
 |---|---|
 | `plink2: command not found` | 没设 `PLINK2`，或者用了 `plink2` 而不是 `$PLINK2` |
-| step 1 报找不到 R / libR.so | 没 `conda activate saige-build` 或没设 `R_HOME` |
 | step 2 报写不了输出文件 | `$ROOT/step2/out` 没建 |
 | step 2 报找不到模型 | `modelFile` 要指向 `models/<表型名>` 这个**目录** |
 | step 1 日志里没有 `GPU tier=` | 在 CPU 上跑了（GPU 不可用时不报错） |

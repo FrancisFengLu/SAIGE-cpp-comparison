@@ -43,8 +43,8 @@ No container image is published. Build from source.
 
 - Linux x86-64. The build uses `-march=native`, so build on the
   machine type you will run on.
-- A conda environment with the libraries below. Step 1 embeds R (for its random
-  number generator), so it needs R and the Rcpp packages at build and run time.
+- A conda environment with the libraries below (any other source of the same
+  libraries works too). Neither program needs R.
 - For the GPU build only: CUDA toolkit 12.x (`nvcc`, cuBLAS) and an NVIDIA GPU
   with compute capability 7.0 or newer. Tested: CUDA 12.9, Tesla V100 (sm_70).
 
@@ -53,8 +53,7 @@ No container image is published. Build from source.
 ```bash
 mamba create -y -p $HOME/miniforge3/envs/saige-build -c conda-forge -c bioconda \
     gxx_linux-64=12 make pkg-config armadillo openblas superlu yaml-cpp htslib \
-    zstd zlib sqlite boost-cpp eigen tbb-devel pcre2 \
-    r-base r-rcpp r-rcpparmadillo r-rcppparallel
+    zstd zlib sqlite boost-cpp eigen
 ```
 
 ### 2. Get the code and point the example scripts at your paths
@@ -74,8 +73,6 @@ variables, each with a default you can override from the shell:
 | `WORK` | `./saige_example` | where the examples write data and results |
 | `PLINK2` | `plink2` | only used to simulate the tutorial data |
 | `CONDA_SH` | `<conda base>/etc/profile.d/conda.sh`, derived from `CONDA_ENV` | set it when the environment is not under `<conda base>/envs/` |
-
-It also exports `R_HOME=$CONDA_PREFIX/lib/R`, which step 1 needs at run time.
 
 ### 3. Build
 

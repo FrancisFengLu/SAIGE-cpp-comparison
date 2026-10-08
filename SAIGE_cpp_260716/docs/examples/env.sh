@@ -18,7 +18,6 @@ conda activate "$CONDA_ENV"
 [ "$_u" = 1 ] && set -u
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-export R_HOME="$CONDA_PREFIX/lib/R"          # step 1 embeds R; it needs R_HOME at run time
 
 S1=${S1:-$SAIGE_HOME/step1_saige-null/saige-null}           # step 1 binary
 S2=${S2:-$SAIGE_HOME/step2_saige-step2/saige-step2}         # step 2 binary

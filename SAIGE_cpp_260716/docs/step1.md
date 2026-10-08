@@ -15,8 +15,6 @@ saige-null -c step1.yaml -t 8                  # threads (= fit.nthreads)
 saige-null -c step1.yaml -o fit.loco=false     # override any config key (repeatable)
 ```
 
-`R_HOME` must point to the R installation of the build environment
-(`export R_HOME=$CONDA_PREFIX/lib/R`).
 
 ## Command-line options
 

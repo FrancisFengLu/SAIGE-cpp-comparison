@@ -26,7 +26,6 @@ run with `saige-null -c step1.yaml --dry-run`.
 
 | Message | Cause / fix |
 |---|---|
-| `Fatal error: R home directory is not defined` | set `R_HOME` (e.g. `export R_HOME=$CONDA_PREFIX/lib/R`) |
 | `IID in design not found in FAM: extra1` | the phenotype file has a sample that is not in the `.fam`. Add `design.whitelist_ids:` with the `.fam` IIDs (`cut -f2 geno.fam > ids.txt`) or remove the row |
 | `ERROR: binary phenotype value must be 0 or 1, found: 2.000000 at sample per3` | recode cases/controls as 1/0 |
 | `ERROR: variance of the phenotype (0.000125) is much smaller than 1. Please consider setting inv_normalize: true in config.` | quantitative trait on a small scale; set `fit.inv_normalize: true` or rescale |
