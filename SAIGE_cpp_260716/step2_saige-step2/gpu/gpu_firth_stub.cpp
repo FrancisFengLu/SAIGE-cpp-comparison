@@ -6,6 +6,7 @@
 namespace saige {
 namespace gpu2 {
 
+bool          firthSupports(Prec t_p)                          { return t_p == Prec::FP64; }
 Firth*        firthCreate(const FirthCreateArgs&)              { return nullptr; }
 void          firthDestroy(Firth*)                             {}
 FirthPairIn*  firthIn(Firth*)                                  { return nullptr; }

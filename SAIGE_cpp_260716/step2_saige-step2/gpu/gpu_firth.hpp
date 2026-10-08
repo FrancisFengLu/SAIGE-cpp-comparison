@@ -43,10 +43,22 @@
 // offset (N), XV (p x N as the model stores it: sample i's p values are
 // contiguous) and XXVX_inv (N x p column-major), uploaded once at firthCreate().
 // Per pair: slot and trait only (16 B).
+//
+// Precision (config key gpuPrecisionFirth, gpu_precision.hpp):
+// FirthCreateArgs::precision, FP64 (default, everything above) or FP32. Only
+// modes firthSupports() accepts may be passed. CONTRACT for any non-fp64
+// variant: FirthPairOut keeps its types -- beta, alpha, se are handed back as
+// double (the fp32 value converted), conv / strict / niter / singular mean what
+// they mean in fp64 (the stopping rule's tolerances xconv / gconv are the
+// caller's; whether an fp32 fit can reach them is the variant's business,
+// and a fit that cannot must report conv = 0 rather than claim convergence).
+// The host (flip sign, seBeta from p, counters) reads those doubles unchanged.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "gpu_precision.hpp"
 
 namespace saige {
 namespace gpu2 {
@@ -83,7 +95,14 @@ struct FirthCreateArgs {
     // Per-trait sample sets (default off): masks per trait, and pair k's own
     // 4-entry dosage table in firthPairLut() at 4k instead of the slot's.
     int ownSamples = 0;
+    // Arithmetic of the fit (gpuPrecisionFirth); see the contract above.
+    Prec precision = Prec::FP64;
 };
+
+// True when firthCreate() accepts FirthCreateArgs::precision = t_p. main.cpp
+// asks first and stops the run on false ("useGPU: Firth precision <mode> is
+// not implemented yet").
+bool firthSupports(Prec t_p);
 
 struct FirthPairIn {
     int slot;     // reducer slot of the marker (last reduce())

@@ -78,10 +78,27 @@ files are byte-identical with `useGPU: true` and `false`).
 | `gpuOverlap` | `true` | GPU and CPU work on different blocks at once |
 | `gpuDecodeX2`, `gpuSpaFused`, `gpuSpaDynamic`, `gpuSpaOrder: trait`, `gpuSpaMinBlocks: 3`, `gpuSpaImpl: lib` | as shown | kernel variants; no effect on results |
 
-Other GPU keys: `gpuDevice` (0), `gpuPrecision` (`fp64`; `fp32` disables
-`gpuSparse`), `gpuBlockSize` (16384, but a batch never exceeds `marker_chunksize`,
+Other GPU keys: `gpuDevice` (0), `gpuBlockSize` (16384, but a batch never exceeds `marker_chunksize`,
 default 10,000, so with defaults the batch is 9,984 markers), `gpuOverlapSets` (6), `gpuOverlapLag` (3),
 `gpuPrefetchSets` (3), `gpuFirthMaxStep` (15), `gpuSparseMaxPairs` (5e7).
+
+Precision per stage (all `fp64` by default, which is the output above; any
+combination may be given; flags of the same names in `step2`):
+
+| Key | Values | Stage |
+|---|---|---|
+| `gpuPrecisionScan` (old name `gpuPrecision`) | `fp64`, `fp32`, `int8` | decode + GEMMs of the marker scan, and the sparse-GRM variance |
+| `gpuPrecisionSPA` | `fp64`, `fp32` | saddlepoint approximation |
+| `gpuPrecisionER` | `fp64`, `fp32` | exact test; the startup self-check runs only with `fp64` |
+| `gpuPrecisionFirth` | `fp64`, `fp32` | Firth fit |
+| `gpuInt8Slices` | 1..8 (7) | `int8` scan: int8 slices of the trait-side matrix |
+
+The log prints `GPU precision: scan=... SPA=... ER=... Firth=... (int8 slices N)`.
+A mode that is not implemented yet stops the run with
+`useGPU: <stage> precision <mode> is not implemented yet`; it is never replaced
+by another mode. Implemented today: `fp64` everywhere and scan `fp32` (without
+a sparse-GRM binary trait, or with `gpuSparse: false`). The CPU path ignores
+these keys.
 
 A dependency that is not met turns the dependent switch off; when the config
 wrote that switch explicitly, the log says so (e.g. `gpuFirth: ignored, it needs gpuSpa: true`).
@@ -136,7 +153,7 @@ Not used — one line with the reason, then the run continues on the CPU:
 | `mtBatch is false` | remove `mtBatch: false` |
 | `trait '<name>': sparseGRM first pass ...` | quantitative sparse-GRM model with `fast_test: false` |
 | `trait '<name>': isnoadjCov=true`, `... runs conditional analysis` | not supported on the GPU |
-| `gpuSparse: ...` | the sparse-GRM variance could not be set up on the GPU (e.g. `gpuPrecision: fp32`) |
+| `gpuSparse: ...` | the sparse-GRM variance could not be set up on the GPU |
 | `device setup failed` | GPU out of memory or CUDA error at start; see memory below |
 
 Also not a refusal, but worth knowing:

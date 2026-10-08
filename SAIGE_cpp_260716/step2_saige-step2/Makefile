@@ -235,29 +235,29 @@ $(TARGET): $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ)
 third_party/pgenlib/%.o: third_party/pgenlib/%.cc
 	$(CXX) $(PGENLIB_CXXFLAGS) -c $< -o $@
 
-gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp
+gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 # The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU
 # build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /
 # log bound and the difference in speed is not measurable.
-gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp
+gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # Firth on the device (gpu/gpu_firth.hpp, config key gpuFirth): the same
 # one-block-per-pair shape as the SPA kernels, --fmad=false for the same reason.
-gpu/gpu_firth.cu.o: gpu/gpu_firth.cu gpu/gpu_firth.hpp gpu/gpu_step2.hpp
+gpu/gpu_firth.cu.o: gpu/gpu_firth.cu gpu/gpu_firth.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # The within-block cross terms of g' Sigma^-1 g for sparse-GRM binary traits
 # (gpu/gpu_sparse.hpp, config key gpuSparse).
-gpu/gpu_sparse.cu.o: gpu/gpu_sparse.cu gpu/gpu_sparse.hpp gpu/gpu_step2.hpp
+gpu/gpu_sparse.cu.o: gpu/gpu_sparse.cu gpu/gpu_sparse.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 # The exact test for binary traits on the device (gpu/gpu_er.hpp, config key
 # gpuER): --fmad=false like the SPA / Firth kernels; the only fused operations are
 # the explicit fma() of the glibc exp / log ports (gpu_er_glibc.cuh).
-gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh
+gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # Device ER against er_binary.cpp pair by pair, and the device exp / log against
@@ -270,7 +270,7 @@ tools/er_gpu_check: tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ)
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
 # Boost's 53-bit erfc with the underflow deferred. Config key gpuSpaImpl picks
 # it (lib, the default) or gpu_spa.cu (own).
-gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp
+gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 clean:

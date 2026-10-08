@@ -749,6 +749,31 @@ std::vector<Section> step2_sections() {
   S.push_back(rg);
 
   common_flags(S, 2);
+
+  // Per-stage arithmetic of the GPU path (engine: gpu/gpu_precision.hpp). The
+  // values are checked here for spelling only; the engine owns the defaults
+  // (--print-defaults) and says when a mode is not implemented.
+  Section gp{"GPU precision (with --useGPU)", {}};
+  auto prec_flag = [](const std::string& name, bool int8ok, const std::string& help) {
+    Flag f = F(name, Kind::Str, int8ok ? "fp64|fp32|int8" : "fp64|fp32", "", help, name, true);
+    f.apply = [name, int8ok](Ctx& c, const std::string& v) {
+      const std::string t = trim(v);
+      if (t != "fp64" && t != "fp32" && !(int8ok && t == "int8"))
+        throw UsageError("--" + name + " must be fp64" + (int8ok ? ", fp32 or int8" : " or fp32") +
+                         ", got '" + v + "'");
+      set_path(c.cfg, name, YAML::Node(t));
+    };
+    return f;
+  };
+  gp.flags.push_back(prec_flag("gpuPrecisionScan", true,
+      "decode + GEMMs of the marker scan and the sparse-GRM variance; int8 = split int8 GEMMs"));
+  gp.flags.push_back(prec_flag("gpuPrecisionSPA", false, "the saddlepoint approximation on the device"));
+  gp.flags.push_back(prec_flag("gpuPrecisionER", false, "the exact test (ER) on the device"));
+  gp.flags.push_back(prec_flag("gpuPrecisionFirth", false, "the Firth fit on the device"));
+  gp.flags.push_back(F("gpuInt8Slices", Kind::Int, "N", "",
+      "with --gpuPrecisionScan=int8: int8 slices of the trait-side matrix (1..8)", "gpuInt8Slices", true));
+  S.push_back(gp);
+
   annotate(S, {
     {"config", "(the file is loaded first)"},
     {"outDir", "models[].outputFile = DIR/<trait>.txt"},

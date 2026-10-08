@@ -452,6 +452,7 @@ bool growDev(T** p, std::size_t* cap, std::size_t need)
 }  // namespace
 
 struct Er {
+    Prec prec = Prec::FP64;   // ErCreateArgs::precision
     int device = 0;
     int nTraits = 0;
     double* dMu = nullptr;
@@ -475,14 +476,32 @@ struct Er {
     long long nPairsDone = 0;
 };
 
+bool erSupports(Prec t_p)
+{
+    switch (t_p) {
+        case Prec::FP64: return true;
+        // TODO(precision:ER): return true once the fp32 enumeration is plugged
+        // in at the launches in erRun().
+        case Prec::FP32: return false;
+        case Prec::INT8: return false;   // not a mode of this stage
+    }
+    return false;
+}
+
 Er* erCreate(const ErCreateArgs& a)
 {
     if (a.nTraits <= 0 || a.traits == nullptr || a.logTable == nullptr || a.maxN <= 0) {
         lastErrEr = "erCreate: bad arguments";
         return nullptr;
     }
+    // ---- precision dispatch ----
+    if (!erSupports(a.precision)) {
+        lastErrEr = std::string("ER precision ") + precName(a.precision) + " is not implemented yet";
+        return nullptr;
+    }
     if (cudaSetDevice(a.device) != cudaSuccess) { lastErrEr = "cudaSetDevice failed"; return nullptr; }
     Er* s = new Er();
+    s->prec = a.precision;
     s->device = a.device;
     s->nTraits = a.nTraits;
     auto fail = [&](const char* w) -> Er* { lastErrEr = w; erDestroy(s); return nullptr; };
@@ -562,6 +581,13 @@ bool erRun(Er* s, const ErPairIn* in, int nPairs, const uint32_t* carIdx, const 
     if (nBig > 0)
         CKE(cudaMemcpyAsync(s->dBigPair, bigPair.data(), (std::size_t)nBig * sizeof(int), cudaMemcpyHostToDevice, s->st));
     CKE(cudaEventRecord(s->e0, s->st));
+    // ---- precision dispatch: the kernel variant ----
+    if (s->prec != Prec::FP64) {
+        // TODO(precision:ER): launch the fp32 variants of er_pairs / er_big
+        // here (same inputs, ErPairOut::pval as double; see gpu_er.hpp).
+        lastErrEr = std::string("ER precision ") + precName(s->prec) + " has no kernel";
+        return false;
+    }
     const int nt = 32;   // few pairs per call: spread them over the SMs
     const int nb = (nPairs + nt - 1) / nt;
     er_pairs<<<nb, nt, 0, s->st>>>(s->dMu, s->dMuOff, s->dN, s->dNcase, s->dLT, s->dIn, nPairs,

@@ -21,6 +21,7 @@ std::string describe(int) { return std::string(); }
 
 int maskWords(int t_N) { return (t_N + 31) / 32; }
 
+bool     scanSupports(Prec t_p) { return t_p == Prec::FP64; }
 Reducer* create(const CreateArgs&) { return nullptr; }
 void     destroy(Reducer*) {}
 

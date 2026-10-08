@@ -207,6 +207,7 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
 }  // namespace
 
 struct Firth {
+    Prec prec = Prec::FP64;   // FirthCreateArgs::precision
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxit = 50;
     double maxstep = 15.0, xconv = 1e-5, gconv = 1e-5;
     std::size_t traitStride = 0;
@@ -226,9 +227,26 @@ struct Firth {
     std::size_t devBytes = 0;
 };
 
+bool firthSupports(Prec t_p)
+{
+    switch (t_p) {
+        case Prec::FP64: return true;
+        // TODO(precision:Firth): return true once the fp32 fit is plugged in at
+        // the launch in firthRun().
+        case Prec::FP32: return false;
+        case Prec::INT8: return false;   // not a mode of this stage
+    }
+    return false;
+}
+
 Firth* firthCreate(const FirthCreateArgs& a)
 {
     if (a.N <= 0 || a.nTraits <= 0 || a.traits == nullptr || a.maxPairs <= 0) return nullptr;
+    // ---- precision dispatch ----
+    if (!firthSupports(a.precision)) {
+        lastErrFirth = std::string("Firth precision ") + precName(a.precision) + " is not implemented yet";
+        return nullptr;
+    }
     if (a.maxit <= 0 || !(a.maxstep > 0.0)) return nullptr;
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
     int pMax = 0;
@@ -238,6 +256,7 @@ Firth* firthCreate(const FirthCreateArgs& a)
         if (a.traits[t].p > pMax) pMax = a.traits[t].p;
     }
     Firth* s = new Firth();
+    s->prec = a.precision;
     s->N = a.N; s->nTraits = a.nTraits; s->maxPairs = a.maxPairs;
     s->blocks = a.blocks > 0 ? a.blocks : 256;
     s->maxit = a.maxit; s->maxstep = a.maxstep; s->xconv = a.xconv; s->gconv = a.gconv;
@@ -335,6 +354,13 @@ bool firthRun(Firth* s, const Reducer* r, int nPairs, int t_devSet)
     if (s->own) CKF(cudaMemcpyAsync(s->dPLut, s->hPLut, (std::size_t)nPairs * 4 * sizeof(double), cudaMemcpyHostToDevice, s->st));
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CKF(cudaEventRecord(s->e0, s->st));
+    // ---- precision dispatch: the kernel variant ----
+    if (s->prec != Prec::FP64) {
+        // TODO(precision:Firth): launch the fp32 variant of firth_pairs here
+        // (same inputs, same FirthPairOut doubles; see gpu_firth.hpp).
+        lastErrFirth = std::string("Firth precision ") + precName(s->prec) + " has no kernel";
+        return false;
+    }
     if (s->own)
         firth_pairs<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dPLut, s->dMask, s->maskWords,
                                             s->dY, s->dOff, s->dXV, s->dXX, s->dP,

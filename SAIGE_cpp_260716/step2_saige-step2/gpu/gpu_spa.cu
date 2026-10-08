@@ -263,6 +263,7 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
 }  // namespace
 
 struct Spa {
+    Prec prec = Prec::FP64;   // SpaCreateArgs::precision
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxiter = 1000;
     double tol = 0.0;
     std::size_t traitStride = 0;
@@ -280,9 +281,26 @@ struct Spa {
     std::size_t devBytes = 0;
 };
 
+bool spaSupports(Prec t_p)
+{
+    switch (t_p) {
+        case Prec::FP64: return true;
+        // TODO(precision:SPA): gpuSpaImpl: own in fp32 -- return true once the
+        // variant is plugged in at the launch in spaRun().
+        case Prec::FP32: return false;
+        case Prec::INT8: return false;   // not a mode of this stage
+    }
+    return false;
+}
+
 Spa* spaCreate(const SpaCreateArgs& a)
 {
     if (a.N <= 0 || a.nTraits <= 0 || a.traits == nullptr || a.maxPairs <= 0) return nullptr;
+    // ---- precision dispatch ----
+    if (!spaSupports(a.precision)) {
+        lastErrSpa = std::string("SPA precision ") + precName(a.precision) + " is not implemented yet";
+        return nullptr;
+    }
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
     int pMax = 0;
     for (int t = 0; t < a.nTraits; ++t) {
@@ -291,6 +309,7 @@ Spa* spaCreate(const SpaCreateArgs& a)
         if (a.traits[t].p > pMax) pMax = a.traits[t].p;
     }
     Spa* s = new Spa();
+    s->prec = a.precision;
     s->N = a.N; s->nTraits = a.nTraits; s->maxPairs = a.maxPairs;
     s->blocks = a.blocks > 0 ? a.blocks : 256; s->maxiter = a.maxiter; s->tol = a.tol;
     s->traitStride = (std::size_t)a.N * pMax;
@@ -365,8 +384,16 @@ bool spaRun(Spa* s, const Reducer* r, int nPairs, int t_devSet)
     CKS(cudaMemcpyAsync(s->dIn, s->hIn, (std::size_t)nPairs * sizeof(SpaPairIn), cudaMemcpyHostToDevice, s->st));
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CKS(cudaEventRecord(s->e0, s->st));
-    spa_pairs<<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
-                                      s->traitStride, s->dIn, nPairs, s->dScratch, s->tol, s->maxiter, s->dOut);
+    // ---- precision dispatch: the kernel variant ----
+    if (s->prec == Prec::FP64) {
+        spa_pairs<<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
+                                          s->traitStride, s->dIn, nPairs, s->dScratch, s->tol, s->maxiter, s->dOut);
+    } else {
+        // TODO(precision:SPA): the fp32 variant of spa_pairs, writing the same
+        // SpaPairOut doubles.
+        lastErrSpa = std::string("SPA precision ") + precName(s->prec) + " has no kernel";
+        return false;
+    }
     CKS(cudaGetLastError());
     CKS(cudaEventRecord(s->e1, s->st));
     CKS(cudaMemcpyAsync(s->hOut, s->dOut, (std::size_t)nPairs * sizeof(SpaPairOut), cudaMemcpyDeviceToHost, s->st));

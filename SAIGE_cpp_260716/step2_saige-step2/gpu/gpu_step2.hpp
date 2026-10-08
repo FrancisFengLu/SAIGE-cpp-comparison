@@ -75,6 +75,8 @@
 #include <cstdint>
 #include <string>
 
+#include "gpu_precision.hpp"
+
 namespace saige {
 namespace gpu2 {
 
@@ -98,12 +100,20 @@ struct CreateArgs {
     // Right operand of C2 = (G % G)^T B2, N x K2. K2 = 0: no second GEMM.
     int K2 = 0; const double* B2 = nullptr;
     int maxSlots = 0;              // markers per reduce() call, at most
-    // Run the decode and the GEMMs in double instead of float. On a V100 this
-    // costs about 40% more GEMM time and about one extra pass of device
-    // bandwidth in the decode -- a few percent of a real step-2 run -- and it
-    // removes the precision question rather than bounding it. See PRECISION in
+    // Arithmetic of the decode and the GEMMs (config key gpuPrecisionScan,
+    // gpu_precision.hpp). FP64 (default): double throughout. On a V100 this
+    // costs about 40% more GEMM time than FP32 and about one extra pass of
+    // device bandwidth in the decode -- a few percent of a real step-2 run --
+    // and it removes the precision question rather than bounding it. FP32:
+    // float decode + SGEMM, float results (outCf / outC2f). INT8: the
+    // Ozaki-style split (int8 genotypes, B1 / B2 split into int8Slices int8
+    // slices with per-column scaling, int32 GEMMs, recombined in fp64); double
+    // results (outCd / outC2d). Only the modes scanSupports() accepts may be
+    // passed; create() returns nullptr for any other. See PRECISION in
     // gpu_step2.cu.
-    bool fp64 = true;
+    Prec precision = Prec::FP64;
+    // INT8 only: slices of the trait-side operand, kInt8SlicesMin..Max.
+    int int8Slices = kInt8SlicesDefault;
     // Code-count masks: nMask rows of maskWords() 64-bit words each (the
     // layout popcount_af.hpp's pcBuildMask writes), 11 in every selected
     // sample's 2-bit field. nMask = 0: no counts.
@@ -130,6 +140,11 @@ struct CreateArgs {
     // set is used, so the numbers are too.
     int deviceSets = 1;
 };
+
+// True when create() accepts CreateArgs::precision = t_p. main.cpp asks
+// before create() and stops the run on false ("useGPU: scan precision <mode>
+// is not implemented yet"); it never falls back to another precision.
+bool scanSupports(Prec t_p);
 
 // Returns nullptr on ANY failure (no device, allocation refused, ...). The
 // caller must fall back to the CPU path; nothing is printed here.
@@ -174,7 +189,8 @@ bool reduce(Reducer* t_r, int t_nSlots, int t_set = 0, int t_devSet = -1);
 // Results of the last reduce(): C1 is t_maxSlots x K1 column-major, so element
 // (slot, k) sits at index (std::size_t)k * ldC() + slot; C2 likewise with K2
 // columns. Pinned, owned here. Exactly one of each pair of accessors is
-// non-null, per isFp64().
+// non-null, per isFp64(), which says whether the RESULT buffers are double:
+// true for precision FP64 and INT8 (recombined in fp64), false for FP32.
 bool          isFp64(const Reducer* t_r);
 const float*  outCf(const Reducer* t_r, int t_devSet = -1);
 const double* outCd(const Reducer* t_r, int t_devSet = -1);

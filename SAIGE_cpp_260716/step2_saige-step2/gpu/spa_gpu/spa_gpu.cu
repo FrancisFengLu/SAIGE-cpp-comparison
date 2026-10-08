@@ -683,6 +683,7 @@ __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, do
 // ---------------------------------------------------------------------------
 
 struct Spa {
+    saige::gpu2::Prec prec = saige::gpu2::Prec::FP64;   // CreateArgs::precision
     int N = 0, nTraits = 0, maxPairs = 0, blocks = 256, maxiter = 1000, erfcMode = 1;
     int fused = 0, dyn = 0, minb = 0;
     int* dCounter = nullptr;
@@ -710,11 +711,28 @@ struct Spa {
     std::size_t devBytes = 0;
 };
 
+bool supports(saige::gpu2::Prec t_p)
+{
+    switch (t_p) {
+        case saige::gpu2::Prec::FP64: return true;
+        // TODO(precision:SPA): return true once the fp32 kernel is plugged in
+        // at the launch in run().
+        case saige::gpu2::Prec::FP32: return false;
+        case saige::gpu2::Prec::INT8: return false;   // not a mode of this stage
+    }
+    return false;
+}
+
 Spa* create(const CreateArgs& a)
 {
     g_lastErr.clear();
     if (a.N <= 0 || a.nTraits <= 0 || a.traits == nullptr || a.maxPairs <= 0) {
         g_lastErr = "create: bad arguments"; return nullptr;
+    }
+    // ---- precision dispatch ----
+    if (!supports(a.precision)) {
+        g_lastErr = std::string("SPA precision ") + saige::gpu2::precName(a.precision) + " is not implemented yet";
+        return nullptr;
     }
     if (cudaSetDevice(a.device) != cudaSuccess) { g_lastErr = "cudaSetDevice failed"; return nullptr; }
     int pMax = 0;
@@ -727,6 +745,7 @@ Spa* create(const CreateArgs& a)
         if (T.p > pMax) pMax = T.p;
     }
     Spa* s = new Spa();
+    s->prec = a.precision;
     s->N = a.N; s->nTraits = a.nTraits; s->maxPairs = a.maxPairs;
     s->blocks = a.blocks > 0 ? a.blocks : 256;
     s->maxiter = a.maxiter; s->tol = a.tol; s->erfcMode = a.erfcMode;
@@ -879,7 +898,18 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     if (s->dyn) CK(cudaMemsetAsync(s->dCounter, 0, sizeof(int), s->st));
     if (s->own) CK(cudaMemcpyAsync(s->dPLut, s->hPLut, (std::size_t)nPairs * 4 * sizeof(double), cudaMemcpyHostToDevice, s->st));
     CK(cudaEventRecord(s->ev[1], s->st));
-    launchSpa(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
+    // ---- precision dispatch: the kernel variant ----
+    switch (s->prec) {
+        case saige::gpu2::Prec::FP64:
+            launchSpa(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
+            break;
+        default:
+            // TODO(precision:SPA): launch the fp32 kernel here. It reads the
+            // same P (scratch, tables, pair table) and writes the same PairOut
+            // doubles (see the contract in spa_gpu.hpp).
+            g_lastErr = std::string("run: SPA precision ") + saige::gpu2::precName(s->prec) + " has no kernel";
+            return false;
+    }
     CK(cudaGetLastError());
     CK(cudaEventRecord(s->ev[2], s->st));
     CK(cudaMemcpyAsync(s->hOut, s->dOut, (std::size_t)nPairs * sizeof(PairOut), cudaMemcpyDeviceToHost, s->st));

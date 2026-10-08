@@ -157,6 +157,16 @@ binary traits).
 | `--set KEY=VALUE` [+] | `KEY` | none | set any config key directly, e.g. gpuSpaOrder=marker (repeatable) |
 | `--dryRun[=TRUE\|FALSE]` [+] | - | FALSE | write the config and print the engine command, do not run it |
 
+**GPU precision (with --useGPU)**
+
+| Flag | Config key | Default | Meaning |
+|---|---|---|---|
+| `--gpuPrecisionScan fp64\|fp32\|int8` [+] | `gpuPrecisionScan` | fp64 | decode + GEMMs of the marker scan and the sparse-GRM variance; int8 = split int8 GEMMs |
+| `--gpuPrecisionSPA fp64\|fp32` [+] | `gpuPrecisionSPA` | fp64 | the saddlepoint approximation on the device |
+| `--gpuPrecisionER fp64\|fp32` [+] | `gpuPrecisionER` | fp64 | the exact test (ER) on the device |
+| `--gpuPrecisionFirth fp64\|fp32` [+] | `gpuPrecisionFirth` | fp64 | the Firth fit on the device |
+| `--gpuInt8Slices N` [+] | `gpuInt8Slices` | 7 | with --gpuPrecisionScan=int8: int8 slices of the trait-side matrix (1..8) |
+
 **R SAIGE flags that are refused**
 
 | Flag | Why |

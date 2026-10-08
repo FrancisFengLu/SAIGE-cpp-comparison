@@ -373,10 +373,24 @@ int  g_gpuDevice  = 0;
 // of the multi-trait block width. Only moves batch boundaries; see the
 // determinism note in mainMarkerMTGpu.
 int  g_gpuBlockSize = 16384;
-// Config key gpuPrecision: "fp64" (default) or "fp32" for the decode and the
-// GEMM. fp64 costs about 40% more GEMM time on a V100 -- a few percent of a
-// real run -- and agrees with the CPU path near 1e-15 rather than near 1e-6.
-bool g_gpuFp64    = true;
+// Per-stage arithmetic of the GPU path (gpu/gpu_precision.hpp); any
+// combination is allowed, fp64 everywhere is the default and today's output.
+//   gpuPrecisionScan  (alias gpuPrecision)  fp64 | fp32 | int8   decode + GEMMs
+//                     and the sparse-GRM cross terms (gpu_step2.cu, gpu_sparse.cu)
+//   gpuPrecisionSPA    fp64 | fp32   spa_gpu/ (lib) or gpu_spa.cu (own)
+//   gpuPrecisionER     fp64 | fp32   gpu_er.cu
+//   gpuPrecisionFirth  fp64 | fp32   gpu_firth.cu
+//   gpuInt8Slices      1..8 (default 7): slices of the int8 scan's trait side
+// Scan fp64 costs about 40% more GEMM time than fp32 on a V100 -- a few
+// percent of a real run -- and agrees with the CPU path near 1e-15 rather than
+// near 1e-6. A mode a module does not implement stops the run
+// ("useGPU: <stage> precision <mode> is not implemented yet"); it is never
+// replaced by another. The CPU path ignores these keys.
+saige::gpu2::Prec g_precScan  = saige::gpu2::Prec::FP64;
+saige::gpu2::Prec g_precSPA   = saige::gpu2::Prec::FP64;
+saige::gpu2::Prec g_precER    = saige::gpu2::Prec::FP64;
+saige::gpu2::Prec g_precFirth = saige::gpu2::Prec::FP64;
+int g_gpuInt8Slices = saige::gpu2::kInt8SlicesDefault;
 // Config key gpuPrefetch (default: true with useGPU): on the GPU path, read + QC + stage
 // superblock k+1 on a reader thread while the device call, the host tail and
 // the device SPA / Firth of superblock k run. The pinned staging buffers and
@@ -2706,6 +2720,25 @@ bool mainMarkerMTGpu(
         return false;
     }
 
+    // ---------------- per-stage precision ----------------
+    // Every requested mode must be one its module implements, whether or not
+    // the stage ends up with work: a run never trades the precision it was
+    // asked for for another one. (The sparse-GRM cross terms, part of the scan
+    // stage, are checked where their plan is built.)
+    {
+        using saige::gpu2::Prec;
+        auto refuse = [](const char* stage, Prec p, const char* extra = "") {
+            throw std::runtime_error(std::string("useGPU: ") + stage + " precision " +
+                                     saige::gpu2::precName(p) + " is not implemented yet" + extra);
+        };
+        if (!saige::gpu2::scanSupports(g_precScan)) refuse("scan", g_precScan);
+        const bool spaOk = (g_gpuSpaImpl == "own") ? saige::gpu2::spaSupports(g_precSPA)
+                                                   : saige::spa_gpu::supports(g_precSPA);
+        if (!spaOk) refuse("SPA", g_precSPA, g_gpuSpaImpl == "own" ? " (gpuSpaImpl: own)" : "");
+        if (!saige::gpu2::erSupports(g_precER)) refuse("ER", g_precER);
+        if (!saige::gpu2::firthSupports(g_precFirth)) refuse("Firth", g_precFirth);
+    }
+
     // Different sample lists (gpuOwnSampleSets): n is the union's, the reader's
     // and every stack's row count; a trait with its own list is scored on its
     // samples through the zero embedding and MTBlockAdj, as in mainMarkerMT.
@@ -2764,10 +2797,19 @@ bool mainMarkerMTGpu(
             }
         }
         if (g_gpuSparse && anyBin) {
-            std::string spWhy;
-            if (!g_gpuFp64) spWhy = "gpuPrecision is fp32; the sparse variance is fp64 only";
-            else spWhy = s2gs::build(ctx, g_saigeObjs, s2blk::config().refreshBudgetS,
-                                     g_gpuSparseMaxPairs, spPlan);
+            // The sparse-GRM variance belongs to the scan stage (its terms ride
+            // in the reducer's GEMMs and in gpu_sparse.cu's cross terms), so it
+            // takes the scan's precision; a mode the cross-term kernel does not
+            // implement stops the run like any other.
+            bool anySparse = false;
+            for (int t = 0; t < P; t++)
+                if (ctx.meta[t].kind == SAIGE::TraitKind::Binary && ctx.meta[t].flagSparseGRM) anySparse = true;
+            if (anySparse && !saige::gpu2::spqSupports(g_precScan))
+                throw std::runtime_error(std::string("useGPU: scan precision ") + saige::gpu2::precName(g_precScan) +
+                                         " is not implemented yet (sparse-GRM variance, gpu/gpu_sparse.cu; "
+                                         "gpuSparse: false keeps that variance on the CPU)");
+            std::string spWhy = s2gs::build(ctx, g_saigeObjs, s2blk::config().refreshBudgetS,
+                                            g_gpuSparseMaxPairs, spPlan);
             if (spWhy.empty()) {
                 for (int t = 0; t < P; t++)
                     if (spFirst[t] && !spPlan.on[ctx.meta[t].binIdx]) {
@@ -2900,7 +2942,8 @@ bool mainMarkerMTGpu(
         a.device = g_gpuDevice; a.N = n;
         a.K1 = K1x; a.B1 = Bf.data();
         a.K2 = K2x; a.B2 = spDev ? B2x.data() : (anyBin ? ctx.MU2bin.memptr() : nullptr);
-        a.maxSlots = slots; a.fp64 = g_gpuFp64; a.stagingSets = nSets;
+        a.maxSlots = slots; a.precision = g_precScan; a.int8Slices = g_gpuInt8Slices;
+        a.stagingSets = nSets;
         a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
         a.decodeX2 = g_gpuDecodeX2;
         a.deviceSets = overlap ? nSets : 1;
@@ -2914,7 +2957,8 @@ bool mainMarkerMTGpu(
     const std::size_t nbRow = (std::size_t)(n + 3) / 4;   // bytes the reader writes per row
 
     std::cout << "  useGPU: " << saige::gpu2::describe(g_gpuDevice)
-              << "; " << (g_gpuFp64 ? "fp64" : "fp32")
+              << "; scan " << saige::gpu2::precName(g_precScan)
+              << (g_precScan == saige::gpu2::Prec::INT8 ? " (" + std::to_string(g_gpuInt8Slices) + " slices)" : std::string())
               << ", K1 = " << K1 << " (" << sumP << " + " << sumPbin << " + " << sumPqnt
               << " + " << P << ")" << ", K2 = " << K2
               << ", " << nBin << " case masks"
@@ -2948,6 +2992,7 @@ bool mainMarkerMTGpu(
         qa.pi = spPlan.pi.data(); qa.pj = spPlan.pj.data(); qa.w = spPlan.w.data();
         qa.maxSlots = slots;
         qa.outSets = overlap ? nSets : 1;
+        qa.precision = g_precScan;
         SQ = saige::gpu2::spqCreate(qa);
         if (SQ == nullptr) {
             bool needFirst = false;
@@ -3041,6 +3086,7 @@ bool mainMarkerMTGpu(
             sa.maxPairs = slots * nBin;
             sa.tol = std::pow(std::numeric_limits<double>::epsilon(), 0.25);
             sa.maxiter = 1000; sa.blocks = 256;
+            sa.precision = g_precSPA;
             SP = saige::gpu2::spaCreate(sa);
         } else if (ok) {
             // The library's structs are field-for-field the same contract.
@@ -3058,6 +3104,7 @@ bool mainMarkerMTGpu(
             la.dynamicPairs = g_gpuSpaDynamic ? 1 : 0;
             la.minBlocksPerSM = g_gpuSpaMinBlocks;
             la.ownSamples = differ ? 1 : 0;
+            la.precision = g_precSPA;
             SL = saige::spa_gpu::create(la);
         }
         if (SP == nullptr && SL == nullptr)
@@ -3115,6 +3162,7 @@ bool mainMarkerMTGpu(
             fc.maxPairs = slots * nBin;
             fc.maxit = 50; fc.maxstep = g_gpuFirthMaxStep; fc.xconv = 1e-5; fc.gconv = 1e-5; fc.blocks = 256;
             fc.ownSamples = differ ? 1 : 0;
+            fc.precision = g_precFirth;
             FP = saige::gpu2::firthCreate(fc);
         }
         if (!any)
@@ -3156,12 +3204,20 @@ bool mainMarkerMTGpu(
             saige::gpu2::ErCreateArgs ec;
             ec.device = g_gpuDevice; ec.nTraits = (int)ea.size(); ec.traits = ea.data();
             ec.logTable = lt.data(); ec.maxN = maxN;
+            ec.precision = g_precER;
             EP = saige::gpu2::erCreate(ec);
         }
         if (EP == nullptr) {
             std::fill(erTraitOf.begin(), erTraitOf.end(), -1);
             std::cout << "  gpuER: device setup failed (" << (ok ? saige::gpu2::erLastError() : "a model's mu is not n long")
                       << "); ER stays on the CPU scalar path" << std::endl;
+        } else if (g_precER != saige::gpu2::Prec::FP64) {
+            // The self-check compares with the CPU bit for bit; that is the
+            // fp64 kernel's contract, not a reduced-precision one's.
+            std::cout << "  gpuER: " << ea.size() << " binary traits' mu resident; the exact test of pairs with "
+                         "MAC <= " << g_MACCutoffforER << " and at most " << saige::gpu2::kErMaxCarriers
+                      << " carriers runs on the device in " << saige::gpu2::precName(g_precER)
+                      << " (gpuPrecisionER; the bit-for-bit startup self-check is skipped)" << std::endl;
         } else if (std::string why; !gpuErSelfCheck(EP, g_gpuDevice, ea.empty() ? arma::vec() :
                                                     g_saigeObjs[binTraits[0]]->muRef(),
                                                     ea.empty() ? 0 : ea[0].ncase, why)) {
@@ -9071,7 +9127,11 @@ int main(int argc, char* argv[])
             std::cerr << "                     pair and thread_local scratch; output byte-identical." << std::endl;
             std::cerr << "  mtPopcountCtrlFromTotal: true/false (default: true). With mtPopcountAF," << std::endl;
             std::cerr << "                     control code counts = marker counts - case counts." << std::endl;
-            std::cerr << "  gpuPrecision:      fp64 (default) or fp32" << std::endl;
+            std::cerr << "  gpuPrecisionScan:  fp64 (default), fp32 or int8: decode + GEMMs and the" << std::endl;
+            std::cerr << "                     sparse-GRM cross terms (gpuPrecision is its old name)" << std::endl;
+            std::cerr << "  gpuPrecisionSPA, gpuPrecisionER, gpuPrecisionFirth: fp64 (default) or fp32" << std::endl;
+            std::cerr << "  gpuInt8Slices:     1..8 (default 7): slices of the int8 scan's trait side" << std::endl;
+            std::cerr << "                     A mode that is not implemented yet stops the run." << std::endl;
             std::cerr << "  gpuBinary:         true/false (default: = useGPU). With useGPU, run binary" << std::endl;
             std::cerr << "                     traits on the device too (gate + AF counts included)." << std::endl;
             std::cerr << "  gpuSpa:            true/false (default: = useGPU). With gpuBinary, SPA-flagged" << std::endl;
@@ -9403,11 +9463,46 @@ int main(int argc, char* argv[])
             if (g_gpuBlockSize < 1)
                 throw std::runtime_error("gpuBlockSize must be >= 1");
         }
-        if (config["gpuPrecision"]) {
-            const std::string gp = config["gpuPrecision"].as<std::string>();
-            if (gp == "fp64")      g_gpuFp64 = true;
-            else if (gp == "fp32") g_gpuFp64 = false;
-            else throw std::runtime_error("gpuPrecision must be fp64 or fp32, not '" + gp + "'");
+        {
+            // Per-stage precision (gpu/gpu_precision.hpp). gpuPrecision is the
+            // old name of gpuPrecisionScan; both may be given if they agree.
+            using saige::gpu2::Prec;
+            auto prec = [&](const char* k, bool int8ok) -> Prec {
+                const std::string v = config[k].as<std::string>();
+                if (v == "fp64") return Prec::FP64;
+                if (v == "fp32") return Prec::FP32;
+                if (v == "int8" && int8ok) return Prec::INT8;
+                throw std::runtime_error(std::string(k) + " must be fp64" + (int8ok ? ", fp32 or int8" : " or fp32") +
+                                         ", not '" + v + "'");
+            };
+            if (cfgSet("gpuPrecision")) g_precScan = prec("gpuPrecision", true);
+            if (cfgSet("gpuPrecisionScan")) {
+                const Prec ps = prec("gpuPrecisionScan", true);
+                if (cfgSet("gpuPrecision") && ps != g_precScan)
+                    throw std::runtime_error(std::string("gpuPrecision (") + saige::gpu2::precName(g_precScan) +
+                                             ") and gpuPrecisionScan (" + saige::gpu2::precName(ps) +
+                                             ") disagree; gpuPrecision is the old name of gpuPrecisionScan, give one");
+                g_precScan = ps;
+            }
+            if (cfgSet("gpuPrecisionSPA"))   g_precSPA   = prec("gpuPrecisionSPA", false);
+            if (cfgSet("gpuPrecisionER"))    g_precER    = prec("gpuPrecisionER", false);
+            if (cfgSet("gpuPrecisionFirth")) g_precFirth = prec("gpuPrecisionFirth", false);
+            if (cfgSet("gpuInt8Slices")) {
+                g_gpuInt8Slices = config["gpuInt8Slices"].as<int>();
+                if (g_gpuInt8Slices < saige::gpu2::kInt8SlicesMin || g_gpuInt8Slices > saige::gpu2::kInt8SlicesMax)
+                    throw std::runtime_error("gpuInt8Slices must be " + std::to_string(saige::gpu2::kInt8SlicesMin) +
+                                             ".." + std::to_string(saige::gpu2::kInt8SlicesMax));
+            }
+            const bool anyPrecKey = cfgSet("gpuPrecision") || cfgSet("gpuPrecisionScan") || cfgSet("gpuPrecisionSPA") ||
+                                    cfgSet("gpuPrecisionER") || cfgSet("gpuPrecisionFirth") || cfgSet("gpuInt8Slices");
+            if (g_gpuStep2 && !printDefaults)
+                std::cout << "GPU precision: scan=" << saige::gpu2::precName(g_precScan)
+                          << " SPA=" << saige::gpu2::precName(g_precSPA)
+                          << " ER=" << saige::gpu2::precName(g_precER)
+                          << " Firth=" << saige::gpu2::precName(g_precFirth)
+                          << " (int8 slices " << g_gpuInt8Slices << ")" << std::endl;
+            else if (anyPrecKey && !printDefaults)
+                std::cout << "  gpuPrecision*: ignored, useGPU is false (the CPU path is fp64)" << std::endl;
         }
         g_gpuPrefetch = cfgBool("gpuPrefetch", gpuDef);
         if (config["gpuPrefetchSets"]) {
@@ -9700,6 +9795,11 @@ int main(int argc, char* argv[])
             kv("sgsPrecision", g_sgsF32 ? "fp32" : "fp64");
             kv("useGPU", b(g_gpuStep2));
             kv("gpuDevice", g_gpuDevice);
+            kv("gpuPrecisionScan", saige::gpu2::precName(g_precScan));
+            kv("gpuPrecisionSPA", saige::gpu2::precName(g_precSPA));
+            kv("gpuPrecisionER", saige::gpu2::precName(g_precER));
+            kv("gpuPrecisionFirth", saige::gpu2::precName(g_precFirth));
+            kv("gpuInt8Slices", g_gpuInt8Slices);
             std::cout << o.str();
             return 0;
         }

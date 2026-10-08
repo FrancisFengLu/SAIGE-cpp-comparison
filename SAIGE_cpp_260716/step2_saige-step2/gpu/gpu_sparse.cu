@@ -169,10 +169,29 @@ struct SpQuad {
     std::size_t devBytes = 0;
 };
 
+bool spqSupports(Prec t_p)
+{
+    switch (t_p) {
+        case Prec::FP64: return true;
+        // TODO(precision:scan): the sparse-GRM cross terms in the scan's fp32 /
+        // int8 mode. Plug the variant in at spq_kernel / spq_kernel_own's
+        // launch in spqRun / spqRunOwn (results stay double) and return true.
+        case Prec::FP32: return false;
+        case Prec::INT8: return false;
+    }
+    return false;
+}
+
 SpQuad* spqCreate(const SpQuadCreateArgs& a)
 {
     if (a.N <= 0 || a.nTraits <= 0 || a.maxSlots <= 0 || a.nPairs < 0) return nullptr;
     if (a.nPairs > 0 && (!a.pi || !a.pj || !a.w)) return nullptr;
+    // ---- precision dispatch (the one place the mode is decided) ----
+    if (!spqSupports(a.precision)) {
+        lastErrSpq = std::string("scan precision ") + precName(a.precision) +
+                     " is not implemented yet (sparse-GRM cross terms)";
+        return nullptr;
+    }
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
     SpQuad* q = new SpQuad();
     q->N = a.N; q->nTr = a.nTraits; q->maxSlots = a.maxSlots; q->nPairs = a.nPairs;

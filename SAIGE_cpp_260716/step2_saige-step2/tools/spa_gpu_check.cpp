@@ -197,7 +197,7 @@ int main(int argc, char** argv)
     // ---- device: reducer with a dummy 1-column right operand, SPA with the traits ----
     const int slotsCap = 4096;
     std::vector<double> B1((std::size_t)n, 0.0);
-    saige::gpu2::CreateArgs ca; ca.device = 0; ca.N = n; ca.K1 = 1; ca.B1 = B1.data(); ca.maxSlots = slotsCap; ca.fp64 = true;
+    saige::gpu2::CreateArgs ca; ca.device = 0; ca.N = n; ca.K1 = 1; ca.B1 = B1.data(); ca.maxSlots = slotsCap; ca.precision = saige::gpu2::Prec::FP64;
     saige::gpu2::Reducer* R = saige::gpu2::create(ca);
     if (!R) { std::fprintf(stderr, "reducer create failed\n"); return 3; }
     std::vector<saige::gpu2::SpaTraitArgs> ta(T);

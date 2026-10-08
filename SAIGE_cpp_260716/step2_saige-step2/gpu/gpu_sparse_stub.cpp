@@ -6,6 +6,7 @@
 namespace saige {
 namespace gpu2 {
 
+bool          spqSupports(Prec t_p)                                { return t_p == Prec::FP64; }
 SpQuad*       spqCreate(const SpQuadCreateArgs&)                   { return nullptr; }
 void          spqDestroy(SpQuad*)                                  {}
 bool          spqRun(SpQuad*, const Reducer*, int, int)            { return false; }

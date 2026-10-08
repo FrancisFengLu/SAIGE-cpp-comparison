@@ -33,6 +33,12 @@
 // for devices where fp64 runs at 1/32 or 1/64 rate (L4, A10, consumer parts)
 // and for measuring the fp32 error itself.
 //
+// The mode comes from CreateArgs::precision (config key gpuPrecisionScan,
+// gpu_precision.hpp): FP64 and FP32 are the two instantiations of T above.
+// INT8 (the Ozaki-style split) is not implemented yet: scanSupports() says no
+// and create() refuses it. Its plug-in points are marked TODO(precision:scan)
+// -- the operand split / upload in create() and the GEMM block in reduce().
+//
 // The dosage TABLE is double in both modes and narrowed inside the kernel for
 // fp32. Three of its four entries are exact small integers, but the fourth is
 // the imputed mean 2*altFreq -- narrowing that on the host would put a 6e-8
@@ -208,7 +214,10 @@ count_codes(const uint8_t* __restrict__ packed, std::size_t bpv, int words,
 
 struct Reducer {
     int  N = 0, K1 = 0, K2 = 0, maxSlots = 0, nMask = 0, words = 0;
-    bool fp64 = true;
+    Prec prec = Prec::FP64;        // CreateArgs::precision
+    int  int8Slices = 0;           // INT8 only
+    bool fp64 = true;              // decode + GEMM in double (prec == FP64)
+    bool outD = true;              // result buffers hC1 / hC2 are double (FP64, INT8); isFp64()
     bool decodeX2 = false;
     std::size_t bpv = 0;           // padded row stride, bytes (multiple of 8)
     std::size_t esz = 0;           // sizeof(T)
@@ -302,20 +311,53 @@ std::string describe(int t_device)
 
 int maskWords(int t_N) { return (t_N + 31) / 32; }
 
+bool scanSupports(Prec t_p)
+{
+    switch (t_p) {
+        case Prec::FP64: return true;
+        case Prec::FP32: return true;
+        // TODO(precision:scan): return true once the int8 split below is in.
+        // The sparse-GRM cross terms (gpu_sparse.cu, spqSupports) are part of
+        // this stage too and have their own switch.
+        case Prec::INT8: return false;
+    }
+    return false;
+}
+
 Reducer* create(const CreateArgs& a)
 {
     if (a.N <= 0 || a.K1 <= 0 || a.maxSlots <= 0 || a.B1 == nullptr) return nullptr;
     if (a.K2 > 0 && a.B2 == nullptr) return nullptr;
     if (a.nMask > 0 && a.masks == nullptr) return nullptr;
+    // ---- precision dispatch (the one place the mode is decided) ----
+    if (!scanSupports(a.precision)) {
+        lastErr = std::string("scan precision ") + precName(a.precision) + " is not implemented yet";
+        return nullptr;
+    }
+    if (a.precision == Prec::INT8 &&
+        (a.int8Slices < kInt8SlicesMin || a.int8Slices > kInt8SlicesMax)) {
+        lastErr = "int8Slices out of range";
+        return nullptr;
+    }
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
 
     Reducer* r = new Reducer();
-    r->N = a.N; r->K1 = a.K1; r->K2 = a.K2; r->maxSlots = a.maxSlots; r->fp64 = a.fp64;
-    r->decodeX2 = a.decodeX2 && a.fp64 && ((a.N & 3) == 0);
+    r->prec = a.precision;
+    r->int8Slices = (a.precision == Prec::INT8) ? a.int8Slices : 0;
+    // TODO(precision:scan): INT8 -- the decode can stay in double or go
+    // straight to int8 (genotypes are exact small integers; the imputed mean
+    // of a missing call is not, see the LUT note above), B1 / B2 are split
+    // into int8Slices slices at upload, and the results are double (outD is
+    // already true for INT8, so isFp64() says so and main.cpp reads outCd /
+    // outC2d; hC1 / hC2 / dC1 / dC2 must then be sized in double, not esz).
+    const bool fp64 = (a.precision == Prec::FP64);
+    r->N = a.N; r->K1 = a.K1; r->K2 = a.K2; r->maxSlots = a.maxSlots; r->fp64 = fp64;
+    r->outD = (a.precision != Prec::FP32);
+    r->decodeX2 = a.decodeX2 && fp64 && ((a.N & 3) == 0);
     r->nMask = a.nMask;
     r->words = maskWords(a.N);
     r->bpv = (std::size_t)r->words * 8;           // >= (N+3)/4, whole 64-bit words
-    r->esz = a.fp64 ? sizeof(double) : sizeof(float);
+    r->esz = fp64 ? sizeof(double) : sizeof(float);
 
     // dG is the big one: slotsPerPass * N elements, twice over. Keep each
     // buffer near 512 MB and never wider than the caller's batch.
@@ -387,7 +429,7 @@ Reducer* create(const CreateArgs& a)
     r->devBytes = db;
 
     auto upload = [&](void* dst, const double* src, std::size_t n) -> bool {
-        if (a.fp64) return cudaMemcpy(dst, src, n * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (fp64) return cudaMemcpy(dst, src, n * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
         std::vector<float> bf(n);
         for (std::size_t i = 0; i < n; ++i) bf[i] = (float)src[i];
         return cudaMemcpy(dst, bf.data(), n * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
@@ -441,7 +483,7 @@ unsigned char*  packed(Reducer* r, int s)      { return (r && s >= 0 && s < r->n
 double*         lut(Reducer* r, int s)         { return (r && s >= 0 && s < r->nSets) ? r->hLut[s] : nullptr; }
 std::size_t     bytesPerSlot(const Reducer* r) { return r ? r->bpv : 0; }
 int             stagingSets(const Reducer* r)  { return r ? r->nSets : 0; }
-bool            isFp64(const Reducer* r)       { return r ? r->fp64 : false; }
+bool            isFp64(const Reducer* r)       { return r ? r->outD : false; }
 namespace {
 // -1 = the set of the last reduce(); out of range -> -1 (callers get nullptr)
 inline int devSetOf(const Reducer* r, int d) {
@@ -449,10 +491,10 @@ inline int devSetOf(const Reducer* r, int d) {
     return d < r->nDev ? d : -1;
 }
 }  // namespace
-const float*    outCf(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->fp64) ? (const float*)r->hC1[k] : nullptr; }
-const double*   outCd(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->fp64) ? (const double*)r->hC1[k] : nullptr; }
-const float*    outC2f(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->fp64 && r->K2 > 0) ? (const float*)r->hC2[k] : nullptr; }
-const double*   outC2d(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->fp64 && r->K2 > 0) ? (const double*)r->hC2[k] : nullptr; }
+const float*    outCf(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->outD) ? (const float*)r->hC1[k] : nullptr; }
+const double*   outCd(const Reducer* r, int d)  { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->outD) ? (const double*)r->hC1[k] : nullptr; }
+const float*    outC2f(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && !r->outD && r->K2 > 0) ? (const float*)r->hC2[k] : nullptr; }
+const double*   outC2d(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 &&  r->outD && r->K2 > 0) ? (const double*)r->hC2[k] : nullptr; }
 std::size_t     ldC(const Reducer* r)          { return r ? (std::size_t)r->maxSlots : 0; }
 const uint32_t* outCounts(const Reducer* r, int d) { const int k = r ? devSetOf(r, d) : -1; return (k >= 0 && r->nMask > 0) ? r->hCnt[k] : nullptr; }
 std::size_t     deviceBytes(const Reducer* r)  { return r ? r->devBytes : 0; }
@@ -564,6 +606,9 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
         CKR(cudaEventRecord(r->ev[b][1], s));
 
         CBR(cublasSetStream(r->cub, s));
+        // TODO(precision:scan): the INT8 GEMMs (slices x cublasGemmEx int8 ->
+        // int32, recombined in fp64 into dC1 / dC2) go here, as a third branch
+        // beside the fp64 / fp32 ones below and for the second GEMM.
         // C1(sc x K1) = dG^T (sc x N) * dB1 (N x K1), into rows [s0, s0+sc) of
         // the maxSlots x K1 result.
         if (r->fp64) {

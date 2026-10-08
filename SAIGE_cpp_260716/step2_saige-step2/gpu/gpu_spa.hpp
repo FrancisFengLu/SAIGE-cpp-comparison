@@ -47,10 +47,20 @@
 // contiguous) and XXVX_inv (N x p column-major), uploaded once at spaCreate().
 // Per pair: slot, trait, the fast / logp flags and Tstat, var1, var2, pval_noadj
 // from the batch kernel -- the GPU GEMM's numbers, not a CPU recompute.
+//
+// Precision (config key gpuPrecisionSPA, gpu_precision.hpp; gpuSpaImpl: own):
+// SpaCreateArgs::precision, FP64 (default) or FP32. Only modes spaSupports()
+// accepts may be passed. CONTRACT for any non-fp64 variant: SpaPairIn /
+// SpaPairOut keep their types -- the double fields of SpaPairOut are handed
+// back as double (the fp32 value converted), conv / s1 / s2 / niter mean what
+// they mean in fp64 -- so the host post-rules read them unchanged. Same
+// contract as spa_gpu/spa_gpu.hpp (gpuSpaImpl: lib, the default).
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "gpu_precision.hpp"
 
 namespace saige {
 namespace gpu2 {
@@ -76,7 +86,13 @@ struct SpaCreateArgs {
     double tol = 0.0;                       // |dt| convergence, eps^(1/4) in SAIGE
     int maxiter = 1000;
     int blocks = 256;                       // resident blocks; scratch is blocks x N doubles
+    Prec precision = Prec::FP64;            // gpuPrecisionSPA; see the contract above
 };
+
+// True when spaCreate() accepts SpaCreateArgs::precision = t_p. main.cpp asks
+// first and stops the run on false ("useGPU: SPA precision <mode> is not
+// implemented yet").
+bool spaSupports(Prec t_p);
 
 struct SpaPairIn {
     int    slot;     // reducer slot of the marker (last reduce())

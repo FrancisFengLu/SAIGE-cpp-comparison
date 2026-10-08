@@ -61,10 +61,23 @@
 // those rules on both sides so the printed strings can be compared.
 //
 // Thread safety: one Spa per host thread; run() is synchronous.
+//
+// Precision (config key gpuPrecisionSPA, ../gpu_precision.hpp): CreateArgs::
+// precision, FP64 (default, everything above) or FP32. Only modes supports()
+// accepts may be passed; create() refuses any other. CONTRACT for any non-fp64
+// variant: the pair table in and out keeps its types -- PairIn's Tstat, var1,
+// var2, pno arrive as double, and every double field of PairOut (pval, roots,
+// p1, p2, m1, q, qinv) is handed back as double (the fp32 value converted),
+// with conv / status / reason / niter / nnz / s1 / s2 meaning exactly what
+// they mean in fp64. The host post-rules (quantile step, p == 0, the Firth
+// decision, the formatting) read those doubles unchanged and do not know which
+// mode ran.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "../gpu_precision.hpp"
 
 namespace saige {
 namespace spa_gpu {
@@ -130,7 +143,14 @@ struct CreateArgs {
     // pairLut() next to in() (a trait's imputed value and flip can differ from
     // the union column's). Off: the slot's table, every sample counts.
     int ownSamples = 0;
+    // Arithmetic of the kernel (gpuPrecisionSPA); see the contract above.
+    saige::gpu2::Prec precision = saige::gpu2::Prec::FP64;
 };
+
+// True when create() accepts CreateArgs::precision = t_p. main.cpp asks first
+// and stops the run on false ("useGPU: SPA precision <mode> is not implemented
+// yet").
+bool supports(saige::gpu2::Prec t_p);
 
 // Device-resident genotype source for the slots PairIn::slot names. Exactly
 // one of the two forms is set.

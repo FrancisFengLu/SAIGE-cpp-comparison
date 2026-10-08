@@ -5,6 +5,7 @@
 namespace saige {
 namespace spa_gpu {
 
+bool supports(saige::gpu2::Prec t_p) { return t_p == saige::gpu2::Prec::FP64; }
 Spa* create(const CreateArgs&) { return nullptr; }
 void destroy(Spa*) {}
 PairIn*  in(Spa*)  { return nullptr; }

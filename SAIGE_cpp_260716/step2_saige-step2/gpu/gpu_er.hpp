@@ -46,10 +46,22 @@
 // SAIGEClass::m_mu), n, ncase. A log table log(0..maxN) from the host. Per pair:
 // trait, k and the carriers (position in the trait's vector, ascending; dosage;
 // case flag), 16 B + 13 B per carrier.
+//
+// Precision (config key gpuPrecisionER, gpu_precision.hpp): ErCreateArgs::
+// precision, FP64 (default, everything above, bit-identical to the CPU) or
+// FP32. Only modes erSupports() accepts may be passed. CONTRACT for any
+// non-fp64 variant: ErPairOut::pval is handed back as double (the fp32 value
+// converted); the host's erFinish ([0, 1] guard, formatting, seBeta) reads it
+// unchanged. main.cpp runs the bit-for-bit startup self-check (gpuErSelfCheck:
+// erMathCheck + 24 exact tests) only when ER is fp64; with any other mode it
+// logs that the check is skipped, so an fp32 variant does not have to be, and
+// cannot be, bit-identical. erMathCheck itself stays the fp64 glibc port.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "gpu_precision.hpp"
 
 namespace saige {
 namespace gpu2 {
@@ -68,7 +80,13 @@ struct ErCreateArgs {
     const ErTraitArgs* traits = nullptr;
     const double* logTable = nullptr;   // log((double)i), i = 0..maxN (entry 0 unused)
     int maxN = 0;                       // >= every trait's n
+    Prec precision = Prec::FP64;        // gpuPrecisionER; see the contract above
 };
+
+// True when erCreate() accepts ErCreateArgs::precision = t_p. main.cpp asks
+// first and stops the run on false ("useGPU: ER precision <mode> is not
+// implemented yet").
+bool erSupports(Prec t_p);
 
 struct ErPairIn {
     int trait;     // index into ErCreateArgs::traits

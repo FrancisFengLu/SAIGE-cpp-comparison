@@ -31,10 +31,20 @@
 // whose g_i g_j is zero -- nearly all of them on a rare marker -- costs two
 // byte loads and nothing else. fp64; the sum order is fixed by (thread, pair)
 // and a fixed tree, so a run repeats itself bit for bit.
+//
+// Precision: this kernel belongs to the SCAN stage (config key
+// gpuPrecisionScan, gpu_precision.hpp). Its other two terms ride in the
+// reducer's GEMMs as extra B1 / B2 columns, so all three terms of var2 are
+// formed in the scan's arithmetic; a split precision inside one variance
+// would cancel badly (var2 is a difference of terms of similar size).
+// main.cpp passes the scan mode as SpQuadCreateArgs::precision; only modes
+// spqSupports() accepts may be passed. Results are double in every mode.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+
+#include "gpu_precision.hpp"
 
 namespace saige {
 namespace gpu2 {
@@ -54,7 +64,14 @@ struct SpQuadCreateArgs {
     // Pinned result sets (gpuOverlap): spqRun(..., t_set) writes set t_set and
     // reads the reducer's device set t_set. 1 = the original single buffer.
     int outSets = 1;
+    // The scan stage's precision (gpuPrecisionScan); see the note above.
+    Prec precision = Prec::FP64;
 };
+
+// True when spqCreate() accepts SpQuadCreateArgs::precision = t_p. main.cpp
+// asks before it builds the sparse plan into the scan and stops the run on
+// false ("useGPU: scan precision <mode> is not implemented yet").
+bool spqSupports(Prec t_p);
 
 // nullptr on any failure; the caller then keeps the sparse variance on the CPU.
 SpQuad* spqCreate(const SpQuadCreateArgs& t_args);

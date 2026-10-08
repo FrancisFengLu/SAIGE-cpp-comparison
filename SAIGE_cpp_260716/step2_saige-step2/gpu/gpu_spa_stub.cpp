@@ -6,6 +6,7 @@
 namespace saige {
 namespace gpu2 {
 
+bool        spaSupports(Prec t_p)                        { return t_p == Prec::FP64; }
 Spa*        spaCreate(const SpaCreateArgs&)              { return nullptr; }
 void        spaDestroy(Spa*)                             {}
 SpaPairIn*  spaIn(Spa*)                                  { return nullptr; }

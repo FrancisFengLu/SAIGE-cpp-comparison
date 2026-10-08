@@ -6,6 +6,7 @@
 namespace saige {
 namespace gpu2 {
 
+bool        erSupports(Prec t_p)                             { return t_p == Prec::FP64; }
 Er*         erCreate(const ErCreateArgs&)                    { return nullptr; }
 void        erDestroy(Er*)                                   {}
 bool        erRun(Er*, const ErPairIn*, int, const uint32_t*, const double*,
