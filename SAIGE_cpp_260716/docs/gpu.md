@@ -8,6 +8,18 @@ nav_order: 4
 Both steps can use one NVIDIA GPU. The GPU is optional: a run that cannot use it
 runs on the CPU and says so in the log (step 2) or silently (step 1, see below).
 
+## In short
+
+| | CPU | GPU |
+|---|---|---|
+| Build | `make` | `make USE_CUDA=1 SM=<compute capability>` (step 2), `GPU_SM=sm_<cc>` (step 1) |
+| Step 1 config | `fit.use_gpu: false` | `fit.use_gpu: true` |
+| Step 2 config | `useGPU: false` (default) | `useGPU: true` |
+
+Nothing else in the configs changes, and the step-2 output is the same.
+Recommended cards: V100, A30, A100, H100 (full-speed fp64); see the table in
+[Home, Build](index.md#3-build).
+
 ## Requirements
 
 - The GPU build ([Home, Build](index.md#3-build)): `01_build.sh gpu <SM>` with the

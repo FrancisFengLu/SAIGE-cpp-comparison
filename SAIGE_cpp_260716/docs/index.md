@@ -20,6 +20,7 @@ Pages:
 | [GPU](gpu.md) | GPU build, switches, what runs on the GPU, memory |
 | [HPC example](hpc_example.md) | one job per chromosome, concatenating results |
 | [Troubleshooting](troubleshooting.md) | error and log messages and what they mean |
+| [Collaborator tests](collaborator_tests.md) | performance/accuracy test protocol for running on your own data |
 
 Every command and config on these pages was run on simulated data
 (`plink2 --dummy`, 5,000 samples x 5,000 markers) with the scripts in
@@ -95,17 +96,27 @@ converter `step2_saige-step2/tools/sgs2txt`. Always `make clean` before
 switching between the CPU and GPU builds. A GPU build also runs on machines
 without a GPU (it falls back to the CPU).
 
-The two Makefiles spell the GPU architecture differently: step 1 takes
-`GPU_SM=sm_XX`, step 2 takes `SM=XX`.
+`SM` is the card's compute capability, a fixed number per GPU model (not a
+setting). Look it up on the machine you will run on:
 
-| GPU | step 1 | step 2 |
-|---|---|---|
-| V100 | `GPU_SM=sm_70` (default) | `SM=70` (default) |
-| T4 | `GPU_SM=sm_75` | `SM=75` |
-| A100 | `GPU_SM=sm_80` | `SM=80` |
-| A10, RTX 30xx | `GPU_SM=sm_86` | `SM=86` |
-| L4, RTX 40xx | `GPU_SM=sm_89` | `SM=89` |
-| H100 | `GPU_SM=sm_90` | `SM=90` |
+```bash
+nvidia-smi --query-gpu=name,compute_cap --format=csv    # e.g. "Tesla V100-SXM2-16GB, 7.0" -> SM=70
+```
+
+The two Makefiles spell it differently: step 1 takes `GPU_SM=sm_XX`, step 2
+takes `SM=XX`. Compute capability 7.0 or newer is required.
+
+| GPU | step 1 | step 2 | fp64 speed (step 2 runs in fp64) |
+|---|---|---|---|
+| V100 | `GPU_SM=sm_70` (default) | `SM=70` (default) | full — **recommended, tested** |
+| T4 | `GPU_SM=sm_75` | `SM=75` | 1/32 of fp32 — slow |
+| A100, A30 | `GPU_SM=sm_80` | `SM=80` | full — recommended |
+| A10, A10G, RTX 30xx | `GPU_SM=sm_86` | `SM=86` | 1/64 of fp32 — slow |
+| L4, L40S, RTX 40xx | `GPU_SM=sm_89` | `SM=89` | 1/64 of fp32 — slow |
+| H100 | `GPU_SM=sm_90` | `SM=90` | full — recommended |
+
+Step 2 computes in double precision (fp64) only, so it runs on every card above
+but is much slower on the cards marked slow. An fp32 version is not available yet.
 
 Only `sm_70` was built and run for this guide.
 
