@@ -1,5 +1,5 @@
 #pragma once
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include <vector>
 
 namespace saige {

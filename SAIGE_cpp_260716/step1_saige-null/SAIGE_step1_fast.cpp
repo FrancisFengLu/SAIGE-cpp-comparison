@@ -1,5 +1,5 @@
 #define ARMA_USE_SUPERLU 1
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -31,8 +31,7 @@
 #include "packed_store.hpp"    // option 3: PackedFlat primary storage
 #include "gpu_matvec.hpp"      // G3: optional cuBLAS K·u acceleration
 #include "tools/avx2_kernel/avx2_kernel.hpp"  // Phase-1: fused 2-bit decode kernels
-#include <RcppParallel.h>
-#include <RcppParallel/TBB.h>
+#include "saige_parallel.hpp"  // OpenMP parallelFor / parallelReduce (was RcppParallel)
 #include <cstdlib>
 
 // Optional R-comparison bypass reads / debug dumps. Opt-in via environment
@@ -42,9 +41,8 @@ static inline std::string saige_env_path(const char* var, const std::string& nam
   const char* e = std::getenv(var);
   return (e && *e) ? (std::string(e) + "/" + name) : std::string();
 }
-using namespace Rcpp;
 using namespace std;
-using namespace RcppParallel;
+using namespace saige::par;
 
 
 // R CONNECTION: Global variable used in R functions for quality control thresholds
@@ -950,7 +948,7 @@ public:
 		const std::size_t chunk  = std::max<std::size_t>(8, ((nrow + 63) / 64 + 7) & ~(std::size_t)7);
 		const std::size_t nchunk = (nrow + chunk - 1) / chunk;
 
-		struct RowRanges : public RcppParallel::Worker {
+		struct RowRanges : public saige::par::Worker {
 			genoClass* g = nullptr; const MaskTrait* T = nullptr;
 			const float* sq = nullptr; const std::size_t* cb = nullptr; float* acc = nullptr;
 			std::size_t m0 = 0, nm = 0, nrow = 0, chunk = 0; bool simd = true;
@@ -984,7 +982,7 @@ public:
 		task.g = this; task.T = T; task.sq = sq.data(); task.cb = T ? cb.data() : nullptr;
 		task.acc = acc; task.m0 = m0; task.nm = nm; task.nrow = nrow; task.chunk = chunk;
 		task.simd = simd;
-		RcppParallel::parallelFor(0, nchunk, task, 1);
+		saige::par::parallelFor(0, nchunk, task, 1);
 	}
 
 	// The loop the fast path replaced, unchanged: the fallback when its
@@ -4464,17 +4462,22 @@ arma::fvec getCrossprodMatAndKin_LOCO(arma::fcolvec& bVec){
 }
 
 
-// [[Rcpp::depends(RcppParallel)]]
-// [[Rcpp::plugins(cpp11)]]
-struct indicesRelatedSamples : public RcppParallel::Worker {
+// Reducer: each chunk collects its own pairs in index order and join()
+// appends them chunk by chunk, so the pair list comes out in index order at
+// any thread count (the old parallelFor + mutex push_back gave a
+// schedule-dependent order with more than one thread).
+struct indicesRelatedSamples {
 
   int  Ntotal;
-  std::vector< std::pair<int, int> > &output;
-  std::vector<float> &kinValues;  // FIX: Also store kinship values
-  std::mutex output_mutex;
+  std::vector< std::pair<int, int> > output;
+  std::vector<float> kinValues;
 
-  indicesRelatedSamples(int Ntotal, std::vector< std::pair<int, int> > &output, std::vector<float> &kinValues) :
-    Ntotal(Ntotal), output(output), kinValues(kinValues) {}
+  indicesRelatedSamples(int Ntotal) : Ntotal(Ntotal) {}
+  indicesRelatedSamples(const indicesRelatedSamples& o, Split) : Ntotal(o.Ntotal) {}
+  void join(const indicesRelatedSamples& rhs) {
+    output.insert(output.end(), rhs.output.begin(), rhs.output.end());
+    kinValues.insert(kinValues.end(), rhs.kinValues.begin(), rhs.kinValues.end());
+  }
 
 
   void operator()(std::size_t begin, size_t end) {
@@ -4501,7 +4504,6 @@ struct indicesRelatedSamples : public RcppParallel::Worker {
       float kinValueTemp = arma::dot((geno.stdGenoMultiMarkersMat).col(i), (geno.stdGenoMultiMarkersMat).col(j));
       kinValueTemp = kinValueTemp/m_M_Submarker;
       if(kinValueTemp >=  geno.relatednessCutoff) {
-        std::lock_guard<std::mutex> lock(output_mutex);
         output.push_back( std::pair<int, int>(i, j) );
         kinValues.push_back(kinValueTemp);  // FIX: Store kinship value
       }
@@ -4539,7 +4541,7 @@ void findIndiceRelatedSample(){
 //  indicesRelatedSamples indicesRelatedSamples(Ntotal,output);
   geno.indiceVec.clear();  // Clear before populating
   geno.kinValueVecSparse.clear();  // Clear kinship values
-  indicesRelatedSamples indicesRelatedSamples(Ntotal, geno.indiceVec, geno.kinValueVecSparse);
+  indicesRelatedSamples indicesRelatedSamples(Ntotal);
 
   long int Ntotal2 = (long int)Ntotal;
 
@@ -4555,7 +4557,9 @@ void findIndiceRelatedSample(){
   std::cout << "a " << a << std::endl;
   std::cout << "b " << b << std::endl;
   
-  parallelFor(0, totalCombination, indicesRelatedSamples);
+  parallelReduce(0, totalCombination, indicesRelatedSamples);
+  geno.indiceVec = std::move(indicesRelatedSamples.output);
+  geno.kinValueVecSparse = std::move(indicesRelatedSamples.kinValues);
 
 //  arma::fmat xout(output.size()+Ntotal,2);
 
@@ -11161,22 +11165,6 @@ arma::vec GetdenominLambda0(const arma::uvec& caseIndexwithTies,
 }
 
 
-arma::vec GetLambda0(const arma::vec& lin_pred, const Rcpp::List& inC) {
-    Rcpp::DataFrame timedata = Rcpp::as<Rcpp::DataFrame>(inC["timedata"]);
-    arma::uvec orgIndex = timedata["orgIndex"];
-    arma::uvec caseIndexwithTies = inC["caseIndexwithTies"];
-    arma::uvec newIndexWithTies = timedata["newIndexWithTies"];
-    
-    arma::vec lin_pred_new(lin_pred.n_elem);
-    for(arma::uword i = 0; i < orgIndex.n_elem; i++) {
-        lin_pred_new(i) = lin_pred(orgIndex(i));
-    }
-    
-    arma::vec demonVec = GetdenominLambda0(caseIndexwithTies, lin_pred_new, newIndexWithTies);
-    arma::vec Lambda0_vec = arma::cumsum(demonVec);
-    
-    return Lambda0_vec;
-}
 
 // COVARIATE TRANSFORMATION FUNCTIONS
 
@@ -11363,62 +11351,4 @@ arma::vec Get_Coef(arma::mat& X, arma::vec& y, arma::vec& mu, arma::vec& mu2,
     }
     
     return coeffs;
-}
-
-// SCORE TEST FUNCTIONS
-
-
-Rcpp::List ScoreTest_NULL_Model(const arma::mat& X, const arma::vec& y, 
-                                const arma::vec& mu, const arma::vec& mu2,
-                                const arma::mat& Sigma_i, const arma::mat& Sigma_iX) {
-    
-    int n = X.n_rows;
-    int p = X.n_cols;
-    
-    // Compute P1 matrix: Sigma_i - Sigma_iX (X^T Sigma_i X)^(-1) X^T Sigma_i
-    arma::mat XtSigma_iX = X.t() * Sigma_i * X;
-    arma::mat XtSigma_iX_inv = arma::inv_sympd(XtSigma_iX);
-    arma::mat P1 = Sigma_i - Sigma_iX * XtSigma_iX_inv * Sigma_iX.t();
-    
-    // Compute residuals
-    arma::vec res = y - mu;
-    
-    // Compute variance matrix components
-    arma::mat P2 = P1;
-    if(mu2.n_elem > 0) {
-        // For non-identity variance (e.g., binary traits)
-        P2 = arma::diagmat(arma::sqrt(mu2)) * P1 * arma::diagmat(arma::sqrt(mu2));
-    }
-    
-    return Rcpp::List::create(
-        Rcpp::Named("P1") = P1,
-        Rcpp::Named("P2") = P2,
-        Rcpp::Named("residuals") = res,
-        Rcpp::Named("mu") = mu,
-        Rcpp::Named("mu2") = mu2
-    );
-}
-
-
-Rcpp::List ScoreTest_NULL_Model_survival(const arma::mat& X, const arma::vec& y,
-                                         const arma::vec& time, const arma::vec& status,
-                                         const arma::vec& lin_pred, const Rcpp::List& inC) {
-    
-    // This is a simplified version - full Cox model implementation would be more complex
-    int n = X.n_rows;
-    
-    // Compute score components for survival model
-    arma::vec Lambda0 = GetLambda0(lin_pred, inC);
-    
-    // Compute martingale residuals (simplified)
-    arma::vec mart_res = status - Lambda0;
-    
-    // Information matrix (simplified)
-    arma::mat Info = X.t() * X;  // Simplified - should be Fisher information
-    
-    return Rcpp::List::create(
-        Rcpp::Named("martingale_residuals") = mart_res,
-        Rcpp::Named("information_matrix") = Info,
-        Rcpp::Named("Lambda0") = Lambda0
-    );
 }

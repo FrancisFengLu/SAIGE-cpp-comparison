@@ -1,5 +1,5 @@
 #pragma once
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 
 // Declare the existing global definitions from SAIGE_step1_fast.cpp:
 extern arma::fvec getCrossprodMatAndKin(arma::fvec& bVec);

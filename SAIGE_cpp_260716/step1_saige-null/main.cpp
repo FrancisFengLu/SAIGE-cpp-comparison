@@ -45,7 +45,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include <iomanip>
 #include <chrono>
 #include <cmath>
@@ -1175,13 +1175,16 @@ int main(int argc, char** argv) {
     cfg.loco = false;
   }
 
-  // Configure thread pools (RcppParallel / OpenMP / OpenBLAS).
+  // Configure thread pools (marker-level workers / OpenMP / OpenBLAS).
   // Design:
-  //   - cfg.nthreads drives RcppParallel (TBB) for marker-level parallelism
-  //     (the parallelCrossProd worker) via the RCPP_PARALLEL_NUM_THREADS env var.
+  //   - cfg.nthreads drives the marker-level parallelism (parallelCrossProd and
+  //     the other workers in saige_parallel.hpp, OpenMP since RcppParallel/TBB
+  //     was dropped) via the RCPP_PARALLEL_NUM_THREADS env var; the name is
+  //     kept so a value users already export keeps working. The parallel BED
+  //     decode reads the same variable.
   //   - OpenMP for any #pragma omp regions.
   //   - OpenBLAS is pinned to 1 thread to avoid over-subscription when
-  //     marker-level TBB workers call into BLAS.
+  //     marker-level workers call into BLAS.
   //   - If the user pre-set OMP_NUM_THREADS / OPENBLAS_NUM_THREADS / RCPP_PARALLEL_NUM_THREADS
   //     in the environment, respect it (don't overwrite).
   {

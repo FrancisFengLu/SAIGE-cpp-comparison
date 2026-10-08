@@ -1,5 +1,5 @@
 #include "covariate_offset.hpp"
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cmath>

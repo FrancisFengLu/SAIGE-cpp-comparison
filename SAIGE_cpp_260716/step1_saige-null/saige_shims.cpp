@@ -1,4 +1,4 @@
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include "saige_shims.hpp"
 #include <cstdio>
 #include <unistd.h>

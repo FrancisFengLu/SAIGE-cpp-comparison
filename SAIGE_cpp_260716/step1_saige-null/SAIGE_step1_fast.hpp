@@ -1,6 +1,6 @@
 #pragma once
 
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include <string>
 #include <vector>
 

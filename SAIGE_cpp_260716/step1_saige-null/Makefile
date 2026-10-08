@@ -11,7 +11,7 @@ endif
 # CXXFLAGS (-march=nocona -O2), so most objects were NOT built with the flags
 # below. `:=` makes the Makefile assignment win over the environment (make only
 # lets the environment override `?=`, or any assignment under `make -e`).
-CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=1 -MMD -MP -pthread -fopenmp
+CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_64BIT_WORD=1 -MMD -MP -pthread -fopenmp
 
 # REQUIRED_DEFS are always appended to CXXFLAGS, even when the environment
 # (e.g. a conda/mamba activate script) pre-exports CXXFLAGS — in which case the
@@ -20,28 +20,15 @@ CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_6
 # (e.g. 158598² ≈ 2.5e10) exceeding the 32-bit arma::uword max (~4.29e9),
 # which triggers "SpMat::init(): requested size is too large" in the
 # sparse-GRM-fit / cate-VR path.
-REQUIRED_DEFS := -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=1
+REQUIRED_DEFS := -DARMA_64BIT_WORD=1
 CXXFLAGS += $(REQUIRED_DEFS)
 
-RSCRIPT      := $(shell command -v Rscript 2>/dev/null)
 PKG_CONFIG   := $(shell command -v pkg-config 2>/dev/null)
 
-# -------------------------
-# R / Rcpp includes (auto-detect via Rscript if available)
-# -------------------------
-ifeq ($(strip $(RSCRIPT)),)
-  R_HOME       :=
-  RCPP_INC     :=
-  RCPPARM_INC  :=
-  RCPPARAL_INC :=
-  RCPPEIG_INC  :=
-else
-  R_HOME       := $(shell "$(RSCRIPT)" -e 'cat(R.home())')
-  RCPP_INC     := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="Rcpp"))')
-  RCPPARM_INC  := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppArmadillo"))')
-  RCPPARAL_INC := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppParallel"))')
-  RCPPEIG_INC  := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppEigen"))')
-endif
+# No R anywhere: Armadillo comes from the system / conda env (saige_arma.hpp
+# reproduces the configuration RcppArmadillo used to apply), the marker-level
+# parallel loops are OpenMP (saige_parallel.hpp), and the RNG is the C++ port
+# in r_rng.cpp. Nothing here calls Rscript or links libR / RcppParallel.
 
 # -------------------------
 # pkg-config (Armadillo / yaml-cpp)
@@ -77,23 +64,6 @@ else
   endif
 endif
 
-# Optional R headers
-ifneq ($(strip $(R_HOME)),)
-  INCLUDES += -I"$(R_HOME)/include"
-endif
-ifneq ($(strip $(RCPP_INC)),)
-  INCLUDES += -I"$(RCPP_INC)"
-endif
-ifneq ($(strip $(RCPPARM_INC)),)
-  INCLUDES += -I"$(RCPPARM_INC)"
-endif
-ifneq ($(strip $(RCPPARAL_INC)),)
-  INCLUDES += -I"$(RCPPARAL_INC)"
-endif
-ifneq ($(strip $(RCPPEIG_INC)),)
-  INCLUDES += -I"$(RCPPEIG_INC)"
-endif
-
 # pkg-config cflags
 ifneq ($(strip $(YAML_CFLAGS)),)
   INCLUDES += $(YAML_CFLAGS)
@@ -110,8 +80,7 @@ ifeq ($(UNAME_S),Darwin)
           -larmadillo \
           -L/opt/homebrew/opt/openblas/lib -lopenblas \
           -llapack \
-          -L/opt/homebrew/opt/superlu/lib -lsuperlu \
-          -L/opt/homebrew/opt/tbb/lib -ltbb
+          -L/opt/homebrew/opt/superlu/lib -lsuperlu
 else
   LIBS := -pthread -fopenmp \
           -lyaml-cpp \
@@ -119,13 +88,12 @@ else
           -lopenblas \
           -llapack \
           -lsuperlu \
-          -ltbb \
           -ldl
   # Conda/mamba env (if active, add its library paths)
   ifneq ($(strip $(CONDA_PREFIX)),)
     LIBS := -pthread -fopenmp \
             -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib \
-            -lyaml-cpp -larmadillo -lopenblas -llapack -lsuperlu -ltbb -ldl
+            -lyaml-cpp -larmadillo -lopenblas -llapack -lsuperlu -ldl
   endif
 endif
 
@@ -135,25 +103,6 @@ ifneq ($(strip $(YAML_LIBS)),)
 endif
 ifneq ($(strip $(ARMA_LIBS)),)
   LIBS += $(ARMA_LIBS)
-endif
-
-# Optional R library
-ifneq ($(strip $(R_HOME)),)
-  LIBS += -L"$(R_HOME)/lib" -lR
-  LIBS += -Wl,-rpath,"$(R_HOME)/lib"
-  # libR has versioned pcre2 refs (PCRE2_10.47); link pcre2 explicitly so the
-  # env's libpcre2-8 resolves them (fixes "undefined reference pcre2_*@PCRE2_10.47").
-  LIBS += -lpcre2-8
-endif
-
-# Optional RcppParallel runtime
-RCPPARAL_LIBDIR := $(shell "$(RSCRIPT)" -e 'cat(system.file("libs", package="RcppParallel"))' 2>/dev/null)
-RCPPARAL_SO     := $(shell ls "$(RCPPARAL_LIBDIR)/RcppParallel.so" 2>/dev/null)
-ifneq ($(strip $(RCPPARAL_LIBDIR)),)
-  LIBS += -Wl,-rpath,"$(RCPPARAL_LIBDIR)"
-endif
-ifneq ($(strip $(RCPPARAL_SO)),)
-  LIBS += "$(RCPPARAL_SO)"
 endif
 
 # -------------------------

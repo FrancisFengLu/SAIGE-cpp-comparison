@@ -27,7 +27,7 @@
 #include "score.hpp"
 #include "SAIGE_step1_fast.hpp"
 
-#include <armadillo>
+#include "saige_arma.hpp"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>

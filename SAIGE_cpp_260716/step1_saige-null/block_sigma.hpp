@@ -32,7 +32,7 @@
 #ifndef BLOCK_SIGMA_HPP
 #define BLOCK_SIGMA_HPP
 
-#include <armadillo>
+#include "saige_arma.hpp"
 #include <vector>
 
 namespace blocksigma {

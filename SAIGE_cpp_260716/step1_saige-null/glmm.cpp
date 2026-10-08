@@ -2,7 +2,7 @@
 #include "saige_ai.hpp"           // Armadillo/PCG wrappers (pure C++ structs)
 #include "score.hpp"   // build_score_null_binary/quant
 #include "SAIGE_step1_fast.hpp"
-#include <armadillo>
+#include "saige_arma.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>

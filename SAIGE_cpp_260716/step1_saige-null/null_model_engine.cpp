@@ -16,7 +16,7 @@
 #include <Eigen/Dense>
 #include <cstdlib>
 #include <Eigen/QR>
-#include <armadillo>
+#include "saige_arma.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>

@@ -1,9 +1,9 @@
 
-// [[Rcpp::depends(RcppArmadillo)]]
-#include <RcppArmadillo.h>
+#include "saige_arma.hpp"
 #include "UTIL.hpp"
 #include "r_rng.hpp"
 #include <sys/time.h>
+#include <cstdio>
 
 // Rcpp::rbinom(n, 1, 0.5) via the C++ port of R's RNG (r_rng.cpp): same draws,
 // same continuous stream as set_seed(). (getWeights(), which used Rcpp::dbeta,
@@ -138,13 +138,13 @@ void printTime(arma::vec t1, arma::vec t2, std::string message){
   double wallTime = t2(0) - t1(0);
   double cpuTime = t2(1) - t1(1);
   if(wallTime < 60){
-    Rprintf ("It took %f seconds (%f CPU seconds) to %s.\n",
+    std::printf ("It took %f seconds (%f CPU seconds) to %s.\n",
              wallTime, cpuTime, message.c_str());
   }else if(wallTime < 3600){
-    Rprintf ("It took %f minutes (%f CPU minutes) to %s.\n",
+    std::printf ("It took %f minutes (%f CPU minutes) to %s.\n",
              wallTime/60, cpuTime/60, message.c_str());
   }else{
-    Rprintf ("It took %f hours (%f CPU hours) to %s.\n",
+    std::printf ("It took %f hours (%f CPU hours) to %s.\n",
              wallTime/3600, cpuTime/3600, message.c_str());
   }
 }
@@ -158,7 +158,6 @@ double getinvStd(double t_freq)
     return 1/Std;
 }
 
-// [[Rcpp::export]]
 double sum_arma1(arma::vec& X) {
     double sum = 0;
     for (uint i = 0; i < X.n_elem; ++i) {
@@ -169,10 +168,8 @@ double sum_arma1(arma::vec& X) {
 }
 
 
-// [[Rcpp::export]]
 double add_logp(double p1, double p2)
 {
-        using namespace Rcpp;
         p1 = -std::abs(p1);
         p2 = -std::abs(p2);
         double maxp = std::max(p1,p2);

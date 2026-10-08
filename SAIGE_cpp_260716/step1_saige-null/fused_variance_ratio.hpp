@@ -24,7 +24,7 @@
 // ------------------------------------------------------------------
 #pragma once
 #include <string>
-#include <armadillo>
+#include "saige_arma.hpp"
 
 namespace saige {
 
