@@ -12,7 +12,10 @@ endif
 # `:=` makes the Makefile assignment win over the environment (make only lets
 # the environment override `?=`, or any assignment under `make -e`).
 # -march=native / -funroll-loops / -DARMA_NO_DEBUG mirror the step1 flags.
-CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -fopenmp -pthread
+# ARCH: CPU instruction set (-march=$(ARCH)); native (default) or e.g.
+# x86-64-v3 for a binary that runs on any AVX2 machine.
+ARCH ?= native
+CXXFLAGS := -std=c++17 -O3 -march=$(ARCH) -funroll-loops -DARMA_NO_DEBUG -DARMA_USE_SUPERLU=1 -DARMA_64BIT_WORD=1 -MMD -MP -fopenmp -pthread
 
 # REQUIRED_DEFS are always appended, protecting the mandatory defines even if
 # CXXFLAGS is force-overridden (make -e / make CXXFLAGS=...).
@@ -118,7 +121,7 @@ endif
 # out of a ~1500 ns per-pair tail). Set USE_MVEC=0 to skip the probe.
 USE_MVEC ?= 1
 ifeq ($(USE_MVEC),1)
-  MVEC_OK := $(shell $(CXX) -O0 -std=c++17 -march=native tools/mvec_probe.cpp \
+  MVEC_OK := $(shell $(CXX) -O0 -std=c++17 -march=$(ARCH) tools/mvec_probe.cpp \
                      -o /dev/null -lmvec > /dev/null 2>&1 && echo yes)
   ifeq ($(MVEC_OK),yes)
     override CXXFLAGS += -DSAIGE_HAVE_MVEC_ERFC=1
@@ -157,8 +160,15 @@ ifeq ($(USE_CUDA),1)
     $(error USE_CUDA=1 but nvcc is not on PATH; set NVCC=/path/to/nvcc)
   endif
   CUDA_HOME ?= $(patsubst %/bin/,%,$(dir $(NVCC_PATH)))
+  # SM="70 80 90": SASS for each listed compute capability + PTX of the highest.
   SM        ?= 70
-  NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(SM) -lineinfo -Xcompiler -fPIC
+  ifeq ($(words $(SM)),1)
+    GPU_ARCH := -arch=sm_$(strip $(SM))
+  else
+    GPU_ARCH := $(foreach s,$(SM),-gencode arch=compute_$(s),code=sm_$(s)) \
+                -gencode arch=compute_$(lastword $(sort $(SM))),code=compute_$(lastword $(sort $(SM)))
+  endif
+  NVCCFLAGS ?= -O3 -std=c++17 $(GPU_ARCH) -lineinfo -Xcompiler -fPIC
   GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o gpu/gpu_sparse.cu.o gpu/gpu_er.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
@@ -177,7 +187,7 @@ OBJECTS := $(SOURCES:.cpp=.o)
 # defines apply to it.
 PGENLIB_SRC      := $(wildcard third_party/pgenlib/*.cc)
 PGENLIB_OBJ      := $(PGENLIB_SRC:.cc=.o)
-PGENLIB_CXXFLAGS := -std=c++17 -O2 -march=native -DNDEBUG -MMD -MP
+PGENLIB_CXXFLAGS := -std=c++17 -O2 -march=$(ARCH) -DNDEBUG -MMD -MP
 
 DEPS    := $(OBJECTS:.o=.d) $(PGENLIB_OBJ:.o=.d)
 

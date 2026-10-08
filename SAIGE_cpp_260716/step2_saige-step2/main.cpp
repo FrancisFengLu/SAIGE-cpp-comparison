@@ -8982,6 +8982,11 @@ int main(int argc, char* argv[])
     timing_mark("00_main_start");  // TIMING_INSTRUMENT_REMOVE_ME
     try {
         // ---- 1. Parse command-line ----
+        // --print-defaults: run the normal config parsing below on a config
+        // that sets only the required keys (placeholders; no file is opened
+        // before the settings are resolved), print the value every other key
+        // took, and exit. Used by the command-line front end for its --help.
+        const bool printDefaults = (argc == 2 && std::string(argv[1]) == "--print-defaults");
         if (argc < 2) {
             std::cerr << "Usage: " << argv[0] << " <config.yaml>" << std::endl;
             std::cerr << std::endl;
@@ -9154,7 +9159,9 @@ int main(int argc, char* argv[])
         std::cout << "Loading config from: " << configFile << std::endl;
 
         // ---- 2. Read YAML config ----
-        YAML::Node config = YAML::LoadFile(configFile);
+        YAML::Node config = printDefaults
+            ? YAML::Load("{plinkFile: _, modelFile: _, varianceRatioFile: _, outputFile: _}")
+            : YAML::LoadFile(configFile);
 
         // Required keys. Either the legacy scalar trio (modelFile /
         // varianceRatioFile / outputFile) or the `models:` sequence; the two
@@ -9644,6 +9651,58 @@ int main(int argc, char* argv[])
         // non-autosome (which silently falls back to the full-genome fit) is
         // still restricted -- same convention as the single-variant path.
         const std::string regionLocoChrom = useLOCO ? locoChrom : std::string("");
+
+        if (printDefaults) {
+            std::ostringstream o;
+            auto kv = [&](const char* k, const auto& v) { o << "default\t" << k << "\t" << v << "\n"; };
+            auto b = [](bool v) { return v ? "true" : "false"; };
+            const char* fromModel = "the model's (step 1)";
+            kv("genoType", genoType);
+            kv("AlleleOrder", alleleOrder);
+            kv("vcfField", vcfField);
+            kv("chrom", locoChrom.empty() ? std::string("none") : locoChrom);
+            kv("isImputation", b(isImputation));
+            kv("minMAF", minMAF);
+            kv("minMAC", minMAC);
+            kv("maxMissRate", maxMissRate);
+            kv("minINFO", minINFO);
+            kv("dosage_zerod_cutoff", dosage_zerod_cutoff);
+            kv("dosage_zerod_MAC_cutoff", dosage_zerod_MAC_cutoff);
+            kv("isMoreOutput", b(isMoreOutput));
+            kv("marker_chunksize", marker_chunksize);
+            kv("nThreads", g_nThreads);
+            kv("LOCO", b(useLOCO));
+            kv("isFirth", b(isFirth));
+            kv("is_Firth_beta", fromModel);
+            kv("pCutoffforFirth", fromModel);
+            kv("isnoadjCov", fromModel);
+            kv("cateVarRatioMinMACVecExclude", "the variance-ratio file's");
+            kv("cateVarRatioMaxMACVecInclude", "the variance-ratio file's");
+            kv("MACCutoffforER", MACCutoffforER);
+            kv("relatednessCutoff", relatednessCutoff);
+            kv("condition", conditionMarkerIDs.empty() ? "none" : "set");
+            kv("weights_for_condition", condition_weights.n_elem ? "set" : "none");
+            kv("groupFile", groupFile.empty() ? std::string("none") : groupFile);
+            kv("annotationList", annotationList.empty() ? "none (required with groupFile)" : "set");
+            kv("maxMAFList", maxMAFList.n_elem ? "set" : "none (required with groupFile)");
+            kv("r_corr", r_corr_val);
+            {
+                std::ostringstream w; w << weights_beta(0) << "," << weights_beta(1);
+                kv("weights_beta", w.str());
+            }
+            kv("MACCutoff_to_CollapseUltraRare", MACCutoff_to_CollapseUltraRare);
+            kv("markers_per_chunk_in_groupTest", markers_per_chunk_in_groupTest);
+            kv("groups_per_chunk", groups_per_chunk);
+            kv("isSingleInGroupTest", b(isSingleInGroupTest));
+            kv("isOutputMarkerList", b(isOutputMarkerList));
+            kv("min_gourpmac_for_burdenonly", min_gourpmac_for_burdenonly);
+            kv("outputFormat", g_outputFormatSgs ? "sgs" : "text");
+            kv("sgsPrecision", g_sgsF32 ? "fp32" : "fp64");
+            kv("useGPU", b(g_gpuStep2));
+            kv("gpuDevice", g_gpuDevice);
+            std::cout << o.str();
+            return 0;
+        }
 
         // Print configuration
         std::cout << std::endl;

@@ -159,6 +159,13 @@ static void yaml_set_dotted(YAML::Node& root,
   node[parts.back()] = value;
 }
 
+// Defaults of the design:/paths: keys that main() reads inline (the fit: keys
+// default through FitNullConfig). One definition each, used by main() and by
+// --print-defaults.
+static const char* const kDefaultIidCol            = "IID";
+static const int         kDefaultMinCovariateCount = -1;
+static const bool        kDefaultOverwriteVarratio = false;
+
 // ------------------ YAML loaders ------------------
 static FitNullConfig load_cfg(const YAML::Node& y) {
   FitNullConfig c;
@@ -1077,6 +1084,73 @@ static void design_take_rows(Design& d, const std::vector<size_t>& keep) {
 }
  
 // ------------------ main ------------------
+// --print-defaults: the value every config key takes when the config does not
+// set it, read off a config parsed from an empty YAML by the same load_cfg()
+// a run uses. One line per key: "default<TAB>key<TAB>value". Used by the
+// command-line front end for its --help; computes nothing.
+static void print_defaults() {
+  const FitNullConfig c = load_cfg(YAML::Node(YAML::NodeType::Map));
+  auto b = [](bool v) { return v ? "true" : "false"; };
+  auto list = [](const auto& v) {
+    std::ostringstream o;
+    for (size_t i = 0; i < v.size(); ++i) o << (i ? "," : "") << v[i];
+    return v.empty() ? std::string("none") : o.str();
+  };
+  auto str = [](const std::string& v) { return v.empty() ? std::string("none") : v; };
+  std::ostringstream o;
+  auto kv = [&](const char* k, const auto& v) { o << "default\t" << k << "\t" << v << "\n"; };
+  kv("design.csv", "none");
+  kv("design.covar_cols", "none");
+  kv("design.q_covar_cols", "none");
+  kv("design.whitelist_ids", "none");
+  kv("paths.sparse_grm", "none");
+  kv("paths.sparse_grm_ids", "none");
+  kv("design.iid_col", kDefaultIidCol);
+  kv("design.min_covariate_count", kDefaultMinCovariateCount);
+  kv("design.sex_col", str(c.sex_col));
+  kv("design.female_only", b(c.female_only));
+  kv("design.male_only", b(c.male_only));
+  kv("design.female_code", c.female_code);
+  kv("design.male_code", c.male_code);
+  kv("paths.overwrite_varratio", b(kDefaultOverwriteVarratio));
+  kv("fit.trait", c.trait);
+  kv("fit.loco", b(c.loco));
+  kv("fit.lowmem_loco", b(c.lowmem_loco));
+  kv("fit.covariate_qr", b(c.covariate_qr));
+  kv("fit.covariate_offset", b(c.covariate_offset));
+  kv("fit.inv_normalize", b(c.inv_normalize));
+  kv("fit.event_time_bin_size", c.event_time_bin_size ? std::to_string(*c.event_time_bin_size) : std::string("none"));
+  kv("fit.tol", c.tol);
+  kv("fit.maxiter", c.maxiter);
+  kv("fit.tolPCG", c.tolPCG);
+  kv("fit.maxiterPCG", c.maxiterPCG);
+  kv("fit.nrun", c.nrun);
+  kv("fit.traceCVcutoff", c.traceCVcutoff);
+  kv("fit.nthreads", c.nthreads);
+  kv("fit.use_gpu", b(c.use_gpu));
+  kv("fit.min_maf_grm", c.min_maf_grm);
+  kv("fit.max_miss_grm", c.max_miss_grm);
+  kv("fit.diag_one", b(c.isDiagofKinSetAsOne));
+  kv("fit.use_sparse_grm_to_fit", b(c.use_sparse_grm_to_fit));
+  kv("fit.use_pcg_with_sparse_grm", b(c.use_pcg_with_sparse_grm));
+  kv("fit.use_sparse_grm_for_vr", b(c.use_sparse_grm_for_vr));
+  kv("fit.relatedness_cutoff", c.relatedness_cutoff);
+  kv("fit.make_sparse_grm_only", b(c.make_sparse_grm_only));
+  kv("fit.num_markers_for_vr", c.num_markers_for_vr);
+  kv("fit.ratio_cv_cutoff", c.ratio_cv_cutoff);
+  kv("fit.isCateVarianceRatio", b(c.isCateVarianceRatio));
+  kv("fit.cateVarRatioMinMACVecExclude", list(c.cateVarRatioMinMACVecExclude));
+  kv("fit.cateVarRatioMaxMACVecInclude", list(c.cateVarRatioMaxMACVecInclude));
+  kv("fit.include_nonauto_for_vr", b(c.include_nonauto_for_vr));
+  kv("fit.spa_cutoff", c.spa_cutoff);
+  kv("fit.firth_beta", c.firth_beta < 0 ? "true for binary traits, false otherwise"
+                                         : b(c.firth_beta != 0));
+  kv("fit.p_cutoff_for_firth", c.p_cutoff_for_firth);
+  kv("fit.fast_test", b(c.fast_test));
+  kv("fit.impute_method", c.impute_method);
+  std::cout << o.str();
+}
+
 int main(int argc, char** argv) {
 
   cxxopts::Options opts("saige-null", "Null GLMM fitting with LOCO/VR (genoClass-integrated)");
@@ -1091,9 +1165,11 @@ int main(int argc, char** argv) {
     ("gemv-verify", "Run both K·u paths and print rel/abs error (debug)", cxxopts::value<bool>()->default_value("false"))
     ("v,verbose",  "Verbose", cxxopts::value<bool>()->default_value("false"))
     ("dry-run",    "Validate inputs only (no genotype loading or solver)", cxxopts::value<bool>()->default_value("false"))
+    ("print-defaults", "Print the default of every config key and exit")
     ("h,help",     "Show help");
 
   auto res = opts.parse(argc, argv);
+  if (res.count("print-defaults")) { print_defaults(); return 0; }
   if (res.count("help") || !res.count("config")) {
     std::cout << opts.help() << "\n";
     return 0;
@@ -1228,7 +1304,7 @@ int main(int argc, char** argv) {
   }
 
   // Design knobs
-  const int  min_cov_ct = (y["design"] && y["design"]["min_covariate_count"]) ? y["design"]["min_covariate_count"].as<int>() : -1;
+  const int  min_cov_ct = (y["design"] && y["design"]["min_covariate_count"]) ? y["design"]["min_covariate_count"].as<int>() : kDefaultMinCovariateCount;
   const bool drop_ref   = true; // can expose via YAML if desired
 
   // FIX: Read covar_cols from config (previously ignored!)
@@ -1241,7 +1317,7 @@ int main(int argc, char** argv) {
       }
     }
   }
-  std::string iid_col_name = "IID";
+  std::string iid_col_name = kDefaultIidCol;
   std::string y_col_name   = "y";
   if (y["design"] && y["design"]["iid_col"])
     iid_col_name = y["design"]["iid_col"].as<std::string>();
@@ -2011,7 +2087,7 @@ int main(int argc, char** argv) {
   // A make_sparse_grm_only run writes no variance ratio, and used to exit before
   // this guard, so it stays exempt.
   if (cfg.num_markers_for_vr > 0 && !cfg.make_sparse_grm_only) {
-    bool allow_overwrite = (y["paths"] && y["paths"]["overwrite_varratio"]) ? y["paths"]["overwrite_varratio"].as<bool>() : false;
+    bool allow_overwrite = (y["paths"] && y["paths"]["overwrite_varratio"]) ? y["paths"]["overwrite_varratio"].as<bool>() : kDefaultOverwriteVarratio;
     for (const auto& m : models) {
       std::string vr_txt = m.out_prefix_vr + ".varianceRatio.txt";
       if (!allow_overwrite && fs::exists(vr_txt)) {

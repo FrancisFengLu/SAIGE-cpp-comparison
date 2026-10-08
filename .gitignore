@@ -14,6 +14,8 @@ SAIGE_cpp_260716/step1_saige-null/saige-null
 SAIGE_cpp_260716/step2_saige-step2/saige-step2
 SAIGE_cpp_260716/step2_saige-step2/saige-step2.cuda
 SAIGE_cpp_260716/step2_saige-step2/tools/sgs2txt
+SAIGE_cpp_260716/bin/
+SAIGE_cpp_260716/.build-config
 SAIGE_cpp_260716/step2_saige-step2/tools/spa_gpu_check
 SAIGE_cpp_260716/step2_saige-step2/tools/er_gpu_check
 SAIGE_cpp_260716/step2_saige-step2/tools/spa_gpos_test

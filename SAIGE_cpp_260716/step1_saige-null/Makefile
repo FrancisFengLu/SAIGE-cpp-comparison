@@ -11,7 +11,12 @@ endif
 # CXXFLAGS (-march=nocona -O2), so most objects were NOT built with the flags
 # below. `:=` makes the Makefile assignment win over the environment (make only
 # lets the environment override `?=`, or any assignment under `make -e`).
-CXXFLAGS := -std=c++17 -O3 -march=native -funroll-loops -DARMA_NO_DEBUG -DARMA_64BIT_WORD=1 -MMD -MP -pthread -fopenmp
+# ARCH: the CPU instruction set the objects are compiled for (-march=$(ARCH)).
+# native (default) = this machine's; x86-64-v3 (AVX2/FMA/BMI2, Haswell 2013 and
+# newer) gives a binary that runs on any such machine. The fused 2-bit decode
+# kernels in SAIGE_step1_fast.cpp need AVX2+FMA (see AVX2_TU_FLAGS below).
+ARCH ?= native
+CXXFLAGS := -std=c++17 -O3 -march=$(ARCH) -funroll-loops -DARMA_NO_DEBUG -DARMA_64BIT_WORD=1 -MMD -MP -pthread -fopenmp
 
 # REQUIRED_DEFS are always appended to CXXFLAGS, even when the environment
 # (e.g. a conda/mamba activate script) pre-exports CXXFLAGS — in which case the
@@ -141,6 +146,16 @@ NVCC           ?= $(firstword $(wildcard /usr/local/cuda/bin/nvcc /usr/local/cud
 CUDA_HOME      := $(patsubst %/bin/nvcc,%,$(NVCC))
 # sm_70 = Volta (V100, this dev box). sm_86/sm_89 for Ampere/Ada.
 GPU_SM         ?= sm_70
+# SM="70 80 90": one build for several GPU generations -- device code (SASS) for
+# each listed compute capability plus PTX of the highest one (which newer GPUs
+# JIT-compile). Without SM, GPU_SM alone is used (-arch=$(GPU_SM): SASS + PTX).
+SM             ?=
+ifneq ($(strip $(SM)),)
+  GPU_ARCH     := $(foreach s,$(SM),-gencode arch=compute_$(s),code=sm_$(s)) \
+                  -gencode arch=compute_$(lastword $(sort $(SM))),code=compute_$(lastword $(sort $(SM)))
+else
+  GPU_ARCH     := -arch=$(GPU_SM)
+endif
 HAS_CUDA       := $(shell test -x $(NVCC) && test -f $(GPU_MATVEC_DIR)/gpu_matvec.cu && echo yes)
 INCLUDES       += -I$(GPU_MATVEC_DIR)
 
@@ -180,7 +195,7 @@ ifeq ($(HAS_CUDA),yes)
 	#   -pthread, -fopenmp    → -Xcompiler=<flag>
 	#   -Wl,-rpath,FOO        → -Xlinker -rpath=FOO    (GNU ld accepts =path form)
 	#   -Wl,<other>           → -Xlinker <flag>
-	PATH=/usr/bin:/bin $(NVCC) -std=c++17 -arch=$(GPU_SM) -ccbin /usr/bin/g++ \
+	PATH=/usr/bin:/bin $(NVCC) -std=c++17 $(GPU_ARCH) -ccbin /usr/bin/g++ \
 	    $(OBJECTS) $(GPU_CU_OBJ) \
 	    $(shell echo "$(LIBS)" | sed \
 	        -e 's/-pthread/-Xcompiler=-pthread/g' \
@@ -197,7 +212,7 @@ endif
 # used the new one, and the resulting ODR/ABI mismatch made saige::gpu::create()
 # read M and nbyte from the wrong offsets and silently fall back to CPU.
 $(GPU_MATVEC_DIR)/%.cu.o: $(GPU_MATVEC_DIR)/%.cu
-	$(NVCC) -std=c++17 -O2 -arch=$(GPU_SM) -I$(BED_READER_DIR) -I$(GPU_MATVEC_DIR) -MMD -MP -c $< -o $@
+	$(NVCC) -std=c++17 -O2 $(GPU_ARCH) -I$(BED_READER_DIR) -I$(GPU_MATVEC_DIR) -MMD -MP -c $< -o $@
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -210,7 +225,12 @@ $(GPU_MATVEC_DIR)/%.cu.o: $(GPU_MATVEC_DIR)/%.cu
 # fma, which changes rounding across the whole TU and breaks bit-identity of
 # the scalar fallback path vs the Phase-0 baseline. The AVX2 kernels use
 # explicit _mm256_fmadd_ps intrinsics, which are unaffected by this flag.
-SAIGE_step1_fast.o: CXXFLAGS += -mavx2 -mfma -ffp-contract=off
+# AVX2_TU_FLAGS forces AVX2+FMA on this one TU whatever ARCH says, so a build
+# for an ARCH without AVX2 still needs an AVX2 CPU. For a binary that runs
+# without AVX2: make ARCH=x86-64-v2 AVX2_TU_FLAGS= (the kernels then compile to
+# the scalar fallback).
+AVX2_TU_FLAGS ?= -mavx2 -mfma
+SAIGE_step1_fast.o: CXXFLAGS += $(AVX2_TU_FLAGS) -ffp-contract=off
 
 # Profile build: debug symbols + light optimization for meaningful callgrind output
 profile: CXXFLAGS := $(filter-out -O2,$(CXXFLAGS)) -O1 -g
