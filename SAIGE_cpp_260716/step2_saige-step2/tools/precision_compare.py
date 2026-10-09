@@ -18,7 +18,14 @@ Reported per trait and overall:
       for the two p columns also max |d log10 p|, read from the printed
       mantissa and exponent so that underflow strings ("1.9E-350") count
   p.value crossing 5e-8 and 1e-5: rows significant on one side only
+  p.value among rows with p < 1e-5 on either side: max relative |d|
+      (from the printed mantissa and exponent, so underflow strings count)
   Is.SPA: rows where it differs
+  With route dumps (SAIGE_STEP2_ROUTE_DUMP; <dir>/routes/<trait>.route found
+  next to the out/ directory, or --routes-a / --routes-b): pairs whose route
+  byte differs; Firth route changes (bit5 is_Firth differs); non-converged
+  changes (SPA: bit4 differs where both sides took SPA, bit0; Firth: bit6
+  differs where both sides ran Firth, bit5).
 Exit status 0 always (it reports; the caller decides what passes).
 """
 import argparse
@@ -150,6 +157,9 @@ def compare_trait(fa, fb):
     cross = {t: [0, 0] for t in THRESH}   # [significant in A only, in B only]
     spa = 0
     common = 0
+    smallrel = 0.0   # p.value, rows with p < 1e-5 on either side
+    nsmall = 0
+    lsmall = math.log10(1e-5)
     for k, ra in A.items():
         rb = B.get(k)
         if rb is None:
@@ -161,6 +171,10 @@ def compare_trait(fa, fb):
         if "Is.SPA" in ra and "Is.SPA" in rb and ra["Is.SPA"] != rb["Is.SPA"]:
             spa += 1
         la, lb = log10p(ra.get("p.value", "NA")), log10p(rb.get("p.value", "NA"))
+        if la is not None and lb is not None and math.isfinite(la) and math.isfinite(lb) \
+                and min(la, lb) < lsmall:
+            nsmall += 1
+            smallrel = max(smallrel, 1.0 - 10.0 ** (-abs(la - lb)))
         if la is not None and lb is not None:
             for t in THRESH:
                 lt = math.log10(t)
@@ -171,19 +185,54 @@ def compare_trait(fa, fb):
                     cross[t][1] += 1
     return dict(rowsA=len(A), rowsB=len(B), common=common, onlyA=len(onlyA), onlyB=len(onlyB),
                 onlyA_ex=[":".join(k) for k in onlyA[:3]], onlyB_ex=[":".join(k) for k in onlyB[:3]],
-                stats=st, cross=cross, spa=spa)
+                stats=st, cross=cross, spa=spa, nsmall=nsmall, smallrel=smallrel,
+                routes=None)
+
+
+ROUTE_KEYS = ("pairs", "differ", "firthRoute", "spaNonconv", "firthNonconv")
+
+
+def compare_routes(fa, fb):
+    """Route dumps of one trait: {u8 route, f64 gateP} per pair, same order."""
+    if not (os.path.isfile(fa) and os.path.isfile(fb)):
+        return None
+    with open(fa, "rb") as h:
+        a = h.read()[0::9]
+    with open(fb, "rb") as h:
+        b = h.read()[0::9]
+    if len(a) != len(b):
+        return dict(pairs=-1, differ=-1, firthRoute=-1, spaNonconv=-1, firthNonconv=-1)
+    r = dict(pairs=0, differ=0, firthRoute=0, spaNonconv=0, firthNonconv=0)
+    for x, y in zip(a, b):
+        if x == 0xFF or y == 0xFF:
+            continue
+        r["pairs"] += 1
+        if x == y:
+            continue
+        r["differ"] += 1
+        d = x ^ y
+        if d & 0x20:
+            r["firthRoute"] += 1
+        if x & y & 0x01 and d & 0x10:
+            r["spaNonconv"] += 1
+        if x & y & 0x20 and d & 0x40:
+            r["firthNonconv"] += 1
+    return r
 
 
 def fmt(x):
     return "0" if x == 0 else f"{x:.3g}"
 
 
+ID_FREE = False
+
+
 def print_block(name, r):
     print(f"== {name}: rows A {r['rowsA']}, B {r['rowsB']}, common {r['common']}, "
           f"only in A {r['onlyA']}, only in B {r['onlyB']}")
-    if r["onlyA_ex"]:
+    if r["onlyA_ex"] and not ID_FREE:
         print(f"   only in A e.g. {', '.join(r['onlyA_ex'])}")
-    if r["onlyB_ex"]:
+    if r["onlyB_ex"] and not ID_FREE:
         print(f"   only in B e.g. {', '.join(r['onlyB_ex'])}")
     print(f"   {'field':<11} {'max|d|':>10} {'max rel':>10} {'max|dlog10p|':>13} {'rows differ':>12} {'NA one side':>12}")
     for f in NUM_FIELDS:
@@ -193,7 +242,13 @@ def print_block(name, r):
     cr = r["cross"]
     print("   p.value crossings: " + "; ".join(
         f"{t:g}: {cr[t][0]} significant in A only, {cr[t][1]} in B only" for t in THRESH))
+    print(f"   p.value rows with p < 1e-5 on either side: {r['nsmall']}, max rel {fmt(r['smallrel'])}")
     print(f"   Is.SPA differs: {r['spa']}")
+    ro = r.get("routes")
+    if ro is not None:
+        print(f"   routes: pairs {ro['pairs']}, route byte differs {ro['differ']}, "
+              f"Firth route changes {ro['firthRoute']}, SPA non-converged changes {ro['spaNonconv']}, "
+              f"Firth non-converged changes {ro['firthNonconv']}")
 
 
 def main():
@@ -202,7 +257,17 @@ def main():
     ap.add_argument("B")
     ap.add_argument("--json", help="also write the numbers as JSON to this file")
     ap.add_argument("--quiet", action="store_true", help="overall block only")
+    ap.add_argument("--no-ids", action="store_true",
+                    help="aggregate numbers only: no marker IDs in the output or the JSON "
+                         "(for results that leave the analysis environment)")
+    ap.add_argument("--routes-a", help="route dump directory of A (default A/routes if present)")
+    ap.add_argument("--routes-b", help="route dump directory of B (default B/routes if present)")
     a = ap.parse_args()
+    if a.no_ids:
+        global ID_FREE
+        ID_FREE = True
+    ra = a.routes_a or (os.path.join(a.A, "routes") if os.path.isdir(os.path.join(a.A, "routes")) else None)
+    rb = a.routes_b or (os.path.join(a.B, "routes") if os.path.isdir(os.path.join(a.B, "routes")) else None)
     TA, TB = trait_files(a.A), trait_files(a.B)
     if os.path.isfile(a.A) and os.path.isfile(a.B):
         TA, TB = {"trait": a.A}, {"trait": a.B}
@@ -214,11 +279,21 @@ def main():
           (f"; only in A: {', '.join(onlyTA)}" if onlyTA else "") +
           (f"; only in B: {', '.join(onlyTB)}" if onlyTB else ""))
     tot = dict(rowsA=0, rowsB=0, common=0, onlyA=0, onlyB=0, onlyA_ex=[], onlyB_ex=[],
-               stats={f: Stat() for f in NUM_FIELDS}, cross={t: [0, 0] for t in THRESH}, spa=0)
+               stats={f: Stat() for f in NUM_FIELDS}, cross={t: [0, 0] for t in THRESH}, spa=0,
+               nsmall=0, smallrel=0.0, routes=None)
     per = {}
     for t in traits:
         r = compare_trait(TA[t], TB[t])
+        if ra and rb:
+            r["routes"] = compare_routes(os.path.join(ra, t + ".route"), os.path.join(rb, t + ".route"))
+            if r["routes"] is not None:
+                if tot["routes"] is None:
+                    tot["routes"] = {k: 0 for k in ROUTE_KEYS}
+                for k in ROUTE_KEYS:
+                    tot["routes"][k] += r["routes"][k]
         per[t] = r
+        tot["nsmall"] += r["nsmall"]
+        tot["smallrel"] = max(tot["smallrel"], r["smallrel"])
         if not a.quiet:
             print_block(t, r)
         for k in ("rowsA", "rowsB", "common", "onlyA", "onlyB", "spa"):
@@ -235,11 +310,12 @@ def main():
     print_block(f"overall ({len(traits)} traits)", tot)
     if a.json:
         def js(r):
-            return dict({k: r[k] for k in ("rowsA", "rowsB", "common", "onlyA", "onlyB", "spa")},
+            return dict({k: r[k] for k in ("rowsA", "rowsB", "common", "onlyA", "onlyB", "spa",
+                                           "nsmall", "smallrel", "routes")},
                         cross={f"{t:g}": r["cross"][t] for t in THRESH},
                         fields={f: dict(maxabs=s.maxabs, maxrel=s.maxrel, maxdlog10p=s.maxdl,
                                         ndiff=s.ndiff, naOneSide=s.nNA1,
-                                        worst=":".join(s.worst) if s.worst else None)
+                                        worst=None if ID_FREE else (":".join(s.worst) if s.worst else None))
                                 for f, s in r["stats"].items()})
         with open(a.json, "w") as h:
             json.dump(dict(A=a.A, B=a.B, traitsOnlyA=onlyTA, traitsOnlyB=onlyTB,
