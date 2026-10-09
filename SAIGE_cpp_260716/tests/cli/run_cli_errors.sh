@@ -31,8 +31,7 @@ expect 2 "unknown flag --useGpu .*did you mean --useGPU" -- step2 --useGpu
 expect 2 "unknown flag --frobnicate for saige-gpu-cpp step2" -- step2 --frobnicate=1
 expect 2 "--memoryChunk is an R SAIGE flag that .* step1 does not support" -- step1 $G --phenoCol b1 --outDir o --memoryChunk 2
 expect 2 "--skipModelFitting is an R SAIGE flag" -- step1 $G --phenoCol b1 --outDir o --skipModelFitting=TRUE
-expect 2 "--SPAcutoff is an R SAIGE flag .*give it to .saige-gpu-cpp step1. --SPAcutoff" -- step2 --step1Dir s1 --plinkFile g --outDir o --SPAcutoff 2
-expect 2 "--is_fastTest is an R SAIGE flag .*step1. --is_fastTest" -- step2 --is_fastTest=TRUE
+expect 2 "--impute_method must be best_guess, mean or minor, got 'median'" -- step2 --step1Dir s1 --plinkFile g --outDir o --impute_method median
 expect 2 "--idstoIncludeFile is an R SAIGE flag .*plink2 --extract" -- step2 --idstoIncludeFile ids.txt
 expect 2 "--savFile is an R SAIGE flag" -- step2 --savFile x.sav
 expect 2 "unexpected argument 'b1'" -- step1 --phenoCol b1 b1
@@ -40,6 +39,8 @@ expect 2 "unknown command 'step3'" -- step3
 echo "== R defaults of refused flags are accepted"
 expect 0 "config written" -- step1 $G --phenoCol b1 --outDir o --tauInit 0,0 --skipModelFitting=FALSE --dryRun
 expect 0 "config written" -- step2 --step1Dir s1 --plinkFile g --outDir out --maxMAC_in_groupTest 0 --is_no_weight_in_groupTest=FALSE --dryRun
+echo "== R's step-2 test flags are step-2 flags"
+expect 0 "config written" -- step2 --step1Dir s1 --plinkFile g --outDir out --SPAcutoff 2 --is_fastTest=FALSE --impute_method best_guess --is_noadjCov=TRUE --dryRun
 echo "== values"
 expect 2 "--LOCO expects TRUE or FALSE, got 'maybe'" -- step1 $G --phenoCol b1 --outDir o --LOCO=maybe
 expect 2 "--tol expects a number, got 'abc'" -- step1 $G --phenoCol b1 --outDir o --tol abc

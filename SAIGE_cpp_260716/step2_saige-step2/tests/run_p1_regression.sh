@@ -75,6 +75,9 @@ mk_loco "$WORK/loco_a" 1 0.90 '[1]' || { echo "FAIL: could not build LOCO model"
 mk_loco "$WORK/loco_b" 2 1.15 '[2]' || { echo "FAIL: could not build LOCO model"; exit 1; }
 
 common () {  # common <plinkFile>
+    # The base binary predates the R step-2 defaults (S2_RDEFAULTS.md): pin
+    # what it read from the model / its own defaults, so the comparison is of
+    # the code paths and not of the defaults.
     cat <<EOF
 genoType:   plink
 plinkFile:  $1
@@ -84,6 +87,13 @@ maxMissRate: 0.15
 AlleleOrder: alt-first
 MACCutoffforER: 4
 nThreads: 1
+LOCO: false
+isnoadjCov: false
+isFastTest: true
+impute_method: mean
+is_Firth_beta: false
+pCutoffforFirth: 0.01
+SPA_Cutoff: 2
 EOF
 }
 

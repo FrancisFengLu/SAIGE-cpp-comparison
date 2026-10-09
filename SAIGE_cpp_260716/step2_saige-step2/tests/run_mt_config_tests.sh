@@ -55,6 +55,7 @@ isMoreOutput: false
 isFirth: false
 MACCutoffforER: 4
 nThreads: 1
+LOCO: false
 EOF
 }
 

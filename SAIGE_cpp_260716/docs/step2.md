@@ -44,8 +44,11 @@ is created.
 - Logical flags take `--LOCO=FALSE`, `--LOCO FALSE`, `T`/`F`, or a bare `--useGPU`
   (= TRUE). A flag that is not given is left out of `step2.yaml`, so the
   engine's own default applies. The defaults below are the engine's
-  (`saige-step2 --print-defaults`; `--help` asks the engine too). Where R's
-  default differs, the table says so (e.g. `--LOCO`: FALSE here, TRUE in R).
+  (`saige-step2 --print-defaults`; `--help` asks the engine too) and are R
+  SAIGE 1.5.2's step-2 defaults: `--is_noadjCov=TRUE`, `--impute_method=best_guess`,
+  `--is_fastTest=FALSE`, `--SPAcutoff=2`, `--is_Firth_beta=FALSE`,
+  `--pCutoffforFirth=0.01`, `--LOCO=TRUE` (a model fitted without LOCO needs
+  `--LOCO=FALSE`, as in R).
 - An R SAIGE flag that this program does not implement stops the run with the
   reason ([refused flags](#flags)); so does an unknown or misspelt flag.
 - `--config FILE` starts from a YAML config; flags override its keys.
@@ -54,11 +57,11 @@ is created.
 - `--dryRun` writes `step2.yaml` and prints the engine command without running it.
 - `saige-gpu-cpp step2 --help` lists every flag with its default.
 
-Differences from R SAIGE: `--SPAcutoff`, `--is_fastTest` and `--impute_method`
-are step-1 flags here (they are stored in the model), and the sparse GRM comes
-from the model, so step 2 refuses `--sparseGRMFile`. `--is_Firth_beta` and
-`--pCutoffforFirth` default to what step 1 stored (`--is_Firth_beta` TRUE for
-binary traits).
+Differences from R SAIGE: the sparse GRM comes from the model, so step 2
+refuses `--sparseGRMFile`. The step-1 front end also records `--SPAcutoff`,
+`--is_fastTest`, `--impute_method`, `--is_Firth_beta` and `--pCutoffforFirth`
+in the model for reference; step 2 does not read that copy (it has its own
+flags, with R's defaults) and prints a note when the two differ.
 
 ### Flags
 
@@ -118,11 +121,15 @@ binary traits).
 
 | Flag | Config key | Default | Meaning |
 |---|---|---|---|
-| `--LOCO[=TRUE\|FALSE]` | `LOCO` | FALSE (R: TRUE) | use the LOCO models of --chrom |
-| `--is_Firth_beta[=TRUE\|FALSE]` | `is_Firth_beta, isFirth` | the model's (step 1) | Firth beta for binary traits with p < --pCutoffforFirth |
-| `--pCutoffforFirth X` | `pCutoffforFirth` | the model's (step 1) | p-value cutoff for Firth |
+| `--LOCO[=TRUE\|FALSE]` | `LOCO` | TRUE | use the LOCO models of --chrom (a model without LOCO results needs --LOCO=FALSE) |
+| `--is_Firth_beta[=TRUE\|FALSE]` | `is_Firth_beta, isFirth` | FALSE | Firth beta for binary traits with p < --pCutoffforFirth |
+| `--pCutoffforFirth X` | `pCutoffforFirth` | 0.01 | p-value cutoff for Firth |
 | `--max_MAC_for_ER X` | `MACCutoffforER` | 4 | binary traits: exact test for MAC <= X |
-| `--is_noadjCov[=TRUE\|FALSE]` | `isnoadjCov` | the model's (step 1) (R: TRUE) | skip the covariate adjustment of the score |
+| `--is_noadjCov[=TRUE\|FALSE]` | `isnoadjCov` | TRUE | score and variance without the covariate projection (R's scoreTestFast_noadjCov) |
+| `--SPAcutoff X` | `SPA_Cutoff` | 2 | SPA when \|Tstat\|/sqrt(var) > X (binary traits) |
+| `--is_fastTest[=TRUE\|FALSE]` | `isFastTest` | FALSE | re-test markers with p < --pval_cutoff_for_fastTest with the adjusted score (and the sparse GRM) |
+| `--pval_cutoff_for_fastTest X` [+] | `pval_cutoff_for_fastTest` | 0.05 | p-value cutoff of --is_fastTest |
+| `--impute_method M` | `impute_method` | best_guess | missing genotypes: best_guess, mean or minor |
 | `--relatednessCutoff X` | `relatednessCutoff` | 0 | sparse GRM entries below this are dropped |
 | `--cateVarRatioMinMACVecExclude X,X,...` | `cateVarRatioMinMACVecExclude` | the variance-ratio file's | MAC category lower bounds |
 | `--cateVarRatioMaxMACVecInclude X,...` | `cateVarRatioMaxMACVecInclude` | the variance-ratio file's | MAC category upper bounds |
@@ -139,7 +146,7 @@ binary traits).
 | `--r.corr 0\|1` | `r_corr` | 0 | 0: SKAT-O (+SKAT, Burden); 1: Burden only |
 | `--weights.beta A,B` | `weights_beta` | 1,25 | Beta(MAF; A, B) weights |
 | `--MACCutoff_to_CollapseUltraRare X` | `MACCutoff_to_CollapseUltraRare` | 10 | collapse variants with MAC <= X |
-| `--markers_per_chunk_in_groupTest N` | `markers_per_chunk_in_groupTest` | 500 (R: 100) | markers per chunk |
+| `--markers_per_chunk_in_groupTest N` | `markers_per_chunk_in_groupTest` | 100 (R: 100) | markers per chunk |
 | `--groups_per_chunk N` | `groups_per_chunk` | 100 | regions per I/O chunk |
 | `--is_single_in_groupTest[=TRUE\|FALSE]` | `isSingleInGroupTest` | TRUE (R: FALSE) | also write single-variant results |
 | `--is_output_markerList_in_groupTest[=TRUE\|FALSE]` | `isOutputMarkerList` | FALSE | write the marker list of each region |
@@ -171,9 +178,6 @@ binary traits).
 
 | Flag | Why |
 |---|---|
-| `--SPAcutoff` | it is stored in the model; give it to `saige-gpu-cpp step1` --SPAcutoff |
-| `--is_fastTest` | it is stored in the model; give it to `saige-gpu-cpp step1` --is_fastTest |
-| `--impute_method` | it is stored in the model; give it to `saige-gpu-cpp step1` --impute_method |
 | `--sparseGRMFile` | the sparse GRM comes from the step-1 model (fit it with `saige-gpu-cpp step1 --sparseGRMFile ...`) |
 | `--sparseGRMSampleIDFile` | the sparse GRM comes from the step-1 model |
 | `--vcfFilters` | not implemented |
@@ -228,8 +232,10 @@ done
 ```
 
 The log shows `LOCO: restricting to chromosome 1: 2500 of 5000 markers retained.`
-`--chrom` must match the genotype file's chromosome codes. `--LOCO=FALSE` (the
-default here) uses the whole-genome model and tests every marker. See the
+`--chrom` must match the genotype file's chromosome codes. `--LOCO=FALSE` uses
+the whole-genome model and tests every marker; it is required for a model
+fitted without LOCO (with the default `--LOCO=TRUE` such a model stops the run,
+as in R). See the
 [HPC example](hpc_example.md) for running all chromosomes and merging.
 
 ## Binary output (sgs)
@@ -329,15 +335,16 @@ not in the model are ignored.
 - `minINFO` — imputation INFO filter (default 0).
 - `dosage_zerod_cutoff` (0.2), `dosage_zerod_MAC_cutoff` (10) — dosage inputs: dosages ≤ cutoff are set to 0 for markers with MAC ≤ the MAC cutoff.
 
-**Tests (binary traits):**
+**Tests** (R's step-2 flags, with R's defaults; the copy step 1 records in
+`nullmodel.json` is not read):
 
-- `is_Firth_beta` — Firth-corrected effect for markers with p < `pCutoffforFirth`. Default: the value stored by step 1 (`fit.firth_beta`). Can be set per model inside a `models:` entry.
-- `pCutoffforFirth` — default: the value stored by step 1 (`fit.p_cutoff_for_firth`, 0.01).
+- `isnoadjCov` — `true` (default, R's): score and variance without the covariate projection (R's `scoreTestFast_noadjCov`: the genotype centred at its post-imputation ALT frequency, with the `null_noXadj` variance ratio); SPA, Firth and the exact test are unchanged. `false`: the covariate-adjusted score. Can be set per model inside a `models:` entry. Every path (single-trait, multi-trait batch, GPU, with or without missing phenotypes) implements both.
+- `impute_method` — `best_guess` (default), `mean` or `minor`.
+- `isFastTest` (default `false`) with `pval_cutoff_for_fastTest` (0.05) — re-test markers whose first-pass p is below the cutoff with the covariate-adjusted score (and the sparse GRM when the model has one), as R's `--is_fastTest`.
+- `SPA_Cutoff` (`SPAcutoff` is accepted too) — SPA when |Tstat|/sqrt(var) exceeds it (default 2).
+- `is_Firth_beta` — Firth-corrected effect for binary markers with p ≤ `pCutoffforFirth` (default `false`; cutoff 0.01). Both can be set per model inside a `models:` entry.
 - `MACCutoffforER` — markers with MAC ≤ this use the exact test (default 4).
-- `isFirth` — only controls the Firth summary lines in the log; whether Firth is applied is decided by `is_Firth_beta`.
-
-The SPA cutoff (`fit.spa_cutoff`) and the fast test (`fit.fast_test`) are set in
-step 1 and read from the model.
+- `isFirth` — only controls the Firth summary lines in the log; defaults to `is_Firth_beta`.
 
 **Run:**
 
@@ -361,7 +368,7 @@ minMAF: 0
 minMAC: 1
 maxMissRate: 0.15
 LOCO: false
-isFirth: true                        # binary traits: Firth correction for p < pCutoffforFirth
+is_Firth_beta: true                  # binary traits: Firth correction for p <= pCutoffforFirth
 pCutoffforFirth: 0.01
 MACCutoffforER: 4                    # binary traits: exact test for MAC <= 4
 nThreads: 8

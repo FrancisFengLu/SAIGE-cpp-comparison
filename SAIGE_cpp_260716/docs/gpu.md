@@ -193,7 +193,7 @@ When to use which:
 | one model | yes (it is run like a one-entry `models:` list) | |
 | `outputFormat: text` or `sgs` | yes | |
 | conditional analysis (`condition`) | no | CPU |
-| `isnoadjCov: true` | no | CPU |
+| `isnoadjCov: true` (the default) and `false` | yes | the per-pair statistics on the device take either form |
 | region / gene-based tests (`groupFile`) | no | CPU |
 
 ### Reading the log
@@ -226,7 +226,7 @@ Not used — one line with the reason, then the run continues on the CPU:
 | `the models do not share one sample list (gpuOwnSampleSets: true ...)` | remove `gpuOwnSampleSets: false` |
 | `mtBatch is false` | remove `mtBatch: false` |
 | `trait '<name>': sparseGRM first pass ...` | quantitative sparse-GRM model with `fast_test: false` |
-| `trait '<name>': isnoadjCov=true`, `... runs conditional analysis` | not supported on the GPU |
+| `trait '<name>' runs conditional analysis` | not supported on the GPU |
 | `gpuSparse: ...` | the sparse-GRM variance could not be set up on the GPU |
 | `device setup failed` | GPU out of memory or CUDA error at start; see memory below |
 

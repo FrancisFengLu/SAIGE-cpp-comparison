@@ -20,7 +20,7 @@ run with `saige-null -c step1.yaml --dry-run`.
 |---|---|
 | `unknown flag --phenoColl for saige-gpu-cpp step1 (did you mean --phenoCol?); ...` | misspelt flag (names are case-sensitive, as in R) |
 | `--memoryChunk is an R SAIGE flag that saige-gpu-cpp step1 does not support: ...` | an R flag without an implementation here; the message says why or what to use instead (the full list: `--help`, end) |
-| ``--SPAcutoff is an R SAIGE flag that saige-gpu-cpp step2 does not support: it is stored in the model; give it to `saige-gpu-cpp step1` --SPAcutoff`` | same for `--is_fastTest`, `--impute_method`: set them in step 1 |
+| ``--sparseGRMFile is an R SAIGE flag that saige-gpu-cpp step2 does not support: the sparse GRM comes from the step-1 model ...`` | fit the model with the sparse GRM in step 1; step 2 reads it from the model |
 | `missing --outDir ...`, `missing --phenoCol ...`, `missing genotypes: ...`, `missing models: ...` | a required flag is not given |
 | `--step1Dir DIR: no step-1 models found ...` | `DIR` is not the `--outDir` of a step-1 run, or step 1 failed |
 | `--phenoCol b9: no such trait in DIR (it has: b1, b2)` | step 2 `--phenoCol` names a trait step 1 did not fit |

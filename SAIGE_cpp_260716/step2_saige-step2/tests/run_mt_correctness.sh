@@ -102,6 +102,7 @@ nThreads: $1
 isMoreOutput: $2
 isFirth: $3
 marker_chunksize: $4
+LOCO: false
 EOF
 }
 

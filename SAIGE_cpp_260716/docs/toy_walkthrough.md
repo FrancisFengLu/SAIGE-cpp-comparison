@@ -187,9 +187,9 @@ Variance ratio: …/step1/vr_b1.varianceRatio.txt
 | `--nThreads 8 --useGPU` | 线程、GPU |
 | `--outDir step2` | 输出目录（不存在会自己建）；每个表型一个 `step2/<表型>.txt` |
 
-只想检验其中几个表型：加 `--phenoCol b1,b3`。参数名和 R SAIGE 的 `step2_SPAtests.R` 一样；
-R 里在 step 2 设的 `--SPAcutoff`、`--is_fastTest`、`--impute_method` 在这里属于 step 1（存在模型里），
-给 step 2 会直接报错说明原因。全部参数：`./saige-gpu-cpp step2 --help`。参考耗时约 2 秒。
+只想检验其中几个表型：加 `--phenoCol b1,b3`。参数名和 R SAIGE 的 `step2_SPAtests.R` 一样，
+默认值也是 R 的（`--is_noadjCov=TRUE`、`--impute_method=best_guess`、`--is_fastTest=FALSE`、
+`--SPAcutoff=2`、`--is_Firth_beta=FALSE`）。全部参数：`./saige-gpu-cpp step2 --help`。参考耗时约 2 秒。
 
 和 step 1 一样，设置写在 `step2/step2.yaml`，引擎是 `saige-step2`。
 

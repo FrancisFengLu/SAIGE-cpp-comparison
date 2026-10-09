@@ -143,15 +143,15 @@ takes in step 2 are given here and stored in the model.
 | `--includeNonautoMarkersforVarRatio[=TRUE\|FALSE]` | `fit.include_nonauto_for_vr` | FALSE | allow non-autosomal variance-ratio markers |
 | `--IsOverwriteVarianceRatioFile[=TRUE\|FALSE]` | `paths.overwrite_varratio` | FALSE | overwrite an existing variance-ratio file |
 
-**Step-2 settings stored in the model**
+**Recorded in the model (step 2 uses its own flags; these are not read)**
 
 | Flag | Config key | Default | Meaning |
 |---|---|---|---|
-| `--SPAcutoff X` | `fit.spa_cutoff` | 2 | SPA is applied when \|z\| > X |
-| `--is_Firth_beta[=TRUE\|FALSE]` [+] | `fit.firth_beta` | true for binary traits, false otherwise | Firth beta for binary traits with p < --pCutoffforFirth (R: a step-2 flag) |
-| `--pCutoffforFirth X` [+] | `fit.p_cutoff_for_firth` | 0.01 | p-value cutoff for Firth (R: a step-2 flag) |
-| `--is_fastTest[=TRUE\|FALSE]` [+] | `fit.fast_test` | TRUE (R step 2: FALSE) | fast test for sparse-GRM models (R: a step-2 flag) |
-| `--impute_method M` [+] | `fit.impute_method` | mean (R step 2: best_guess) | missing genotypes in step 2: best_guess, mean or minor (R: a step-2 flag) |
+| `--SPAcutoff X` | `fit.spa_cutoff` | 2 (recorded only; give it to step2) | SPA is applied when \|z\| > X |
+| `--is_Firth_beta[=TRUE\|FALSE]` [+] | `fit.firth_beta` | true for binary traits, false otherwise (recorded only; give it to step2) | Firth beta for binary traits with p < --pCutoffforFirth |
+| `--pCutoffforFirth X` [+] | `fit.p_cutoff_for_firth` | 0.01 (recorded only; give it to step2) | p-value cutoff for Firth |
+| `--is_fastTest[=TRUE\|FALSE]` [+] | `fit.fast_test` | TRUE (recorded only; give it to step2) | fast test for sparse-GRM models |
+| `--impute_method M` [+] | `fit.impute_method` | mean (recorded only; give it to step2) | missing genotypes in step 2: best_guess, mean or minor |
 
 **Output**
 
@@ -379,13 +379,11 @@ The config has three sections: `paths`, `design`, `fit`. Relative paths under
 - `relatedness_cutoff` — sparse GRM entries below this are dropped when building it (default 0.05).
 - `tol` (0.02), `maxiter` (20), `tolPCG` (1e-5), `maxiterPCG` (500), `nrun` (30), `trace_seed` — fitting controls, SAIGE's meaning and defaults.
 
-**Stored in the model and used by step 2** (step 2 can override the two Firth keys):
+**Recorded in the model, not read by step 2** (step 2 has its own keys for
+these, with R's step-2 defaults, and prints a note when the recorded value
+differs; see [step 2](step2.md#config-keys)):
 
-- `spa_cutoff` — saddle-point approximation is used when |test statistic| > this (default 2).
-- `fast_test` — fast score test with re-computation of markers with p < 0.05 (default `true`).
-- `firth_beta` — Firth-corrected effect sizes for binary traits (default: `true` for binary traits).
-- `p_cutoff_for_firth` — Firth is applied when p < this (default 0.01).
-- `impute_method` — missing genotypes in step 2: `mean` (default).
+- `spa_cutoff` (2), `fast_test` (`true`), `firth_beta` (`true` for binary traits), `p_cutoff_for_firth` (0.01), `impute_method` (`mean`).
 
 ### Example config: four binary traits, full GRM, GPU
 

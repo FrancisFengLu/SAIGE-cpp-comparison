@@ -36,7 +36,8 @@
 #   D11 D2 with mtBatch: false  == D2 byte for byte (all pairs scalar)
 #   D12 D3 with mtBlockSize 7 and nThreads 4 == D3
 #   D13 D6 under SAIGE_STEP2_SCALAR_DECODE=1 (goldens under the same env)
-#   D14 D3 with a per-model isnoadjCov on one own-sample trait (not batchable)
+#   D14 D3 with a per-model isnoadjCov on one own-sample trait (batchable; the
+#       batch kernel takes the centred score of that trait, saige_mt.hpp t_AF)
 #   D15 LOCO chrom 1, P=4: two models with a perturbed chr1/ fit (one full set,
 #       one subset), one subset model whose loco_chroms lacks chr1 (silent
 #       genome-wide fallback), one quantitative subset model with a chr1/ fit
@@ -151,6 +152,7 @@ nThreads: $2
 isMoreOutput: $more
 isFirth: $firth
 EOF
+    [ "$1" = mid_loco ] || echo "LOCO: false"   # the models have no LOCO fit; LOCO defaults to true (R)
     [ -n "$extra" ] && printf '%s\n' "$extra"
     return 0
 }
@@ -278,10 +280,11 @@ if has_case D14; then
     MT_OVERRIDE="I3"
     mt_case D14_noadj_override mid_plain 1 $D3T
     MT_OVERRIDE=""
-    if grep -q "isnoadjCov=true" "$WORK/out/D14_noadj_override.log"; then
-        ok "D14: I3 gated out of the batch path (isnoadjCov=true)"
+    if grep -q "\[I3\] isnoadjCov overridden per model: true" "$WORK/out/D14_noadj_override.log" &&
+       ! grep -q "isnoadjCov=true" "$WORK/out/D14_noadj_override.log"; then
+        ok "D14: I3 takes the per-model isnoadjCov and stays on the batch path"
     else
-        bad "D14: the override did not reach the gate table"
+        bad "D14: the per-model isnoadjCov override did not reach I3, or it left the batch path"
     fi
 fi
 if has_case D15; then
