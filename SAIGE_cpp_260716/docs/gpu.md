@@ -159,20 +159,9 @@ byte-identical to the fp64 GPU run, the CPU path or R SAIGE.
 Speed: on V100, A100 and H100 fp64 runs at half the fp32 rate, so the low
 precision modes do not pay off there: on V100 SPA `fp32` is 30-55% slower than
 SPA `fp64` (it was built to move fp64 work off weak-fp64 cards). **The fp32 and
-int8 modes are meant for weak-fp64 cards only.** Measured on this guide's V100 (200,000
-markers x 50,000 samples, 128 binary traits, Firth on with `pCutoffforFirth: 0.05`,
-1.35 million Firth fits, `outputFormat: sgs`, cold page cache, mean of 2 runs;
-measured before the SPA projection passes moved to fp32, where SPA took 0.3 s
-of the run):
+int8 modes are meant for weak-fp64 cards only.**
 
-| Mode | wall | GEMM (device) | Firth + post |
-|---|---|---|---|
-| all `fp64` | 40.7 s | 14.2 s | 11.9 s |
-| all `fp32` | 40.5 s | 15.9 s | 12.6 s |
-| scan `int8`, rest `fp32` | 43.2 s | 20.3 s | 13.0 s |
-
-V100 has no int8 tensor cores, so the 7 int8 GEMMs of scan `int8` are slower
-than one fp64 GEMM there. Cards with weak fp64 (L4,
+V100 has no int8 tensor cores, so scan `int8` is not faster than fp64 there. Cards with weak fp64 (L4,
 A10, T4, RTX: 1/32 to 1/64 of fp32) are where they are meant to pay off, and
 int8 tensor cores exist from Turing (T4) on; measure there before choosing
 (the `precision` block of the [collaborator tests](collaborator_tests.md#block-precision)
