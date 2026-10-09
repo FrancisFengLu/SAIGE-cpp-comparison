@@ -71,6 +71,7 @@ struct PairCtx {
     // mu > 1/2, and the m1 of those stored floats, for centring (see kpass32).
     const float2* gt32;
     double m1;
+    float4 L32;            // the dosage table as floats
 };
 
 // mode 0: K1 sum  sum mu g~ / ((1-mu) e^{-g~ t} + mu)           (+ NAmu + NAsigma t)
@@ -115,10 +116,24 @@ __device__ double kpass(int mode, double t, const PairCtx& P, double* sh)
 // formed, so nothing overflows float. Stored mu is min(mu, 1 - mu), negative
 // when flipped. fp64's own overflow of Korg (exp(g~ t) = inf for
 // g~ t > 709.78, which makes the tail "not a saddle") is reproduced: mode 2
-// returns +inf then. Per-thread sums are Neumaier-compensated floats, finished
-// in double; the block sum is the fp64 one.
+// returns +inf then. Per-thread sums are Neumaier-compensated floats, merged
+// in float-float across the block (blockSumF) and read out in double.
 // ---------------------------------------------------------------------------
 using spa_fp32::NSum;
+
+__device__ __forceinline__ float dose32(const unsigned char* col, const float4& L, int i)
+{
+    const unsigned c = (col[i >> 2] >> (2 * (i & 3))) & 3u;
+    return (c == 0) ? L.x : (c == 1 ? L.y : (c == 2 ? L.z : L.w));
+}
+// Block sum of one compensated float sum, float throughout; every thread gets
+// it. sh: the fp64 path's NT/32 + 1 doubles, used as 2 NT/32 floats.
+__device__ __forceinline__ NSum blockSumF(NSum v, double* sh)
+{
+    NSum r[1] = {v};
+    spa_fp32::blockReduceF<1, NT / 32>(r, reinterpret_cast<float*>(sh));
+    return r[0];
+}
 
 __device__ double kpass32(int mode, double t, const PairCtx& P, double* sh)
 {
@@ -126,7 +141,7 @@ __device__ double kpass32(int mode, double t, const PairCtx& P, double* sh)
     bool inf = false;
     const float th = (float)t, tl = (float)(t - (double)th);   // t = th + tl: g~ t to float precision
     for (int i = threadIdx.x; i < P.N; i += NT) {
-        if (P.fast && dose(P.col, P.L, i) == 0.0) continue;
+        if (P.fast && dose32(P.col, P.L32, i) == 0.0f) continue;
         const float2 e2 = P.gt32[i];
         const float g = e2.x, m = fabsf(e2.y), a = 1.0f - m;   // m <= 1/2
         const float x = g * th + g * tl;
@@ -152,7 +167,9 @@ __device__ double kpass32(int mode, double t, const PairCtx& P, double* sh)
             acc.add(h);
         }
     }
-    double s = blockSum((mode == 2 && inf) ? CUDART_INF : acc.val(), sh);
+    inf = __syncthreads_or(mode == 2 && inf);
+    const double sv = blockSumF(acc, sh).val();
+    double s = inf ? CUDART_INF : sv;
     if (P.fast) {
         if (mode == 0)      s += P.NAsigma * t;
         else if (mode == 1) s += P.NAsigma;
@@ -249,6 +266,9 @@ __global__ void __launch_bounds__(NT)
 spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const double* __restrict__ lut, int N,
           const double* __restrict__ MU, const double* __restrict__ XV, const double* __restrict__ XX,
           const int* __restrict__ pOfTrait, std::size_t traitStride,
+          const float* __restrict__ MU32, const float* __restrict__ MU32lo,
+          const float* __restrict__ XV32, const float* __restrict__ XX32,
+          const float* __restrict__ XV32lo, const float* __restrict__ XX32lo,
           const SpaPairIn* __restrict__ in, int nPairs, double* __restrict__ scratch,
           double tol, int maxiter, SpaPairOut* __restrict__ out)
 {
@@ -271,58 +291,104 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
         const double* xx = XX + (std::size_t)t * traitStride;   // xx[j*N + i]
         P.gt = gt; P.N = N; P.fast = pin.fast;
 
-        // pass A: b = XV g over carriers (getadjGFast's loop over iIndex)
-        double a[SPA_PMAX];
-        for (int j = 0; j < SPA_PMAX; ++j) a[j] = 0.0;
-        for (int i = threadIdx.x; i < N; i += NT) {
-            const double g = dose(P.col, P.L, i);
-            if (g == 0.0) continue;
-            const double* x = xv + (std::size_t)i * p;
-            for (int j = 0; j < p; ++j) a[j] += x[j] * g;
-        }
-        for (int j = 0; j < p; ++j) {
-            const double s = blockSum(a[j], sh);
-            if (threadIdx.x == 0) bsh[j] = s;
-        }
-        __syncthreads();
-
-        // pass B: g~ = g - XXVX_inv b; gpos / gneg; m1; the fast variant's
-        // carrier sums.
-        double ap = 0.0, an = 0.0, m1 = 0.0, nbmu = 0.0, nbsig = 0.0, m1f = 0.0;
-        for (int i = threadIdx.x; i < N; i += NT) {
-            const double g = dose(P.col, P.L, i);
-            double proj = 0.0;
-            for (int j = 0; j < p; ++j) proj += xx[(std::size_t)j * N + i] * bsh[j];
-            const double v = g - proj;
-            if constexpr (F32) {
-                const double mu_i = P.mu[i];
-                const float2 e = (mu_i > 0.5) ? make_float2((float)(-v), -(float)(1.0 - mu_i))
-                                              : make_float2((float)v, (float)mu_i);
-                reinterpret_cast<float2*>(gt)[i] = e;
-                // mu g~ as the stored floats give it back, for the centring
-                if (!P.fast || g != 0.0)
-                    m1f += (mu_i > 0.5) ? (1.0 + (double)e.y) * -(double)e.x : (double)e.y * (double)e.x;
-            } else {
-                gt[i] = v;
-            }
-            if (v > 0) ap += v; else if (v < 0) an += v;
-            const double m = P.mu[i];
-            m1 += m * v;
-            if (g != 0.0) { nbmu += v * m; nbsig += m * (1.0 - m) * v * v; }
-        }
-        const double gpos = blockSum(ap, sh);
-        const double gneg = blockSum(an, sh);
-        m1    = blockSum(m1, sh);
-        nbmu  = blockSum(nbmu, sh);
-        nbsig = blockSum(nbsig, sh);
-        P.NAmu = m1 - nbmu;
-        P.NAsigma = pin.var2 - nbsig;
-        P.gt32 = reinterpret_cast<const float2*>(gt);
+        double gpos, gneg, m1;
         if constexpr (F32) {
-            // centre on the m1 of the stored floats (fast: + the non-carriers'
-            // NAmu), so input rounding does not leak into K1 - q, zeta q - Korg
-            m1f  = blockSum(m1f, sh);
-            P.m1 = P.fast ? P.NAmu + m1f : m1f;
+            // gpuPrecisionSPA fp32: passes A and B in float (float copies of XV,
+            // XXVX_inv and mu; compensated sums; float block sums), same outputs.
+            const float* mu32 = MU32 + (std::size_t)t * N;
+            const float* xv32 = XV32 + (std::size_t)t * traitStride;
+            const float* xx32 = XX32 + (std::size_t)t * traitStride;
+            const float* xv32lo = XV32lo + (std::size_t)t * traitStride;
+            const float* xx32lo = XX32lo + (std::size_t)t * traitStride;
+            P.L32 = make_float4((float)P.L.x, (float)P.L.y, (float)P.L.z, (float)P.L.w);
+            __shared__ float bsh32[SPA_PMAX], bsh32lo[SPA_PMAX];   // b = hi + lo
+            // pass A: b = XV g over carriers
+            NSum a[SPA_PMAX];
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const float g = dose32(P.col, P.L32, i);
+                if (g == 0.0f) continue;
+                const float* x = xv32 + (std::size_t)i * p;
+                const float* xl = xv32lo + (std::size_t)i * p;
+                for (int j = 0; j < p; ++j) { a[j].addProd(x[j], g); a[j].c += xl[j] * g; }
+            }
+            for (int j = 0; j < p; ++j) {
+                const NSum s = blockSumF(a[j], sh);
+                if (threadIdx.x == 0) { bsh32[j] = s.s + s.c; bsh32lo[j] = s.c - (bsh32[j] - s.s); }
+            }
+            __syncthreads();
+            // pass B: g~, gpos / gneg, m1 = sum mu g~ from exactly the stored
+            // floats (error-free products; also the centring of kpass32), the
+            // fast variant's carrier sums; store (s g~, s min(mu, 1 - mu)).
+            NSum sp, sn, sm, snbmu, snbsig;
+            float bh[SPA_PMAX], bl[SPA_PMAX];
+            for (int j = 0; j < SPA_PMAX; ++j) { bh[j] = j < p ? bsh32[j] : 0.0f; bl[j] = j < p ? bsh32lo[j] : 0.0f; }
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const float g = dose32(P.col, P.L32, i);
+                float v, vl = 0.0f;
+                if (g != 0.0f) {
+                    spa_fp32::carrierGt<SPA_PMAX>(g, xx32 + i, xx32lo + i, (std::size_t)N, bh, bl, p, &v, &vl);
+                } else {
+                    float proj = 0.0f;
+                    for (int j = 0; j < p; ++j) proj += xx32[(std::size_t)j * N + i] * bh[j];
+                    v = g - proj;
+                }
+                const float ms = mu32[i], m = fabsf(ms);
+                const bool flip = signbit(ms);   // stored mu is 1 - mu
+                reinterpret_cast<float2*>(gt)[i] = make_float2(flip ? -v : v, ms);
+                if (v > 0) sp.add(v); else if (v < 0) sn.add(v);
+                if (flip) { sm.add(v); sm.addProd(-m, v); } else sm.addProd(m, v);
+                if (g != 0.0f) {
+                    if (flip) { snbmu.add(v); snbmu.addProd(-m, v); } else snbmu.addProd(m, v);
+                    spa_fp32::addVarTerm(snbsig, m, MU32lo[(std::size_t)t * N + i], v, vl);
+                }
+            }
+            gpos = blockSumF(sp, sh).val();
+            gneg = blockSumF(sn, sh).val();
+            m1   = blockSumF(sm, sh).val();
+            const double nbmu = blockSumF(snbmu, sh).val();
+            const double nbsig = blockSumF(snbsig, sh).val();
+            P.NAmu = m1 - nbmu;
+            P.NAsigma = pin.var2 - nbsig;
+            P.gt32 = reinterpret_cast<const float2*>(gt);
+            P.m1 = m1;
+        } else {
+            // pass A: b = XV g over carriers (getadjGFast's loop over iIndex)
+            double a[SPA_PMAX];
+            for (int j = 0; j < SPA_PMAX; ++j) a[j] = 0.0;
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const double g = dose(P.col, P.L, i);
+                if (g == 0.0) continue;
+                const double* x = xv + (std::size_t)i * p;
+                for (int j = 0; j < p; ++j) a[j] += x[j] * g;
+            }
+            for (int j = 0; j < p; ++j) {
+                const double s = blockSum(a[j], sh);
+                if (threadIdx.x == 0) bsh[j] = s;
+            }
+            __syncthreads();
+
+            // pass B: g~ = g - XXVX_inv b; gpos / gneg; m1; the fast variant's
+            // carrier sums.
+            double ap = 0.0, an = 0.0, nbmu = 0.0, nbsig = 0.0;
+            m1 = 0.0;
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const double g = dose(P.col, P.L, i);
+                double proj = 0.0;
+                for (int j = 0; j < p; ++j) proj += xx[(std::size_t)j * N + i] * bsh[j];
+                const double v = g - proj;
+                gt[i] = v;
+                if (v > 0) ap += v; else if (v < 0) an += v;
+                const double m = P.mu[i];
+                m1 += m * v;
+                if (g != 0.0) { nbmu += v * m; nbsig += m * (1.0 - m) * v * v; }
+            }
+            gpos = blockSum(ap, sh);
+            gneg = blockSum(an, sh);
+            m1    = blockSum(m1, sh);
+            nbmu  = blockSum(nbmu, sh);
+            nbsig = blockSum(nbsig, sh);
+            P.NAmu = m1 - nbmu;
+            P.NAsigma = pin.var2 - nbsig;
         }
 
         // q, qinv as getMarkerPval forms them for a binary trait
@@ -368,6 +434,8 @@ struct Spa {
     SpaPairIn*  dIn  = nullptr;
     SpaPairOut* dOut = nullptr;
     double* dMu = nullptr; double* dXV = nullptr; double* dXX = nullptr;
+    float*  dMu32 = nullptr; float* dXV32 = nullptr; float* dXX32 = nullptr;   // FP32 only
+    float*  dMu32lo = nullptr; float* dXV32lo = nullptr; float* dXX32lo = nullptr;
     int*    dP  = nullptr;
     double* dScratch = nullptr;
     cudaStream_t st = nullptr;
@@ -432,6 +500,35 @@ Spa* spaCreate(const SpaCreateArgs& a)
         if (cudaMemcpy(s->dXX + (std::size_t)t * s->traitStride, T.XXVX_inv, (std::size_t)a.N * T.p * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
     }
     if (cudaMemcpy(s->dP, pv.data(), pv.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+    if (a.precision == Prec::FP32) {
+        // float copies for passes A and B; mu as min(mu, 1 - mu), negated
+        // where mu > 1/2 (1 - mu formed in double)
+        auto dev32 = [&](float** p, std::size_t n) {
+            if (cudaMalloc((void**)p, n * sizeof(float)) != cudaSuccess) { *p = nullptr; return false; }
+            s->devBytes += n * sizeof(float); return true;
+        };
+        if (!dev32(&s->dMu32, (std::size_t)a.nTraits * a.N) || !dev32(&s->dMu32lo, (std::size_t)a.nTraits * a.N) ||
+            !dev32(&s->dXV32lo, (std::size_t)a.nTraits * s->traitStride) || !dev32(&s->dXX32lo, (std::size_t)a.nTraits * s->traitStride) || !dev32(&s->dXV32, (std::size_t)a.nTraits * s->traitStride) ||
+            !dev32(&s->dXX32, (std::size_t)a.nTraits * s->traitStride)) return fail();
+        std::vector<float> f;
+        for (int t = 0; t < a.nTraits; ++t) {
+            const SpaTraitArgs& T = a.traits[t];
+            f.resize((std::size_t)a.N);
+            for (int i = 0; i < a.N; ++i) f[i] = T.mu[i] > 0.5 ? -(float)(1.0 - T.mu[i]) : (float)T.mu[i];
+            if (cudaMemcpy(s->dMu32 + (std::size_t)t * a.N, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+            for (int i = 0; i < a.N; ++i) { const double mm = T.mu[i] > 0.5 ? 1.0 - T.mu[i] : T.mu[i]; f[i] = (float)(mm - (double)(float)mm); }
+            if (cudaMemcpy(s->dMu32lo + (std::size_t)t * a.N, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+            f.resize((std::size_t)a.N * T.p);
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)T.XV[i];
+            if (cudaMemcpy(s->dXV32 + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)(T.XV[i] - (double)(float)T.XV[i]);
+            if (cudaMemcpy(s->dXV32lo + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)T.XXVX_inv[i];
+            if (cudaMemcpy(s->dXX32 + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)(T.XXVX_inv[i] - (double)(float)T.XXVX_inv[i]);
+            if (cudaMemcpy(s->dXX32lo + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+        }
+    }
     if (cudaStreamCreate(&s->st) != cudaSuccess) return fail();
     if (cudaEventCreate(&s->e0) != cudaSuccess || cudaEventCreate(&s->e1) != cudaSuccess) return fail();
     return s;
@@ -449,6 +546,12 @@ void spaDestroy(Spa* s)
     if (s->dXV) cudaFree(s->dXV);
     if (s->dXX) cudaFree(s->dXX);
     if (s->dP) cudaFree(s->dP);
+    if (s->dMu32) cudaFree(s->dMu32);
+    if (s->dMu32lo) cudaFree(s->dMu32lo);
+    if (s->dXV32lo) cudaFree(s->dXV32lo);
+    if (s->dXX32lo) cudaFree(s->dXX32lo);
+    if (s->dXV32) cudaFree(s->dXV32);
+    if (s->dXX32) cudaFree(s->dXX32);
     if (s->dScratch) cudaFree(s->dScratch);
     if (s->hIn) cudaFreeHost(s->hIn);
     if (s->hOut) cudaFreeHost(s->hOut);
@@ -481,12 +584,12 @@ bool spaRun(Spa* s, const Reducer* r, int nPairs, int t_devSet)
     // ---- precision dispatch: the kernel variant ----
     if (s->prec == Prec::FP64) {
         spa_pairs<false><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
-                                          s->traitStride, s->dIn, nPairs, s->dScratch, s->tol, s->maxiter, s->dOut);
+                                          s->traitStride, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, s->dIn, nPairs, s->dScratch, s->tol, s->maxiter, s->dOut);
     } else if (s->prec == Prec::FP32) {
         // Newton tolerance: the caller's, floored at 1e-5 (gpu_spa.hpp).
         const double tol32 = s->tol < 1e-5 ? 1e-5 : s->tol;
         spa_pairs<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
-                                                s->traitStride, s->dIn, nPairs, s->dScratch, tol32, s->maxiter, s->dOut);
+                                                s->traitStride, s->dMu32, s->dMu32lo, s->dXV32, s->dXX32, s->dXV32lo, s->dXX32lo, s->dIn, nPairs, s->dScratch, tol32, s->maxiter, s->dOut);
     } else {
         lastErrSpa = std::string("SPA precision ") + precName(s->prec) + " has no kernel";
         return false;

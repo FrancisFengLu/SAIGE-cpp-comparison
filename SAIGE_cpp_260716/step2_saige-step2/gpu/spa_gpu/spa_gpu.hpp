@@ -75,12 +75,16 @@
 // mode ran.
 //
 // FP32 (spa_gpu.cu, "fp32 variant"): same control flow, same block per pair,
-// same fused / dynamic / ownSamples / occupancy options. Float: the per-sample
-// work of the Newton and tail passes (exp, expm1, log1p, the K', K'', K sums).
-// Double: passes A and B (g~, gpos / gneg, m1, NAmu / NAsigma, nnz, the
-// variant choice), the Newton scalars, the block reduction and the whole
-// saddlepoint tail (w, v, Ztest, the erfc port, the log domain), so a p-value
-// cannot underflow because of float. Safeguards:
+// same fused / dynamic / ownSamples / occupancy options. Meant for GPUs whose
+// fp64 rate is 1/64 of fp32, so every per-sample and per-reduction operation
+// is float: passes A and B (b = XV g, g~ = g - XXVX_inv b, gpos / gneg, m1,
+// the carrier sums) read float copies of XV, XXVX_inv and mu made once at
+// create(); the Newton and tail passes (exp, expm1, log1p, the K', K'', K
+// sums); and the block reductions (float-float). Double: only the per-pair
+// scalars -- the sums read out, q, NAmu / NAsigma, the Newton step (t, K1,
+// K2, prevJump) and the whole saddlepoint tail (w, v, Ztest, the erfc port,
+// the log domain), so a p-value cannot underflow because of float.
+// Safeguards:
 //   * centred sums: the passes return K' - m1 and K - t m1, and K' - q,
 //     zeta q - K are formed in double from them and q - m1 -- no difference
 //     of two large float numbers;
@@ -89,7 +93,19 @@
 //     overflows; mu is stored as min(mu, 1 - mu) with g~ negated when
 //     mu > 1/2 (each term is invariant under that), so 1 - mu is exact enough
 //     for mu near 1;
-//   * per-thread sums are Neumaier-compensated floats, read out in double;
+//   * per-thread sums are Neumaier-compensated floats; products that feed
+//     m1 and b are added error-free (TwoProd via fma); block reductions merge
+//     the (sum, compensation) pairs with TwoSum, in a fixed order; a sum is
+//     read out in double once per pair / pass;
+//   * m1 is summed from exactly the stored float (g~, mu), so it is also the
+//     centring the passes need;
+//   * NAsigma = var2 - sum_c mu (1-mu) g~^2 cancels by up to ~1e3 for very
+//     rare markers; that carrier sum is float-float: mu, XV and XXVX_inv
+//     are also kept as lo floats (x - float(x)), read for carriers only, so
+//     b and the carriers' g~ come out as hi + lo pairs. Without it the root
+//     moves by ~1e-4 relative and can cross fp64's Korg overflow threshold.
+//     Device memory for FP32: 8 N (mu hi, lo) + 16 traitStride (XV, XXVX_inv
+//     hi, lo) bytes per trait, on top of the fp64 tables;
 //   * g~ t is formed as g~ th + g~ tl with t = th + tl split into two floats,
 //     so a large t is not rounded to float before the product;
 //   * Newton tolerance: max(tol, 1e-5, 2^-17 max(|t|, |tnew|)) (kTolFp32,

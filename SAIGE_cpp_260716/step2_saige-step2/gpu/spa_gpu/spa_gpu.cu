@@ -140,6 +140,11 @@ struct KParams {
     // traits
     int N;
     const double* MU;            // nTraits x N
+    // gpuPrecisionSPA fp32 only: float copies made at create(). MU32 holds
+    // min(mu, 1 - mu), negated where mu > 1/2 (the stored form of terms32).
+    const float* MU32; const float* XV32; const float* XX32;
+    const float* MU32lo;         // min(mu, 1 - mu) - |MU32|, for the NAsigma sum
+    const float* XV32lo; const float* XX32lo;   // XV - XV32, XXVX_inv - XX32 (carriers only)
     const double* XV;            // per trait: traitStride doubles, sample i at i*p
     const double* XX;            // per trait: traitStride doubles, column j at j*N
     const int*    pOfTrait;
@@ -172,6 +177,15 @@ struct GenoCol {
         const unsigned c = (col[i >> 2] >> (2 * (i & 3))) & 3u;
         return (c & 2u) ? ((c & 1u) ? L.w : L.z) : ((c & 1u) ? L.y : L.x);
     }
+    float4 L32;                  // F32: the dosage table as floats
+    template <bool OWN>
+    __device__ __forceinline__ float dose32(int i) const
+    {
+        if (OWN && !((mk[i >> 6] >> (i & 63)) & 1ull)) return 0.0f;
+        if (dcol) return (float)dcol[i];   // dense input: tests only
+        const unsigned c = (col[i >> 2] >> (2 * (i & 3))) & 3u;
+        return (c & 2u) ? ((c & 1u) ? L32.w : L32.z) : ((c & 1u) ? L32.y : L32.x);
+    }
 };
 
 // Per-pair state the root / tail passes need.
@@ -190,11 +204,11 @@ struct Ctx {
 // ---------------------------------------------------------------------------
 // fp32 variant (gpuPrecisionSPA: fp32). Same control flow, same block
 // structure; the per-sample work of the root and tail passes (exp / log, the
-// K', K'' and K sums) runs in float. Everything around it stays double: passes
-// A and B (g~, gpos / gneg, m1, NAmu / NAsigma, the carrier count and the
-// fast / full choice), the Newton scalars (t, K1, K2, prevJump), and the
-// saddlepoint tail (w, v, Ztest, the erfc port, the log domain), which reads
-// the fp32 sums as doubles. Mathematically identical rewrites, chosen so that
+// K', K'' and K sums) runs in float, and so do passes A and B (float copies
+// of XV, XXVX_inv, mu; see spa_gpu.hpp "FP32") and the block reductions. Only
+// the per-pair scalars stay double: the Newton step (t, K1, K2, prevJump), q,
+// NAsigma, and the saddlepoint tail (w, v, Ztest, the erfc port, the log
+// domain), which reads the float sums as doubles. Mathematically identical rewrites, chosen so that
 // float cannot overflow and the big cancellations happen in double:
 //
 //   p(x)  = mu e^x / (1 - mu + mu e^x),  x = g~ t  (the tilted mean)
@@ -211,7 +225,7 @@ struct Ctx {
 // invariant under mu -> 1 - mu, g~ -> -g~), so 1 - mu is formed without
 // cancellation and a mu within 1e-8 of 1 is not lost; the flip is kept in the
 // sign bit of the stored mu. Per-thread sums are Neumaier-compensated floats,
-// finished in double, and the block reduction is the fp64 one.
+// merged across the block in float-float (blockReduceF) and read out in double.
 //
 // One fp64 overflow is part of SAIGE's control flow and is reproduced: in
 // Korg's log(1 - mu + mu exp(g~ t)) the exp overflows to +inf for
@@ -223,6 +237,7 @@ struct Ctx {
 // which the rewritten terms give directly.
 // ---------------------------------------------------------------------------
 using spa_fp32::NSum;
+using spa_fp32::blockReduceF;
 
 // exp(x) overflows double for x above this (CUDA and glibc agree).
 constexpr float kLogDblMax = 709.782712893384f;
@@ -275,8 +290,9 @@ __device__ void passK1K2_32(const Ctx& C, double t, double q, double (*sh)[NWARP
         s0.add(k1c);
         if (isfinite(k2)) s1.add(k2);
     }
-    double a[2] = {s0.val(), s1.val()};
-    blockReduce<2>(a, sh);
+    NSum r[2] = {s0, s1};
+    blockReduceF<2, NWARP>(r, reinterpret_cast<float*>(&sh[0][0]));
+    const double a[2] = {r[0].val(), r[1].val()};
     const double dq = q - C.m1;
     if (C.fast) { *K1 = a[0] + C.NAsigma * t - dq; *K2 = a[1] + C.NAsigma; }
     else        { *K1 = a[0] - dq;                 *K2 = a[1]; }
@@ -295,8 +311,10 @@ __device__ void passK0K2_32(const Ctx& C, double t, double (*sh)[NWARP], double*
         s0.add(h); inf |= ovf;
         if (isfinite(k2)) s1.add(k2);
     }
-    double a[2] = {inf ? CUDART_INF : s0.val(), s1.val()};
-    blockReduce<2>(a, sh);
+    inf = __syncthreads_or(inf);
+    NSum r[2] = {s0, s1};
+    blockReduceF<2, NWARP>(r, reinterpret_cast<float*>(&sh[0][0]));
+    const double a[2] = {inf ? CUDART_INF : r[0].val(), r[1].val()};
     if (C.fast) { *H = a[0] + 0.5 * C.NAsigma * (t * t); *K2 = a[1] + C.NAsigma; }
     else        { *H = a[0];                             *K2 = a[1]; }
 }
@@ -312,8 +330,8 @@ __device__ void passK1K2x2_32(const Ctx& C, bool e1, double t1, double q1, bool 
         if (e1) { terms32<false>(e.x, e.y, tf1, &k1c, &k2, &h, nullptr); s[0].add(k1c); if (isfinite(k2)) s[1].add(k2); }
         if (e2) { terms32<false>(e.x, e.y, tf2, &k1c, &k2, &h, nullptr); s[2].add(k1c); if (isfinite(k2)) s[3].add(k2); }
     }
-    double a[4] = {s[0].val(), s[1].val(), s[2].val(), s[3].val()};
-    blockReduce<4>(a, sh);
+    blockReduceF<4, NWARP>(s, reinterpret_cast<float*>(&sh[0][0]));
+    const double a[4] = {s[0].val(), s[1].val(), s[2].val(), s[3].val()};
     if (e1) {
         const double dq = q1 - C.m1;
         if (C.fast) { *K1a = a[0] + C.NAsigma * t1 - dq; *K2a = a[1] + C.NAsigma; }
@@ -338,8 +356,10 @@ __device__ void passK0K2x2_32(const Ctx& C, double t1, double t2, double (*sh)[N
         terms32<true>(e.x, e.y, tf1, &k1c, &k2, &h, &ovf); s[0].add(h); inf1 |= ovf; if (isfinite(k2)) s[1].add(k2);
         terms32<true>(e.x, e.y, tf2, &k1c, &k2, &h, &ovf); s[2].add(h); inf2 |= ovf; if (isfinite(k2)) s[3].add(k2);
     }
-    double a[4] = {inf1 ? CUDART_INF : s[0].val(), s[1].val(), inf2 ? CUDART_INF : s[2].val(), s[3].val()};
-    blockReduce<4>(a, sh);
+    inf1 = __syncthreads_or(inf1);
+    inf2 = __syncthreads_or(inf2);
+    blockReduceF<4, NWARP>(s, reinterpret_cast<float*>(&sh[0][0]));
+    const double a[4] = {inf1 ? CUDART_INF : s[0].val(), s[1].val(), inf2 ? CUDART_INF : s[2].val(), s[3].val()};
     if (C.fast) {
         *Ha = a[0] + 0.5 * C.NAsigma * (t1 * t1);  *K2a = a[1] + C.NAsigma;
         *Hb = a[2] + 0.5 * C.NAsigma * (t2 * t2);  *K2b = a[3] + C.NAsigma;
@@ -726,6 +746,7 @@ __device__ __forceinline__ void spaBody(const KParams& P)
             const double2 a = d[0], b = d[1];
             G.L = make_double4(a.x, a.y, b.x, b.y);
         }
+        if constexpr (F32) G.L32 = make_float4((float)G.L.x, (float)G.L.y, (float)G.L.z, (float)G.L.w);
         const int t = pin.trait;
         G.mk = OWN ? P.masks + (std::size_t)t * P.maskWords : nullptr;
         const int p = P.pOfTrait[t];
@@ -733,109 +754,175 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         const double* xv = P.XV + (std::size_t)t * P.traitStride;
         const double* xx = P.XX + (std::size_t)t * P.traitStride;
 
-        // ---- pass A: b = XV g over carriers (getadjGFast's loop), carrier count
-        double acc[NACC];
-        #pragma unroll
-        for (int j = 0; j < NACC; ++j) acc[j] = 0.0;
-        for (int i = segLo + lane; i < segHi; i += 32) {
-            const double g = G.template dose<OWN>(i);
-            if (g != 0.0) {
-                const double* x = xv + (std::size_t)i * p;
-                #pragma unroll
-                for (int j = 0; j < PMAX; ++j) if (j < p) acc[j] += x[j] * g;
-                acc[PMAX] += 1.0;
+        int nnz; bool fast;
+        double gpos, gneg, m1, NAmu, NAsigma, cen;   // cen: centring of the fp32 passes
+        if constexpr (F32) {
+            // ---- gpuPrecisionSPA fp32: passes A and B in float (float copies of
+            //      XV, XXVX_inv and mu; compensated sums; float block reductions).
+            //      Same carrier set, same compaction, same outputs as below.
+            const float* mu32 = P.MU32 + (std::size_t)t * N;
+            const float* mu32lo = P.MU32lo + (std::size_t)t * N;
+            const float* xv32 = P.XV32 + (std::size_t)t * P.traitStride;
+            const float* xx32 = P.XX32 + (std::size_t)t * P.traitStride;
+            const float* xv32lo = P.XV32lo + (std::size_t)t * P.traitStride;
+            const float* xx32lo = P.XX32lo + (std::size_t)t * P.traitStride;
+            float* shf = reinterpret_cast<float*>(&sh[0][0]);
+            __shared__ int shC[NWARP];
+            // pass A: b = XV g over carriers, carrier count
+            NSum accA[PMAX];
+            int cnt = 0;
+            for (int i = segLo + lane; i < segHi; i += 32) {
+                const float g = G.template dose32<OWN>(i);
+                if (g != 0.0f) {
+                    const float* x = xv32 + (std::size_t)i * p;
+                    const float* xl = xv32lo + (std::size_t)i * p;
+                    #pragma unroll
+                    for (int j = 0; j < PMAX; ++j) if (j < p) { accA[j].addProd(x[j], g); accA[j].c += xl[j] * g; }
+                    ++cnt;
+                }
             }
-        }
-        // reduce; keep this warp's exclusive carrier prefix for the compaction
-        {
+            cnt = spa_fp32::warpSumI(cnt);
+            if (lane == 0) shC[warp] = cnt;
+            blockReduceF<PMAX, NWARP>(accA, shf);   // its barriers publish shC
+            int wbase = 0;
+            nnz = 0;
+            for (int w = 0; w < NWARP; ++w) { if (w < warp) wbase += shC[w]; nnz += shC[w]; }
+            // the CPU's rule |{g==0}| / N >= 0.5, in integers
+            fast = (pin.fast > 0) || (pin.fast < 0 && 2LL * (N - nnz) >= (long long)N);
+            float b[PMAX], bl[PMAX];   // b = b + bl (float-float), for the carriers' g~
             #pragma unroll
-            for (int j = 0; j < NACC; ++j) acc[j] = warpSum(acc[j]);
-            if (lane == 0) {
-                #pragma unroll
-                for (int j = 0; j < NACC; ++j) sh[j][warp] = acc[j];
-            }
-        }
-        __syncthreads();
-        int wbase = 0;
-        {
-            #pragma unroll
-            for (int j = 0; j < NACC; ++j) {
-                double s = 0.0;
-                #pragma unroll
-                for (int w = 0; w < NWARP; ++w) s += sh[j][w];
-                acc[j] = s;
-            }
-            for (int w = 0; w < warp; ++w) wbase += (int)sh[PMAX][w];
-        }
-        __syncthreads();
-        const int nnz = (int)acc[PMAX];
-        // the CPU's rule: p_iIndexComVecSize = double(|{g==0}|) / m_n >= 0.5
-        const bool fast = (pin.fast > 0) || (pin.fast < 0 && ((double)(N - nnz) / (double)N) >= 0.5);
-        double b[PMAX];
-        #pragma unroll
-        for (int j = 0; j < PMAX; ++j) b[j] = acc[j];
+            for (int j = 0; j < PMAX; ++j) { b[j] = accA[j].s + accA[j].c; bl[j] = accA[j].c - (b[j] - accA[j].s); }
 
-        // ---- pass B: g~, its positive / negative sums, m1, the fast variant's
-        //      carrier sums; store (g~, mu)
-        double s[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // gpos, gneg, m1, sum_c g~ mu, sum_c mu(1-mu) g~^2,
-                                                        // F32: sum of mu g~ over the stored float entries
-        int base = wbase;
-        for (int i0 = segLo; i0 < segHi; i0 += 32) {
-            const int i = i0 + lane;
-            const bool valid = i < segHi;
-            double g = 0.0, v = 0.0, m = 0.0;
-            if (valid) {
-                g = G.template dose<OWN>(i);
-                double proj = 0.0;
-                #pragma unroll
-                for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx[(std::size_t)j * N + i] * b[j];
-                v = g - proj;
-                m = mu[i];
-                if (v > 0) s[0] += v; else if (v < 0) s[1] += v;
-                s[2] += m * v;
-                if (g != 0.0) { s[3] += v * m; s[4] += m * (1 - m) * (v * v); }
-            }
-            if constexpr (F32) {
-                // (s g~, s min(mu, 1 - mu)), s = -1 where mu > 1/2 (see terms32)
-                const float2 e32 = (m > 0.5) ? make_float2((float)(-v), -(float)(1.0 - m))
-                                             : make_float2((float)v, (float)m);
-                // mu g~ as the stored floats give it back (unflipped), for the centring
-                const double mgf = (m > 0.5) ? (1.0 + (double)e32.y) * -(double)e32.x : (double)e32.y * (double)e32.x;
-                if (valid && (!fast || g != 0.0)) s[5] += mgf;
+            // pass B: g~ = g - XXVX_inv b; gpos, gneg, m1 = sum mu g~, the fast
+            // variant's carrier sums; store (s g~, s min(mu, 1 - mu)). m1 is summed
+            // from exactly the stored floats (error-free products), so it is also
+            // the centring of the root and tail passes.
+            NSum sB[5];   // gpos, gneg, m1, sum_c mu g~, sum_c mu(1-mu) g~^2
+            int base = wbase;
+            for (int i0 = segLo; i0 < segHi; i0 += 32) {
+                const int i = i0 + lane;
+                const bool valid = i < segHi;
+                float g = 0.0f, v = 0.0f, ms = 0.0f;
+                if (valid) {
+                    g = G.template dose32<OWN>(i);
+                    float vl = 0.0f;
+                    if (g != 0.0f) {
+                        spa_fp32::carrierGt<PMAX>(g, xx32 + i, xx32lo + i, (std::size_t)N, b, bl, p, &v, &vl);
+                    } else {
+                        float proj = 0.0f;
+                        #pragma unroll
+                        for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx32[(std::size_t)j * N + i] * b[j];
+                        v = g - proj;
+                    }
+                    ms = mu32[i];
+                    const float m = fabsf(ms);
+                    if (v > 0) sB[0].add(v); else if (v < 0) sB[1].add(v);
+                    // mu v with mu = m, or 1 - m where flipped (sign bit of ms)
+                    const bool flip = signbit(ms);
+                    if (flip) { sB[2].add(v); sB[2].addProd(-m, v); } else sB[2].addProd(m, v);
+                    if (g != 0.0f) {
+                        if (flip) { sB[3].add(v); sB[3].addProd(-m, v); } else sB[3].addProd(m, v);
+                        spa_fp32::addVarTerm(sB[4], m, mu32lo[i], v, vl);
+                    }
+                }
+                const float2 e32 = make_float2(signbit(ms) ? -v : v, ms);
                 if (!fast) {
                     if (valid) buf32[i] = e32;
                 } else {
-                    const bool carrier = valid && (g != 0.0);
+                    const bool carrier = valid && (g != 0.0f);
                     const unsigned mask = __ballot_sync(0xffffffffu, carrier);
                     if (carrier) buf32[base + __popc(mask & ((1u << lane) - 1u))] = e32;
                     base += __popc(mask);
                 }
-            } else {
-            if (!fast) {
-                if (valid) buf[i] = make_double2(v, m);
-            } else {
-                const bool carrier = valid && (g != 0.0);
-                const unsigned mask = __ballot_sync(0xffffffffu, carrier);
-                if (carrier) buf[base + __popc(mask & ((1u << lane) - 1u))] = make_double2(v, m);
-                base += __popc(mask);
             }
+            blockReduceF<5, NWARP>(sB, shf);   // its barriers also complete buf32
+            gpos = sB[0].val(); gneg = sB[1].val(); m1 = sB[2].val();
+            NAmu    = fast ? (m1 - sB[3].val()) : 0.0;
+            NAsigma = fast ? (pin.var2 - sB[4].val()) : 0.0;
+            cen = m1;
+        } else {
+            // ---- pass A: b = XV g over carriers (getadjGFast's loop), carrier count
+            double acc[NACC];
+            #pragma unroll
+            for (int j = 0; j < NACC; ++j) acc[j] = 0.0;
+            for (int i = segLo + lane; i < segHi; i += 32) {
+                const double g = G.template dose<OWN>(i);
+                if (g != 0.0) {
+                    const double* x = xv + (std::size_t)i * p;
+                    #pragma unroll
+                    for (int j = 0; j < PMAX; ++j) if (j < p) acc[j] += x[j] * g;
+                    acc[PMAX] += 1.0;
+                }
             }
+            // reduce; keep this warp's exclusive carrier prefix for the compaction
+            {
+                #pragma unroll
+                for (int j = 0; j < NACC; ++j) acc[j] = warpSum(acc[j]);
+                if (lane == 0) {
+                    #pragma unroll
+                    for (int j = 0; j < NACC; ++j) sh[j][warp] = acc[j];
+                }
+            }
+            __syncthreads();
+            int wbase = 0;
+            {
+                #pragma unroll
+                for (int j = 0; j < NACC; ++j) {
+                    double s = 0.0;
+                    #pragma unroll
+                    for (int w = 0; w < NWARP; ++w) s += sh[j][w];
+                    acc[j] = s;
+                }
+                for (int w = 0; w < warp; ++w) wbase += (int)sh[PMAX][w];
+            }
+            __syncthreads();
+            nnz = (int)acc[PMAX];
+            // the CPU's rule: p_iIndexComVecSize = double(|{g==0}|) / m_n >= 0.5
+            fast = (pin.fast > 0) || (pin.fast < 0 && ((double)(N - nnz) / (double)N) >= 0.5);
+            double b[PMAX];
+            #pragma unroll
+            for (int j = 0; j < PMAX; ++j) b[j] = acc[j];
+
+            // ---- pass B: g~, its positive / negative sums, m1, the fast variant's
+            //      carrier sums; store (g~, mu)
+            double s[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // gpos, gneg, m1, sum_c g~ mu, sum_c mu(1-mu) g~^2
+            int base = wbase;
+            for (int i0 = segLo; i0 < segHi; i0 += 32) {
+                const int i = i0 + lane;
+                const bool valid = i < segHi;
+                double g = 0.0, v = 0.0, m = 0.0;
+                if (valid) {
+                    g = G.template dose<OWN>(i);
+                    double proj = 0.0;
+                    #pragma unroll
+                    for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx[(std::size_t)j * N + i] * b[j];
+                    v = g - proj;
+                    m = mu[i];
+                    if (v > 0) s[0] += v; else if (v < 0) s[1] += v;
+                    s[2] += m * v;
+                    if (g != 0.0) { s[3] += v * m; s[4] += m * (1 - m) * (v * v); }
+                }
+                if (!fast) {
+                    if (valid) buf[i] = make_double2(v, m);
+                } else {
+                    const bool carrier = valid && (g != 0.0);
+                    const unsigned mask = __ballot_sync(0xffffffffu, carrier);
+                    if (carrier) buf[base + __popc(mask & ((1u << lane) - 1u))] = make_double2(v, m);
+                    base += __popc(mask);
+                }
+            }
+            blockReduce<5>(s, sh);
+            __syncthreads();   // buf complete before the passes read it
+            gpos = s[0]; gneg = s[1]; m1 = s[2];
+            NAmu    = fast ? (m1 - s[3]) : 0.0;           // NAmu = m1 - dot(gNB, muNB)
+            NAsigma = fast ? (pin.var2 - s[4]) : 0.0;     // NAsigma = var2 - sum(muNB % (1-muNB) % pow(gNB,2))
+            cen = m1;
         }
-        if constexpr (F32) blockReduce<6>(s, sh);
-        else               blockReduce<5>(*reinterpret_cast<double(*)[5]>(s), sh);
-        __syncthreads();   // buf complete before the passes read it
-        const double gpos = s[0], gneg = s[1], m1 = s[2];
 
         Ctx C;
         C.buf = buf; C.nEff = fast ? nnz : N; C.fast = fast;
-        C.NAmu    = fast ? (m1 - s[3]) : 0.0;           // NAmu = m1 - dot(gNB, muNB)
-        C.NAsigma = fast ? (pin.var2 - s[4]) : 0.0;     // NAsigma = var2 - sum(muNB % (1-muNB) % pow(gNB,2))
-        // F32 centring: K'(t) and K(t) - t m1 are split around the m1 of the
-        // values the float passes actually read (rounded g~, mu), so the
-        // rounding of the inputs does not leak into K' - q and zeta q - K at
-        // the size eps_float sum |mu g~|. Fast: the non-carriers' NAmu + the
-        // stored carriers' sum.
-        C.buf32 = buf32; C.m1 = fast ? (C.NAmu + s[5]) : s[5];
+        C.NAmu = NAmu; C.NAsigma = NAsigma;
+        C.buf32 = buf32; C.m1 = cen;
 
         // q, qinv as getMarkerPval forms them for a binary trait
         const double q = pin.Tstat / sqrt(pin.var1 / pin.var2) + m1;
@@ -951,6 +1038,8 @@ struct Spa {
     PairIn*  dIn  = nullptr;
     PairOut* dOut = nullptr;
     double* dMu = nullptr; double* dXV = nullptr; double* dXX = nullptr;
+    float*  dMu32 = nullptr; float* dXV32 = nullptr; float* dXX32 = nullptr;   // FP32 only (KParams)
+    float*  dMu32lo = nullptr; float* dXV32lo = nullptr; float* dXX32lo = nullptr;
     int*    dP  = nullptr;
     double* dScratch = nullptr;
     // library-owned genotype buffers (uploadPacked / uploadDense)
@@ -1046,6 +1135,37 @@ Spa* create(const CreateArgs& a)
         if (cudaMemcpy(s->dXX + (std::size_t)t * s->traitStride, T.XXVX_inv, (std::size_t)a.N * T.p * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy XXVX_inv");
     }
     if (cudaMemcpy(s->dP, pv.data(), pv.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy p");
+    if (a.precision == saige::gpu2::Prec::FP32) {
+        // float copies for passes A and B; mu in the stored form of terms32:
+        // min(mu, 1 - mu), negated where mu > 1/2 (1 - mu formed in double)
+        std::size_t db32 = 0;
+        auto dev32 = [&](float** p, std::size_t n) {
+            if (cudaMalloc((void**)p, n * sizeof(float)) != cudaSuccess) { *p = nullptr; return false; }
+            db32 += n * sizeof(float); return true;
+        };
+        if (!dev32(&s->dMu32, (std::size_t)a.nTraits * a.N) || !dev32(&s->dMu32lo, (std::size_t)a.nTraits * a.N) ||
+            !dev32(&s->dXV32lo, (std::size_t)a.nTraits * s->traitStride) || !dev32(&s->dXX32lo, (std::size_t)a.nTraits * s->traitStride) || !dev32(&s->dXV32, (std::size_t)a.nTraits * s->traitStride) ||
+            !dev32(&s->dXX32, (std::size_t)a.nTraits * s->traitStride)) return fail("cudaMalloc fp32 copies");
+        s->devBytes += db32;
+        std::vector<float> f;
+        for (int t = 0; t < a.nTraits; ++t) {
+            const TraitArgs& T = a.traits[t];
+            f.resize((std::size_t)a.N);
+            for (int i = 0; i < a.N; ++i) f[i] = T.mu[i] > 0.5 ? -(float)(1.0 - T.mu[i]) : (float)T.mu[i];
+            if (cudaMemcpy(s->dMu32 + (std::size_t)t * a.N, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy mu32");
+            for (int i = 0; i < a.N; ++i) { const double mm = T.mu[i] > 0.5 ? 1.0 - T.mu[i] : T.mu[i]; f[i] = (float)(mm - (double)(float)mm); }
+            if (cudaMemcpy(s->dMu32lo + (std::size_t)t * a.N, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy mu32lo");
+            f.resize((std::size_t)a.N * T.p);
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)T.XV[i];
+            if (cudaMemcpy(s->dXV32 + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy XV32");
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)(T.XV[i] - (double)(float)T.XV[i]);
+            if (cudaMemcpy(s->dXV32lo + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy XV32lo");
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)T.XXVX_inv[i];
+            if (cudaMemcpy(s->dXX32 + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy XX32");
+            for (std::size_t i = 0; i < f.size(); ++i) f[i] = (float)(T.XXVX_inv[i] - (double)(float)T.XXVX_inv[i]);
+            if (cudaMemcpy(s->dXX32lo + (std::size_t)t * s->traitStride, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail("memcpy XX32lo");
+        }
+    }
     if (cudaStreamCreate(&s->st) != cudaSuccess) return fail("cudaStreamCreate");
     for (int i = 0; i < 4; ++i) if (cudaEventCreate(&s->ev[i]) != cudaSuccess) return fail("cudaEventCreate");
     return s;
@@ -1062,6 +1182,12 @@ void destroy(Spa* s)
     if (s->dXV) cudaFree(s->dXV);
     if (s->dXX) cudaFree(s->dXX);
     if (s->dP) cudaFree(s->dP);
+    if (s->dMu32) cudaFree(s->dMu32);
+    if (s->dMu32lo) cudaFree(s->dMu32lo);
+    if (s->dXV32lo) cudaFree(s->dXV32lo);
+    if (s->dXX32lo) cudaFree(s->dXX32lo);
+    if (s->dXV32) cudaFree(s->dXV32);
+    if (s->dXX32) cudaFree(s->dXX32);
     if (s->dScratch) cudaFree(s->dScratch);
     if (s->dCounter) cudaFree(s->dCounter);
     if (s->dPLut) cudaFree(s->dPLut);
@@ -1136,6 +1262,8 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     KParams P;
     P.packed = hasPk ? geno.packed : nullptr; P.bpv = geno.bpv; P.lut = hasPk ? geno.lut : nullptr;
     P.dense = hasDn ? geno.dense : nullptr; P.ld = geno.ld;
+    P.MU32lo = s->dMu32lo; P.XV32lo = s->dXV32lo; P.XX32lo = s->dXX32lo;
+    P.MU32 = s->dMu32; P.XV32 = s->dXV32; P.XX32 = s->dXX32;
     P.N = s->N; P.MU = s->dMu; P.XV = s->dXV; P.XX = s->dXX; P.pOfTrait = s->dP; P.traitStride = s->traitStride;
     P.in = s->dIn; P.nPairs = nPairs; P.scratch = s->dScratch;
     P.tol = s->tol; P.maxiter = s->maxiter; P.erfcMode = s->erfcMode; P.out = s->dOut;

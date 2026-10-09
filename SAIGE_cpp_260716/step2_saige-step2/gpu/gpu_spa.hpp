@@ -57,8 +57,9 @@
 // contract as spa_gpu/spa_gpu.hpp (gpuSpaImpl: lib, the default).
 // FP32 is the library's fp32 design (spa_gpu/spa_gpu.hpp): float per-sample
 // work in kpass with centred sums, overflow-free terms and compensated
-// per-thread sums; g~ t from a two-float split of t; g~, m1, the Newton
-// scalars and the tail in double; fp64's Korg overflow (g~ t > 709.78, "not a
+// per-thread sums; passes A and B in float from float copies of XV, XXVX_inv
+// and mu (hi + lo, read for carriers only, for the NAsigma sum); float-float block sums; g~ t from a
+// two-float split of t; only the Newton scalars and the tail in double; fp64's Korg overflow (g~ t > 709.78, "not a
 // saddle") reproduced; Newton tolerance max(tol, 1e-5, 2^-17 max(|t|, |tnew|)).
 #pragma once
 
