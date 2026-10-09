@@ -222,6 +222,12 @@ tools/out_fieldcmp: tools/out_fieldcmp.cpp
 tools/spa_gpu_check: tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -o $@
 
+# gpuPrecisionSPA fp32 against fp64, pair by pair, for both device SPA
+# implementations (lib and own), the CPU SPA alongside (USE_CUDA=1 only).
+#   make USE_CUDA=1 SM=70 gpu/spa_gpu/spa_fp32_check
+gpu/spa_gpu/spa_fp32_check: gpu/spa_gpu/spa_fp32_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) gpu/spa_gpu/spa_fp32_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -o $@
+
 # Accuracy + cost of score_vec.hpp's chi-square(1) tail against boost's.
 tools/mtvec_tail_accuracy: tools/mtvec_tail_accuracy.cpp score_vec.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/mtvec_tail_accuracy.cpp $(filter -lmvec,$(LIBS)) -o $@
@@ -275,7 +281,7 @@ gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa
 
 clean:
 	rm -f $(OBJECTS) $(PGENLIB_OBJ) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
-	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check
+	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check gpu/spa_gpu/spa_fp32_check
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml
