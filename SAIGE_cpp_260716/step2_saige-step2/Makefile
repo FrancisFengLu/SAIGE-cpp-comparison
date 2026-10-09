@@ -271,6 +271,10 @@ gpu/gpu_er_fp32.cu.o: gpu/gpu_er_fp32.cu gpu/gpu_er_fp32.cuh gpu/gpu_er.hpp gpu/
 tools/er_gpu_check: tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
 
+# gpuPrecisionER fp32 against er_binary.cpp on the same generated pairs.
+gpu/er_tools/er_fp32_check: gpu/er_tools/er_fp32_check.cpp er_binary.o $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. gpu/er_tools/er_fp32_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
+
 # The SPA GPU library (gpu/spa_gpu/, from branch spa-gpu-lib, SPA_GPU_LIB.md):
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
 # Boost's 53-bit erfc with the underflow deferred. Config key gpuSpaImpl picks
@@ -280,7 +284,7 @@ gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa
 
 clean:
 	rm -f $(OBJECTS) $(PGENLIB_OBJ) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
-	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check
+	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check gpu/er_tools/er_fp32_check
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml
