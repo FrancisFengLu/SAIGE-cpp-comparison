@@ -23,8 +23,8 @@
 //
 // PRECISION
 // ---------
-// Decode and GEMM both run in one type T -- float or double -- chosen at
-// create(). Measured on this V100 (14.28 TFLOP/s fp32, 7.19 fp64): fp64 costs
+// FP64: decode and GEMM run in double. Measured on this V100 (14.28 TFLOP/s
+// fp32, 7.19 fp64): fp64 costs
 // about 40% more GEMM time and one extra pass of device bandwidth in the
 // decode. In a real step-2 run the GEMM is single-digit seconds against
 // a hundred-plus seconds of reading and decoding the .bed, so that is a few
@@ -34,23 +34,50 @@
 // and for measuring the fp32 error itself.
 //
 // The mode comes from CreateArgs::precision (config key gpuPrecisionScan,
-// gpu_precision.hpp): FP64 and FP32 are the two instantiations of T above.
-// INT8 (the Ozaki-style split) is not implemented yet: scanSupports() says no
-// and create() refuses it. Its plug-in points are marked TODO(precision:scan)
-// -- the operand split / upload in create() and the GEMM block in reduce().
+// gpu_precision.hpp). FP64 is the code above, untouched. FP32 and INT8 are in
+// gpu_scan_lowp.cuh: FP32 decodes g - rint(mean g) per marker in float, runs
+// one SGEMM per kChunkF32 samples and sums the chunks (and the exact shift /
+// centring corrections) in fp64; INT8 is the Ozaki-style split, int8 x int8
+// -> int32 GEMMs per slice of B, recombined in fp64. Both hand back double
+// results (outD), so the sparse-GRM variance (outCd) works in every mode.
 //
-// The dosage TABLE is double in both modes and narrowed inside the kernel for
-// fp32. Three of its four entries are exact small integers, but the fourth is
+// What the old fp32 (one SGEMM over all N samples, float results) got wrong,
+// measured on bingpu_test bt full (N = 50,000, P = 8) against fp64 at full
+// precision (outputFormat sgs):
+//   * its 1.9e-2 max relative p.value difference is not a large score error:
+//     it sits on MAC-5 markers of the 50%-prevalence traits whose score is at
+//     the edge of its support (SPA p 9e-18 against a normal-approximation p
+//     of 2e-2), where the saddle point runs off and p moves 2% for an 8e-8
+//     relative move of the score; printed Tstat / var agree to 6 digits there.
+//   * the real errors: Tstat 9e-6 of its standard deviation (one fp32 dot
+//     product of 50,000 nearly cancelling terms), var 2.7e-6 and SE 2.5e-4
+//     relative (the mu2 and W X columns are all-positive, so their sums carry
+//     a large common part).
+// The fp32 mode now (gpu_scan_lowp.cuh): 4096-sample chunks summed in fp64
+// (Tstat 9e-6 -> 1.1e-6 of its sd), integer shift of g and centring of the
+// columns with |mean| > sd, both undone exactly in fp64 (var -> 3e-8, SE ->
+// 8e-7). What is left of the Tstat error is fp32 rounding of a sum whose size
+// is far above its spread (A columns with a nonzero mean), magnified by the
+// cancellation in S = g'res - S_a'(A'g); neither smaller chunks nor a hi/lo
+// split of B move it, and centring those columns would cost a MAC-1 marker
+// the relative precision of its one entry. INT8 is the mode for fp64-level
+// agreement.
+//
+// The dosage TABLE is double in every mode (FP32 narrows g - r inside the
+// kernel). Three of its four entries are exact small integers, but the fourth is
 // the imputed mean 2*altFreq -- narrowing that on the host would put a 6e-8
 // relative error into every missing cell before the reduction starts, which is
 // a difference from the CPU's INPUT rather than from its arithmetic. It costs
 // 32 bytes per marker to carry.
 
 #include "gpu_step2.hpp"
+#include "gpu_scan_lowp.cuh"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -92,12 +119,8 @@ __device__ __forceinline__ T pick(const Lut4<T>& L, unsigned c)
     return (c & 2u) ? b : a;
 }
 
-// float -> one 16-byte store; double -> two. Both aligned because N % 4 == 0
-// on this path, so every marker's column starts on a 16-byte boundary.
-__device__ __forceinline__ void storeQuad(float* p, float a, float b, float c, float d)
-{
-    *reinterpret_cast<float4*>(p) = make_float4(a, b, c, d);
-}
+// double -> two 16-byte stores, aligned because N % 4 == 0 on this path, so
+// every marker's column starts on a 16-byte boundary.
 __device__ __forceinline__ void storeQuad(double* p, double a, double b, double c, double d)
 {
     reinterpret_cast<double2*>(p)[0] = make_double2(a, b);
@@ -256,6 +279,27 @@ struct Reducer {
     bool           evLive[2] = {false, false};
     cublasHandle_t cub = nullptr;
 
+    // ---- FP32 / INT8 (gpu_scan_lowp.cuh); unused in FP64 ----
+    std::size_t cesz = 8;               // bytes per result element (dC*, hC*)
+    double*  dCs1 = nullptr;            // FP32: colsum(B1), fp64, K1
+    double*  dCs2 = nullptr;            // FP32: colsum(B2), fp64, K2
+    double*  dShift1 = nullptr;         // FP32: per-slot integer shift of g, maxSlots
+    double*  dShift2 = nullptr;         // FP32: per-slot integer shift of g^2, maxSlots
+    void*    dPart[2] = {nullptr, nullptr};  // per stream: fp32 chunk / int32 slice product
+    int      Np = 0;                    // INT8: padded sample count (multiple of 16)
+    int      capX = 0;                  // INT8: indicator columns per pass, at most
+    int8_t*  dBs1 = nullptr;            // INT8: slices of B1, int8Slices x Np x K1
+    int8_t*  dBs2 = nullptr;            // INT8: slices of B2
+    int*     dE1 = nullptr;             // INT8: per-column exponent of B1, K1
+    int*     dE2 = nullptr;             // INT8: per-column exponent of B2, K2
+    // INT8 indicator columns of one reduce(): per slot (global) its first
+    // indicator (pass-relative) and count; per indicator (global, in slot
+    // order) its slot (pass-relative), code and the two table deltas.
+    int*     hXf = nullptr; int* hXn = nullptr; int* hXs = nullptr; int* hXc = nullptr;
+    double*  hXd1 = nullptr; double* hXd2 = nullptr;
+    int*     dXf = nullptr; int* dXn = nullptr; int* dXs = nullptr; int* dXc = nullptr;
+    double*  dXd1 = nullptr; double* dXd2 = nullptr;
+
     double tH2D = 0, tDec = 0, tGemm = 0, tD2H = 0, tPopc = 0;
     std::size_t devBytes = 0;
 };
@@ -316,10 +360,9 @@ bool scanSupports(Prec t_p)
     switch (t_p) {
         case Prec::FP64: return true;
         case Prec::FP32: return true;
-        // TODO(precision:scan): return true once the int8 split below is in.
         // The sparse-GRM cross terms (gpu_sparse.cu, spqSupports) are part of
         // this stage too and have their own switch.
-        case Prec::INT8: return false;
+        case Prec::INT8: return true;
     }
     return false;
 }
@@ -344,29 +387,39 @@ Reducer* create(const CreateArgs& a)
     Reducer* r = new Reducer();
     r->prec = a.precision;
     r->int8Slices = (a.precision == Prec::INT8) ? a.int8Slices : 0;
-    // TODO(precision:scan): INT8 -- the decode can stay in double or go
-    // straight to int8 (genotypes are exact small integers; the imputed mean
-    // of a missing call is not, see the LUT note above), B1 / B2 are split
-    // into int8Slices slices at upload, and the results are double (outD is
-    // already true for INT8, so isFp64() says so and main.cpp reads outCd /
-    // outC2d; hC1 / hC2 / dC1 / dC2 must then be sized in double, not esz).
     const bool fp64 = (a.precision == Prec::FP64);
+    const bool i8   = (a.precision == Prec::INT8);
+    // int8: every partial sum is bounded by 4 * 64 * N (gpu_scan_lowp.cuh)
+    if (i8 && (long long)a.N * lowp::kI8MaxA * 64 >= (1LL << 31)) {
+        lastErr = "int8 scan: N too large for the int32 accumulation bound";
+        return nullptr;
+    }
     r->N = a.N; r->K1 = a.K1; r->K2 = a.K2; r->maxSlots = a.maxSlots; r->fp64 = fp64;
-    r->outD = (a.precision != Prec::FP32);
+    r->outD = true;                     // every mode hands back double results
+    r->cesz = sizeof(double);
     r->decodeX2 = a.decodeX2 && fp64 && ((a.N & 3) == 0);
     r->nMask = a.nMask;
     r->words = maskWords(a.N);
     r->bpv = (std::size_t)r->words * 8;           // >= (N+3)/4, whole 64-bit words
     r->esz = fp64 ? sizeof(double) : sizeof(float);
+    r->Np = i8 ? ((a.N + 15) / 16) * 16 : a.N;
+    const int Kmax = a.K1 > a.K2 ? a.K1 : a.K2;
 
     // dG is the big one: slotsPerPass * N elements, twice over. Keep each
-    // buffer near 512 MB and never wider than the caller's batch.
-    const std::size_t perSlot = (std::size_t)a.N * r->esz;
+    // buffer near 512 MB and never wider than the caller's batch. FP32 / INT8
+    // also keep the per-stream partial product (slots x K, 4 bytes) near 256 MB;
+    // INT8's dG is int8, Np x (2 * slots + indicator columns), capX = slots.
+    const std::size_t perSlot = i8 ? (std::size_t)r->Np * 3 : (std::size_t)a.N * r->esz;
     long long sp = (long long)((512ull << 20) / perSlot);
+    if (!fp64) {
+        const long long spp = (long long)((256ull << 20) / ((std::size_t)Kmax * 4 * (i8 ? 2 : 1)));
+        if (sp > spp) sp = spp;
+    }
     if (sp < 1) sp = 1;
     if (sp > a.maxSlots) sp = a.maxSlots;
     if (sp > 4096) sp = 4096;
     r->slotsPerPass = (int)sp;
+    r->capX = i8 ? std::max((int)sp, 4) : 0;
 
     auto fail = [&]() -> Reducer* { destroy(r); return nullptr; };
 
@@ -387,9 +440,16 @@ Reducer* create(const CreateArgs& a)
     r->dPk.assign((std::size_t)r->nDev, nullptr);
     r->dLut.assign((std::size_t)r->nDev, nullptr);
     for (int d = 0; d < r->nDev; ++d) {
-        if (cudaHostAlloc(&r->hC1[d], nSlots * a.K1 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
-        if (a.K2 > 0 && cudaHostAlloc(&r->hC2[d], nSlots * a.K2 * r->esz, cudaHostAllocDefault) != cudaSuccess) return fail();
+        if (cudaHostAlloc(&r->hC1[d], nSlots * a.K1 * r->cesz, cudaHostAllocDefault) != cudaSuccess) return fail();
+        if (a.K2 > 0 && cudaHostAlloc(&r->hC2[d], nSlots * a.K2 * r->cesz, cudaHostAllocDefault) != cudaSuccess) return fail();
         if (a.nMask > 0 && cudaHostAlloc((void**)&r->hCnt[d], nSlots * a.nMask * 4 * sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess) return fail();
+    }
+    if (i8) {
+        auto ha = [&](void** p, std::size_t n) { return cudaHostAlloc(p, n, cudaHostAllocDefault) == cudaSuccess; };
+        if (!ha((void**)&r->hXf, nSlots * sizeof(int)) || !ha((void**)&r->hXn, nSlots * sizeof(int)) ||
+            !ha((void**)&r->hXs, nSlots * 4 * sizeof(int)) || !ha((void**)&r->hXc, nSlots * 4 * sizeof(int)) ||
+            !ha((void**)&r->hXd1, nSlots * 4 * sizeof(double)) || !ha((void**)&r->hXd2, nSlots * 4 * sizeof(double)))
+            return fail();
     }
 
     std::size_t db = 0;
@@ -397,19 +457,44 @@ Reducer* create(const CreateArgs& a)
         if (cudaMalloc(p, n) != cudaSuccess) { *p = nullptr; return false; }
         db += n; return true;
     };
-    if (!dev(&r->dB1, (std::size_t)a.N * a.K1 * r->esz)) return fail();
-    if (!dev(&r->dC1, nSlots * a.K1 * r->esz)) return fail();
+    const int nSl = i8 ? a.int8Slices : 1;
+    const std::size_t bEsz = i8 ? (std::size_t)nSl : r->esz;   // bytes per B element (all slices)
+    if (!dev(&r->dB1, (std::size_t)r->Np * a.K1 * bEsz)) return fail();
+    if (!dev(&r->dC1, nSlots * a.K1 * r->cesz)) return fail();
     if (a.K2 > 0) {
-        if (!dev(&r->dB2, (std::size_t)a.N * a.K2 * r->esz)) return fail();
-        if (!dev(&r->dC2, nSlots * a.K2 * r->esz)) return fail();
+        if (!dev(&r->dB2, (std::size_t)r->Np * a.K2 * bEsz)) return fail();
+        if (!dev(&r->dC2, nSlots * a.K2 * r->cesz)) return fail();
     }
     for (int d = 0; d < r->nDev; ++d) {
         if (!dev((void**)&r->dPk[d],  nSlots * r->bpv)) return fail();
         if (!dev((void**)&r->dLut[d], nSlots * 4 * sizeof(double))) return fail();
     }
     if (!dev((void**)&r->dLut2, nSlots * 4 * sizeof(double))) return fail();
+    const std::size_t gBytes = i8 ? (std::size_t)r->Np * (2 * (std::size_t)r->slotsPerPass + r->capX)
+                                  : (std::size_t)r->slotsPerPass * perSlot;
     for (int b = 0; b < 2; ++b)
-        if (!dev(&r->dG[b], (std::size_t)r->slotsPerPass * a.N * r->esz)) return fail();
+        if (!dev(&r->dG[b], gBytes)) return fail();
+    if (!fp64) {
+        const std::size_t rows = (std::size_t)r->slotsPerPass + (std::size_t)r->capX;
+        for (int b = 0; b < 2; ++b)
+            if (!dev(&r->dPart[b], rows * Kmax * 4)) return fail();
+    }
+    if (a.precision == Prec::FP32) {
+        if (!dev((void**)&r->dCs1, (std::size_t)2 * a.K1 * sizeof(double))) return fail();
+        if (!dev((void**)&r->dShift1, nSlots * 2 * sizeof(double))) return fail();
+        if (a.K2 > 0) {
+            if (!dev((void**)&r->dCs2, (std::size_t)2 * a.K2 * sizeof(double))) return fail();
+            if (!dev((void**)&r->dShift2, nSlots * 2 * sizeof(double))) return fail();
+        }
+    }
+    if (i8) {
+        if (!dev((void**)&r->dE1, (std::size_t)a.K1 * sizeof(int))) return fail();
+        if (a.K2 > 0 && !dev((void**)&r->dE2, (std::size_t)a.K2 * sizeof(int))) return fail();
+        if (!dev((void**)&r->dXf, nSlots * sizeof(int)) || !dev((void**)&r->dXn, nSlots * sizeof(int)) ||
+            !dev((void**)&r->dXs, nSlots * 4 * sizeof(int)) || !dev((void**)&r->dXc, nSlots * 4 * sizeof(int)) ||
+            !dev((void**)&r->dXd1, nSlots * 4 * sizeof(double)) || !dev((void**)&r->dXd2, nSlots * 4 * sizeof(double)))
+            return fail();
+    }
     if (a.nMask > 0) {
         if (!dev((void**)&r->dMask, (std::size_t)a.nMask * r->words * sizeof(uint64_t))) return fail();
         if (!dev((void**)&r->dMaskPop, (std::size_t)a.nMask * sizeof(uint32_t))) return fail();
@@ -428,14 +513,74 @@ Reducer* create(const CreateArgs& a)
     }
     r->devBytes = db;
 
+    // Right operands. FP64: as given. FP32: narrowed, plus colsum in fp64 for
+    // the shift. INT8: the slices and per-column exponents.
     auto upload = [&](void* dst, const double* src, std::size_t n) -> bool {
         if (fp64) return cudaMemcpy(dst, src, n * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
         std::vector<float> bf(n);
         for (std::size_t i = 0; i < n; ++i) bf[i] = (float)src[i];
         return cudaMemcpy(dst, bf.data(), n * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
     };
-    if (!upload(r->dB1, a.B1, (std::size_t)a.N * a.K1)) return fail();
-    if (a.K2 > 0 && !upload(r->dB2, a.B2, (std::size_t)a.N * a.K2)) return fail();
+    // FP32: column k goes up as float(b_ik - mean_k) and dCs gets
+    // (colsum_k, mean_k) in fp64, 2 x K.
+    auto uploadCentered = [&](void* dst, double* dCs, const double* src, int K) -> bool {
+        std::vector<double> cs((std::size_t)2 * K, 0.0);
+        std::vector<float> bf((std::size_t)a.N * K);
+        for (int k = 0; k < K; ++k) {
+            const double* c = src + (std::size_t)k * a.N;
+            double t = 0.0;
+            for (int i = 0; i < a.N; ++i) t += c[i];
+            // Centre only a column whose entries cluster around a nonzero
+            // mean (|mean| > sd: mu2, W X's intercept). Centring a column of
+            // small entries around a larger mean would cost those entries
+            // their relative precision (a MAC-1 marker reads one of them).
+            double mu = t / (double)a.N, ss = 0.0;
+            for (int i = 0; i < a.N; ++i) ss += (c[i] - mu) * (c[i] - mu);
+            if (!(mu * mu * (double)a.N > ss)) mu = 0.0;
+            cs[(std::size_t)k] = t; cs[(std::size_t)K + k] = mu;
+            for (int i = 0; i < a.N; ++i) bf[(std::size_t)k * a.N + i] = (float)(c[i] - mu);
+        }
+        return cudaMemcpy(dst, bf.data(), bf.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(dCs, cs.data(), cs.size() * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    // B[:,k] = 2^(E_k-6) sum_s d_s 2^(-7s) + O(2^(E_k-6-7 nSl)), |d_s| <= 64;
+    // every step exact in fp64 (power-of-two scalings, x - rint(x)).
+    auto slices = [&](int8_t* dst, int* dE, const double* src, int K) -> bool {
+        const int Np = r->Np;
+        std::vector<int8_t> sl((std::size_t)nSl * Np * K, 0);
+        std::vector<int> E((std::size_t)K, 0);
+        for (int k = 0; k < K; ++k) {
+            const double* c = src + (std::size_t)k * a.N;
+            double mx = 0.0;
+            for (int i = 0; i < a.N; ++i) mx = std::max(mx, std::fabs(c[i]));
+            if (!(mx > 0.0) || !std::isfinite(mx)) { if (!std::isfinite(mx)) return false; continue; }
+            int e = 0; std::frexp(mx, &e);              // mx < 2^e
+            E[(std::size_t)k] = e;
+            for (int i = 0; i < a.N; ++i) {
+                double x = std::ldexp(c[i], 6 - e);     // |x| < 64
+                for (int q = 0; q < nSl; ++q) {
+                    const double d = std::rint(x);      // |d| <= 64
+                    sl[((std::size_t)q * K + k) * Np + i] = (int8_t)d;
+                    x = (x - d) * 128.0;                // |x - d| <= 1/2, exact
+                }
+            }
+        }
+        return cudaMemcpy(dst, sl.data(), sl.size(), cudaMemcpyHostToDevice) == cudaSuccess &&
+               cudaMemcpy(dE, E.data(), E.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (i8) {
+        if (!slices((int8_t*)r->dB1, r->dE1, a.B1, a.K1)) return fail();
+        if (a.K2 > 0 && !slices((int8_t*)r->dB2, r->dE2, a.B2, a.K2)) return fail();
+        r->dBs1 = (int8_t*)r->dB1; r->dBs2 = (int8_t*)r->dB2;
+    } else {
+        if (fp64) {
+            if (!upload(r->dB1, a.B1, (std::size_t)a.N * a.K1)) return fail();
+            if (a.K2 > 0 && !upload(r->dB2, a.B2, (std::size_t)a.N * a.K2)) return fail();
+        } else {
+            if (!uploadCentered(r->dB1, r->dCs1, a.B1, a.K1)) return fail();
+            if (a.K2 > 0 && !uploadCentered(r->dB2, r->dCs2, a.B2, a.K2)) return fail();
+        }
+    }
 
     for (int b = 0; b < 2; ++b) {
         if (cudaStreamCreate(&r->st[b]) != cudaSuccess) return fail();
@@ -476,6 +621,14 @@ void destroy(Reducer* r)
     for (void* p : r->hC1) if (p) cudaFreeHost(p);
     for (void* p : r->hC2) if (p) cudaFreeHost(p);
     for (uint32_t* p : r->hCnt) if (p) cudaFreeHost(p);
+    for (int b = 0; b < 2; ++b) if (r->dPart[b]) cudaFree(r->dPart[b]);
+    for (void* p : {(void*)r->dCs1, (void*)r->dCs2, (void*)r->dShift1, (void*)r->dShift2,
+                    (void*)r->dE1, (void*)r->dE2, (void*)r->dXf, (void*)r->dXn, (void*)r->dXs,
+                    (void*)r->dXc, (void*)r->dXd1, (void*)r->dXd2})
+        if (p) cudaFree(p);
+    for (void* p : {(void*)r->hXf, (void*)r->hXn, (void*)r->hXs, (void*)r->hXc,
+                    (void*)r->hXd1, (void*)r->hXd2})
+        if (p) cudaFreeHost(p);
     delete r;
 }
 
@@ -522,6 +675,99 @@ void timings(const Reducer* r, double* h2d, double* dec, double* gemm, double* d
     if (popc) *popc = r->tPopc;
 }
 
+namespace {
+
+// Launch shape of acc_f32 / acc_i8: x over the sc slots, y over the K columns.
+inline dim3 accGrid(int sc, int K)
+{
+    const int gx = (sc + 255) / 256;
+    return dim3((unsigned)(gx < 64 ? gx : 64), (unsigned)(K < 65535 ? K : 65535));
+}
+
+// FP32 pass (gpu_scan_lowp.cuh): shifted float decode, one SGEMM per
+// kChunkF32 samples into dPart[b], each chunk added into the fp64 result.
+// Records ev[b][1..3] as the fp64 pass does.
+bool passF32(Reducer* r, int b, cudaStream_t s, const unsigned char* pk, const double* lu,
+             const double* lu2, int s0, int sc)
+{
+    const float onef = 1.f, zerof = 0.f;
+    float* g = (float*)r->dG[b];
+    float* part = (float*)r->dPart[b];
+    auto gemm = [&](const float* B, int K, double* C, const double* shift, const double* cs, int chunk) -> bool {
+        // floor(N / chunk) chunks of `chunk` samples, the last one also taking
+        // the remainder (a narrow GEMM of its own costs more than the
+        // remainder's share: cuBLAS picks small tiles for it).
+        const int nc = std::max(1, r->N / chunk);
+        for (int c = 0; c < nc; ++c) {
+            const int c0 = c * chunk;
+            const int kk = (c == nc - 1) ? r->N - c0 : chunk;
+            CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, K, kk,
+                            &onef, g + c0, r->N, B + c0, r->N, &zerof, part, sc));
+            lowp::acc_f32<<<accGrid(sc, K), 256, 0, s>>>(part, sc, K, C, (std::size_t)r->maxSlots,
+                                                                   c0 == 0 ? 1 : 0, shift, cs);
+            CKR(cudaGetLastError());
+        }
+        return true;
+    };
+    lowp::decode_f32_shift<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g, r->dShift1 + 2 * (std::size_t)s0);
+    CKR(cudaGetLastError());
+    CKR(cudaEventRecord(r->ev[b][1], s));
+    if (!gemm((const float*)r->dB1, r->K1, (double*)r->dC1 + s0, r->dShift1 + 2 * (std::size_t)s0, r->dCs1,
+              lowp::kChunkF32)) return false;
+    CKR(cudaEventRecord(r->ev[b][2], s));
+    if (r->K2 > 0) {
+        lowp::decode_f32_shift<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g, r->dShift2 + 2 * (std::size_t)s0);
+        CKR(cudaGetLastError());
+        if (!gemm((const float*)r->dB2, r->K2, (double*)r->dC2 + s0, r->dShift2 + 2 * (std::size_t)s0, r->dCs2,
+                  lowp::kChunkF32Sq)) return false;
+        CKR(cudaEventRecord(r->ev[b][3], s));
+    }
+    return true;
+}
+
+// INT8 pass (gpu_scan_lowp.cuh): A = [g_int (sc) | indicators (nx) | g2_int
+// (sc, binary only)], one int8 GEMM per slice of B into dPart[b], each slice
+// recombined into the fp64 result, smallest slice first.
+bool passI8(Reducer* r, int b, cudaStream_t s, const unsigned char* pk, const double* lu,
+            const double* lu2, int s0, int sc, int x0, int nx)
+{
+    const int onei = 1, zeroi = 0;
+    const int Np = r->Np, nSl = r->int8Slices;
+    int8_t* A = (int8_t*)r->dG[b];
+    int* part = (int*)r->dPart[b];
+    const int sc2 = (r->K2 > 0) ? sc : 0;
+    lowp::decode_i8<<<sc + nx + sc2, 256, 0, s>>>(pk, r->bpv, r->N, Np, lu, lu2, sc, nx,
+                                                 r->dXs + x0, r->dXc + x0, A);
+    CKR(cudaGetLastError());
+    CKR(cudaEventRecord(r->ev[b][1], s));
+    auto gemm = [&](const int8_t* Aop, int rows, int rowOff, int xOff, const int8_t* Bs, int K,
+                    const int* E, double* C, const double* delta) -> bool {
+        for (int q = nSl - 1; q >= 0; --q) {
+            CBR(cublasGemmEx(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, rows, K, Np,
+                             &onei, Aop, CUDA_R_8I, Np,
+                             Bs + (std::size_t)q * Np * K, CUDA_R_8I, Np,
+                             &zeroi, part, CUDA_R_32I, rows,
+                             CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+            lowp::acc_i8<<<accGrid(sc, K), 256, 0, s>>>(part, rows, rowOff, xOff, sc, K, E, q,
+                                                                  C, (std::size_t)r->maxSlots,
+                                                                  q == nSl - 1 ? 1 : 0,
+                                                                  r->dXf + s0, r->dXn + s0, delta);
+            CKR(cudaGetLastError());
+        }
+        return true;
+    };
+    if (!gemm(A, sc + nx, 0, sc, r->dBs1, r->K1, r->dE1, (double*)r->dC1 + s0, r->dXd1 + x0)) return false;
+    CKR(cudaEventRecord(r->ev[b][2], s));
+    if (r->K2 > 0) {
+        if (!gemm(A + (std::size_t)sc * Np, nx + sc, nx, 0, r->dBs2, r->K2, r->dE2,
+                  (double*)r->dC2 + s0, r->dXd2 + x0)) return false;
+        CKR(cudaEventRecord(r->ev[b][3], s));
+    }
+    return true;
+}
+
+}  // namespace
+
 bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
 {
     if (!r) return false;
@@ -539,7 +785,6 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
     uint32_t* const      hCnt = r->hCnt[(std::size_t)t_devSet];
     r->lastDev = t_devSet;
 
-    const float  onef = 1.f, zerof = 0.f;
     const double oned = 1.0, zerod = 0.0;
     const bool x4 = ((r->N & 3) == 0);
     const std::size_t nS = (std::size_t)t_nSlots;
@@ -548,6 +793,44 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
     // CPU kernel's Gb % Gb forms per cell.
     if (r->K2 > 0)
         for (std::size_t i = 0; i < nS * 4; ++i) r->hLut2[i] = hLu[i] * hLu[i];
+
+    // Passes: slotsPerPass markers each; INT8 also caps the indicator columns
+    // of a pass at capX and builds them here (gpu_scan_lowp.cuh).
+    struct Pass { int s0, sc, x0, nx; };
+    std::vector<Pass> passes;
+    int nxTot = 0;
+    if (r->prec == Prec::INT8) {
+        Pass cur{0, 0, 0, 0};
+        for (int j = 0; j < t_nSlots; ++j) {
+            int nxj = 0;
+            double d1[4], d2[4];
+            for (int c = 0; c < 4; ++c) {
+                const double v = hLu[(std::size_t)j * 4 + c], n1 = std::rint(v);
+                const double v2 = (r->K2 > 0) ? r->hLut2[(std::size_t)j * 4 + c] : 0.0, n2 = std::rint(v2);
+                if (!(std::fabs(n1) <= lowp::kI8MaxA) || !(std::fabs(n2) <= lowp::kI8MaxA)) {
+                    lastErr = "int8 scan: dosage table entry outside [-4, 4]"; return false;
+                }
+                d1[c] = v - n1; d2[c] = v2 - n2;
+                if (d1[c] != 0.0 || d2[c] != 0.0) ++nxj;
+            }
+            if (cur.sc > 0 && (cur.sc + 1 > r->slotsPerPass || cur.nx + nxj > r->capX)) {
+                passes.push_back(cur);
+                cur = Pass{j, 0, nxTot, 0};
+            }
+            r->hXf[j] = cur.nx; r->hXn[j] = nxj;
+            for (int c = 0; c < 4; ++c) {
+                if (d1[c] == 0.0 && d2[c] == 0.0) continue;
+                r->hXs[nxTot] = cur.sc; r->hXc[nxTot] = c;
+                r->hXd1[nxTot] = d1[c]; r->hXd2[nxTot] = d2[c];
+                ++nxTot; ++cur.nx;
+            }
+            ++cur.sc;
+        }
+        passes.push_back(cur);
+    } else {
+        for (int s0 = 0; s0 < t_nSlots; s0 += r->slotsPerPass)
+            passes.push_back(Pass{s0, std::min(r->slotsPerPass, t_nSlots - s0), 0, 0});
+    }
 
     // Everything from the previous reduce() has been harvested already; both
     // streams are idle at the top of a call.
@@ -558,6 +841,17 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
     CKR(cudaMemcpyAsync(dLut, hLu, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
     if (r->K2 > 0)
         CKR(cudaMemcpyAsync(r->dLut2, r->hLut2, nS * 4 * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+    if (r->prec == Prec::INT8) {
+        CKR(cudaMemcpyAsync(r->dXf, r->hXf, nS * sizeof(int), cudaMemcpyHostToDevice, r->st[0]));
+        CKR(cudaMemcpyAsync(r->dXn, r->hXn, nS * sizeof(int), cudaMemcpyHostToDevice, r->st[0]));
+        if (nxTot > 0) {
+            const std::size_t nx = (std::size_t)nxTot;
+            CKR(cudaMemcpyAsync(r->dXs, r->hXs, nx * sizeof(int), cudaMemcpyHostToDevice, r->st[0]));
+            CKR(cudaMemcpyAsync(r->dXc, r->hXc, nx * sizeof(int), cudaMemcpyHostToDevice, r->st[0]));
+            CKR(cudaMemcpyAsync(r->dXd1, r->hXd1, nx * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+            CKR(cudaMemcpyAsync(r->dXd2, r->hXd2, nx * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
+        }
+    }
     CKR(cudaEventRecord(r->evUp, r->st[0]));
     if (timed) {
         cudaEventRecord(a1, r->st[0]);
@@ -575,9 +869,9 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
                             cudaMemcpyDeviceToHost, r->st[1]));
     }
 
-    int pass = 0;
-    for (int s0 = 0; s0 < t_nSlots; s0 += r->slotsPerPass, ++pass) {
-        const int sc = (t_nSlots - s0 < r->slotsPerPass) ? (t_nSlots - s0) : r->slotsPerPass;
+    for (int pass = 0; pass < (int)passes.size(); ++pass) {
+        const int s0 = passes[(std::size_t)pass].s0;
+        const int sc = passes[(std::size_t)pass].sc;
         const int b  = pass & 1;
         cudaStream_t s = r->st[b];
 
@@ -592,41 +886,35 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
         const double* lu2 = r->dLut2 + (std::size_t)s0 * 4;
 
         CKR(cudaEventRecord(r->ev[b][0], s));
-        if (r->fp64) {
+        if (r->prec != Prec::FP64) {
+            CBR(cublasSetStream(r->cub, s));
+            if (r->prec == Prec::FP32) { if (!passF32(r, b, s, pk, lu, lu2, s0, sc)) return false; }
+            else if (!passI8(r, b, s, pk, lu, lu2, s0, sc, passes[(std::size_t)pass].x0,
+                             passes[(std::size_t)pass].nx)) return false;
+            r->evLive[b] = true;
+            continue;
+        }
+        {
             double* g = (double*)r->dG[b];
             if (r->decodeX2) decode_lut_x2<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
             else if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
             else    decode_lut_any<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
-        } else {
-            float* g = (float*)r->dG[b];
-            if (x4) decode_lut_x4<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
-            else    decode_lut_any<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu, g);
         }
         CKR(cudaGetLastError());
         CKR(cudaEventRecord(r->ev[b][1], s));
 
         CBR(cublasSetStream(r->cub, s));
-        // TODO(precision:scan): the INT8 GEMMs (slices x cublasGemmEx int8 ->
-        // int32, recombined in fp64 into dC1 / dC2) go here, as a third branch
-        // beside the fp64 / fp32 ones below and for the second GEMM.
         // C1(sc x K1) = dG^T (sc x N) * dB1 (N x K1), into rows [s0, s0+sc) of
         // the maxSlots x K1 result.
-        if (r->fp64) {
-            CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K1, r->N,
-                            &oned, (const double*)r->dG[b], r->N,
-                            (const double*)r->dB1, r->N,
-                            &zerod, (double*)r->dC1 + s0, r->maxSlots));
-        } else {
-            CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K1, r->N,
-                            &onef, (const float*)r->dG[b], r->N,
-                            (const float*)r->dB1, r->N,
-                            &zerof, (float*)r->dC1 + s0, r->maxSlots));
-        }
+        CBR(cublasDgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K1, r->N,
+                        &oned, (const double*)r->dG[b], r->N,
+                        (const double*)r->dB1, r->N,
+                        &zerod, (double*)r->dC1 + s0, r->maxSlots));
         CKR(cudaEventRecord(r->ev[b][2], s));
 
         if (r->K2 > 0) {
             // Same buffer, squared table, second right operand.
-            if (r->fp64) {
+            {
                 double* g = (double*)r->dG[b];
                 if (r->decodeX2) decode_lut_x2<<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
                 else if (x4) decode_lut_x4<double><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
@@ -636,15 +924,6 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
                                 &oned, (const double*)r->dG[b], r->N,
                                 (const double*)r->dB2, r->N,
                                 &zerod, (double*)r->dC2 + s0, r->maxSlots));
-            } else {
-                float* g = (float*)r->dG[b];
-                if (x4) decode_lut_x4<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
-                else    decode_lut_any<float><<<sc, 256, 0, s>>>(pk, r->bpv, r->N, lu2, g);
-                CKR(cudaGetLastError());
-                CBR(cublasSgemm(r->cub, CUBLAS_OP_T, CUBLAS_OP_N, sc, r->K2, r->N,
-                                &onef, (const float*)r->dG[b], r->N,
-                                (const float*)r->dB2, r->N,
-                                &zerof, (float*)r->dC2 + s0, r->maxSlots));
             }
             CKR(cudaEventRecord(r->ev[b][3], s));
         }
@@ -665,14 +944,14 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
     const bool timed2 = timed && (cudaEventCreate(&z0) == cudaSuccess) && (cudaEventCreate(&z1) == cudaSuccess);
     if (timed2) cudaEventRecord(z0, r->st[0]);
     // Only the first t_nSlots rows of each of the K columns are live.
-    CKR(cudaMemcpy2DAsync(hC1, (std::size_t)r->maxSlots * r->esz,
-                          r->dC1, (std::size_t)r->maxSlots * r->esz,
-                          nS * r->esz, (std::size_t)r->K1,
+    CKR(cudaMemcpy2DAsync(hC1, (std::size_t)r->maxSlots * r->cesz,
+                          r->dC1, (std::size_t)r->maxSlots * r->cesz,
+                          nS * r->cesz, (std::size_t)r->K1,
                           cudaMemcpyDeviceToHost, r->st[0]));
     if (r->K2 > 0)
-        CKR(cudaMemcpy2DAsync(hC2, (std::size_t)r->maxSlots * r->esz,
-                              r->dC2, (std::size_t)r->maxSlots * r->esz,
-                              nS * r->esz, (std::size_t)r->K2,
+        CKR(cudaMemcpy2DAsync(hC2, (std::size_t)r->maxSlots * r->cesz,
+                              r->dC2, (std::size_t)r->maxSlots * r->cesz,
+                              nS * r->cesz, (std::size_t)r->K2,
                               cudaMemcpyDeviceToHost, r->st[0]));
     if (timed2) cudaEventRecord(z1, r->st[0]);
     CKR(cudaStreamSynchronize(r->st[0]));

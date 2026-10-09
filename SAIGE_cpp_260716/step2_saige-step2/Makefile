@@ -235,7 +235,7 @@ $(TARGET): $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ)
 third_party/pgenlib/%.o: third_party/pgenlib/%.cc
 	$(CXX) $(PGENLIB_CXXFLAGS) -c $< -o $@
 
-gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp
+gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp gpu/gpu_scan_lowp.cuh
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 # The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU

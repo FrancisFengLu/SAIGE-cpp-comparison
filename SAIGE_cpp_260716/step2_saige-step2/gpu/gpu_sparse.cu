@@ -152,12 +152,152 @@ spq_kernel_own(const unsigned char* __restrict__ pk, std::size_t bpv,
     }
 }
 
+// ---- scan precision FP32 ---------------------------------------------------
+// The same sums as spq_kernel / spq_kernel_own with float weights, float
+// dosages and float products. Each thread's float partial is flushed into a
+// double every kFlushF32 of its pairs, so fp32 only ever sums kFlushF32 terms
+// (the K-chunking of the fp32 scan GEMMs, gpu_scan_lowp.cuh); the block
+// reduction is in double as in fp64.
+constexpr int kFlushF32 = 64;
+
+__device__ __forceinline__ float decodeF(const unsigned char* col, const float* L, int i)
+{
+    return L[(col[i >> 2] >> ((i & 3) * 2)) & 3u];
+}
+
+__global__ void __launch_bounds__(NT)
+spq_kernel_f32(const unsigned char* __restrict__ pk, std::size_t bpv,
+               const double* __restrict__ lut,
+               long long nPairs, const int* __restrict__ pi, const int* __restrict__ pj,
+               const float* __restrict__ w, int nTr, int useShared,
+               double* __restrict__ out)
+{
+    extern __shared__ unsigned char shCol[];
+    __shared__ float L[4];
+    __shared__ double part[TR][NT / 32];
+    const int s = blockIdx.x;
+    const unsigned char* gcol = pk + (std::size_t)s * bpv;
+    if (threadIdx.x < 4) L[threadIdx.x] = (float)lut[(std::size_t)s * 4 + threadIdx.x];
+    const unsigned char* col = gcol;
+    if (useShared) {
+        for (std::size_t b = threadIdx.x; b < bpv; b += NT) shCol[b] = gcol[b];
+        col = shCol;
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int t0 = 0; t0 < nTr; t0 += TR) {
+        const int nt = (nTr - t0 < TR) ? (nTr - t0) : TR;
+        double acc[TR];
+        float accf[TR];
+        #pragma unroll
+        for (int k = 0; k < TR; k++) { acc[k] = 0.0; accf[k] = 0.f; }
+        int nf = 0;
+        for (long long p = threadIdx.x; p < nPairs; p += NT) {
+            if (++nf == kFlushF32) {
+                nf = 0;
+                #pragma unroll
+                for (int k = 0; k < TR; k++) { acc[k] += (double)accf[k]; accf[k] = 0.f; }
+            }
+            const float gi = decodeF(col, L, pi[p]);
+            if (gi == 0.f) continue;
+            const float gg = gi * decodeF(col, L, pj[p]);
+            if (gg == 0.f) continue;
+            const float* wp = w + (std::size_t)t0 * nPairs + p;
+            #pragma unroll
+            for (int k = 0; k < TR; k++)
+                if (k < nt) accf[k] += gg * wp[(std::size_t)k * nPairs];
+        }
+        #pragma unroll
+        for (int k = 0; k < TR; k++) {
+            const double v = warpSum(acc[k] + (double)accf[k]);
+            if (lane == 0) part[k][wid] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < nt) {
+            double v = 0.0;
+            for (int q = 0; q < NT / 32; q++) v += part[threadIdx.x][q];
+            out[(std::size_t)s * nTr + t0 + threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(NT)
+spq_kernel_own_f32(const unsigned char* __restrict__ pk, std::size_t bpv,
+                   const double* __restrict__ tl,
+                   long long nPairs, const int* __restrict__ pi, const int* __restrict__ pj,
+                   const float* __restrict__ w, int nTr, int useShared,
+                   double* __restrict__ out)
+{
+    extern __shared__ unsigned char shCol[];
+    __shared__ float L[TR][4];
+    __shared__ unsigned char nz[16];
+    __shared__ double part[TR][NT / 32];
+    const int s = blockIdx.x;
+    const unsigned char* gcol = pk + (std::size_t)s * bpv;
+    const unsigned char* col = gcol;
+    if (useShared) {
+        for (std::size_t b = threadIdx.x; b < bpv; b += NT) shCol[b] = gcol[b];
+        col = shCol;
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    for (int t0 = 0; t0 < nTr; t0 += TR) {
+        const int nt = (nTr - t0 < TR) ? (nTr - t0) : TR;
+        if (threadIdx.x < TR * 4) {
+            const int k = threadIdx.x >> 2, c = threadIdx.x & 3;
+            L[k][c] = (k < nt) ? (float)tl[((std::size_t)s * nTr + t0 + k) * 4 + c] : 0.f;
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            const int ci = threadIdx.x >> 2, cj = threadIdx.x & 3;
+            unsigned char any = 0;
+            for (int k = 0; k < nt; k++) if (L[k][ci] * L[k][cj] != 0.f) any = 1;
+            nz[threadIdx.x] = any;
+        }
+        __syncthreads();
+        double acc[TR];
+        float accf[TR];
+        #pragma unroll
+        for (int k = 0; k < TR; k++) { acc[k] = 0.0; accf[k] = 0.f; }
+        int nf = 0;
+        for (long long p = threadIdx.x; p < nPairs; p += NT) {
+            if (++nf == kFlushF32) {
+                nf = 0;
+                #pragma unroll
+                for (int k = 0; k < TR; k++) { acc[k] += (double)accf[k]; accf[k] = 0.f; }
+            }
+            const int i = pi[p], j = pj[p];
+            const unsigned ci = (col[i >> 2] >> ((i & 3) * 2)) & 3u;
+            const unsigned cj = (col[j >> 2] >> ((j & 3) * 2)) & 3u;
+            if (!nz[ci * 4 + cj]) continue;
+            const float* wp = w + (std::size_t)t0 * nPairs + p;
+            #pragma unroll
+            for (int k = 0; k < TR; k++)
+                if (k < nt) accf[k] += (L[k][ci] * L[k][cj]) * wp[(std::size_t)k * nPairs];
+        }
+        #pragma unroll
+        for (int k = 0; k < TR; k++) {
+            const double v = warpSum(acc[k] + (double)accf[k]);
+            if (lane == 0) part[k][wid] = v;
+        }
+        __syncthreads();
+        if (threadIdx.x < nt) {
+            double v = 0.0;
+            for (int q = 0; q < NT / 32; q++) v += part[threadIdx.x][q];
+            out[(std::size_t)s * nTr + t0 + threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 struct SpQuad {
     int N = 0, nTr = 0, maxSlots = 0;
     long long nPairs = 0;
     int* dI = nullptr; int* dJ = nullptr; double* dW = nullptr;
+    float* dWf = nullptr;                  // scan precision FP32: the weights narrowed (dW unused)
+    Prec prec = Prec::FP64;
     double* dOut = nullptr;
     std::vector<double*> hOut;             // one pinned result set per outSets
     int lastOut = 0;
@@ -173,11 +313,13 @@ bool spqSupports(Prec t_p)
 {
     switch (t_p) {
         case Prec::FP64: return true;
-        // TODO(precision:scan): the sparse-GRM cross terms in the scan's fp32 /
-        // int8 mode. Plug the variant in at spq_kernel / spq_kernel_own's
-        // launch in spqRun / spqRunOwn (results stay double) and return true.
-        case Prec::FP32: return false;
-        case Prec::INT8: return false;
+        // FP32: spq_kernel_f32 / spq_kernel_own_f32. INT8: the fp64 kernels --
+        // the weights 2 B_ij are arbitrary reals with no GEMM to split them
+        // into, and this sum is not a GEMM, so int8 has nothing to offer here;
+        // the int8 scan's GEMM terms come back near fp64 accuracy, and this
+        // term at fp64 keeps the variance's three terms at that level.
+        case Prec::FP32: return true;
+        case Prec::INT8: return true;
     }
     return false;
 }
@@ -205,7 +347,10 @@ SpQuad* spqCreate(const SpQuadCreateArgs& a)
     const std::size_t np = (std::size_t)a.nPairs;
     if (!dev((void**)&q->dI, np * sizeof(int))) return fail();
     if (!dev((void**)&q->dJ, np * sizeof(int))) return fail();
-    if (!dev((void**)&q->dW, np * a.nTraits * sizeof(double))) return fail();
+    q->prec = a.precision;
+    const bool f32 = (a.precision == Prec::FP32);
+    if (f32) { if (!dev((void**)&q->dWf, np * a.nTraits * sizeof(float))) return fail(); }
+    else if (!dev((void**)&q->dW, np * a.nTraits * sizeof(double))) return fail();
     if (!dev((void**)&q->dOut, (std::size_t)a.maxSlots * a.nTraits * sizeof(double))) return fail();
     q->hOut.assign((std::size_t)(a.outSets < 1 ? 1 : a.outSets), nullptr);
     for (double*& h : q->hOut)
@@ -215,7 +360,11 @@ SpQuad* spqCreate(const SpQuadCreateArgs& a)
     if (np > 0) {
         if (cudaMemcpy(q->dI, a.pi, np * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
         if (cudaMemcpy(q->dJ, a.pj, np * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
-        if (cudaMemcpy(q->dW, a.w, np * a.nTraits * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+        if (f32) {
+            std::vector<float> wf(np * a.nTraits);
+            for (std::size_t k = 0; k < wf.size(); ++k) wf[k] = (float)a.w[k];
+            if (cudaMemcpy(q->dWf, wf.data(), wf.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
+        } else if (cudaMemcpy(q->dW, a.w, np * a.nTraits * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
     }
     if (cudaStreamCreate(&q->st) != cudaSuccess) return fail();
     if (cudaEventCreate(&q->e0) != cudaSuccess || cudaEventCreate(&q->e1) != cudaSuccess) return fail();
@@ -231,6 +380,7 @@ void spqDestroy(SpQuad* q)
     if (q->dI) cudaFree(q->dI);
     if (q->dJ) cudaFree(q->dJ);
     if (q->dW) cudaFree(q->dW);
+    if (q->dWf) cudaFree(q->dWf);
     if (q->dOut) cudaFree(q->dOut);
     if (q->dTl) cudaFree(q->dTl);
     for (double* h : q->hOut) if (h) cudaFreeHost(h);
@@ -273,6 +423,10 @@ bool spqRun(SpQuad* q, const Reducer* r, int nSlots, int t_set)
     // The reducer's last reduce() is complete (it synchronises before
     // returning), so its resident rows are safe to read on our own stream.
     CKQ(cudaEventRecord(q->e0, q->st));
+    if (q->prec == Prec::FP32)
+        spq_kernel_f32<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, dLut, q->nPairs, q->dI, q->dJ, q->dWf,
+                                                                  q->nTr, useShared, q->dOut);
+    else
     spq_kernel<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, dLut, q->nPairs, q->dI, q->dJ, q->dW,
                                                           q->nTr, useShared, q->dOut);
     CKQ(cudaGetLastError());
@@ -309,6 +463,10 @@ bool spqRunOwn(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, int 
     const int useShared = (bpv <= SHMAX) ? 1 : 0;
     CKQ(cudaMemcpyAsync(q->dTl, tlut, nOut * 4 * sizeof(double), cudaMemcpyHostToDevice, q->st));
     CKQ(cudaEventRecord(q->e0, q->st));
+    if (q->prec == Prec::FP32)
+        spq_kernel_own_f32<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, q->dTl, q->nPairs, q->dI, q->dJ,
+                                                                      q->dWf, q->nTr, useShared, q->dOut);
+    else
     spq_kernel_own<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, q->dTl, q->nPairs, q->dI, q->dJ,
                                                               q->dW, q->nTr, useShared, q->dOut);
     CKQ(cudaGetLastError());
