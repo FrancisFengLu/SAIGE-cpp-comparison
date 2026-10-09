@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "erfc_boost53.cuh"
+#include "spa_fp32_terms.cuh"
 
 namespace saige {
 namespace spa_gpu {
@@ -48,6 +49,8 @@ namespace {
 constexpr int NT    = 256;
 constexpr int NWARP = NT / 32;
 constexpr int NACC  = PMAX + 1;   // widest reduction: p partial dot products + the carrier count
+// gpuPrecisionSPA fp32: floor of the Newton |dt| tolerance (spa_gpu.hpp).
+constexpr double kTolFp32 = 1e-5;
 
 thread_local std::string g_lastErr;
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -126,6 +129,7 @@ __device__ __forceinline__ double addLogp(double p1, double p2)   // UTIL.cpp ad
     return maxp + log(1 + exp(minp - maxp));
 }
 
+
 // ---------------------------------------------------------------------------
 // Kernel
 // ---------------------------------------------------------------------------
@@ -176,7 +180,174 @@ struct Ctx {
     int nEff;
     bool fast;
     double NAmu, NAsigma;
+    // fp32 variant only (gpuPrecisionSPA: fp32): the same entries as float2
+    // (s g~, s min(mu, 1 - mu)) with s = -1 where mu > 1/2, and the m1 used
+    // for centring (that of the stored floats; see spaBody).
+    const float2* buf32;
+    double m1;
 };
+
+// ---------------------------------------------------------------------------
+// fp32 variant (gpuPrecisionSPA: fp32). Same control flow, same block
+// structure; the per-sample work of the root and tail passes (exp / log, the
+// K', K'' and K sums) runs in float. Everything around it stays double: passes
+// A and B (g~, gpos / gneg, m1, NAmu / NAsigma, the carrier count and the
+// fast / full choice), the Newton scalars (t, K1, K2, prevJump), and the
+// saddlepoint tail (w, v, Ztest, the erfc port, the log domain), which reads
+// the fp32 sums as doubles. Mathematically identical rewrites, chosen so that
+// float cannot overflow and the big cancellations happen in double:
+//
+//   p(x)  = mu e^x / (1 - mu + mu e^x),  x = g~ t  (the tilted mean)
+//   K'(t) - q    = sum g~ (p - mu) + [fast: NAsigma t] - (q - m1)
+//   K''(t)       = sum g~^2 p (1 - p) + [fast: NAsigma]
+//   K(t) - t m1  = sum h,  h = log(1 - mu + mu e^x) - mu x  (+ [fast: NAsigma t^2 / 2])
+//   zeta q - K(zeta) = zeta (q - m1) - (K(zeta) - zeta m1)
+//
+// m1 = sum mu g~ is the double from pass B, so neither K' - q nor zeta q - K
+// is formed as a difference of two large float numbers. Per term only
+// exp(-|x|) <= 1 is formed (p, 1 - p, p - mu and h are written with it and
+// expm1 / log1p), so e^{x} never overflows float (it would from x ~ 88). The
+// stored mu is min(mu, 1 - mu) with g~ negated when mu > 1/2 (every term is
+// invariant under mu -> 1 - mu, g~ -> -g~), so 1 - mu is formed without
+// cancellation and a mu within 1e-8 of 1 is not lost; the flip is kept in the
+// sign bit of the stored mu. Per-thread sums are Neumaier-compensated floats,
+// finished in double, and the block reduction is the fp64 one.
+//
+// One fp64 overflow is part of SAIGE's control flow and is reproduced: in
+// Korg's log(1 - mu + mu exp(g~ t)) the exp overflows to +inf for
+// g~ t > log(DBL_MAX) = 709.78, Korg is then +inf and the tail is "not a
+// saddle" (p = pno / 2, convergence withdrawn, Is.SPA false). That happens on
+// real data (very rare markers, roots of several hundred). The fp32 tail pass
+// returns H = +inf in exactly that case, so the route matches fp64; every
+// other fp64 overflow (exp(-g~ t) in K', K'') only produces the limit value,
+// which the rewritten terms give directly.
+// ---------------------------------------------------------------------------
+using spa_fp32::NSum;
+
+// exp(x) overflows double for x above this (CUDA and glibc agree).
+constexpr float kLogDblMax = 709.782712893384f;
+
+// Per-term K' (centred), K'' and, when H, h, for one stored entry
+// (s g~, sign(s) min(mu, 1 - mu)). With H, *ovf is set when the fp64 Korg term
+// of the unflipped sample overflows (see above).
+// t as a float pair th + tl (th = float(t), tl = float(t - th)), so g~ t is
+// formed to float precision even when t is large: float(t) alone would put an
+// error of up to |t| 2^-24 into every x.
+struct T2 { float h, l; };
+__device__ __forceinline__ T2 split(double t) { const float h = (float)t; return T2{h, (float)(t - (double)h)}; }
+
+template <bool H>
+__device__ __forceinline__ void terms32(float g, float ms, T2 t, float* k1c, float* k2, float* h, bool* ovf)
+{
+    const float m = fabsf(ms);
+    const float a = 1.0f - m;     // m <= 1/2: no cancellation
+    const float x = g * t.h + g * t.l;
+    if (H) *ovf = (signbit(ms) ? -x : x) > kLogDblMax;
+    float p, q, pm;
+    if (x >= 0.0f) {
+        const float e = expf(-x), em = expm1f(-x);
+        const float den = a * e + m;                 // 1 - mu + mu e^x, times e^-x
+        p  = m / den;
+        q  = (a * e) / den;
+        pm = -(m * a * em) / den;                    // p - mu
+        if (H) *h = spa_fp32::hTerm(m, a, x, em);   // forms without cancellation: spa_fp32_terms.cuh
+    } else {
+        const float e = expf(x), em = expm1f(x);
+        const float den = a + m * e;                 // 1 - mu + mu e^x
+        p  = (m * e) / den;
+        q  = a / den;
+        pm = (m * a * em) / den;
+        if (H) *h = spa_fp32::hTerm(m, a, x, 0.0f);
+    }
+    *k1c = g * pm;
+    *k2  = (g * g) * (p * q);
+}
+
+// One pass: K1(t) - q and K2(t), fp32 per sample (the fp32 passK1K2).
+__device__ void passK1K2_32(const Ctx& C, double t, double q, double (*sh)[NWARP], double* K1, double* K2)
+{
+    NSum s0, s1;
+    const T2 tf = split(t);
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const float2 e = C.buf32[i];
+        float k1c, k2, h;
+        terms32<false>(e.x, e.y, tf, &k1c, &k2, &h, nullptr);
+        s0.add(k1c);
+        if (isfinite(k2)) s1.add(k2);
+    }
+    double a[2] = {s0.val(), s1.val()};
+    blockReduce<2>(a, sh);
+    const double dq = q - C.m1;
+    if (C.fast) { *K1 = a[0] + C.NAsigma * t - dq; *K2 = a[1] + C.NAsigma; }
+    else        { *K1 = a[0] - dq;                 *K2 = a[1]; }
+}
+
+// One pass: H = K(zeta) - zeta m1 and K2(zeta), fp32 per sample.
+__device__ void passK0K2_32(const Ctx& C, double t, double (*sh)[NWARP], double* H, double* K2)
+{
+    NSum s0, s1;
+    bool inf = false;
+    const T2 tf = split(t);
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const float2 e = C.buf32[i];
+        float k1c, k2, h; bool ovf;
+        terms32<true>(e.x, e.y, tf, &k1c, &k2, &h, &ovf);
+        s0.add(h); inf |= ovf;
+        if (isfinite(k2)) s1.add(k2);
+    }
+    double a[2] = {inf ? CUDART_INF : s0.val(), s1.val()};
+    blockReduce<2>(a, sh);
+    if (C.fast) { *H = a[0] + 0.5 * C.NAsigma * (t * t); *K2 = a[1] + C.NAsigma; }
+    else        { *H = a[0];                             *K2 = a[1]; }
+}
+
+__device__ void passK1K2x2_32(const Ctx& C, bool e1, double t1, double q1, bool e2, double t2, double q2,
+                              double (*sh)[NWARP], double* K1a, double* K2a, double* K1b, double* K2b)
+{
+    NSum s[4];
+    const T2 tf1 = split(t1), tf2 = split(t2);
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const float2 e = C.buf32[i];
+        float k1c, k2, h;
+        if (e1) { terms32<false>(e.x, e.y, tf1, &k1c, &k2, &h, nullptr); s[0].add(k1c); if (isfinite(k2)) s[1].add(k2); }
+        if (e2) { terms32<false>(e.x, e.y, tf2, &k1c, &k2, &h, nullptr); s[2].add(k1c); if (isfinite(k2)) s[3].add(k2); }
+    }
+    double a[4] = {s[0].val(), s[1].val(), s[2].val(), s[3].val()};
+    blockReduce<4>(a, sh);
+    if (e1) {
+        const double dq = q1 - C.m1;
+        if (C.fast) { *K1a = a[0] + C.NAsigma * t1 - dq; *K2a = a[1] + C.NAsigma; }
+        else        { *K1a = a[0] - dq; *K2a = a[1]; }
+    }
+    if (e2) {
+        const double dq = q2 - C.m1;
+        if (C.fast) { *K1b = a[2] + C.NAsigma * t2 - dq; *K2b = a[3] + C.NAsigma; }
+        else        { *K1b = a[2] - dq; *K2b = a[3]; }
+    }
+}
+
+__device__ void passK0K2x2_32(const Ctx& C, double t1, double t2, double (*sh)[NWARP],
+                              double* Ha, double* K2a, double* Hb, double* K2b)
+{
+    NSum s[4];
+    bool inf1 = false, inf2 = false;
+    const T2 tf1 = split(t1), tf2 = split(t2);
+    for (int i = threadIdx.x; i < C.nEff; i += NT) {
+        const float2 e = C.buf32[i];
+        float k1c, k2, h; bool ovf;
+        terms32<true>(e.x, e.y, tf1, &k1c, &k2, &h, &ovf); s[0].add(h); inf1 |= ovf; if (isfinite(k2)) s[1].add(k2);
+        terms32<true>(e.x, e.y, tf2, &k1c, &k2, &h, &ovf); s[2].add(h); inf2 |= ovf; if (isfinite(k2)) s[3].add(k2);
+    }
+    double a[4] = {inf1 ? CUDART_INF : s[0].val(), s[1].val(), inf2 ? CUDART_INF : s[2].val(), s[3].val()};
+    blockReduce<4>(a, sh);
+    if (C.fast) {
+        *Ha = a[0] + 0.5 * C.NAsigma * (t1 * t1);  *K2a = a[1] + C.NAsigma;
+        *Hb = a[2] + 0.5 * C.NAsigma * (t2 * t2);  *K2b = a[3] + C.NAsigma;
+    } else {
+        *Ha = a[0]; *K2a = a[1];
+        *Hb = a[2]; *K2b = a[3];
+    }
+}
 
 // One pass: K1(t) - q and K2(t). Per-term arithmetic associated as the
 // Armadillo expressions in spa_binary.cpp evaluate it:
@@ -230,9 +401,30 @@ __device__ void passK0K2(const Ctx& C, double t, double (*sh)[NWARP], double* K0
     }
 }
 
+// Newton tolerance at the step t -> tnew. fp64: tol. fp32: max(tol, kRelTolFp32
+// max(|t|, |tnew|)) -- the float sums resolve K' to about 1e-7 of its terms,
+// so a step is only known to about 1e-7 |t|; with a purely absolute tol a root
+// at |t| ~ 1e4 (very rare markers, full-N variant) could never converge.
+constexpr double kRelTolFp32 = 1.0 / 131072;   // 2^-17, ~64 float ulps
+template <bool F32>
+__device__ __forceinline__ double tolAt(double tol, double t, double tnew)
+{
+    if constexpr (F32) return fmax(tol, kRelTolFp32 * fmax(fabs(t), fabs(tnew)));
+    else return tol;
+}
+
+// The pass of the chosen arithmetic (F32: gpuPrecisionSPA fp32). In fp32 the
+// "K0" a tail pass returns is H = K(zeta) - zeta m1 (see passK0K2_32).
+template <bool F32>
+__device__ __forceinline__ void PK1K2(const Ctx& C, double t, double q, double (*sh)[NWARP], double* K1, double* K2)
+{
+    if constexpr (F32) passK1K2_32(C, t, q, sh, K1, K2); else passK1K2(C, t, q, sh, K1, K2);
+}
+
 // getroot_K1_Binom (full) / getroot_K1_fast_Binom (fast), init 0, with the
 // two variants' own tests. Every thread runs the same scalar code on the
 // same block-wide sums, so there is no divergence and no broadcast.
+template <bool F32>
 __device__ void getroot(const Ctx& C, double q, double gpos, double gneg, double tol, int maxiter,
                         double (*sh)[NWARP], double* root, int* niter, int* conv, int* reason)
 {
@@ -240,7 +432,7 @@ __device__ void getroot(const Ctx& C, double q, double gpos, double gneg, double
     if (q >= gpos || q <= gneg) { *root = CUDART_INF; *niter = 0; *conv = 1; return; }
     double t = 0.0;
     double K1, K2;
-    passK1K2(C, t, q, sh, &K1, &K2);         // K1_eval at init; K2 at the same t for the loop top
+    PK1K2<F32>(C, t, q, sh, &K1, &K2);         // K1_eval at init; K2 at the same t for the loop top
     double prevJump = CUDART_INF;
     int rep = 1;
     int c = 1;
@@ -249,15 +441,16 @@ __device__ void getroot(const Ctx& C, double q, double gpos, double gneg, double
         if (!C.fast && (!isfinite(K2) || fabs(K2) < 1e-15)) { c = 0; *reason = RS_K2_GUARD; break; }
         double tnew = t - K1 / K2;
         if (C.fast ? isnan(tnew) : !isfinite(tnew)) { c = 0; *reason = RS_TNEW; break; }
-        if (fabs(tnew - t) < tol) { c = 1; break; }
+        const double tolE = tolAt<F32>(tol, t, tnew);
+        if (fabs(tnew - t) < tolE) { c = 1; break; }
         if (rep == maxiter) { c = 0; *reason = RS_MAXITER; break; }
         double newK1, newK2;
-        passK1K2(C, tnew, q, sh, &newK1, &newK2);
+        PK1K2<F32>(C, tnew, q, sh, &newK1, &newK2);
         const bool flipped = C.fast ? ((K1 * newK1) < 0) : (sgn(K1) != sgn(newK1));
         if (flipped) {
-            if (fabs(tnew - t) > (prevJump - tol)) {
+            if (fabs(tnew - t) > (prevJump - tolE)) {
                 tnew = t + (double)sgn(newK1 - K1) * prevJump / 2;
-                passK1K2(C, tnew, q, sh, &newK1, &newK2);
+                PK1K2<F32>(C, tnew, q, sh, &newK1, &newK2);
                 prevJump = prevJump / 2;
             } else {
                 prevJump = fabs(tnew - t);
@@ -348,12 +541,21 @@ __device__ void passK0K2x2(const Ctx& C, double t1, double t2, double (*sh)[NWAR
 // root (its own t, K1, K2, prevJump, rep, failure reason), every pass shared.
 // A root finishes when getroot() would have; the other continues alone, its
 // passes then carrying one root's arithmetic.
+template <bool F32>
+__device__ __forceinline__ void PK1K2x2(const Ctx& C, bool e1, double t1, double q1, bool e2, double t2, double q2,
+                                        double (*sh)[NWARP], double* K1a, double* K2a, double* K1b, double* K2b)
+{
+    if constexpr (F32) passK1K2x2_32(C, e1, t1, q1, e2, t2, q2, sh, K1a, K2a, K1b, K2b);
+    else               passK1K2x2(C, e1, t1, q1, e2, t2, q2, sh, K1a, K2a, K1b, K2b);
+}
+
 struct RootSt {
     double q, t, K1, K2, prevJump, tn, nK1, nK2;
     int rep, c, reason;
     bool live, eval, inf;
 };
 
+template <bool F32>
 __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double gneg, double tol, int maxiter,
                          double (*sh)[NWARP],
                          double* root1, int* niter1, int* conv1, int* reason1,
@@ -370,7 +572,7 @@ __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double
         S.live = !S.inf;
     }
     if (R[0].live || R[1].live)
-        passK1K2x2(C, R[0].live, 0.0, q1, R[1].live, 0.0, q2, sh, &R[0].K1, &R[0].K2, &R[1].K1, &R[1].K2);
+        PK1K2x2<F32>(C, R[0].live, 0.0, q1, R[1].live, 0.0, q2, sh, &R[0].K1, &R[0].K2, &R[1].K1, &R[1].K2);
     while (R[0].live || R[1].live) {
         #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -380,12 +582,12 @@ __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double
             if (!C.fast && (!isfinite(S.K2) || fabs(S.K2) < 1e-15)) { S.c = 0; S.reason = RS_K2_GUARD; S.live = false; continue; }
             const double tnew = S.t - S.K1 / S.K2;
             if (C.fast ? isnan(tnew) : !isfinite(tnew)) { S.c = 0; S.reason = RS_TNEW; S.live = false; continue; }
-            if (fabs(tnew - S.t) < tol) { S.c = 1; S.live = false; continue; }
+            if (fabs(tnew - S.t) < tolAt<F32>(tol, S.t, tnew)) { S.c = 1; S.live = false; continue; }
             if (S.rep == maxiter) { S.c = 0; S.reason = RS_MAXITER; S.live = false; continue; }
             S.tn = tnew; S.eval = true;
         }
         if (!(R[0].eval || R[1].eval)) continue;
-        passK1K2x2(C, R[0].eval, R[0].tn, q1, R[1].eval, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
+        PK1K2x2<F32>(C, R[0].eval, R[0].tn, q1, R[1].eval, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
         bool re0 = false, re1 = false;
         #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -393,7 +595,7 @@ __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double
             if (!S.eval) continue;
             const bool flipped = C.fast ? ((S.K1 * S.nK1) < 0) : (sgn(S.K1) != sgn(S.nK1));
             if (flipped) {
-                if (fabs(S.tn - S.t) > (S.prevJump - tol)) {
+                if (fabs(S.tn - S.t) > (S.prevJump - tolAt<F32>(tol, S.t, S.tn))) {
                     S.tn = S.t + (double)sgn(S.nK1 - S.K1) * S.prevJump / 2;
                     if (r == 0) re0 = true; else re1 = true;
                 } else {
@@ -402,7 +604,7 @@ __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double
             }
         }
         if (re0 || re1) {
-            passK1K2x2(C, re0, R[0].tn, q1, re1, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
+            PK1K2x2<F32>(C, re0, R[0].tn, q1, re1, R[1].tn, q2, sh, &R[0].nK1, &R[0].nK2, &R[1].nK1, &R[1].nK2);
             if (re0) R[0].prevJump = R[0].prevJump / 2;
             if (re1) R[1].prevJump = R[1].prevJump / 2;
         }
@@ -421,13 +623,13 @@ __device__ void getroot2(const Ctx& C, double q1, double q2, double gpos, double
 
 // The scalar tail of Get_Saddle_Prob_*_Binom once Korg(zeta) and K2(zeta) are
 // known; shared by the unfused and the fused path.
-__device__ double saddleTail(double zeta, double q, double k1, double k2, int logp, int erfcMode, int* isSaddle)
+// temp1 = zeta q - Korg(zeta); k1fin = isfinite(Korg(zeta)).
+__device__ double saddleTailT(double zeta, double temp1, bool k1fin, double k2, int logp, int erfcMode, int* isSaddle)
 {
-    const double temp1 = zeta * q - k1;
     *isSaddle = 0;
     bool flagrun = false;
     double w = 0.0, v = 0.0;
-    if (isfinite(k1) && isfinite(k2) && temp1 >= 0 && k2 >= 0) {
+    if (k1fin && isfinite(k2) && temp1 >= 0 && k2 >= 0) {
         w = (double)sgn(zeta) * sqrt(2 * temp1);
         v = zeta * sqrt(k2);
         if (w != 0) flagrun = true;
@@ -446,27 +648,50 @@ __device__ double saddleTail(double zeta, double q, double k1, double k2, int lo
         return -pval0;
     }
 }
+__device__ __forceinline__ double saddleTail(double zeta, double q, double k1, double k2, int logp, int erfcMode, int* isSaddle)
+{
+    return saddleTailT(zeta, zeta * q - k1, isfinite(k1), k2, logp, erfcMode, isSaddle);
+}
+// fp32: H = K(zeta) - zeta m1, so zeta q - K(zeta) = zeta (q - m1) - H in double.
+__device__ __forceinline__ double saddleTail32(const Ctx& C, double zeta, double q, double H, double k2, int logp,
+                                               int erfcMode, int* isSaddle)
+{
+    return saddleTailT(zeta, zeta * (q - C.m1) - H, isfinite(H), k2, logp, erfcMode, isSaddle);
+}
 
 // Get_Saddle_Prob_Binom / Get_Saddle_Prob_fast_Binom.
+template <bool F32>
 __device__ double saddle(const Ctx& C, double zeta, double q, int logp, int erfcMode,
                          double (*sh)[NWARP], int* isSaddle)
 {
     double k1, k2;
-    passK0K2(C, zeta, sh, &k1, &k2);
-    return saddleTail(zeta, q, k1, k2, logp, erfcMode, isSaddle);
+    if constexpr (F32) {
+        passK0K2_32(C, zeta, sh, &k1, &k2);
+        return saddleTail32(C, zeta, q, k1, k2, logp, erfcMode, isSaddle);
+    } else {
+        passK0K2(C, zeta, sh, &k1, &k2);
+        return saddleTail(zeta, q, k1, k2, logp, erfcMode, isSaddle);
+    }
 }
 
 // Both tails of a pair from one pass (fusedRoots).
+template <bool F32>
 __device__ void saddle2(const Ctx& C, double z1, double q1, double z2, double q2, int logp, int erfcMode,
                         double (*sh)[NWARP], double* p1, int* s1, double* p2, int* s2)
 {
     double k1a, k2a, k1b, k2b;
-    passK0K2x2(C, z1, z2, sh, &k1a, &k2a, &k1b, &k2b);
-    *p1 = saddleTail(z1, q1, k1a, k2a, logp, erfcMode, s1);
-    *p2 = saddleTail(z2, q2, k1b, k2b, logp, erfcMode, s2);
+    if constexpr (F32) {
+        passK0K2x2_32(C, z1, z2, sh, &k1a, &k2a, &k1b, &k2b);
+        *p1 = saddleTail32(C, z1, q1, k1a, k2a, logp, erfcMode, s1);
+        *p2 = saddleTail32(C, z2, q2, k1b, k2b, logp, erfcMode, s2);
+    } else {
+        passK0K2x2(C, z1, z2, sh, &k1a, &k2a, &k1b, &k2b);
+        *p1 = saddleTail(z1, q1, k1a, k2a, logp, erfcMode, s1);
+        *p2 = saddleTail(z2, q2, k1b, k2b, logp, erfcMode, s2);
+    }
 }
 
-template <bool FUSED, bool DYN, bool OWN>
+template <bool FUSED, bool DYN, bool OWN, bool F32>
 __device__ __forceinline__ void spaBody(const KParams& P)
 {
     __shared__ double sh[NACC][NWARP];
@@ -474,6 +699,7 @@ __device__ __forceinline__ void spaBody(const KParams& P)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int N = P.N;
     double2* buf = reinterpret_cast<double2*>(P.scratch) + (std::size_t)blockIdx.x * N;
+    float2* buf32 = reinterpret_cast<float2*>(buf);   // F32: the same region, 8 bytes per entry
     // this warp's contiguous share of the samples (passes A and B)
     const int segLo = (int)(((long long)N * warp) / NWARP);
     const int segHi = (int)(((long long)N * (warp + 1)) / NWARP);
@@ -551,7 +777,8 @@ __device__ __forceinline__ void spaBody(const KParams& P)
 
         // ---- pass B: g~, its positive / negative sums, m1, the fast variant's
         //      carrier sums; store (g~, mu)
-        double s[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // gpos, gneg, m1, sum_c g~ mu, sum_c mu(1-mu) g~^2
+        double s[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};   // gpos, gneg, m1, sum_c g~ mu, sum_c mu(1-mu) g~^2,
+                                                        // F32: sum of mu g~ over the stored float entries
         int base = wbase;
         for (int i0 = segLo; i0 < segHi; i0 += 32) {
             const int i = i0 + lane;
@@ -568,6 +795,22 @@ __device__ __forceinline__ void spaBody(const KParams& P)
                 s[2] += m * v;
                 if (g != 0.0) { s[3] += v * m; s[4] += m * (1 - m) * (v * v); }
             }
+            if constexpr (F32) {
+                // (s g~, s min(mu, 1 - mu)), s = -1 where mu > 1/2 (see terms32)
+                const float2 e32 = (m > 0.5) ? make_float2((float)(-v), -(float)(1.0 - m))
+                                             : make_float2((float)v, (float)m);
+                // mu g~ as the stored floats give it back (unflipped), for the centring
+                const double mgf = (m > 0.5) ? (1.0 + (double)e32.y) * -(double)e32.x : (double)e32.y * (double)e32.x;
+                if (valid && (!fast || g != 0.0)) s[5] += mgf;
+                if (!fast) {
+                    if (valid) buf32[i] = e32;
+                } else {
+                    const bool carrier = valid && (g != 0.0);
+                    const unsigned mask = __ballot_sync(0xffffffffu, carrier);
+                    if (carrier) buf32[base + __popc(mask & ((1u << lane) - 1u))] = e32;
+                    base += __popc(mask);
+                }
+            } else {
             if (!fast) {
                 if (valid) buf[i] = make_double2(v, m);
             } else {
@@ -576,8 +819,10 @@ __device__ __forceinline__ void spaBody(const KParams& P)
                 if (carrier) buf[base + __popc(mask & ((1u << lane) - 1u))] = make_double2(v, m);
                 base += __popc(mask);
             }
+            }
         }
-        blockReduce<5>(s, sh);
+        if constexpr (F32) blockReduce<6>(s, sh);
+        else               blockReduce<5>(*reinterpret_cast<double(*)[5]>(s), sh);
         __syncthreads();   // buf complete before the passes read it
         const double gpos = s[0], gneg = s[1], m1 = s[2];
 
@@ -585,6 +830,12 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         C.buf = buf; C.nEff = fast ? nnz : N; C.fast = fast;
         C.NAmu    = fast ? (m1 - s[3]) : 0.0;           // NAmu = m1 - dot(gNB, muNB)
         C.NAsigma = fast ? (pin.var2 - s[4]) : 0.0;     // NAsigma = var2 - sum(muNB % (1-muNB) % pow(gNB,2))
+        // F32 centring: K'(t) and K(t) - t m1 are split around the m1 of the
+        // values the float passes actually read (rounded g~, mu), so the
+        // rounding of the inputs does not leak into K' - q and zeta q - K at
+        // the size eps_float sum |mu g~|. Fast: the non-carriers' NAmu + the
+        // stored carriers' sum.
+        C.buf32 = buf32; C.m1 = fast ? (C.NAmu + s[5]) : s[5];
 
         // q, qinv as getMarkerPval forms them for a binary trait
         const double q = pin.Tstat / sqrt(pin.var1 / pin.var2) + m1;
@@ -596,10 +847,10 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         unsigned status = (fast ? ST_FAST : 0u) | (pin.logp ? ST_LOGP : 0u);
         double r1, r2; int n1, n2, c1, c2, rs1, rs2;
         if (FUSED) {
-            getroot2(C, q, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1, &r2, &n2, &c2, &rs2);
+            getroot2<F32>(C, q, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1, &r2, &n2, &c2, &rs2);
         } else {
-            getroot(C, q,    gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1);
-            getroot(C, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r2, &n2, &c2, &rs2);
+            getroot<F32>(C, q,    gpos, gneg, P.tol, P.maxiter, sh, &r1, &n1, &c1, &rs1);
+            getroot<F32>(C, qinv, gpos, gneg, P.tol, P.maxiter, sh, &r2, &n2, &c2, &rs2);
         }
         if (n1 == 0 && isinf(r1)) status |= ST_ROOT1_INF;
         if (n2 == 0 && isinf(r2)) status |= ST_ROOT2_INF;
@@ -610,10 +861,10 @@ __device__ __forceinline__ void spaBody(const KParams& P)
         if (c1 && c2) {
             // spa.cpp SPA / SPA_fast: a tail that is not a saddle withdraws convergence
             if (FUSED) {
-                saddle2(C, r1, q, r2, qinv, pin.logp, P.erfcMode, sh, &p1, &s1, &p2, &s2);
+                saddle2<F32>(C, r1, q, r2, qinv, pin.logp, P.erfcMode, sh, &p1, &s1, &p2, &s2);
             } else {
-                p1 = saddle(C, r1, q,    pin.logp, P.erfcMode, sh, &s1);
-                p2 = saddle(C, r2, qinv, pin.logp, P.erfcMode, sh, &s2);
+                p1 = saddle<F32>(C, r1, q,    pin.logp, P.erfcMode, sh, &s1);
+                p2 = saddle<F32>(C, r2, qinv, pin.logp, P.erfcMode, sh, &s2);
             }
             conv = 1;
             if (!s1) { conv = 0; status |= ST_SADDLE1_FAIL; p1 = pin.logp ? pin.pno - LOG2 : pin.pno / 2; }
@@ -641,32 +892,33 @@ __device__ __forceinline__ void spaBody(const KParams& P)
 // 1..4: __launch_bounds__(NT, MINB). An explicit 1 is NOT the same as no hint:
 // ptxas then takes 162 registers for the unfused kernel (1 block per SM).
 // 2 / 3 / 4 cap the registers at 128 / 80 / 64 and spill the rest.
-template <bool FUSED, bool DYN, bool OWN>
-__global__ void __launch_bounds__(NT) spaKernel0(const KParams P) { spaBody<FUSED, DYN, OWN>(P); }
-template <bool FUSED, bool DYN, int MINB, bool OWN>
-__global__ void __launch_bounds__(NT, MINB) spaKernel(const KParams P) { spaBody<FUSED, DYN, OWN>(P); }
+template <bool FUSED, bool DYN, bool OWN, bool F32>
+__global__ void __launch_bounds__(NT) spaKernel0(const KParams P) { spaBody<FUSED, DYN, OWN, F32>(P); }
+template <bool FUSED, bool DYN, int MINB, bool OWN, bool F32>
+__global__ void __launch_bounds__(NT, MINB) spaKernel(const KParams P) { spaBody<FUSED, DYN, OWN, F32>(P); }
 
-template <bool F, bool D, bool O>
+template <bool F, bool D, bool O, bool F32>
 void launchSpaM(int minb, int grid, cudaStream_t st, const KParams& P)
 {
     switch (minb) {
-        case 1:  spaKernel<F, D, 1, O><<<grid, NT, 0, st>>>(P); break;
-        case 2:  spaKernel<F, D, 2, O><<<grid, NT, 0, st>>>(P); break;
-        case 3:  spaKernel<F, D, 3, O><<<grid, NT, 0, st>>>(P); break;
-        case 4:  spaKernel<F, D, 4, O><<<grid, NT, 0, st>>>(P); break;
-        default: spaKernel0<F, D, O><<<grid, NT, 0, st>>>(P); break;
+        case 1:  spaKernel<F, D, 1, O, F32><<<grid, NT, 0, st>>>(P); break;
+        case 2:  spaKernel<F, D, 2, O, F32><<<grid, NT, 0, st>>>(P); break;
+        case 3:  spaKernel<F, D, 3, O, F32><<<grid, NT, 0, st>>>(P); break;
+        case 4:  spaKernel<F, D, 4, O, F32><<<grid, NT, 0, st>>>(P); break;
+        default: spaKernel0<F, D, O, F32><<<grid, NT, 0, st>>>(P); break;
     }
 }
-template <bool O>
+template <bool O, bool F32>
 void launchSpaO(int fused, int dyn, int minb, int grid, cudaStream_t st, const KParams& P)
 {
-    if (fused) { if (dyn) launchSpaM<true, true, O>(minb, grid, st, P);  else launchSpaM<true, false, O>(minb, grid, st, P); }
-    else       { if (dyn) launchSpaM<false, true, O>(minb, grid, st, P); else launchSpaM<false, false, O>(minb, grid, st, P); }
+    if (fused) { if (dyn) launchSpaM<true, true, O, F32>(minb, grid, st, P);  else launchSpaM<true, false, O, F32>(minb, grid, st, P); }
+    else       { if (dyn) launchSpaM<false, true, O, F32>(minb, grid, st, P); else launchSpaM<false, false, O, F32>(minb, grid, st, P); }
 }
+template <bool F32>
 void launchSpa(int fused, int dyn, int minb, int own, int grid, cudaStream_t st, const KParams& P)
 {
-    if (own) launchSpaO<true>(fused, dyn, minb, grid, st, P);
-    else     launchSpaO<false>(fused, dyn, minb, grid, st, P);
+    if (own) launchSpaO<true, F32>(fused, dyn, minb, grid, st, P);
+    else     launchSpaO<false, F32>(fused, dyn, minb, grid, st, P);
 }
 
 __global__ void erfcDebugKernel(const double* z, int n, double* a, double* b, double* c)
@@ -715,9 +967,7 @@ bool supports(saige::gpu2::Prec t_p)
 {
     switch (t_p) {
         case saige::gpu2::Prec::FP64: return true;
-        // TODO(precision:SPA): return true once the fp32 kernel is plugged in
-        // at the launch in run().
-        case saige::gpu2::Prec::FP32: return false;
+        case saige::gpu2::Prec::FP32: return true;    // spaBody<.., F32 = true>
         case saige::gpu2::Prec::INT8: return false;   // not a mode of this stage
     }
     return false;
@@ -901,12 +1151,14 @@ bool run(Spa* s, const Geno& geno, int nPairs)
     // ---- precision dispatch: the kernel variant ----
     switch (s->prec) {
         case saige::gpu2::Prec::FP64:
-            launchSpa(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
+            launchSpa<false>(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
+            break;
+        case saige::gpu2::Prec::FP32:
+            // Newton tolerance: the caller's, floored at kTolFp32 (spa_gpu.hpp).
+            if (P.tol < kTolFp32) P.tol = kTolFp32;
+            launchSpa<true>(s->fused, s->dyn, s->minb, s->own, grid, s->st, P);
             break;
         default:
-            // TODO(precision:SPA): launch the fp32 kernel here. It reads the
-            // same P (scratch, tables, pair table) and writes the same PairOut
-            // doubles (see the contract in spa_gpu.hpp).
             g_lastErr = std::string("run: SPA precision ") + saige::gpu2::precName(s->prec) + " has no kernel";
             return false;
     }

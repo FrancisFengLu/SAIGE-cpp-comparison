@@ -241,7 +241,7 @@ gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 # The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU
 # build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /
 # log bound and the difference in speed is not measurable.
-gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
+gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp gpu/spa_gpu/spa_fp32_terms.cuh
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # Firth on the device (gpu/gpu_firth.hpp, config key gpuFirth): the same
@@ -270,7 +270,7 @@ tools/er_gpu_check: tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ)
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
 # Boost's 53-bit erfc with the underflow deferred. Config key gpuSpaImpl picks
 # it (lib, the default) or gpu_spa.cu (own).
-gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp gpu/gpu_precision.hpp
+gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp gpu/spa_gpu/spa_fp32_terms.cuh gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 clean:
