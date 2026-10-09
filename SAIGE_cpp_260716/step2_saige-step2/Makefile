@@ -222,6 +222,12 @@ tools/out_fieldcmp: tools/out_fieldcmp.cpp
 tools/spa_gpu_check: tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/spa_gpu_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -o $@
 
+# gpuPrecisionSPA fp32 against fp64, pair by pair, for both device SPA
+# implementations (lib and own), the CPU SPA alongside (USE_CUDA=1 only).
+#   make USE_CUDA=1 SM=70 gpu/spa_gpu/spa_fp32_check
+gpu/spa_gpu/spa_fp32_check: gpu/spa_gpu/spa_fp32_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) gpu/spa_gpu/spa_fp32_check.cpp $(filter-out main.o,$(OBJECTS)) $(PGENLIB_OBJ) $(GPU_OBJ) $(LIBS) -o $@
+
 # Accuracy + cost of score_vec.hpp's chi-square(1) tail against boost's.
 tools/mtvec_tail_accuracy: tools/mtvec_tail_accuracy.cpp score_vec.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tools/mtvec_tail_accuracy.cpp $(filter -lmvec,$(LIBS)) -o $@
@@ -247,7 +253,7 @@ gpu/scan_prec_test: gpu/scan_prec_test.cpp gpu/gpu_step2.hpp gpu/gpu_step2.cu.o
 # The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU
 # build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /
 # log bound and the difference in speed is not measurable.
-gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
+gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp gpu/spa_gpu/spa_fp32_terms.cuh
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # Firth on the device (gpu/gpu_firth.hpp, config key gpuFirth): the same
@@ -285,12 +291,13 @@ gpu/er_tools/er_fp32_check: gpu/er_tools/er_fp32_check.cpp er_binary.o $(GPU_OBJ
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
 # Boost's 53-bit erfc with the underflow deferred. Config key gpuSpaImpl picks
 # it (lib, the default) or gpu_spa.cu (own).
-gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp gpu/gpu_precision.hpp
+gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa_gpu/erfc_boost53.cuh gpu/spa_gpu/erfc_boost53_consts.hpp gpu/spa_gpu/spa_fp32_terms.cuh gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 clean:
 	rm -f $(OBJECTS) $(PGENLIB_OBJ) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
-	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check gpu/er_tools/er_fp32_check
+	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check gpu/er_tools/er_fp32_check \
+	      gpu/spa_gpu/spa_fp32_check gpu/scan_prec_test
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml

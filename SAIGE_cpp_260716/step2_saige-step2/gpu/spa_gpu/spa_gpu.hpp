@@ -53,7 +53,8 @@
 //     the difference (SPA_GPU_LIB.md section 4);
 //   * K2's sum skips non-finite terms like sum_arma1 does; Korg and K1 keep
 //     them like arma::sum does.
-// fp64 throughout: in fp32 the squared denominator of K2 underflows.
+// fp64 throughout (FP64): in plain fp32 the squared denominator of K2
+// underflows; the FP32 variant below avoids it by rewriting the terms.
 //
 // What stays on the host, after run(): the quantile step that turns the SPA
 // p-value into seBeta (and can itself withdraw convergence), the p == 0 rule,
@@ -72,6 +73,38 @@
 // they mean in fp64. The host post-rules (quantile step, p == 0, the Firth
 // decision, the formatting) read those doubles unchanged and do not know which
 // mode ran.
+//
+// FP32 (spa_gpu.cu, "fp32 variant"): same control flow, same block per pair,
+// same fused / dynamic / ownSamples / occupancy options. Float: the per-sample
+// work of the Newton and tail passes (exp, expm1, log1p, the K', K'', K sums).
+// Double: passes A and B (g~, gpos / gneg, m1, NAmu / NAsigma, nnz, the
+// variant choice), the Newton scalars, the block reduction and the whole
+// saddlepoint tail (w, v, Ztest, the erfc port, the log domain), so a p-value
+// cannot underflow because of float. Safeguards:
+//   * centred sums: the passes return K' - m1 and K - t m1, and K' - q,
+//     zeta q - K are formed in double from them and q - m1 -- no difference
+//     of two large float numbers;
+//   * only exp(-|g~ t|) <= 1 is formed per term (p, 1 - p, p - mu and
+//     log(1 - mu + mu e^x) - mu x via expm1 / log1p), so float never
+//     overflows; mu is stored as min(mu, 1 - mu) with g~ negated when
+//     mu > 1/2 (each term is invariant under that), so 1 - mu is exact enough
+//     for mu near 1;
+//   * per-thread sums are Neumaier-compensated floats, read out in double;
+//   * g~ t is formed as g~ th + g~ tl with t = th + tl split into two floats,
+//     so a large t is not rounded to float before the product;
+//   * Newton tolerance: max(tol, 1e-5, 2^-17 max(|t|, |tnew|)) (kTolFp32,
+//     kRelTolFp32), used for both the |dt| test and the prevJump test. The
+//     default tol, eps^(1/4) = 1.2e-4, is what decides almost every pair; the
+//     relative term takes over only for |t| > ~16 and exists because the
+//     float sums resolve a Newton step to about 1e-7 |t|: roots of 1e3 .. 1e5
+//     occur for very rare markers (full-N variant, sparse GRM) and would
+//     otherwise run to maxiter. maxiter still bounds the loop. The root error
+//     this allows does not reach p at first order (zeta q - K is stationary at
+//     the root).
+//   * fp64's overflow of exp(g~ t) in Korg (g~ t > 709.78), which makes a tail
+//     "not a saddle" in SAIGE, is reproduced as Korg = +inf, so the route
+//     (Is.SPA) is fp64's.
+// The fp64 path's arithmetic is unchanged by the variant (bit for bit).
 #pragma once
 
 #include <cstddef>

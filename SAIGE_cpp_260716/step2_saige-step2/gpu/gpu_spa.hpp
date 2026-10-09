@@ -55,6 +55,11 @@
 // back as double (the fp32 value converted), conv / s1 / s2 / niter mean what
 // they mean in fp64 -- so the host post-rules read them unchanged. Same
 // contract as spa_gpu/spa_gpu.hpp (gpuSpaImpl: lib, the default).
+// FP32 is the library's fp32 design (spa_gpu/spa_gpu.hpp): float per-sample
+// work in kpass with centred sums, overflow-free terms and compensated
+// per-thread sums; g~ t from a two-float split of t; g~, m1, the Newton
+// scalars and the tail in double; fp64's Korg overflow (g~ t > 709.78, "not a
+// saddle") reproduced; Newton tolerance max(tol, 1e-5, 2^-17 max(|t|, |tnew|)).
 #pragma once
 
 #include <cstddef>

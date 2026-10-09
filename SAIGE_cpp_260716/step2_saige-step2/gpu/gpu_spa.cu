@@ -7,6 +7,7 @@
 
 #include "gpu_spa.hpp"
 #include "gpu_step2.hpp"
+#include "spa_gpu/spa_fp32_terms.cuh"
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -66,6 +67,10 @@ struct PairCtx {
     int N;
     int fast;
     double NAmu, NAsigma;
+    // fp32 variant only: (s g~, s min(mu, 1 - mu)) per sample, s = -1 where
+    // mu > 1/2, and the m1 of those stored floats, for centring (see kpass32).
+    const float2* gt32;
+    double m1;
 };
 
 // mode 0: K1 sum  sum mu g~ / ((1-mu) e^{-g~ t} + mu)           (+ NAmu + NAsigma t)
@@ -98,29 +103,100 @@ __device__ double kpass(int mode, double t, const PairCtx& P, double* sh)
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// fp32 variant (gpuPrecisionSPA: fp32, gpuSpaImpl: own). Same passes, same
+// Newton loop; the per-sample work of kpass runs in float and the sums are
+// centred so the large cancellations happen in double (the same rewrite as
+// spa_gpu/spa_gpu.cu's fp32 variant, where it is derived):
+//   mode 0: sum g~ (p - mu)            (+ NAsigma t)          = K1 - m1
+//   mode 1: sum g~^2 p (1 - p)         (+ NAsigma)            = K2
+//   mode 2: sum log(1-mu+mu e^x) - mu x (+ NAsigma t^2 / 2)   = Korg - t m1
+// with x = g~ t, p = mu e^x / (1 - mu + mu e^x); only exp(-|x|) <= 1 is
+// formed, so nothing overflows float. Stored mu is min(mu, 1 - mu), negative
+// when flipped. fp64's own overflow of Korg (exp(g~ t) = inf for
+// g~ t > 709.78, which makes the tail "not a saddle") is reproduced: mode 2
+// returns +inf then. Per-thread sums are Neumaier-compensated floats, finished
+// in double; the block sum is the fp64 one.
+// ---------------------------------------------------------------------------
+using spa_fp32::NSum;
+
+__device__ double kpass32(int mode, double t, const PairCtx& P, double* sh)
+{
+    NSum acc;
+    bool inf = false;
+    const float th = (float)t, tl = (float)(t - (double)th);   // t = th + tl: g~ t to float precision
+    for (int i = threadIdx.x; i < P.N; i += NT) {
+        if (P.fast && dose(P.col, P.L, i) == 0.0) continue;
+        const float2 e2 = P.gt32[i];
+        const float g = e2.x, m = fabsf(e2.y), a = 1.0f - m;   // m <= 1/2
+        const float x = g * th + g * tl;
+        if (mode == 2 && (signbit(e2.y) ? -x : x) > 709.782712893384f) inf = true;   // fp64 exp overflow
+        float p, q, pm, h = 0.0f;
+        if (x >= 0.0f) {
+            const float e = expf(-x), em = expm1f(-x);
+            const float den = a * e + m;
+            p = m / den; q = (a * e) / den; pm = -(m * a * em) / den;
+            if (mode == 2) h = spa_fp32::hTerm(m, a, x, em);
+        } else {
+            const float e = expf(x), em = expm1f(x);
+            const float den = a + m * e;
+            p = (m * e) / den; q = a / den; pm = (m * a * em) / den;
+            if (mode == 2) h = spa_fp32::hTerm(m, a, x, 0.0f);
+        }
+        if (mode == 0) {
+            acc.add(g * pm);
+        } else if (mode == 1) {
+            const float term = (g * g) * (p * q);
+            if (isfinite(term)) acc.add(term);
+        } else {
+            acc.add(h);
+        }
+    }
+    double s = blockSum((mode == 2 && inf) ? CUDART_INF : acc.val(), sh);
+    if (P.fast) {
+        if (mode == 0)      s += P.NAsigma * t;
+        else if (mode == 1) s += P.NAsigma;
+        else                s += 0.5 * P.NAsigma * t * t;
+    }
+    return s;
+}
+
+// The pass of the chosen arithmetic. Modes 0 and 2 return K1 - m1 and
+// Korg - t m1 in fp32 (centred), K1 and Korg in fp64.
+template <bool F32>
+__device__ __forceinline__ double kp(int mode, double t, const PairCtx& P, double* sh)
+{
+    if constexpr (F32) return kpass32(mode, t, P, sh); else return kpass(mode, t, P, sh);
+}
+
 // getroot_K1_Binom (fast == 0) / getroot_K1_fast_Binom (fast == 1), from init 0.
+// F32: K1 is formed as (K1 - m1) - (q - m1).
+template <bool F32>
 __device__ void getroot(const PairCtx& P, double q, double gpos, double gneg, double tol, int maxiter,
                         double* sh, double* root, int* niter, int* conv)
 {
     if (q >= gpos || q <= gneg) { *root = CUDART_INF; *niter = 0; *conv = 1; return; }
+    const double qc = F32 ? q - P.m1 : q;   // what the pass's sum is compared with
     double t = 0.0;
-    double K1 = kpass(0, t, P, sh) - q;
+    double K1 = kp<F32>(0, t, P, sh) - qc;
     double prevJump = CUDART_INF;
     int rep = 1, c = 1;
     double tnew = t, newK1 = K1;
     while (rep <= maxiter) {
-        const double K2 = kpass(1, t, P, sh);
+        const double K2 = kp<F32>(1, t, P, sh);
         if (!P.fast && (!isfinite(K2) || fabs(K2) < 1e-15)) { c = 0; break; }   // non-fast only
         tnew = t - K1 / K2;
         if (P.fast ? isnan(tnew) : !isfinite(tnew)) { c = 0; break; }
-        if (fabs(tnew - t) < tol) { c = 1; break; }
+        // fp32: max(tol, 2^-17 max(|t|, |tnew|)) -- see gpu_spa.hpp
+        const double tolE = F32 ? fmax(tol, (1.0 / 131072) * fmax(fabs(t), fabs(tnew))) : tol;
+        if (fabs(tnew - t) < tolE) { c = 1; break; }
         if (rep == maxiter) { c = 0; break; }
-        newK1 = kpass(0, tnew, P, sh) - q;
+        newK1 = kp<F32>(0, tnew, P, sh) - qc;
         const bool flipped = P.fast ? ((K1 * newK1) < 0) : (sgn(K1) != sgn(newK1));
         if (flipped) {
-            if (fabs(tnew - t) > (prevJump - tol)) {
+            if (fabs(tnew - t) > (prevJump - tolE)) {
                 tnew = t + (double)sgn(newK1 - K1) * prevJump / 2.0;
-                newK1 = kpass(0, tnew, P, sh) - q;
+                newK1 = kp<F32>(0, tnew, P, sh) - qc;
                 prevJump = prevJump / 2.0;
             } else {
                 prevJump = fabs(tnew - t);
@@ -136,12 +212,14 @@ __device__ void getroot(const PairCtx& P, double q, double gpos, double gneg, do
 __device__ __forceinline__ double PhiUpper(double z) { return 0.5 * erfc(z / sqrt(2.0)); }
 __device__ __forceinline__ double PhiLower(double z) { return 0.5 * erfc(-z / sqrt(2.0)); }
 
-// Get_Saddle_Prob_Binom / Get_Saddle_Prob_fast_Binom.
+// Get_Saddle_Prob_Binom / Get_Saddle_Prob_fast_Binom. F32: k1 = Korg - zeta m1,
+// so temp1 = zeta (q - m1) - k1, in double.
+template <bool F32>
 __device__ double saddle(const PairCtx& P, double zeta, double q, int logp, double* sh, int* isSaddle)
 {
-    const double k1 = kpass(2, zeta, P, sh);
-    const double k2 = kpass(1, zeta, P, sh);
-    const double temp1 = zeta * q - k1;
+    const double k1 = kp<F32>(2, zeta, P, sh);
+    const double k2 = kp<F32>(1, zeta, P, sh);
+    const double temp1 = F32 ? zeta * (q - P.m1) - k1 : zeta * q - k1;
     *isSaddle = 0;
     bool flagrun = false;
     double w = 0.0, v = 0.0;
@@ -166,6 +244,7 @@ __device__ __forceinline__ double addLogp(double p1, double p2)   // UTIL.cpp ad
     return mx + log(1.0 + exp(mn - mx));
 }
 
+template <bool F32>
 __global__ void __launch_bounds__(NT)
 spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const double* __restrict__ lut, int N,
           const double* __restrict__ MU, const double* __restrict__ XV, const double* __restrict__ XX,
@@ -209,13 +288,23 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
 
         // pass B: g~ = g - XXVX_inv b; gpos / gneg; m1; the fast variant's
         // carrier sums.
-        double ap = 0.0, an = 0.0, m1 = 0.0, nbmu = 0.0, nbsig = 0.0;
+        double ap = 0.0, an = 0.0, m1 = 0.0, nbmu = 0.0, nbsig = 0.0, m1f = 0.0;
         for (int i = threadIdx.x; i < N; i += NT) {
             const double g = dose(P.col, P.L, i);
             double proj = 0.0;
             for (int j = 0; j < p; ++j) proj += xx[(std::size_t)j * N + i] * bsh[j];
             const double v = g - proj;
-            gt[i] = v;
+            if constexpr (F32) {
+                const double mu_i = P.mu[i];
+                const float2 e = (mu_i > 0.5) ? make_float2((float)(-v), -(float)(1.0 - mu_i))
+                                              : make_float2((float)v, (float)mu_i);
+                reinterpret_cast<float2*>(gt)[i] = e;
+                // mu g~ as the stored floats give it back, for the centring
+                if (!P.fast || g != 0.0)
+                    m1f += (mu_i > 0.5) ? (1.0 + (double)e.y) * -(double)e.x : (double)e.y * (double)e.x;
+            } else {
+                gt[i] = v;
+            }
             if (v > 0) ap += v; else if (v < 0) an += v;
             const double m = P.mu[i];
             m1 += m * v;
@@ -228,6 +317,13 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
         nbsig = blockSum(nbsig, sh);
         P.NAmu = m1 - nbmu;
         P.NAsigma = pin.var2 - nbsig;
+        P.gt32 = reinterpret_cast<const float2*>(gt);
+        if constexpr (F32) {
+            // centre on the m1 of the stored floats (fast: + the non-carriers'
+            // NAmu), so input rounding does not leak into K1 - q, zeta q - Korg
+            m1f  = blockSum(m1f, sh);
+            P.m1 = P.fast ? P.NAmu + m1f : m1f;
+        }
 
         // q, qinv as getMarkerPval forms them for a binary trait
         const double q = pin.Tstat / sqrt(pin.var1 / pin.var2) + m1;
@@ -237,12 +333,12 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
         else                    qinv = fabs(q - m1) + m1;
 
         double r1, r2; int n1, n2, c1, c2, s1 = -1, s2 = -1, conv = 0; double pv;
-        getroot(P, q,    gpos, gneg, tol, maxiter, sh, &r1, &n1, &c1);
-        getroot(P, qinv, gpos, gneg, tol, maxiter, sh, &r2, &n2, &c2);
+        getroot<F32>(P, q,    gpos, gneg, tol, maxiter, sh, &r1, &n1, &c1);
+        getroot<F32>(P, qinv, gpos, gneg, tol, maxiter, sh, &r2, &n2, &c2);
         if (c1 && c2) {
             // spa.cpp SPA / SPA_fast: a non-saddle tail withdraws convergence
-            double p1 = saddle(P, r1, q,    pin.logp, sh, &s1);
-            double p2 = saddle(P, r2, qinv, pin.logp, sh, &s2);
+            double p1 = saddle<F32>(P, r1, q,    pin.logp, sh, &s1);
+            double p2 = saddle<F32>(P, r2, qinv, pin.logp, sh, &s2);
             conv = 1;
             if (!s1) { conv = 0; p1 = pin.logp ? pin.pno - log(2.0) : pin.pno / 2; }
             if (!s2) { conv = 0; p2 = pin.logp ? pin.pno - log(2.0) : pin.pno / 2; }
@@ -285,9 +381,7 @@ bool spaSupports(Prec t_p)
 {
     switch (t_p) {
         case Prec::FP64: return true;
-        // TODO(precision:SPA): gpuSpaImpl: own in fp32 -- return true once the
-        // variant is plugged in at the launch in spaRun().
-        case Prec::FP32: return false;
+        case Prec::FP32: return true;    // spa_pairs<true>
         case Prec::INT8: return false;   // not a mode of this stage
     }
     return false;
@@ -386,11 +480,14 @@ bool spaRun(Spa* s, const Reducer* r, int nPairs, int t_devSet)
     CKS(cudaEventRecord(s->e0, s->st));
     // ---- precision dispatch: the kernel variant ----
     if (s->prec == Prec::FP64) {
-        spa_pairs<<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
+        spa_pairs<false><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
                                           s->traitStride, s->dIn, nPairs, s->dScratch, s->tol, s->maxiter, s->dOut);
+    } else if (s->prec == Prec::FP32) {
+        // Newton tolerance: the caller's, floored at 1e-5 (gpu_spa.hpp).
+        const double tol32 = s->tol < 1e-5 ? 1e-5 : s->tol;
+        spa_pairs<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dMu, s->dXV, s->dXX, s->dP,
+                                                s->traitStride, s->dIn, nPairs, s->dScratch, tol32, s->maxiter, s->dOut);
     } else {
-        // TODO(precision:SPA): the fp32 variant of spa_pairs, writing the same
-        // SpaPairOut doubles.
         lastErrSpa = std::string("SPA precision ") + precName(s->prec) + " has no kernel";
         return false;
     }
