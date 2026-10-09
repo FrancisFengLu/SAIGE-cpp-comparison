@@ -377,8 +377,9 @@ fp64 / fp32 / int8), SPA, the exact test (ER) and Firth (`gpuPrecisionSPA`,
 everywhere, which is what every other block runs. Whether the other modes are
 faster depends on the card: on V100 / A100 / H100 fp64 runs at half the fp32
 rate, on most other cards (L4, A10, T4, consumer cards) at 1/32 to 1/64, and
-int8 tensor cores exist from Turing (T4) on. So we need the timings from your
-GPU.
+int8 tensor cores exist from Turing (T4) on. On V100 the fp32 / int8 modes are
+not faster (SPA fp32 is slower than fp64); they are meant for weak-fp64 cards.
+So we need the timings from your GPU.
 
 The block runs the same configuration (full GRM, Firth on, P = top level,
 `.bed` genotypes) eight times:
@@ -586,7 +587,7 @@ On GCP n1-standard-8 (8 vCPU, 30 GB), Tesla V100 16 GB, CUDA 12.9, commit
   component), the GPU runs with fast test off fell back to the CPU path
   (`gpu_refused`), and our sparse-GRM results were then byte-identical to R.
 - `cache_evict.py` with `drop_caches`, `fadvise` and `none`, checked with `fincore`.
-- Block `precision` alone (`BLOCKS=precision`, commit `186c15fb`, the
+- Block `precision` alone (`BLOCKS=precision`, commits `186c15fb` and `63a94267`, the
   rehearsal cohort's step-1 models, P = 8, `CACHE_MODE=fadvise`): 8 runs,
   7 comparisons with all-fp64 in `compare_precision/` and the `vs_fp64_*`
   columns of `summary.csv`, result files and route records deleted after the

@@ -121,9 +121,12 @@ What the modes do (every stage hands its results back in double):
   the results matched fp64 to the printed digits on every test set. The
   sparse-GRM cross terms run in fp64. Needs N < 8,388,608 samples.
 - **SPA `fp32`**: the per-sample sums of the cumulant generating function and
-  its derivatives in fp32 (centred, compensated, overflow-safe forms); Newton
-  scalars, reductions and the whole tail probability in fp64, so p-values do
-  not underflow earlier than in fp64.
+  its derivatives, the projection passes (fp32 copies of the trait-side
+  matrices, float-float for the carriers) and the block reductions in fp32
+  (centred, compensated, overflow-safe forms); the Newton scalars and the whole
+  tail probability in fp64, so p-values do not underflow earlier than in fp64.
+  Needs 8N + 16 x traitStride bytes more device memory per trait (traitStride
+  = the padded trait-side row length), on top of the fp64 tables.
 - **ER `fp32`**: the 2^k enumeration in the log domain in fp32, with the final
   p-value formed in double.
 - **Firth `fp32`**: the per-sample work of each Newton step in fp32 with
@@ -140,11 +143,11 @@ Largest value over all sets:
 |---|---|---|---|---|---|---|
 | scan `fp32` | 1.7e-3 | 1.7e-3 | 1e-5 | 3.7e-5 | 0 / 0 | 0 |
 | scan `int8` | 0 | 0 | 0 | 0 | 0 / 0 | 0 |
-| SPA `fp32` | 1.1e-4 | 1.1e-4 | 0 | 1.2e-5 | 0 / 0 | 0 |
+| SPA `fp32` | 2.7e-4 | 1.2e-4 | 0 | 3.5e-5 | 0 / 0 | 0 |
 | ER `fp32` | 3.9e-6 | 0 | 0 | 9.8e-6 | 0 / 0 | 0 |
 | Firth `fp32` | 0 | 0 | 8e-5 | 1.1e-4 | 0 / 0 | 0 |
 | all `fp32` | 1.6e-3 | 1.6e-3 | 8e-5 | 1.1e-4 | 0 / 0 | 0 |
-| scan `int8`, rest `fp32` | 1.1e-4 | 1.1e-4 | 8e-5 | 1.1e-4 | 0 / 0 | 0 |
+| scan `int8`, rest `fp32` | 2.7e-4 | 1.2e-4 | 8e-5 | 1.1e-4 | 0 / 0 | 0 |
 
 Differences are measured on the printed text output (6-7 significant digits).
 The scan `fp32` maximum sits on SPA-adjusted markers whose score is at the edge
@@ -154,9 +157,13 @@ or below 1.5e-4. Results in any non-fp64 mode are **not**
 byte-identical to the fp64 GPU run, the CPU path or R SAIGE.
 
 Speed: on V100, A100 and H100 fp64 runs at half the fp32 rate, so the low
-precision modes gain little there. Measured on this guide's V100 (200,000
+precision modes do not pay off there: on V100 SPA `fp32` is 30-55% slower than
+SPA `fp64` (it was built to move fp64 work off weak-fp64 cards). **The fp32 and
+int8 modes are meant for weak-fp64 cards only.** Measured on this guide's V100 (200,000
 markers x 50,000 samples, 128 binary traits, Firth on with `pCutoffforFirth: 0.05`,
-1.35 million Firth fits, `outputFormat: sgs`, cold page cache, mean of 2 runs):
+1.35 million Firth fits, `outputFormat: sgs`, cold page cache, mean of 2 runs;
+measured before the SPA projection passes moved to fp32, where SPA took 0.3 s
+of the run):
 
 | Mode | wall | GEMM (device) | Firth + post |
 |---|---|---|---|
