@@ -3313,6 +3313,9 @@ bool mainMarkerMTGpu(
         if (!why.empty()) {
             saige::gpu2::statsDisable(R);
             std::cout << "  gpuDeviceStats: off (" << why << "); the host tail computes every pair" << std::endl;
+            if (!detail1.empty())
+                std::cout << "  gpuDeviceStats: host order probe: XVX Z pattern " << pat.xz << ", S_a'Z pattern " << pat.saz
+                          << ", Hadamard sums " << pat.zxz << " / " << pat.gwz << " (" << detail1 << ")" << std::endl;
         } else {
             devStatsOn = true;
             std::cout << "  gpuDeviceStats: on -- S / var2 / p / gates of " << devTraits.size() << " of " << nBin

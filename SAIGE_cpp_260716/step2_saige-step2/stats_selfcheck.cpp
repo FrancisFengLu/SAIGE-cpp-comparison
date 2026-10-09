@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -124,8 +125,12 @@ inline double zScale(const TraitConst& c)
     s = std::sqrt(s);
     return (s > 1e-300 && std::isfinite(s)) ? 5.0 / s : 1.0;
 }
-// One pair's columns: z, w (p each), gr, g2.
-inline void drawPair(RandCols& rc, const TraitConst& c, double* z, double* w, double& gr, double& g2)
+// One pair's columns: z, w (p each), gr, g2. sMode 0: g'res such that S is of
+// the size of S_a'Z itself, so the last bit of S_a'Z reaches S (that is what
+// tells its contraction order apart; with the model's small S_a a
+// statistic-sized S would swallow it); 1: g'res such that stat = S^2 / var2
+// spans 0 .. ~80 (realistic gates). The probes alternate the two.
+inline void drawPair(RandCols& rc, const TraitConst& c, double* z, double* w, double& gr, double& g2, int sMode)
 {
     const double sZ = zScale(c);
     double xz[saige::gpu2::STATS_PMAX];
@@ -142,7 +147,9 @@ inline void drawPair(RandCols& rc, const TraitConst& c, double* z, double* w, do
     const double zabs = std::fabs(zxz) + 1e-300;
     g2 = zabs * (1.2 + rc.ud(rc.rng));
     const double var2 = g2 - zxz;
-    const double Starget = rc.nd(rc.rng) * std::sqrt(std::fabs(var2)) * (0.5 + 2.5 * rc.ud(rc.rng));
+    const double Starget = (sMode == 0)
+        ? rc.nd(rc.rng) * (std::fabs(saz) + 1e-300) * (0.3 + 3.0 * rc.ud(rc.rng))
+        : rc.nd(rc.rng) * std::sqrt(std::fabs(var2)) * (0.5 + 2.5 * rc.ud(rc.rng));
     gr = saz + Starget * c.tau0;
 }
 
@@ -174,7 +181,7 @@ std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& t
         const TraitMeta& M = ctx.meta[t];
         for (int j = 0; j < B; ++j) {
             double z[saige::gpu2::STATS_PMAX], w[saige::gpu2::STATS_PMAX], gr, g2;
-            drawPair(rc, tc[t], z, w, gr, g2);
+            drawPair(rc, tc[t], z, w, gr, g2, j & 1);
             for (int i = 0; i < M.p; ++i) {
                 scr.Zall(M.colOff + i, j)  = z[i];
                 scr.GWbin(M.binOff + i, j) = w[i];
@@ -220,8 +227,8 @@ std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& t
             }
         }
     }
-    int saz = -1;
-    for (int ps = 0; ps < 5; ++ps) if (mismS[ps] == 0) { saz = ps; break; }
+    int saz = -1, nSaz = 0;
+    for (int ps = 0; ps < 5; ++ps) if (mismS[ps] == 0) { if (saz < 0) saz = ps; ++nSaz; }
     int xz = -1, zxz = -1, gwz = -1;
     for (int px = 0; px < 5 && xz < 0; ++px)
         for (int pz = 0; pz < 2 && xz < 0; ++pz)
@@ -236,6 +243,14 @@ std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& t
     detail = d.str();
     if (saz < 0) return "no candidate order reproduces the host's S_a'Z (" + detail + ")";
     if (xz < 0) return "no candidate order reproduces the host's var2 (" + detail + ")";
+    // p >= 3 separates every candidate on these probes; several matches mean
+    // the probe could not see the last bit, and a guess is not good enough.
+    int nV = 0;
+    for (int px = 0; px < 5; ++px) for (int pz = 0; pz < 2; ++pz) for (int pg = 0; pg < 2; ++pg) if (mismV[px][pz][pg] == 0) ++nV;
+    int pmax = 0;
+    for (int t : traits) pmax = std::max(pmax, ctx.meta[t].p);
+    if (pmax >= 3 && (nSaz > 1 || nV > 1))
+        return "the probe does not separate the candidate orders (" + detail + ")";
     out.saz = saz; out.xz = xz; out.zxz = zxz; out.gwz = gwz;
     return std::string();
 }
@@ -321,7 +336,7 @@ std::string deviceSelfTest(saige::gpu2::Reducer* R, const MTContext& ctx,
         const TraitMeta& M = ctx.meta[t];
         for (int s = 0; s < nS; ++s) {
             double z[saige::gpu2::STATS_PMAX], w[saige::gpu2::STATS_PMAX], gr, g2;
-            drawPair(rc, tc[t], z, w, gr, g2);
+            drawPair(rc, tc[t], z, w, gr, g2, s & 1);
             // a few exactly-degenerate columns too (zero columns, as an unused slot)
             const bool zero = (s % 97 == 5);
             for (int i = 0; i < M.p; ++i) {
@@ -375,8 +390,27 @@ std::string deviceSelfTest(saige::gpu2::Reducer* R, const MTContext& ctx,
             for (int j = 0; j < nb; ++j) {
                 const std::size_t o = (std::size_t)(j0 + j) * ctx.nBin + M.binIdx;
                 ++nPairs;
-                if (!sameBits(dS[o], res.Tstat(j, t))) ++mismS;
-                if (!sameBits(dV[o], res.var2(j, t))) ++mismV;
+                const bool badS = !sameBits(dS[o], res.Tstat(j, t));
+                const bool badV = !sameBits(dV[o], res.var2(j, t));
+                if (badS) ++mismS;
+                if (badV) ++mismV;
+                if ((badS || badV) && std::getenv("SAIGE_DEVSTATS_DEBUG")) {
+                    // the pair's inputs and both results, for a look at the order
+                    std::printf("  devstats mismatch trait %s slot %d:%s%s\n", M.name.c_str(), j0 + j, badS ? " S" : "", badV ? " var2" : "");
+                    std::printf("    tau0 %.17g gr %.17g g2 %.17g vr %.17g\n", M.tau0, C1[(std::size_t)(oR + t) * maxSlots + j0 + j],
+                                C2[(std::size_t)M.binIdx * maxSlots + j0 + j], vr[(std::size_t)(j0 + j) * ctx.nBin + M.binIdx]);
+                    for (int i = 0; i < M.p; ++i)
+                        std::printf("    i %d z %.17g w %.17g Sa %.17g XVX row %.17g %.17g %.17g\n", i,
+                                    C1[(std::size_t)(M.colOff + i) * maxSlots + j0 + j], C1[(std::size_t)(oW + M.binOff + i) * maxSlots + j0 + j],
+                                    tc[t].Sa[i], tc[t].XVX[i * saige::gpu2::STATS_PMAX], tc[t].XVX[i * saige::gpu2::STATS_PMAX + 1],
+                                    M.p > 2 ? tc[t].XVX[i * saige::gpu2::STATS_PMAX + 2] : 0.0);
+                    std::printf("    host S %.17g var2 %.17g | device S %.17g var2 %.17g\n", res.Tstat(j, t), res.var2(j, t), dS[o], dV[o]);
+                    double zz[saige::gpu2::STATS_PMAX];
+                    for (int i = 0; i < M.p; ++i) zz[i] = C1[(std::size_t)(M.colOff + i) * maxSlots + j0 + j];
+                    for (int ps = 0; ps < 5; ++ps)
+                        std::printf("    saz pattern %d -> S %.17g\n", ps,
+                                    (C1[(std::size_t)(oR + t) * maxSlots + j0 + j] - dotPattern(ps, tc[t].Sa, zz, M.p)) / M.tau0);
+                }
                 const unsigned f = dF[o];
                 if (f & STATS_HOST) { ++nHost; ++reason[(f >> STATS_REASON_SHIFT) & 7u]; continue; }
                 ++nGate;
