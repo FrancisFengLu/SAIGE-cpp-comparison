@@ -169,7 +169,7 @@ ifeq ($(USE_CUDA),1)
                 -gencode arch=compute_$(lastword $(sort $(SM))),code=compute_$(lastword $(sort $(SM)))
   endif
   NVCCFLAGS ?= -O3 -std=c++17 $(GPU_ARCH) -lineinfo -Xcompiler -fPIC
-  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o gpu/gpu_sparse.cu.o gpu/gpu_er.cu.o
+  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o gpu/gpu_sparse.cu.o gpu/gpu_er.cu.o gpu/gpu_er_fp32.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
   GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o gpu/spa_gpu/spa_gpu_stub.o gpu/gpu_firth_stub.o gpu/gpu_sparse_stub.o gpu/gpu_er_stub.o
@@ -257,8 +257,13 @@ gpu/gpu_sparse.cu.o: gpu/gpu_sparse.cu gpu/gpu_sparse.hpp gpu/gpu_step2.hpp gpu/
 # The exact test for binary traits on the device (gpu/gpu_er.hpp, config key
 # gpuER): --fmad=false like the SPA / Firth kernels; the only fused operations are
 # the explicit fma() of the glibc exp / log ports (gpu_er_glibc.cuh).
-gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh gpu/gpu_precision.hpp
+gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh gpu/gpu_er_fp32.cuh gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
+
+# gpuPrecisionER: fp32 (gpu/gpu_er_fp32.cu): log-domain enumeration in fp32.
+# Not bit-identical by design, so FMA contraction is left on.
+gpu/gpu_er_fp32.cu.o: gpu/gpu_er_fp32.cu gpu/gpu_er_fp32.cuh gpu/gpu_er.hpp gpu/gpu_precision.hpp
+	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 # Device ER against er_binary.cpp pair by pair, and the device exp / log against
 # the host's bit by bit (USE_CUDA=1 only).

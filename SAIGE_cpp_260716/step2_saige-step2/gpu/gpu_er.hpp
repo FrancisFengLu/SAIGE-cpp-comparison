@@ -49,7 +49,10 @@
 //
 // Precision (config key gpuPrecisionER, gpu_precision.hpp): ErCreateArgs::
 // precision, FP64 (default, everything above, bit-identical to the CPU) or
-// FP32. Only modes erSupports() accepts may be passed. CONTRACT for any
+// FP32 (gpu_er_fp32.cu: the same assignments, strata and two kernels in fp32,
+// log domain -- log Fisher weights, compensated log-sum-exp per stratum, one
+// pass instead of three, no O(N) loop per pair; header of that file). Only
+// modes erSupports() accepts may be passed. CONTRACT for any
 // non-fp64 variant: ErPairOut::pval is handed back as double (the fp32 value
 // converted); the host's erFinish ([0, 1] guard, formatting, seBeta) reads it
 // unchanged. main.cpp runs the bit-for-bit startup self-check (gpuErSelfCheck:
