@@ -4,11 +4,13 @@
 #   BIN_DIR   where build_bins.sh puts the binaries (default $SAIGE_HOME/collab_bin)
 #   NULLBIN   step 1 (GPU build)          S2BIN   step 2 (GPU build; also used for the CPU path)
 #   S2PHASE   step 2, CPU build with PHASE_TIMING=1 (per-stage timers, block 3b only)
+#   PREC_CMP  tools/precision_compare.py (block precision)
 COLLAB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$COLLAB/../examples/env.sh"
 BIN_DIR=${BIN_DIR:-$SAIGE_HOME/collab_bin}
 NULLBIN=$BIN_DIR/saige-null
 S2BIN=$BIN_DIR/saige-step2
 S2PHASE=$BIN_DIR/saige-step2.phase
+PREC_CMP=$SAIGE_HOME/step2_saige-step2/tools/precision_compare.py
 PYTHON=${PYTHON:-python3}
 NPROC=$(nproc)

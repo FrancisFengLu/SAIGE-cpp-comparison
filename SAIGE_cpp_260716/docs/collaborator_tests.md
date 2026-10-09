@@ -46,11 +46,12 @@ traits tested together in one step-2 run (the first P traits of your list).
 | `stage` | 2 | CPU build with stage timers + GPU with `gpuOverlap: false`; full GRM, Firth on, P = top level | where the time goes: read, scan, host tail, SPA, ER, Firth, write, with pair counts |
 | `pgen` | 1 | GPU on a hard-call PGEN of the same chromosome; full GRM, Firth on, P = top level (only if you have PGEN) | PGEN input on the GPU |
 | `vsr` | 8 + 8 | ours (CPU) and R SAIGE 1.5.2: P {1, 8} x GRM {full; sparse, fast test off} x Firth {off, on} | agreement with R: p.value, BETA, SE |
+| `precision` | 8 | GPU, full GRM, Firth on, P = top level: all fp64 (default), scan fp32, scan int8, SPA fp32, ER fp32, Firth fp32, all fp32, scan int8 + SPA / ER / Firth fp32 | speed of the [GPU precision modes](gpu.md#precision) on your card, and their difference from all-fp64 |
 
 P levels at or above your number of binary traits are dropped, and the top level
 uses all your binary traits (with 60 traits: P = 1, 8, 32, 60; with 300 traits:
 1, 8, 32, 300). With at least 128 binary traits and a PGEN file the matrix is
-**69 runs**: 48 + 2 + 2 + 1 + 8 of ours + 8 of R (an R "run" at P = 8 is 8 R
+**77 runs**: 48 + 2 + 2 + 1 + 8 + 8 of ours + 8 of R (an R "run" at P = 8 is 8 R
 processes at once, one per trait).
 
 "Fast test" is SAIGE's `isFastTest` for sparse-GRM models: off means every marker
@@ -159,7 +160,7 @@ A few minutes (about 3 on the reference machine). This runs sections 5 to 7 on a
 (4,000 samples, half in sibling pairs, 6,000 markers on two chromosomes, 30% of
 them rare, 8 binary traits) so you see every output before touching real data.
 Set `R_STEP2` and `RSCRIPT` as in [section 6](#6-run-the-test-matrix) first, or
-add `BLOCKS="main rare stage pgen"` to skip R.
+add `BLOCKS="main rare stage pgen precision"` to skip R.
 
 ```bash
 D=$OUT_ROOT/rehearsal; mkdir -p $D/data
@@ -174,7 +175,7 @@ plink2 --bfile $D/data/chr1 --make-pgen --out $D/data/chr1
   bash docs/collab/step1_models.sh && bash docs/collab/run_matrix.sh && bash docs/collab/collect_results.sh )
 ```
 
-With 8 traits the P levels are 1 and 8 (45 runs). Expected: every
+With 8 traits the P levels are 1 and 8 (53 runs). Expected: every
 `cpu_vs_gpu` and the `pgen_vs_bed` row of `compare.csv` has `identical` True; the
 `cpp_vs_R` rows are identical for the full GRM and differ slightly for the sparse
 GRM ([why](#things-you-may-see)). The relatedness cutoff is raised to 0.125 here
@@ -276,7 +277,7 @@ limit) start the same command again.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OUT_ROOT`, `GENO`, `BIN_TRAITS` | (required) | as above; `BIN_TRAITS` in the same order as for step 1 |
-| `BLOCKS` | `main rare stage pgen vsr` | which blocks to run |
+| `BLOCKS` | `main rare stage pgen vsr precision` | which blocks to run |
 | `P_LEVELS` | `1 8 32 128` | P levels; see [What is tested](#what-is-tested) for the top level. `P_TOP=cap` keeps 128 as the top even with more traits |
 | `NTHREADS` | all cores | `nThreads` of every C++ step-2 run (R runs use 1 thread per process) |
 | `PGEN` | unset | block `pgen` is skipped without it |
@@ -293,7 +294,7 @@ Check the plan first:
 
 ```bash
 DRY_RUN=1 bash docs/collab/run_matrix.sh | head -3
-# traits: 60   P levels: 1 8 32 60   cells selected: 69   threads: 64   commit: 39bc03e3
+# traits: 60   P levels: 1 8 32 60   cells selected: 77   threads: 64   commit: 39bc03e3
 ```
 
 **R SAIGE.** `RSCRIPT` must start an Rscript that can `library(SAIGE)` (1.5.2).
@@ -324,15 +325,20 @@ runs also get `--sparseGRMFile/--sparseGRMSampleIDFile` (the files step 1 used).
 Per run, one directory `$OUT_ROOT/cells/<run>/`:
 
 1. writes `cfg.yaml` (step-2 config; GPU runs: `useGPU: true` with all defaults;
-   the `stage` GPU run adds `gpuOverlap: false`) or `rjobs.sh` (R);
+   the `stage` GPU run adds `gpuOverlap: false`, the `precision` runs their
+   `gpuPrecision*` keys) or `rjobs.sh` (R);
 2. evicts the run's input files from the page cache (`cache.json`);
 3. runs `/usr/bin/time -v <binary> cfg.yaml` with `SAIGE_STEP2_ROUTE_DUMP` set
    (per-pair route records, used for the counts), and for GPU runs samples
    `nvidia-smi` memory every 200 ms (`gpu_mem.txt`);
-4. summarises into `cell.json` and `md5.txt`, deletes the route records;
+4. summarises into `cell.json` and `md5.txt`, deletes the route records (block
+   `precision`: after its comparison);
 5. compares: a GPU run against its CPU twin, an R run against our CPU run, the
-   PGEN run against the `.bed` GPU run (into `$OUT_ROOT/compare/`); result files
-   are then deleted unless `KEEP_OUTPUTS=1` or they differ (kept for us to look at).
+   PGEN run against the `.bed` GPU run (into `$OUT_ROOT/compare/`), a
+   `precision` run against the all-fp64 `precision` run (into
+   `$OUT_ROOT/compare_precision/`, [below](#block-precision)); result files
+   are then deleted unless `KEEP_OUTPUTS=1` or they differ (kept for us to look at;
+   `precision` results always differ a little and are deleted once compared).
 
 At the end `summary.csv` and `compare.csv` are written to `$OUT_ROOT`.
 
@@ -361,6 +367,39 @@ On network filesystems (Lustre, GPFS, NFS) eviction on your node may not reach
 the file server's cache, so a "cold" run can still read from server memory.
 The filesystem type is recorded automatically; please also say in `manual.txt`
 what the storage is.
+
+### Block precision
+
+Step 2 on the GPU can run each of its four stages in a lower precision
+([GPU, Precision](gpu.md#precision)): the marker scan (`gpuPrecisionScan`
+fp64 / fp32 / int8), SPA, the exact test (ER) and Firth (`gpuPrecisionSPA`,
+`gpuPrecisionER`, `gpuPrecisionFirth`, fp64 / fp32). The default is fp64
+everywhere, which is what every other block runs. Whether the other modes are
+faster depends on the card: on V100 / A100 / H100 fp64 runs at half the fp32
+rate, on most other cards (L4, A10, T4, consumer cards) at 1/32 to 1/64, and
+int8 tensor cores exist from Turing (T4) on. So we need the timings from your
+GPU.
+
+The block runs the same configuration (full GRM, Firth on, P = top level,
+`.bed` genotypes) eight times:
+
+| Run | Keys on top of the defaults |
+|---|---|
+| `prec_fp64_...` | none (all fp64; the reference) |
+| `prec_scan_fp32_...`, `prec_scan_int8_...` | `gpuPrecisionScan: fp32` / `int8` |
+| `prec_spa_fp32_...`, `prec_er_fp32_...`, `prec_firth_fp32_...` | that stage in fp32 |
+| `prec_all_fp32_...` | all four fp32 |
+| `prec_int8_fp32_...` | scan int8, SPA / ER / Firth fp32 |
+
+Each run is timed like every other run (cold page cache, `/usr/bin/time -v`),
+and each non-fp64 run is compared with `prec_fp64_...` by
+`step2_saige-step2/tools/precision_compare.py --no-ids` (rows matched on CHR,
+POS, MarkerID, Allele1, Allele2; route records compared pair by pair). The
+comparison writes aggregate numbers only (no marker IDs) to
+`$OUT_ROOT/compare_precision/prec_vs_fp64__<mode>.{json,txt}`, and its main
+numbers go into the `vs_fp64_*` columns of `summary.csv`. These results are
+**not** byte-identical to the fp64 run (or to R); what we look at is the size of
+the differences and whether any p-value crosses 5e-8 or 1e-5.
 
 ### Comparing two runs yourself
 
@@ -396,7 +435,7 @@ result-table header, and writes the tar plus a listing of its contents.
 | `step1/*/step1.yaml`, `step1.log` | genotype, phenotype files |
 | `cells/<run>/` cfg, log, `cell.json`, `cache.json`, `md5.txt`, `gpu_mem.txt`, `stage.txt`; for R runs `rjobs.sh` and each process's `/usr/bin/time` record | sample or marker ID lists |
 | | R SAIGE's own logs (for sparse-GRM runs they print a table of sample IDs); only for a failed R run their last 30 lines |
-| `compare/*.json` (aggregates), `summary.csv`, `compare.csv` | |
+| `compare/*.json` (aggregates), `compare_precision/*.json`, `*.txt` (aggregates, no marker IDs), `summary.csv`, `compare.csv` | |
 
 Please read `<tar>.contents.txt` and `REDACTION_REPORT.txt` before sending.
 Sample IDs shorter than 5 characters are not searched for (short numbers occur
@@ -439,6 +478,14 @@ check `REDACTION_REPORT.txt` for lines removed by accident.
 | `log_errors` | lines matching error / terminate / segfault in the log |
 | `cpu_vs_gpu_identical` | `main`/`rare`: CPU and GPU result files byte-identical |
 | `compare_label` | the row of `compare.csv` for this run |
+| `prec_scan`, `prec_spa`, `prec_er`, `prec_firth` | GPU runs: the precision of each stage, from the log line `GPU precision: scan=... SPA=... ER=... Firth=...` |
+| `vs_fp64_p_max_rel`, `vs_fp64_max_abs_dlog10p` | block `precision`: against the all-fp64 run, max relative difference of p.value, max abs(Δ log10 p) |
+| `vs_fp64_p_max_rel_p_lt_1e-5`, `vs_fp64_n_p_lt_1e-5` | the same over the rows with p < 1e-5 on either side, and their number |
+| `vs_fp64_beta_max_rel`, `vs_fp64_se_max_rel` | max relative difference of BETA, SE |
+| `vs_fp64_cross_5e-8`, `vs_fp64_cross_1e-5` | rows significant at 5e-8 (1e-5) in only one of the two runs |
+| `vs_fp64_is_spa_differs` | rows whose Is.SPA differs |
+| `vs_fp64_firth_route_changes`, `vs_fp64_spa_nonconv_changes`, `vs_fp64_firth_nonconv_changes` | from the route records: pairs Firth-fitted in only one run; pairs where SPA (Firth) ran in both and converged in only one |
+| `vs_fp64_rows_one_side`, `vs_fp64_note` | rows present in one run only; why a comparison is missing |
 | `md5_all`, `commit`, `start` | md5 over the run's `md5.txt`, source commit, start time |
 
 ### `compare.csv`: one row per comparison
@@ -539,6 +586,12 @@ On GCP n1-standard-8 (8 vCPU, 30 GB), Tesla V100 16 GB, CUDA 12.9, commit
   component), the GPU runs with fast test off fell back to the CPU path
   (`gpu_refused`), and our sparse-GRM results were then byte-identical to R.
 - `cache_evict.py` with `drop_caches`, `fadvise` and `none`, checked with `fincore`.
+- Block `precision` alone (`BLOCKS=precision`, commit `186c15fb`, the
+  rehearsal cohort's step-1 models, P = 8, `CACHE_MODE=fadvise`): 8 runs,
+  7 comparisons with all-fp64 in `compare_precision/` and the `vs_fp64_*`
+  columns of `summary.csv`, result files and route records deleted after the
+  comparisons; `collect_results.sh` packed the comparison summaries and no
+  result rows (no marker or sample IDs found).
 
 Not verified here: P = 32 and 128, biobank-scale N and M, other GPUs, network
 filesystems, `CACHE_MODE=vmtouch`.

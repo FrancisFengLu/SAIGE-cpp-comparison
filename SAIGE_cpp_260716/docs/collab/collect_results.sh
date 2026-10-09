@@ -4,7 +4,8 @@
 # Included (allow-list): environment record, build info, self-check result, step-1 configs and
 # logs, per-run configs / logs / timing / cache records / GPU-memory samples / route-count
 # summaries / md5s of result files, comparison summaries (aggregate numbers only),
-# summary.csv, compare.csv.
+# precision comparisons with all-fp64 (compare_precision/*.json and .txt, aggregate numbers,
+# written with --no-ids), summary.csv, compare.csv.
 # Never included: result files (out/*.txt), route dumps, null models, genotype or phenotype
 # files, sparse GRM, sample ID lists. As a last check every included text file is scanned for
 # sample IDs and marker IDs (redact.py); lines that contain one are removed and counted.
@@ -43,6 +44,9 @@ for d in "$OUT_ROOT"/cells/*/; do
   fi
 done
 for f in "$OUT_ROOT"/compare/*.json; do cp_if "$f" "$ST/compare/$(basename "$f")"; done
+for f in "$OUT_ROOT"/compare_precision/*.json "$OUT_ROOT"/compare_precision/*.txt; do
+  cp_if "$f" "$ST/compare_precision/$(basename "$f")"
+done
 cp_if "$OUT_ROOT/summary.csv" "$ST/summary.csv"
 cp_if "$OUT_ROOT/compare.csv" "$ST/compare.csv"
 

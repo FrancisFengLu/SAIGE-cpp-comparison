@@ -96,6 +96,9 @@ if r.get("path") in ("cpu", "gpu"):
     m = re.search(r"\[TIMING\] 60_after_main_loop\s+\S+\s+total=([0-9.eE+-]+)s", log)
     r["main_loop_s"] = round(float(m.group(1)) - (r["startup_s"] or 0), 3) if m else None
     r["n_firth_log"] = sum(int(x) for x in re.findall(r"Firth approx was applied to (\d+) markers", log))
+    m = re.search(r"GPU precision: scan=(\S+) SPA=(\S+) ER=(\S+) Firth=(\S+)", log)
+    for k, v in zip(("prec_scan", "prec_spa", "prec_er", "prec_firth"), m.groups() if m else ("",) * 4):
+        r[k] = v
     r["log_errors"] = len(re.findall(r"(?i)\berror\b|terminate called|Segmentation fault|std::bad_alloc", log))
 
 # route dump

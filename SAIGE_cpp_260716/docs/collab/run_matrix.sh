@@ -1,12 +1,15 @@
 #!/bin/bash
 # run_matrix.sh -- the step-2 test matrix of docs/collaborator_tests.md (binary traits).
 #
-# Blocks (BLOCKS, space separated; default "main rare stage pgen vsr"):
+# Blocks (BLOCKS, space separated; default "main rare stage pgen vsr precision"):
 #   main   path {cpu,gpu} x P x GRM {full, sparse_nofast, sparse_fast} x Firth {0,1}
 #   rare   rare-variant marker set (MAC < 20), cpu + gpu, full GRM, Firth on, P = top level
 #   stage  per-stage timing: CPU PHASE_TIMING build + GPU with gpuOverlap false, full, Firth on, P = top
 #   pgen   GPU on a hard-call PGEN of the same chromosome, full, Firth on, P = top (needs PGEN)
 #   vsr    our CPU vs R SAIGE 1.5.2: P {1,8} x GRM {full, sparse_nofast} x Firth {0,1}
+#   precision  GPU per-stage precision, full GRM, Firth on, P = top: all fp64, scan fp32, scan int8,
+#          SPA fp32, ER fp32, Firth fp32, all fp32, scan int8 + SPA/ER/Firth fp32; each one
+#          compared with the all-fp64 run by precision_compare.py (aggregate numbers only)
 #
 # Required environment:
 #   OUT_ROOT     output root (the step-1 models from step1_models.sh are under $OUT_ROOT/step1)
@@ -35,15 +38,15 @@
 set -uo pipefail
 source "$(dirname "$0")/common.sh"
 : "${OUT_ROOT:?}" "${GENO:?}" "${BIN_TRAITS:?}"
-BLOCKS=${BLOCKS:-main rare stage pgen vsr}
+BLOCKS=${BLOCKS:-main rare stage pgen vsr precision}
 P_LEVELS=${P_LEVELS:-1 8 32 128}; P_TOP=${P_TOP:-all}
 NTHREADS=${NTHREADS:-$NPROC}; CACHE_MODE=${CACHE_MODE:-auto}; GPU_ID=${GPU_ID:-0}
 MIN_MAC=${MIN_MAC:-1}; KEEP_OUTPUTS=${KEEP_OUTPUTS:-0}; R_PAR=${R_PAR:-8}; RSCRIPT=${RSCRIPT:-Rscript}
 ONLY=${ONLY:-}; SKIP=${SKIP:-}; MIN_FREE_GB=${MIN_FREE_GB:-20}
 [[ $BIN_TRAITS == @* ]] && BIN_TRAITS=$(grep -v '^\s*$' "${BIN_TRAITS#@}" | tr '\n' ' ')
 read -r -a TR <<< "$BIN_TRAITS"; NT=${#TR[@]}
-M=$OUT_ROOT/step1; C=$OUT_ROOT/cells; CMP=$OUT_ROOT/compare
-mkdir -p "$C" "$CMP" "$OUT_ROOT/data"
+M=$OUT_ROOT/step1; C=$OUT_ROOT/cells; CMP=$OUT_ROOT/compare; CMPP=$OUT_ROOT/compare_precision
+mkdir -p "$C" "$CMP" "$CMPP" "$OUT_ROOT/data"
 COMMIT=$(git -C "$SAIGE_HOME" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 # ---------- P levels ----------
@@ -75,6 +78,18 @@ for b in $BLOCKS; do case $b in
       add "vsr_cpp_P${P}_${g}_firth${f}|vsr|cpu|$P|$g|$f|bed|prod|"
       add "vsr_R_P${P}_${g}_firth${f}|vsr|R|$P|$g|$f|bed|R|"
     done; done; done ;;
+  precision)
+    # name|...|extra: extra YAML lines separated by ';'. prec_fp64 first: the others compare with it.
+    for pc in "fp64|" \
+              "scan_fp32|gpuPrecisionScan: fp32" \
+              "scan_int8|gpuPrecisionScan: int8" \
+              "spa_fp32|gpuPrecisionSPA: fp32" \
+              "er_fp32|gpuPrecisionER: fp32" \
+              "firth_fp32|gpuPrecisionFirth: fp32" \
+              "all_fp32|gpuPrecisionScan: fp32;gpuPrecisionSPA: fp32;gpuPrecisionER: fp32;gpuPrecisionFirth: fp32" \
+              "int8_fp32|gpuPrecisionScan: int8;gpuPrecisionSPA: fp32;gpuPrecisionER: fp32;gpuPrecisionFirth: fp32"; do
+      add "prec_${pc%%|*}_gpu_P${PTOP}_full_firth1|precision|gpu|$PTOP|full|1|bed|prod|${pc#*|}"
+    done ;;
   *) echo "unknown block $b"; exit 1 ;;
 esac; done
 SEL=()
@@ -143,7 +158,7 @@ nThreads: $NTHREADS
 useGPU: $GPUV
 outputFormat: text
 YAML
-    [ -n "$extra" ] && echo "$extra"
+    [ -n "$extra" ] && tr ';' '\n' <<< "$extra"
     echo "models:"
     for t in "${TR[@]:0:$P}"; do
       printf '  - traitName: %s\n    modelFile: %s\n    varianceRatioFile: %s\n    outputFile: %s\n' \
@@ -212,7 +227,7 @@ run_cell() {   # spec
   if [ "$blk" = stage ]; then
     $PYTHON "$COLLAB/stage_table.py" "$d" --csv "$d/stage.csv" > "$d/stage.txt" 2>&1 || true
   fi
-  rm -rf "$d/routes"
+  [ "$blk" = precision ] || rm -rf "$d/routes"     # precision: kept until compared with all-fp64
   [ "$(cat "$d/rc")" = 0 ] || echo "      WARNING: $name exited with rc=$(cat "$d/rc"); see $d/log.txt"
   touch "$d/DONE"
 }
@@ -233,6 +248,22 @@ compare_pair() {   # label dirA dirB [--rows]
     return 0
   fi
   $PYTHON "$COLLAB/compare_outputs.py" "$a/out" "$b/out" --label "$lab" --json "$CMP/$lab.json" "$@" | sed 's/^/      /'
+}
+
+compare_prec() {   # label dirA(all fp64) dirB -> $CMPP/label.{json,txt}; aggregate numbers only
+  local lab=$1 a=$2 b=$3
+  [ -e "$CMPP/$lab.json" ] && return 0
+  [ -e "$a/DONE" ] && [ -e "$b/DONE" ] || return 0
+  if [ "$(cat "$a/rc")" != 0 ] || [ "$(cat "$b/rc")" != 0 ]; then
+    echo "{\"label\":\"$lab\",\"note\":\"a run failed (rc $(cat "$a/rc") / $(cat "$b/rc"))\"}" > "$CMPP/$lab.json"
+    echo "      $lab: not compared, a run failed"; return 0
+  fi
+  if [ -z "$(ls "$a/out" 2>/dev/null)" ] || [ -z "$(ls "$b/out" 2>/dev/null)" ]; then
+    echo "{\"label\":\"$lab\",\"note\":\"result files already removed\"}" > "$CMPP/$lab.json"
+    echo "      $lab: not compared, result files already removed"; return 0
+  fi
+  $PYTHON "$PREC_CMP" "$a" "$b" --quiet --no-ids --json "$CMPP/$lab.json" > "$CMPP/$lab.txt" 2>&1
+  sed -n 's/^   //; /^p.value \|^BETA \|^SE \|crossings\|p < 1e-5\|Is.SPA\|routes:/p' "$CMPP/$lab.txt" | sed "s/^/      $lab: /"
 }
 
 cleanup_outputs() {   # dirs... : remove result files when every comparison involving them is done
@@ -260,6 +291,23 @@ for spec in "${SEL[@]}"; do
       [ -e "$ref/DONE" ] && compare_pair "pgen_vs_bed__P${PTOP}_full_firth1" "$ref" "$C/$name"
       cleanup_outputs "$C/$name" ;;
     stage_*) cleanup_outputs "$C/$name" ;;
+    prec_fp64_*) ;;
+    prec_*)
+      ref=$C/prec_fp64_gpu_${name##*_gpu_}; pl=${name%%_gpu_*}; pl=prec_vs_fp64__${pl#prec_}
+      compare_prec "$pl" "$ref" "$C/$name"
+      [ -e "$CMPP/$pl.json" ] && { cleanup_outputs "$C/$name"; [ "$KEEP_OUTPUTS" = 1 ] || rm -rf "$C/$name/routes"; } ;;
+  esac
+done
+# precision: the all-fp64 reference once every selected comparison with it is written
+for spec in "${SEL[@]}"; do
+  name=${spec%%|*}
+  case $name in prec_fp64_*)
+    left=0
+    for s2 in "${SEL[@]}"; do n2=${s2%%|*}
+      pl=${n2%%_gpu_*}; pl=prec_vs_fp64__${pl#prec_}
+      case $n2 in prec_fp64_*) ;; prec_*) [ -e "$CMPP/$pl.json" ] || left=1 ;; esac
+    done
+    [ "$left" = 0 ] && { cleanup_outputs "$C/$name"; [ "$KEEP_OUTPUTS" = 1 ] || rm -rf "$C/$name/routes"; } ;;
   esac
 done
 # CPU cells whose GPU partner was not selected: nothing left to compare against
