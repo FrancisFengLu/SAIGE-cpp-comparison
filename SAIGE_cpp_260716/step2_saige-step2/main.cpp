@@ -2544,6 +2544,11 @@ struct PendSpa {
     // sparse variance. vrFast is the recompute's variance ratio.
     char   stage = 0;
     double vrFast = 1.0;
+    // gpuDeviceStats: pno is the device's erfc p (within 2e-14 of boost's,
+    // same printed string and gates by the guard band). A number derived
+    // from it for OUTPUT -- the Firth SE of a pair whose SPA did not
+    // converge -- is taken from boost's p instead (phase 4).
+    char   devP = 0;
 };
 
 // Per-block state that has to survive the barrier between the read phase and
@@ -4203,6 +4208,12 @@ bool mainMarkerMTGpu(
                             if (!rawP) fmtP();
                         } else {
                             pvalFinal = pd.pno;
+                            if (pd.devP) {
+                                // boost's p for anything printed off it (phase 5's SE)
+                                double b1, b2, b4, b5, b6, b7; bool b8; std::string b3;
+                                SAIGE::format_score_result(pd.Tstat, pd.var1, pd.var2, b1, b2, b3, b4, b8, b5, b6, b7);
+                                pvalFinal = b4;
+                            }
                             if (rawP) {
                                 pvKind = O.pvalNADk[jj];
                                 if (pvKind == 2) pvalStr = O.pvalNA[jj]; else pvRaw = O.pvalNAD[jj];
@@ -5566,6 +5577,7 @@ bool mainMarkerMTGpu(
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
                                 pd.stage = 1; pd.vrFast = vrFast;
+                                pd.devP = (devPair && !devHost) ? 1 : 0;
                                 pend[omp_get_thread_num()].push_back(pd);
                                 devFastDone = true;
                             } else {
@@ -5632,6 +5644,7 @@ bool mainMarkerMTGpu(
                                 pd.fast = (!sparseCur && (double)cz / nT >= 0.5) ? 1 : 0;
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
+                                pd.devP = (devPair && !devHost) ? 1 : 0;
                                 pend[omp_get_thread_num()].push_back(pd);
                             } else {
                                 if (toFirthOnly) {
@@ -5639,6 +5652,12 @@ bool mainMarkerMTGpu(
                                     pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
                                     pf.p = bP;
                                     pf.logp = bLog ? 1 : 0;
+                                    if (devPair && !devHost) {
+                                        // phase 5 back-calculates the SE from this p: boost's, not the device's
+                                        double b1, b2, b4, b5, b6, b7; bool b8; std::string b3;
+                                        SAIGE::format_score_result(bT, bV1, bV2, b1, b2, b3, b4, b8, b5, b6, b7);
+                                        pf.p = b4; pf.logp = b8 ? 1 : 0;
+                                    }
                                     pf.flip = flip ? 1 : 0;
                                     for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
                                     pendF[omp_get_thread_num()].push_back(pf);
