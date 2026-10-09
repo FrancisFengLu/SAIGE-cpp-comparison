@@ -220,6 +220,28 @@ static bool canonical_6E(const std::string& s, double& out) {
     return true;
 }
 
+// sgsRawDouble: the computed doubles with their kind; a PK_STR row that is
+// present carries its string verbatim (an absent one nothing: the reader
+// takes "NA" from the present mask). No parsing, no formatting.
+static void put_col_pval_raw(std::string& b, const std::vector<double>& d,
+                             const std::vector<unsigned char>& kind,
+                             const std::vector<std::string>& str,
+                             const std::vector<uint8_t>& present, std::size_t n) {
+    put_u8(b, E_PVALRAW);
+    put_bytes(b, d.data(), n * sizeof(double));
+    put_bytes(b, kind.data(), n);
+    std::string exc;
+    uint32_t nexc = 0;
+    for (std::size_t i = 0; i < n; i++) {
+        if (kind[i] != PK_STR || !present[i]) continue;
+        put_u32(exc, (uint32_t)i);
+        put_sstr(exc, str[i]);
+        nexc++;
+    }
+    put_u32(b, nexc);
+    b.append(exc);
+}
+
 static void put_col_pval(std::string& b, const std::vector<std::string>& v,
                          std::size_t n, bool f32) {
     put_u8(b, f32 ? E_PVAL32 : E_PVAL);
@@ -279,6 +301,7 @@ struct SgsSink::Impl {
     std::vector<std::vector<uint8_t> > cols;
     bool isImputation = false;
     bool storeF32 = false;
+    bool rawP = false;
     uint64_t nMarkers = 0;
     std::vector<uint64_t> nEmitted;
     std::vector<std::string> bufs;       // one scratch buffer per trait
@@ -288,18 +311,21 @@ struct SgsSink::Impl {
 SgsSink::~SgsSink() { delete m_impl; }
 
 bool SgsSink::open(const std::vector<TraitMeta>& metas, bool isImputation,
-                   bool storeF32, std::string& err)
+                   bool storeF32, bool rawP, std::string& err)
 {
     if (metas.empty()) { err = "no traits"; return false; }
+    if (rawP && storeF32) { err = "sgsRawDouble needs sgsPrecision: fp64"; return false; }
     m_impl = new Impl();
     m_impl->metas = metas;
     m_impl->isImputation = isImputation;
     m_impl->storeF32 = storeF32;
+    m_impl->rawP = rawP;
     m_impl->nEmitted.assign(metas.size(), 0);
     m_impl->bufs.resize(metas.size());
     m_markerPath = metas[0].outFile + ".markers.sgs";
     const uint32_t hdrFlags = (isImputation ? H_IMPUTATION : 0u)
-                            | (storeF32     ? H_F32        : 0u);
+                            | (storeF32     ? H_F32        : 0u)
+                            | (rawP         ? H_PRAW       : 0u);
 
 
     m_impl->markerFd = ::open(m_markerPath.c_str(),
@@ -393,12 +419,16 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
         std::string& b = I.bufs[t];
         b.clear();
 
-        // present mask: the text writer skips rows whose pval is "NA".
+        // present mask: the text writer skips rows whose pval is "NA" --
+        // with raw p-values, rows whose p is a string and that string is "NA".
+        const bool rawT = I.rawP && C.pvalRaw && C.pvalRawKind && C.pvalNARaw && C.pvalNARawKind;
         std::vector<uint8_t> present(nRows, 1);
         int emitted = 0;
         bool allPresent = true;
         for (std::size_t k = 0; k < nRows; k++) {
-            if ((*C.pval)[k] == "NA") { present[k] = 0; allPresent = false; }
+            const bool absent = rawT ? ((*C.pvalRawKind)[k] == PK_STR && (*C.pval)[k] == "NA")
+                                     : ((*C.pval)[k] == "NA");
+            if (absent) { present[k] = 0; allPresent = false; }
             else emitted++;
         }
         numtest[t] = emitted;
@@ -430,8 +460,10 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
                 case C_SE:     put_col_f64 (b, C.seBeta->data(), nRows, f32); break;
                 case C_TSTAT:  put_col_f64 (b, C.Tstat->data(), nRows, f32); break;
                 case C_VAR:    put_col_f64 (b, C.varT->data(), nRows, f32); break;
-                case C_PVAL:   put_col_pval(b, *C.pval, nRows, f32); break;
-                case C_PVALNA: put_col_pval(b, *C.pvalNA, nRows, f32); break;
+                case C_PVAL:   if (rawT) put_col_pval_raw(b, *C.pvalRaw, *C.pvalRawKind, *C.pval, present, nRows);
+                               else      put_col_pval(b, *C.pval, nRows, f32); break;
+                case C_PVALNA: if (rawT) put_col_pval_raw(b, *C.pvalNARaw, *C.pvalNARawKind, *C.pvalNA, present, nRows);
+                               else      put_col_pval(b, *C.pvalNA, nRows, f32); break;
                 case C_ISSPA:  put_col_pod (b, C.isSPAConverge->data(), nRows); break;
                 case C_BETA_C: put_col_f64 (b, C.Beta_c->data(), nRows, f32); break;
                 case C_SE_C:   put_col_f64 (b, C.seBeta_c->data(), nRows, f32); break;

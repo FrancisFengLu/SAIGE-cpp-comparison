@@ -152,6 +152,13 @@ struct TraitCols {
     const std::vector<double>*      varT        = nullptr;
     const std::vector<std::string>* pval        = nullptr;
     const std::vector<std::string>* pvalNA      = nullptr;
+    // sgsRawDouble (SgsSink::open rawP): the p-value columns as doubles with a
+    // per-row kind (sgs_format.hpp PvalKind); a row of kind PK_STR takes its
+    // string from pval / pvalNA. Ignored by format_text and without rawP.
+    const std::vector<double>*        pvalRaw       = nullptr;
+    const std::vector<unsigned char>* pvalRawKind   = nullptr;
+    const std::vector<double>*        pvalNARaw     = nullptr;
+    const std::vector<unsigned char>* pvalNARawKind = nullptr;
     const std::vector<char>*        isSPAConverge = nullptr;   // 0/1
     const std::vector<double>*      Beta_c      = nullptr;
     const std::vector<double>*      seBeta_c    = nullptr;
@@ -190,9 +197,12 @@ public:
     // for the shared marker block. storeF32 narrows every floating-point column
     // to float (sgsPrecision: fp32), which halves the file and gives up the
     // byte-identical round trip -- see sgs_format.hpp for the measured cost.
-    // Returns false and fills err on any failure.
+    // rawP (sgsRawDouble): the p-value columns are written from TraitCols'
+    // pvalRaw / pvalRawKind as E_PVALRAW, no string parsed; a trait whose
+    // raw pointers are null falls back to the string column. Not with
+    // storeF32. Returns false and fills err on any failure.
     bool open(const std::vector<TraitMeta>& metas, bool isImputation,
-              bool storeF32, std::string& err);
+              bool storeF32, bool rawP, std::string& err);
     bool isOpen() const { return m_open; }
     const std::string& markerPath() const { return m_markerPath; }
 

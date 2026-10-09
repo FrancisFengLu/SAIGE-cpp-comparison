@@ -73,13 +73,24 @@ enum Enc : uint8_t {
     E_PVAL    = 2,   // f64[nRows] + exception list (see above)
     E_RAW32   = 3,   // nRows floats
     E_CONST32 = 4,   // one float, repeated
-    E_PVAL32  = 5    // f32[nRows] + exception list
+    E_PVAL32  = 5,   // f32[nRows] + exception list
+    // sgsRawDouble: f64[nRows] of the COMPUTED p-values (not strtod of the
+    // printed string) + u8 kind[nRows] + exception list. kind PK_LIN: the
+    // double prints through "%.6E"; PK_LOG: the double is the natural log of
+    // p and prints through format_logp_e1 ("%.1fE%d"); PK_STR: no double --
+    // a present row's string is in the exception list verbatim, an absent row
+    // (present mask 0) has no entry. Either way the text comes out byte for
+    // byte as the text writer printed it, since that writer printed exactly
+    // these doubles with exactly these formatters.
+    E_PVALRAW = 6
 };
+enum PvalKind : uint8_t { PK_LIN = 0, PK_LOG = 1, PK_STR = 2 };
 
 // Header flag bits (the u32 after VERSION in both file kinds).
 enum HdrFlag : uint32_t {
     H_IMPUTATION = 1u << 0,   // the info column is imputationInfo, not MissingRate
-    H_F32        = 1u << 1    // floating-point columns stored as float
+    H_F32        = 1u << 1,   // floating-point columns stored as float
+    H_PRAW       = 1u << 2    // p-value columns are E_PVALRAW (sgsRawDouble)
 };
 
 // Block flag bits.

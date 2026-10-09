@@ -34,6 +34,8 @@
 
 #include "../out_fast.hpp"
 #include "../sgs_format.hpp"
+#include "../score_format.hpp"
+#include "../score_vec.hpp"
 
 using namespace SAIGE;
 using namespace SAIGE::sgs;
@@ -109,6 +111,33 @@ static void get_col_str(Reader& r, std::vector<std::string>& v, size_t n) {
 static void get_col_pval(Reader& r, std::vector<std::string>& v, size_t n) {
     v.assign(n, std::string());
     uint8_t e = r.u8();
+    if (e == E_PVALRAW) {
+        // sgsRawDouble: the computed doubles, formatted here with the very
+        // code the text writer used -- "%.6E" (std::to_chars, byte-identical
+        // to sprintf over 5e7 values, score_vec.hpp) for a linear p, the
+        // "%.1fE%d" branch of format_score_result for a natural-log p.
+        const uint8_t* q = r.take(n * sizeof(double));
+        const uint8_t* kq = r.take(n);
+        if (!q || !kq) return;
+        const double* d = (const double*)(const void*)q;
+        char b[64];
+        for (size_t i = 0; i < n; i++) {
+            if (kq[i] == PK_LIN) {
+                const int len = mtVecFormatE6(d[i], b);
+                v[i].assign(b, (size_t)len);
+            } else if (kq[i] == PK_LOG) {
+                format_logp_e1(d[i], b);
+                v[i].assign(b);
+            }
+        }
+        uint32_t nexc = r.u32();
+        for (uint32_t k = 0; k < nexc; k++) {
+            uint32_t idx = r.u32();
+            std::string s = r.sstr();
+            if (idx < n) v[idx] = s;
+        }
+        return;
+    }
     if (e != E_PVAL && e != E_PVAL32) { r.bad = true; return; }
     const size_t w = (e == E_PVAL) ? sizeof(double) : sizeof(float);
     const uint8_t* q = r.take(n * w);

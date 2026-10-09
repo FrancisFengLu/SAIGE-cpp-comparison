@@ -51,6 +51,22 @@ inline double log_chisq1_uppertail(double stat) {
     return std::log(e);
 }
 
+// The "%.1fE%d" form of a natural-log p-value (the underflow branch of
+// format_score_result below, and of the SPA post-rules): the very expressions
+// that used to be inline there, so tools/sgs2txt can print a stored log-p
+// (sgsRawDouble) to the same bytes. t_buf must hold >= 32 characters.
+inline void format_logp_e1(double logp, char* t_buf)
+{
+    double log10p = logp / (std::log(10.0));
+    int exponent = std::floor(log10p);
+    double fraction = std::pow(10.0, log10p - exponent);
+    if (fraction >= 9.95) {
+        fraction = 1;
+        exponent++;
+    }
+    sprintf(t_buf, "%.1fE%d", fraction, exponent);
+}
+
 // One (marker, trait) score-test result: turn (S, var1, var2) into the
 // p-value string / Beta / seBeta the output writer expects.
 //
@@ -89,14 +105,7 @@ inline void format_score_result(double S, double var1, double var2,
     } else {
         // P1 fix: direct log(upper-tail) avoiding cdf underflow at p<1e-300
         double logp = log_chisq1_uppertail(stat);
-        double log10p = logp / (std::log(10.0));
-        int exponent = std::floor(log10p);
-        double fraction = std::pow(10.0, log10p - exponent);
-        if (fraction >= 9.95) {
-            fraction = 1;
-            exponent++;
-        }
-        sprintf(pValueBuf, "%.1fE%d", fraction, exponent);
+        format_logp_e1(logp, pValueBuf);
         t_pval = logp;
         t_islogp = true;
     }
