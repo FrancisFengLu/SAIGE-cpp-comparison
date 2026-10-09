@@ -518,18 +518,20 @@ std::vector<Section> step1_sections() {
       "overwrite an existing variance-ratio file", "paths.overwrite_varratio"));
   S.push_back(vr);
 
-  Section st2{"Step-2 settings stored in the model", {}};
-  st2.flags.push_back(F("SPAcutoff", Kind::Num, "X", "",
+  // Written into nullmodel.json for the record only: step 2 has its own flags
+  // for these (with R's defaults) and does not read the model's copy.
+  Section st2{"Recorded in the model (step 2 uses its own flags; these are not read)", {}};
+  st2.flags.push_back(F("SPAcutoff", Kind::Num, "X", "(recorded only; give it to step2)",
       "SPA is applied when |z| > X", "fit.spa_cutoff"));
-  st2.flags.push_back(F("is_Firth_beta", Kind::Bool, "", "",
-      "Firth beta for binary traits with p < --pCutoffforFirth (R: a step-2 flag)",
+  st2.flags.push_back(F("is_Firth_beta", Kind::Bool, "", "(recorded only; give it to step2)",
+      "Firth beta for binary traits with p < --pCutoffforFirth",
       "fit.firth_beta", true));
-  st2.flags.push_back(F("pCutoffforFirth", Kind::Num, "X", "",
-      "p-value cutoff for Firth (R: a step-2 flag)", "fit.p_cutoff_for_firth", true));
-  st2.flags.push_back(F("is_fastTest", Kind::Bool, "", "(R step 2: FALSE)",
-      "fast test for sparse-GRM models (R: a step-2 flag)", "fit.fast_test", true));
-  st2.flags.push_back(FX("impute_method", Kind::Str, "M", "(R step 2: best_guess)",
-      "missing genotypes in step 2: best_guess, mean or minor (R: a step-2 flag)",
+  st2.flags.push_back(F("pCutoffforFirth", Kind::Num, "X", "(recorded only; give it to step2)",
+      "p-value cutoff for Firth", "fit.p_cutoff_for_firth", true));
+  st2.flags.push_back(F("is_fastTest", Kind::Bool, "", "(recorded only; give it to step2)",
+      "fast test for sparse-GRM models", "fit.fast_test", true));
+  st2.flags.push_back(FX("impute_method", Kind::Str, "M", "(recorded only; give it to step2)",
+      "missing genotypes in step 2: best_guess, mean or minor",
       [](Ctx& c, const std::string& v) {
         const std::string t = trim(v);
         if (t != "best_guess" && t != "mean" && t != "minor")
@@ -695,8 +697,8 @@ std::vector<Section> step2_sections() {
   S.push_back(qc);
 
   Section ts{"Tests", {}};
-  ts.flags.push_back(F("LOCO", Kind::Bool, "", "(R: TRUE)",
-      "use the LOCO models of --chrom", "LOCO"));
+  ts.flags.push_back(F("LOCO", Kind::Bool, "", "",
+      "use the LOCO models of --chrom (a model without LOCO results needs --LOCO=FALSE)", "LOCO"));
   ts.flags.push_back(FX("is_Firth_beta", Kind::Bool, "", "",
       "Firth beta for binary traits with p < --pCutoffforFirth",
       [](Ctx& c, const std::string& v) {
@@ -708,8 +710,24 @@ std::vector<Section> step2_sections() {
       "p-value cutoff for Firth", "pCutoffforFirth"));
   ts.flags.push_back(F("max_MAC_for_ER", Kind::Num, "X", "",
       "binary traits: exact test for MAC <= X", "MACCutoffforER"));
-  ts.flags.push_back(F("is_noadjCov", Kind::Bool, "", "(R: TRUE)",
-      "skip the covariate adjustment of the score", "isnoadjCov"));
+  ts.flags.push_back(F("is_noadjCov", Kind::Bool, "", "",
+      "score and variance without the covariate projection (R's scoreTestFast_noadjCov)",
+      "isnoadjCov"));
+  ts.flags.push_back(F("SPAcutoff", Kind::Num, "X", "",
+      "SPA when |Tstat|/sqrt(var) > X (binary traits)", "SPA_Cutoff"));
+  ts.flags.push_back(F("is_fastTest", Kind::Bool, "", "",
+      "re-test markers with p < --pval_cutoff_for_fastTest with the adjusted score (and the sparse GRM)",
+      "isFastTest"));
+  ts.flags.push_back(F("pval_cutoff_for_fastTest", Kind::Num, "X", "",
+      "p-value cutoff of --is_fastTest", "pval_cutoff_for_fastTest", true));
+  ts.flags.push_back(FX("impute_method", Kind::Str, "M", "",
+      "missing genotypes: best_guess, mean or minor",
+      [](Ctx& c, const std::string& v) {
+        const std::string t = trim(v);
+        if (t != "best_guess" && t != "mean" && t != "minor")
+          throw UsageError("--impute_method must be best_guess, mean or minor, got '" + v + "'");
+        set_path(c.cfg, "impute_method", YAML::Node(t));
+      }));
   ts.flags.push_back(F("relatednessCutoff", Kind::Num, "X", "",
       "sparse GRM entries below this are dropped", "relatednessCutoff"));
   ts.flags.push_back(F("cateVarRatioMinMACVecExclude", Kind::NumList, "X,X,...", "",
@@ -801,20 +819,18 @@ std::vector<Section> step2_sections() {
     {"sgsPrecision", "sgsPrecision"},
     {"is_overwrite_output", "- (checked)"},
     {"is_Firth_beta", "is_Firth_beta, isFirth"},
+    {"impute_method", "impute_method"},
   }, {
     {"useGPU", "useGPU"}, {"gpuDevice", "gpuDevice"}, {"vcfField", "vcfField"},
     {"AlleleOrder", "AlleleOrder"}, {"outputFormat", "outputFormat"},
     {"sgsPrecision", "sgsPrecision"}, {"is_Firth_beta", "is_Firth_beta"},
+    {"impute_method", "impute_method"},
   });
   return S;
 }
 
 std::vector<Rejected> step2_rejected() {
-  const std::string s1 = std::string("it is stored in the model; give it to `") + PROG + " step1`";
   return {
-    {"SPAcutoff", s1 + " --SPAcutoff", ""},
-    {"is_fastTest", s1 + " --is_fastTest", ""},
-    {"impute_method", s1 + " --impute_method", ""},
     {"sparseGRMFile", "the sparse GRM comes from the step-1 model (fit it with `" +
         std::string(PROG) + " step1 --sparseGRMFile ...`)", ""},
     {"sparseGRMSampleIDFile", "the sparse GRM comes from the step-1 model", ""},

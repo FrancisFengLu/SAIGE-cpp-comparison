@@ -238,14 +238,6 @@ $(TARGET): $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-# The gpuDeviceStats start-up check enumerates the host tail's possible
-# a*b+c contraction orders; its own reference evaluations must not be
-# contracted by the compiler (g++ contracts C++ by default even under
-# -std=c++17), so this one object is built with contraction off. The fma
-# candidates call std::fma explicitly.
-stats_selfcheck.o: stats_selfcheck.cpp
-	$(CXX) $(CXXFLAGS) -ffp-contract=off $(INCLUDES) -c $< -o $@
-
 third_party/pgenlib/%.o: third_party/pgenlib/%.cc
 	$(CXX) $(PGENLIB_CXXFLAGS) -c $< -o $@
 

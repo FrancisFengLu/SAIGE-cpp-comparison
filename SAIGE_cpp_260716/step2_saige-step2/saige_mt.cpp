@@ -361,7 +361,6 @@ const char* batchableReason(const TraitMeta& t_meta)
 {
     if (t_meta.kind == TraitKind::Survival)  return "survival";
     if (t_meta.isCondition)                  return "isCondition=true";
-    if (t_meta.isnoadjCov)                   return "isnoadjCov=true";
     // First-pass flagSparseGRM_cur, mirroring main()'s per-marker ctx: with
     // isFastTest the first pass is forced onto the dense path, which is the one
     // the batch kernel implements.
@@ -534,6 +533,10 @@ void buildMTContext(MTContext& t_ctx,
                 t_ctx.WXstack.cols(wa, wb) = nm.X.each_col() % nm.mu2;
                 t_ctx.MU2bin.col(M.binIdx) = nm.mu2;
             }
+            // sum res_t and sum mu2_t (n_t for a quantitative trait): the
+            // constants of the isnoadjCov score (noadjPairBin / noadjPairQnt).
+            t_ctx.sumR[t] = arma::accu(nm.res);
+            t_ctx.sumM[t] = (M.kind == TraitKind::Binary) ? arma::accu(nm.mu2) : static_cast<double>(nT);
         } else {
             // Embed: the trait's k-th row goes to union row pos[k]; every other
             // row is an exact zero, so a GEMM against a union-length genotype
@@ -887,6 +890,29 @@ static void emitBlockResultsVecQuant(int t_t, int t_j0,
     (void)nFall;
 }
 
+// R's scoreTestFast_noadjCov (SAIGE_test.cpp) on a block's sums: the
+// genotype is centred at 2 AF (its post-imputation ALT frequency, flipped
+// allele and all, exactly the number R hands getMarkerPval) instead of being
+// projected off the covariates.
+//   S    = (g'res - 2 AF sum(res)) / tau0
+//   var2 = tau0 * ( sum mu2 g^2 - 4 AF sum mu2 g + 4 AF^2 sum mu2 )
+// Binary: mu2 = mu(1-mu), tau0 = 1. Quantitative: mu2 = 1/tau0 for every
+// sample, so the tau0s cancel and var2 = g'g - 4 AF sum(g) + 4 AF^2 n.
+static inline void noadjPairBin(double t_tau0, double t_af, double t_gr, double t_gmu, double t_g2mu,
+                                double t_sumR, double t_sumM, double& t_S, double& t_var2)
+{
+    const double c = 2.0 * t_af;
+    t_S    = (t_gr - t_sumR * c) / t_tau0;
+    t_var2 = (t_g2mu - 2.0 * c * t_gmu + t_sumM * c * c) * t_tau0;
+}
+static inline void noadjPairQnt(double t_tau0, double t_af, double t_gr, double t_gsum, double t_gsq,
+                                double t_sumR, double t_n, double& t_S, double& t_var2)
+{
+    const double c = 2.0 * t_af;
+    t_S    = (t_gr - t_sumR * c) / t_tau0;
+    t_var2 = t_gsq - 2.0 * c * t_gsum + t_n * c * c;
+}
+
 // The one place that decides which tail a (block, trait) takes.
 static inline void emitBlock(const MTContext& t_ctx, const TraitMeta& t_M,
                              int t_t, int t_j0,
@@ -907,6 +933,7 @@ void scoreTestBatchMT(const MTContext& t_ctx,
                       const arma::mat& t_Gb,
                       int t_j0, int t_j1,
                       const arma::mat& t_VR,
+                      const arma::mat& t_AF,
                       const MTBlockAdj* t_adj,
                       MTScratch& t_scr,
                       MTBlockResult& t_out)
@@ -920,13 +947,24 @@ void scoreTestBatchMT(const MTContext& t_ctx,
     // splitting the GEMM.
     const int INTMAX = std::numeric_limits<int>::max();
     const bool foldOn = t_ctx.foldQuant;
-    bool anyBin = false, anyQnt = false;
+    bool anyBin = false, anyQnt = false;         // some trait of the kind needs the covariate GEMMs
+    bool anyBinG2 = false, anyQntGsq = false;    // some trait of the kind at all (g^2 sums)
     bool anyFold = false, anyWideA = false;
     bool anyAdj = false, anyAdjBin = false, anyAdjQnt = false;
+    // isnoadjCov traits read no covariate block: only g'res, and for a binary
+    // trait g'mu2 / (g^2)'mu2, for a quantitative one sum(g) / g'g.
+    bool anyNoadjBin = false, anyNoadjQnt = false, anyNoadjQntAdj = false;
     int c0 = INTMAX, c1 = 0, b0 = INTMAX, b1 = 0, q0 = INTMAX, q1 = 0;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (M.kind == TraitKind::Binary) anyBinG2 = true; else anyQntGsq = true;
+        anyAdj = anyAdj || adj;
+        if (M.isnoadjCov) {
+            if (M.kind == TraitKind::Binary) { anyNoadjBin = true; anyAdjBin = anyAdjBin || adj; }
+            else { anyNoadjQnt = true; anyAdjQnt = anyAdjQnt || adj; anyNoadjQntAdj = anyNoadjQntAdj || adj; }
+            continue;
+        }
         // A folded trait reads neither Astack nor Xstack in the marker loop --
         // its whole sample-space contribution is the shared Z0 -- so it must
         // not widen either GEMM's column range. buildMTContext only ever marks
@@ -944,7 +982,6 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             q0 = std::min(q0, M.colOff); q1 = std::max(q1, M.colOff + M.p);
             anyAdjQnt = anyAdjQnt || adj;
         }
-        anyAdj = anyAdj || adj;
     }
     if (anyAdj && t_adj == nullptr)
         throw std::runtime_error("scoreTestBatchMT: traits with their own sample list need t_adj");
@@ -959,20 +996,24 @@ void scoreTestBatchMT(const MTContext& t_ctx,
     // g^2 feeds both the binary sum_i mu2_i g_i^2 and the quantitative g'g.
     t_scr.Gb2 = Gv % Gv;                                            // N x B
 
-    if (anyBin) {
+    if (anyBin && b0 != INTMAX)
         t_scr.GWbin  = colView(t_ctx.WXstack, b0, b1).t() * Gv;     // (b1-b0) x B
+    if (anyBinG2)
         t_scr.G2Mu2  = t_scr.Gb2.t() * t_ctx.MU2bin;                // B x nBin
+    if (anyNoadjBin)
+        t_scr.GMu2   = Gv.t() * t_ctx.MU2bin;                       // B x nBin
+    if (anyQnt && q0 != INTMAX) {
+        MTF_TIC();
+        t_scr.GWqnt = colView(t_ctx.Xstack, q0, q1).t() * Gv;       // (q1-q0) x B
+        MTF_TOC(SAIGE::g_mtfProfGW);
     }
-    if (anyQnt) {
-        if (q0 != INTMAX) {
-            MTF_TIC();
-            t_scr.GWqnt = colView(t_ctx.Xstack, q0, q1).t() * Gv;   // (q1-q0) x B
-            MTF_TOC(SAIGE::g_mtfProfGW);
-        }
+    if (anyQntGsq) {
         MTF_TIC();
         t_scr.Gsq    = arma::sum(t_scr.Gb2, 0).t();                 // B
         MTF_TOC(SAIGE::g_mtfProfGsq);
     }
+    if (anyNoadjQnt)
+        t_scr.Gsum   = arma::sum(Gv, 0).t();                        // B
     if (t_ctx.fuseGemm && anyFold) {
         // One pass over G for both: GH = [Xref | RES]' G. The leading p
         // rows are Z0, the trailing P rows are GR transposed. Each element is
@@ -1013,36 +1054,38 @@ void scoreTestBatchMT(const MTContext& t_ctx,
             if (anyFlipAdj) break;
         }
         const arma::uword nMask = t_ctx.MASKq.n_cols;
-        if (anyAdjBin && anyFlipAdj) t_scr.GMu2 = Gv.t() * t_ctx.MU2bin;       // B x nBin
+        if (anyAdjBin && anyFlipAdj && !anyNoadjBin) t_scr.GMu2 = Gv.t() * t_ctx.MU2bin;   // B x nBin
         if (anyAdjQnt && nMask > 0) {
             t_scr.GMask2 = t_scr.Gb2.t() * t_ctx.MASKq;                          // B x nMask
-            if (anyFlipAdj) t_scr.GMask1 = Gv.t() * t_ctx.MASKq;                 // B x nMask
+            if (anyFlipAdj || anyNoadjQntAdj) t_scr.GMask1 = Gv.t() * t_ctx.MASKq;   // B x nMask
         }
         // Stack rows summed over each column's missing cells. Rows outside a
         // trait are zero in its stack columns, so summing over every missing
         // cell of the union column collects exactly the trait's own missing
-        // cells.
-        t_scr.MissA.zeros(static_cast<arma::uword>(c1 - c0), B);
+        // cells. The covariate stacks are only read by the traits that take
+        // the covariate projection (c0 .. c1 etc. are their ranges).
+        const bool covA = (c0 != INTMAX), covB = (b0 != INTMAX), covQ = (q0 != INTMAX);
+        if (covA) t_scr.MissA.zeros(static_cast<arma::uword>(c1 - c0), B);
         t_scr.MissR.zeros(B, t_ctx.RES.n_cols);
         if (anyAdjBin) {
-            t_scr.MissWbin.zeros(static_cast<arma::uword>(b1 - b0), B);
+            if (covB) t_scr.MissWbin.zeros(static_cast<arma::uword>(b1 - b0), B);
             t_scr.MissMu2.zeros(B, t_ctx.MU2bin.n_cols);
         }
         if (anyAdjQnt) {
-            t_scr.MissWqnt.zeros(static_cast<arma::uword>(q1 - q0), B);
+            if (covQ) t_scr.MissWqnt.zeros(static_cast<arma::uword>(q1 - q0), B);
             if (nMask > 0) t_scr.MissMask.zeros(B, nMask);
         }
         for (arma::uword j = 0; j < B; ++j) {
             const std::vector<arma::uword>& mv = t_adj->miss[t_j0 + j];
             if (mv.empty()) continue;
-            sumRowsIntoCol(t_ctx.Astack, c0, c1, mv, t_scr.MissA, j);
+            if (covA) sumRowsIntoCol(t_ctx.Astack, c0, c1, mv, t_scr.MissA, j);
             sumRowsIntoRow(t_ctx.RES, mv, t_scr.MissR, j);
             if (anyAdjBin) {
-                sumRowsIntoCol(t_ctx.WXstack, b0, b1, mv, t_scr.MissWbin, j);
+                if (covB) sumRowsIntoCol(t_ctx.WXstack, b0, b1, mv, t_scr.MissWbin, j);
                 sumRowsIntoRow(t_ctx.MU2bin, mv, t_scr.MissMu2, j);
             }
             if (anyAdjQnt) {
-                sumRowsIntoCol(t_ctx.Xstack, q0, q1, mv, t_scr.MissWqnt, j);
+                if (covQ) sumRowsIntoCol(t_ctx.Xstack, q0, q1, mv, t_scr.MissWqnt, j);
                 if (nMask > 0) sumRowsIntoRow(t_ctx.MASKq, mv, t_scr.MissMask, j);
             }
         }
@@ -1050,6 +1093,56 @@ void scoreTestBatchMT(const MTContext& t_ctx,
 
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
+        if (M.isnoadjCov) {
+            // R's scoreTestFast_noadjCov (noadjPairBin / noadjPairQnt): no
+            // covariate block at all. A trait with its own sample list maps
+            // the union column's sums to its own vector g_t = a g + b + d
+            // [missing] exactly as the adjusted branch below does.
+            const bool adj = anyAdj && !t_ctx.samp[t].sameAsUnion;
+            arma::vec S(B), var2(B);
+            for (arma::uword j = 0; j < B; ++j) {
+                const arma::uword jo = static_cast<arma::uword>(t_j0) + j;
+                const double af = t_AF(jo, t);
+                double R = t_scr.GR(j, t);
+                if (M.kind == TraitKind::Binary) {
+                    double Q = t_scr.G2Mu2(j, M.binIdx);
+                    double L = t_scr.GMu2(j, M.binIdx);
+                    if (adj) {
+                        const double a = t_adj->a(jo, t), b = t_adj->b(jo, t);
+                        const double d = t_adj->d(jo, t), q = t_adj->q(jo, t);
+                        const bool flip = (a < 0.0), shift = (b != 0.0);
+                        const bool miss = (t_adj->nMiss(jo, t) > 0);
+                        if (flip)  { R = -R; L = -L; }
+                        if (shift) { R += b * t_ctx.sumR[t]; L += b * t_ctx.sumM[t]; }
+                        if (miss)  { R += d * t_scr.MissR(j, t); L += d * t_scr.MissMu2(j, M.binIdx); }
+                        if (shift) Q += 2.0 * a * b * t_scr.GMu2(j, M.binIdx) + b * b * t_ctx.sumM[t];
+                        if (miss)  Q += q * t_scr.MissMu2(j, M.binIdx);
+                    }
+                    noadjPairBin(M.tau0, af, R, L, Q, t_ctx.sumR[t], t_ctx.sumM[t], S[j], var2[j]);
+                } else {
+                    double Q, L;
+                    if (adj) {
+                        const double a = t_adj->a(jo, t), b = t_adj->b(jo, t);
+                        const double d = t_adj->d(jo, t), q = t_adj->q(jo, t);
+                        const bool flip = (a < 0.0), shift = (b != 0.0);
+                        const bool miss = (t_adj->nMiss(jo, t) > 0);
+                        Q = t_scr.GMask2(j, M.maskIdx);
+                        L = t_scr.GMask1(j, M.maskIdx);
+                        if (flip)  { R = -R; L = -L; }
+                        if (shift) { R += b * t_ctx.sumR[t]; L += b * t_ctx.sumM[t]; }
+                        if (miss)  { R += d * t_scr.MissR(j, t); L += d * t_scr.MissMask(j, M.maskIdx); }
+                        if (shift) Q += 2.0 * a * b * t_scr.GMask1(j, M.maskIdx) + b * b * t_ctx.sumM[t];
+                        if (miss)  Q += q * t_scr.MissMask(j, M.maskIdx);
+                    } else {
+                        Q = t_scr.Gsq[j];
+                        L = t_scr.Gsum[j];
+                    }
+                    noadjPairQnt(M.tau0, af, R, L, Q, t_ctx.sumR[t], t_ctx.sumM[t], S[j], var2[j]);
+                }
+            }
+            emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+            continue;
+        }
         if (foldOn && t_ctx.foldable[t]) {
             // Same three contractions as the !adj branch below, with
             //   A_t' G  ->  K_t' Z0        (Astack block == Xref K_t)
@@ -1188,27 +1281,98 @@ inline void preCheckWidth(const MTScratch& t_scr, const MTContext& t_ctx, int t_
 
 }  // namespace
 
+// isnoadjCov tail of the GPU-fed variants: the trait's own g'res / sum(g) /
+// g'g (quantitative) or g'res / g'mu2 / (g^2)'mu2 (binary) for the block
+// columns [j0, j1), possibly mapped through the trait's affine map.
+static void emitNoadjQnt(const MTContext& t_ctx, const TraitMeta& M, int t, int t_j0, int t_j1,
+                         const arma::mat& t_VR, const arma::mat& t_AF, MTScratch& t_scr,
+                         const MTBlockAdj* t_adj, const arma::mat* t_Qown, const arma::mat* t_Sown,
+                         MTBlockResult& t_out)
+{
+    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    const bool adj = (t_adj != nullptr) && !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+    arma::vec S(B), var2(B);
+    for (arma::uword j = 0; j < B; ++j) {
+        const arma::uword jo = static_cast<arma::uword>(t_j0) + j;
+        const double af = t_AF(jo, t);
+        double R = t_scr.GR(jo, t), Q, L;
+        if (adj) {
+            const double a = t_adj->a(jo, t), b = t_adj->b(jo, t), d = t_adj->d(jo, t);
+            const bool flip = (a < 0.0), shift = (b != 0.0);
+            const bool miss = (t_adj->nMiss(jo, t) > 0);
+            if (flip)  R = -R;
+            if (shift) R += b * t_ctx.sumR[t];
+            if (miss)  R += d * t_scr.MissR(j, t);
+            Q = (*t_Qown)(jo, t);
+            L = (*t_Sown)(jo, t);
+        } else {
+            Q = t_scr.Gsq[jo];
+            L = t_scr.Gsum[jo];
+        }
+        noadjPairQnt(M.tau0, af, R, L, Q, t_ctx.sumR[t], t_ctx.sumM[t], S[j], var2[j]);
+    }
+    emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+}
+static void emitNoadjBin(const MTContext& t_ctx, const TraitMeta& M, int t, int t_j0, int t_j1,
+                         const arma::mat& t_VR, const arma::mat& t_AF, MTScratch& t_scr,
+                         const MTBlockAdj* t_adj, MTBlockResult& t_out)
+{
+    const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    const arma::uword bi = static_cast<arma::uword>(M.binIdx);
+    const bool adj = (t_adj != nullptr) && !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+    arma::vec S(B), var2(B);
+    for (arma::uword j = 0; j < B; ++j) {
+        const arma::uword jo = static_cast<arma::uword>(t_j0) + j;
+        const double af = t_AF(jo, t);
+        double R = t_scr.GR(jo, t);
+        double Q = t_scr.G2Mu2(jo, bi);
+        double L = t_scr.GMu2(jo, bi);
+        if (adj) {
+            const double a = t_adj->a(jo, t), b = t_adj->b(jo, t);
+            const double d = t_adj->d(jo, t), q = t_adj->q(jo, t);
+            const bool flip = (a < 0.0), shift = (b != 0.0);
+            const bool miss = (t_adj->nMiss(jo, t) > 0);
+            if (flip)  { R = -R; L = -L; }
+            if (shift) { R += b * t_ctx.sumR[t]; L += b * t_ctx.sumM[t]; }
+            if (miss)  { R += d * t_scr.MissR(j, t); L += d * t_scr.MissMu2(j, bi); }
+            if (shift) Q += 2.0 * a * b * t_scr.GMu2(jo, bi) + b * b * t_ctx.sumM[t];
+            if (miss)  Q += q * t_scr.MissMu2(j, bi);
+        }
+        noadjPairBin(M.tau0, af, R, L, Q, t_ctx.sumR[t], t_ctx.sumM[t], S[j], var2[j]);
+    }
+    emitBlock(t_ctx, M, t, t_j0, S, var2, t_VR, t_scr, t_out);
+}
+
 void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               const std::vector<int>& t_traitSet,
                               int t_j0, int t_j1,
                               const arma::mat& t_VR,
+                              const arma::mat& t_AF,
                               MTScratch& t_scr,
                               MTBlockResult& t_out)
 {
     if (t_traitSet.empty() || t_j1 <= t_j0) return;
+    bool anyNoadj = false;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         if (M.kind != TraitKind::Quantitative)
             throw std::runtime_error("scoreTestBatchMTQuantPre: non-quantitative trait");
         if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion)
             throw std::runtime_error("scoreTestBatchMTQuantPre: trait has its own sample list");
+        if (M.isnoadjCov) anyNoadj = true;
     }
     preCheckWidth(t_scr, t_ctx, t_j1, false, "scoreTestBatchMTQuantPre");
+    if (anyNoadj && t_scr.Gsum.n_elem < static_cast<arma::uword>(t_j1))
+        throw std::runtime_error("scoreTestBatchMTQuantPre: prefilled Gsum is too short");
     const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
     const arma::vec Gsq = t_scr.Gsq.subvec(c0, c1);
 
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
+        if (M.isnoadjCov) {
+            emitNoadjQnt(t_ctx, M, t, t_j0, t_j1, t_VR, t_AF, t_scr, nullptr, nullptr, nullptr, t_out);
+            continue;
+        }
         const arma::uword r0 = static_cast<arma::uword>(M.colOff);
         const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
         const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
@@ -1228,10 +1392,12 @@ void scoreTestBatchMTBinPre(const MTContext& t_ctx,
                             const std::vector<int>& t_traitSet,
                             int t_j0, int t_j1,
                             const arma::mat& t_VR,
+                            const arma::mat& t_AF,
                             MTScratch& t_scr,
                             MTBlockResult& t_out)
 {
     if (t_traitSet.empty() || t_j1 <= t_j0) return;
+    bool anyNoadj = false;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         if (M.kind != TraitKind::Binary)
@@ -1240,12 +1406,20 @@ void scoreTestBatchMTBinPre(const MTContext& t_ctx,
             throw std::runtime_error("scoreTestBatchMTBinPre: trait has its own sample list");
         if (M.binOff < 0 || M.binIdx < 0)
             throw std::runtime_error("scoreTestBatchMTBinPre: trait has no binary stack block");
+        if (M.isnoadjCov) anyNoadj = true;
     }
     preCheckWidth(t_scr, t_ctx, t_j1, true, "scoreTestBatchMTBinPre");
+    if (anyNoadj && (t_scr.GMu2.n_rows < static_cast<arma::uword>(t_j1) ||
+                     t_scr.GMu2.n_cols != (arma::uword)t_ctx.nBin))
+        throw std::runtime_error("scoreTestBatchMTBinPre: prefilled GMu2 has the wrong shape");
     const arma::uword c0 = static_cast<arma::uword>(t_j0), c1 = static_cast<arma::uword>(t_j1) - 1;
 
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
+        if (M.isnoadjCov) {
+            emitNoadjBin(t_ctx, M, t, t_j0, t_j1, t_VR, t_AF, t_scr, nullptr, t_out);
+            continue;
+        }
         const arma::uword r0 = static_cast<arma::uword>(M.colOff);
         const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
         const arma::uword w0 = static_cast<arma::uword>(M.binOff);
@@ -1268,12 +1442,13 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
                                const std::vector<int>& t_traitSet,
                                int t_j0, int t_j1,
                                const arma::mat& t_VR,
+                               const arma::mat& t_AF,
                                const MTBlockAdj& t_adj,
                                MTScratch& t_scr,
                                MTBlockResult& t_out)
 {
     if (t_traitSet.empty() || t_j1 <= t_j0) return;
-    bool anyAdj = false;
+    bool anyAdj = false, anyNoadj = false;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         if (M.kind != TraitKind::Binary)
@@ -1281,13 +1456,16 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
         if (M.binOff < 0 || M.binIdx < 0)
             throw std::runtime_error("scoreTestBatchMTBinPreAdj: trait has no binary stack block");
         if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion) anyAdj = true;
+        if (M.isnoadjCov) anyNoadj = true;
     }
     preCheckWidth(t_scr, t_ctx, t_j1, true, "scoreTestBatchMTBinPreAdj");
     const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
-    if (anyAdj) {
+    if (anyAdj || anyNoadj) {
         if (t_scr.GMu2.n_rows < static_cast<arma::uword>(t_j1) ||
             t_scr.GMu2.n_cols != (arma::uword)t_ctx.nBin)
             throw std::runtime_error("scoreTestBatchMTBinPreAdj: prefilled GMu2 has the wrong shape");
+    }
+    if (anyAdj) {
         if (t_adj.a.n_rows < static_cast<arma::uword>(t_j1) || t_adj.miss.size() < static_cast<size_t>(t_j1))
             throw std::runtime_error("scoreTestBatchMTBinPreAdj: t_adj is narrower than the block");
         // Rows summed over each column's missing cells, columns j0..j1 of the
@@ -1317,6 +1495,10 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
         const arma::uword w1 = w0 + static_cast<arma::uword>(M.p) - 1;
         const arma::uword bi = static_cast<arma::uword>(M.binIdx);
         const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (M.isnoadjCov) {
+            emitNoadjBin(t_ctx, M, t, t_j0, t_j1, t_VR, t_AF, t_scr, adj ? &t_adj : nullptr, t_out);
+            continue;
+        }
         if (!adj) {
             // scoreTestBatchMTBinPre's expressions, unchanged
             const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B
@@ -1376,21 +1558,29 @@ void scoreTestBatchMTQuantPreAdj(const MTContext& t_ctx,
                                  const std::vector<int>& t_traitSet,
                                  int t_j0, int t_j1,
                                  const arma::mat& t_VR,
+                                 const arma::mat& t_AF,
                                  const MTBlockAdj& t_adj,
                                  const arma::mat& t_Qown,
+                                 const arma::mat& t_Sown,
                                  MTScratch& t_scr,
                                  MTBlockResult& t_out)
 {
     if (t_traitSet.empty() || t_j1 <= t_j0) return;
-    bool anyAdj = false;
+    bool anyAdj = false, anyNoadj = false, anyNoadjAdj = false;
     for (int t : t_traitSet) {
         const TraitMeta& M = t_ctx.meta[t];
         if (M.kind != TraitKind::Quantitative)
             throw std::runtime_error("scoreTestBatchMTQuantPreAdj: non-quantitative trait");
-        if (!t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion) anyAdj = true;
+        const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (adj) anyAdj = true;
+        if (M.isnoadjCov) { anyNoadj = true; if (adj) anyNoadjAdj = true; }
     }
     preCheckWidth(t_scr, t_ctx, t_j1, false, "scoreTestBatchMTQuantPreAdj");
     const arma::uword B = static_cast<arma::uword>(t_j1 - t_j0);
+    if (anyNoadj && t_scr.Gsum.n_elem < static_cast<arma::uword>(t_j1))
+        throw std::runtime_error("scoreTestBatchMTQuantPreAdj: prefilled Gsum is too short");
+    if (anyNoadjAdj && (t_Sown.n_rows < static_cast<arma::uword>(t_j1) || t_Sown.n_cols != (arma::uword)t_ctx.P))
+        throw std::runtime_error("scoreTestBatchMTQuantPreAdj: t_Sown has the wrong shape");
     if (anyAdj) {
         if (t_Qown.n_rows < static_cast<arma::uword>(t_j1) || t_Qown.n_cols != (arma::uword)t_ctx.P)
             throw std::runtime_error("scoreTestBatchMTQuantPreAdj: t_Qown has the wrong shape");
@@ -1419,6 +1609,11 @@ void scoreTestBatchMTQuantPreAdj(const MTContext& t_ctx,
         const arma::uword r0 = static_cast<arma::uword>(M.colOff);
         const arma::uword r1 = r0 + static_cast<arma::uword>(M.p) - 1;
         const bool adj = !t_ctx.samp.empty() && !t_ctx.samp[t].sameAsUnion;
+        if (M.isnoadjCov) {
+            emitNoadjQnt(t_ctx, M, t, t_j0, t_j1, t_VR, t_AF, t_scr, adj ? &t_adj : nullptr,
+                         &t_Qown, &t_Sown, t_out);
+            continue;
+        }
         if (!adj) {
             // scoreTestBatchMTQuantPre's expressions, unchanged
             const arma::mat Z_t = t_scr.Zall.submat(r0, c0, r1, c1);        // p x B

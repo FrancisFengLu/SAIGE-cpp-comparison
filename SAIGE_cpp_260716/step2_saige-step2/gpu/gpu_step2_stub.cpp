@@ -50,12 +50,11 @@ bool                 statsSetup(Reducer*, const StatsArgs&)  { return false; }
 void                 statsDisable(Reducer*)                  {}
 std::string          statsLastError()                        { return "built without CUDA"; }
 double*              statsVr(Reducer*, int)                  { return nullptr; }
+double*              statsAf(Reducer*, int)                  { return nullptr; }
 const double*        statsS(const Reducer*, int)             { return nullptr; }
 const double*        statsVar2(const Reducer*, int)          { return nullptr; }
 const double*        statsP(const Reducer*, int)             { return nullptr; }
 const unsigned char* statsFlags(const Reducer*, int)         { return nullptr; }
-bool                 statsSelfTest(Reducer*, const double*, const double*, const double*, int) { return false; }
-bool                 statsErfcTest(Reducer*, const double*, int, double*) { return false; }
 double               statsSeconds(const Reducer*)            { return 0.0; }
 
 }  // namespace gpu2

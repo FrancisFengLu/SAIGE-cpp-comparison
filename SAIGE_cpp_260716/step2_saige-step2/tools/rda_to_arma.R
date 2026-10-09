@@ -86,11 +86,14 @@ writeLines(c(
   '  "loco": false,',
   '  "lowmem_loco": false,',
   '  "loco_chroms": [],',
+  # R keeps these as step-2 options; they are recorded here with R's step-2
+  # defaults and saige-step2 does not read them (it has its own config keys,
+  # with the same defaults).
   '  "SPA_Cutoff": 2,',
-  '  "impute_method": "mean",',
+  '  "impute_method": "best_guess",',
   '  "flagSparseGRM": false,',
-  '  "isFastTest": true,',
-  '  "isnoadjCov": false,',
+  '  "isFastTest": false,',
+  '  "isnoadjCov": true,',
   '  "pval_cutoff_for_fastTest": 0.05,',
   '  "isCondition": false,',
   '  "is_Firth_beta": false,',

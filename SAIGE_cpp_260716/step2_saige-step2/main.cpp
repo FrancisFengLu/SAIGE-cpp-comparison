@@ -77,7 +77,6 @@ extern "C" void openblas_set_num_threads(int);
 #include "gpu_er.hpp"             // the exact test (ER) on the device (gpuER)
 #include "er_binary.hpp"
 #include "s2_gpu_sparse.hpp"
-#include "stats_selfcheck.hpp"
 #include "score_format.hpp"
 #include "UTIL.hpp"
 #include "cct.hpp"
@@ -425,21 +424,18 @@ int  g_gpuPrefetchThreads = 4;
 bool g_gpuOverlap     = false;
 int  g_gpuOverlapSets = 6;
 int  g_gpuOverlapLag  = 3;
-// Config key gpuDeviceStats (default false): on the GPU path, the per-pair
-// statistics of the binary traits -- S, var2, var1, Beta, SE, StdStat, the
-// chi-square(1) p-value -- and the SPA / Firth / fast-test gate bits are
-// formed on the device right after the scan GEMMs (gpu/gpu_step2.hpp "Per-pair
-// statistics", stats_selfcheck.hpp), so the host tail no longer runs the
-// per-block arma tail, boost's chi-square tail and sprintf for every pair.
-// S / var2 are bit-identical to the host's (the operation order is identified
-// and verified at start-up; any failure leaves this off for the run); p is
-// erfc on the device with a guard band: a pair whose printed string or gate
-// decision could depend on the last bits of p, with p < 1e-5, or with a
-// degenerate statistic, is handed back to format_score_result on the host.
-// Text output is byte-identical; the fp64 BETA / SE / Tstat / var in an .sgs
-// are the same bits. S2_DEVSTATS.md.
+// Config key gpuDeviceStats (default: = useGPU): on the GPU path, the per-pair
+// statistics of the binary traits -- S, var2, the chi-square(1) p-value --
+// and the SPA / Firth / fast-test gate bits are formed on the device right
+// after the scan GEMMs (gpu/gpu_step2.hpp "Per-pair statistics"), so the host
+// tail no longer runs the per-block arma tail, boost's chi-square tail and
+// sprintf for every pair; it forms var1 / Beta / SE from the device's S and
+// var2. Same algebra as the host tail in another summation order (agreement to
+// rounding, not to the bit). A degenerate pair, or one whose p underflowed to
+// 0, is handed back to format_score_result on the host. S2_DEVSTATS.md,
+// S2_RDEFAULTS.md.
 bool g_gpuDeviceStats = false;
-// Config key sgsRawDouble (default false; outputFormat: sgs only): store a
+// Config key sgsRawDouble (default: with outputFormat: sgs at fp64): store a
 // p-value column as the computed double (plus a per-row kind byte: linear,
 // natural log for the "%.1fE%d" underflow form, or a verbatim string) instead
 // of strtod of the printed string, so the GPU path formats no p-value string
@@ -2358,6 +2354,7 @@ struct MTBlockWork {
                                   // up, low-MAC ones from column B-1 down, so
                                   // both groups are contiguous (design 3.2)
     arma::mat VR;                 // B x P, per-pair variance ratio
+    arma::mat AF;                 // B x P, per-pair post-imputation ALT frequency (saige_mt.hpp t_AF)
     std::vector<int>    colOf;    // block-local marker -> Gb column, -1 if not scored
     std::vector<char>   isHi;     // per Gb column
     std::vector<double> MACc, altFreqc;
@@ -2384,6 +2381,7 @@ struct MTBlockWork {
     arma::vec gT;                     // a trait's own genotype vector (fallback)
     arma::uvec idxZt, idxNZt;
     arma::mat Qown;                   // GPU path: B x P, g_t'g_t of a quantitative trait with its own list
+    arma::mat Sown;                   // GPU path: B x P, sum of g_t of such a trait (isnoadjCov)
 
     // ---- mtPopcountAF only ----
     // The marker's 2-bit codes as the .bed row holds them, in analysis order,
@@ -2407,7 +2405,8 @@ struct MTBlockWork {
             if (cntc.size() != (std::size_t)t_B * 4) cntc.resize((std::size_t)t_B * 4);
             hasPacked.assign(t_B, 0);
         }
-        if (VR.n_rows != B || VR.n_cols != (arma::uword)t_P) VR.set_size(B, t_P);
+        if (VR.n_rows != B || VR.n_cols != (arma::uword)t_P) { VR.set_size(B, t_P); AF.set_size(B, t_P); }
+        AF.zeros();
         if (tmpG.n_elem != N) { tmpG.set_size(N); gtilde.set_size(N); }
         colOf.assign(t_B, -1);
         isHi.assign(t_B, 0);
@@ -2454,7 +2453,7 @@ struct MTBlockWork {
 // decides whether the batch result stands or the pair takes the scalar path.
 // That is exactly mainMarkerMT's gate, on the device's numbers. Refused here,
 // before a marker is read, so the refusal is one printed line rather than a
-// silent divergence: survival traits, conditional analysis, isnoadjCov,
+// silent divergence: survival traits, conditional analysis,
 // sparse-GRM-first-pass traits, traits whose sample list is not the union's,
 // non-PLINK input, and the scalar-decode rollback switch. Region and set-based
 // tests never reach here at all (different entry point).
@@ -2544,11 +2543,6 @@ struct PendSpa {
     // sparse variance. vrFast is the recompute's variance ratio.
     char   stage = 0;
     double vrFast = 1.0;
-    // gpuDeviceStats: pno is the device's erfc p (within 2e-14 of boost's,
-    // same printed string and gates by the guard band). A number derived
-    // from it for OUTPUT -- the Firth SE of a pair whose SPA did not
-    // converge -- is taken from boost's p instead (phase 4).
-    char   devP = 0;
 };
 
 // Per-block state that has to survive the barrier between the read phase and
@@ -2556,11 +2550,12 @@ struct PendSpa {
 struct GpuBlk {
     std::vector<int>      colOf;     // block-local marker index -> slot in block
     std::vector<char>     isHi;      // per slot: MAC > MACCutoffforER
-    std::vector<double>   MACc, AFc, ssc;
+    std::vector<double>   MACc, AFc, ssc, gsc;   // gsc: sum_i g_i from the counts (isnoadjCov, quantitative)
     std::vector<double>   fdc;       // 4 per slot: code -> final dosage
     std::vector<uint64_t> cntc;      // 4 per slot: the column's code counts
     std::vector<char>     flipc;
     arma::mat             VR;        // Bblk x P
+    arma::mat             AF;        // Bblk x P, the pair's post-imputation ALT frequency (saige_mt.hpp t_AF)
     int nHi = 0, nLo = 0;
     // ---- gpuOwnSampleSets only: per (slot, trait), as MTBlockWork holds them ----
     std::vector<char>     qcP, flipP, affP;   // [B*P]
@@ -2586,11 +2581,15 @@ struct GpuBlk {
         MACc.assign(B, 0.0);
         AFc.assign(B, 0.0);
         ssc.assign(B, 0.0);
+        gsc.assign(B, 0.0);
         fdc.assign((std::size_t)B * 4, 0.0);
         cntc.assign((std::size_t)B * 4, 0);
         flipc.assign(B, 0);
-        if (VR.n_rows != (arma::uword)B || VR.n_cols != (arma::uword)P)
+        if (VR.n_rows != (arma::uword)B || VR.n_cols != (arma::uword)P) {
             VR.set_size(B, P);
+            AF.set_size(B, P);
+        }
+        AF.zeros();
         nHi = nLo = 0;
     }
 };
@@ -2727,11 +2726,11 @@ bool mainMarkerMTGpu(
             // tail takes g~' Sigma^-1 g~ from the device (s2_gpu_sparse.hpp).
             // Whether the device data could actually be built is checked below.
             const bool sparseFirstOK = g_gpuSparse && M.kind == SAIGE::TraitKind::Binary &&
-                                       M.flagSparseGRM && !M.isFastTest && !M.isCondition && !M.isnoadjCov;
+                                       M.flagSparseGRM && !M.isFastTest && !M.isCondition;
             if (!M.batchable && !sparseFirstOK) {
                 why = "trait '" + M.name + "': " + SAIGE::batchableReason(M);
                 if (M.kind == SAIGE::TraitKind::Quantitative && M.flagSparseGRM && !M.isFastTest &&
-                    !M.isCondition && !M.isnoadjCov)
+                    !M.isCondition)
                     why += " (gpuSparse covers binary traits only)";
                 break;
             }
@@ -2805,10 +2804,15 @@ bool mainMarkerMTGpu(
     // same way.
     const int sumP = ctx.sumP, sumPbin = ctx.sumPbin, sumPqnt = ctx.sumPqnt, qOff = ctx.qOff;
     const int oW = sumP, oXq = sumP + sumPbin, oR = sumP + sumPbin + sumPqnt;
-    // differ: G^T MU2bin too (the flip correction of a trait with its own list,
-    // scoreTestBatchMTBinPreAdj), nBin more columns after RES.
+    // G^T MU2bin too, nBin more columns after RES: the flip correction of a
+    // trait with its own list (differ, scoreTestBatchMTBinPreAdj), and the
+    // centred variance of a binary trait with isnoadjCov (g'mu2).
+    bool anyNoadjBin = false;
+    for (int t = 0; t < P; t++)
+        if (ctx.meta[t].kind == SAIGE::TraitKind::Binary && ctx.meta[t].isnoadjCov) anyNoadjBin = true;
+    const bool needGM = (differ || anyNoadjBin) && nBin > 0;
     const int oGM = oR + P;
-    const int K1 = oR + P + ((differ && nBin > 0) ? nBin : 0);
+    const int K1 = oR + P + (needGM ? nBin : 0);
     const int K2 = nBin;
     if ((int)ctx.Astack.n_rows != n || (int)ctx.Xstack.n_rows != n ||
         (int)ctx.RES.n_rows != n ||
@@ -3286,48 +3290,54 @@ bool mainMarkerMTGpu(
     }
 
     // ---------------- per-pair statistics on the device (gpuDeviceStats) ----------------
-    // Patterns identified against the host tail, buffers set up, the kernel
-    // checked end to end (stats_selfcheck.hpp); any failure keeps the host
-    // tail for the run. Not with different sample lists (the adjusted tail
-    // is not on the device) nor for a sparse first pass (its statistic is
-    // spStats'); such traits keep the host path pair by pair.
+    // The per-trait constants (XVX / S_a, the isnoadjCov sums) go up once;
+    // from then on every reduce() also forms S / var2 / p / gates per (slot,
+    // binary trait) (gpu_step2.hpp "Per-pair statistics"). Not with different
+    // sample lists (the adjusted tail is not on the device) nor for a sparse
+    // first pass (its statistic is spStats'); such traits keep the host path
+    // pair by pair.
     bool devStatsOn = false;
     std::vector<char> devStatsEnabled((std::size_t)std::max(nBin, 1), 0);
     if (g_gpuDeviceStats && anyBin) {
-        std::string why, detail1, detail2;
+        std::string why;
         std::vector<int> devTraits;
         for (int t : binTraits)
             if (!(spDev && spFirst[t])) { devStatsEnabled[(std::size_t)ctx.meta[t].binIdx] = 1; devTraits.push_back(t); }
         if (differ) why = "the models do not share one sample list (gpuOwnSampleSets); the adjusted tail stays on the host";
         else if (!saige::gpu2::isFp64(R)) why = "the scan results are not fp64";
         else if (devTraits.empty()) why = "every binary trait takes the sparse first pass";
-        SAIGE::devstats::Patterns pat;
-        if (why.empty()) why = SAIGE::devstats::identifyHostPatterns(ctx, devTraits, pat, detail1);
         if (why.empty()) {
-            std::vector<saige::gpu2::StatsTrait> st;
-            SAIGE::devstats::fillStatsTraits(ctx, binTraits, devStatsEnabled, oW, oR, st);
+            std::vector<saige::gpu2::StatsTrait> st((std::size_t)nBin);
+            std::vector<double> consts;
+            for (int t : binTraits) {
+                const SAIGE::TraitMeta& M = ctx.meta[t];
+                saige::gpu2::StatsTrait& T = st[(std::size_t)M.binIdx];
+                T.p = M.p; T.rowZ = M.colOff; T.rowW = oW + M.binOff; T.rowGR = oR + t; T.colG2 = M.binIdx;
+                T.rowGM = needGM ? oGM + M.binIdx : -1;
+                T.enabled = devStatsEnabled[(std::size_t)M.binIdx] ? 1 : 0;
+                T.isFirth = M.is_Firth_beta ? 1 : 0;
+                T.isFast = M.isFastTest ? 1 : 0;
+                T.noadj = M.isnoadjCov ? 1 : 0;
+                T.tau0 = M.tau0; T.spaCut = M.SPA_Cutoff; T.firthCut = M.pCutoffforFirth; T.fastCut = M.pval_cutoff_for_fastTest;
+                T.sumR = ctx.sumR[t]; T.sumM = ctx.sumM[t];
+                T.xvxOff = (int)consts.size();
+                for (int i = 0; i < M.p; i++)
+                    for (int k = 0; k < M.p; k++) consts.push_back(ctx.XVX[t](i, k));
+                T.saOff = (int)consts.size();
+                for (int i = 0; i < M.p; i++) consts.push_back(ctx.S_a[t](i));
+            }
             saige::gpu2::StatsArgs sa;
             sa.nTraits = nBin; sa.traits = st.data();
-            sa.statCutoff = SAIGE::mtVecStatCutoff(); sa.pRelTol = 2e-14;
-            sa.patXZ = pat.xz; sa.patSaz = pat.saz; sa.patZxz = pat.zxz; sa.patGwz = pat.gwz;
+            sa.consts = consts.data(); sa.nConsts = (int)consts.size();
             if (!saige::gpu2::statsSetup(R, sa)) why = "device setup failed (" + saige::gpu2::statsLastError() + ")";
         }
-        if (why.empty())
-            why = SAIGE::devstats::deviceSelfTest(R, ctx, binTraits, devStatsEnabled, K1x, K2x, oW, oR, slots, Bblk,
-                                                  SAIGE::mtVecStatCutoff(), 2e-14, detail2);
         if (!why.empty()) {
             saige::gpu2::statsDisable(R);
             std::cout << "  gpuDeviceStats: off (" << why << "); the host tail computes every pair" << std::endl;
-            if (!detail1.empty())
-                std::cout << "  gpuDeviceStats: host order probe: XVX Z pattern " << pat.xz << ", S_a'Z pattern " << pat.saz
-                          << ", Hadamard sums " << pat.zxz << " / " << pat.gwz << " (" << detail1 << ")" << std::endl;
         } else {
             devStatsOn = true;
             std::cout << "  gpuDeviceStats: on -- S / var2 / p / gates of " << devTraits.size() << " of " << nBin
-                      << " binary traits on the device; host order found: XVX Z pattern " << pat.xz
-                      << ", S_a'Z pattern " << pat.saz << ", Hadamard sums " << pat.zxz << " / " << pat.gwz
-                      << " (" << detail1 << ")" << std::endl;
-            std::cout << "  gpuDeviceStats: startup self-check passed (" << detail2 << ")" << std::endl;
+                      << " binary traits formed on the device after the scan" << std::endl;
         }
     } else if (g_gpuDeviceStats) {
         std::cout << "  gpuDeviceStats: no binary trait; nothing to do" << std::endl;
@@ -3604,6 +3614,7 @@ bool mainMarkerMTGpu(
         unsigned char* hPkS = hPkSet[s];
         double*        hLuS = hLuSet[s];
         double* const  hVrS = devStatsOn ? saige::gpu2::statsVr(R, s) : nullptr;   // gpuDeviceStats: VR per (slot, binary trait)
+        double* const  hAfS = devStatsOn ? saige::gpu2::statsAf(R, s) : nullptr;   // gpuDeviceStats: AF per (slot, binary trait)
             #pragma omp parallel for schedule(dynamic, 1) num_threads(nThr)
             for (int bi = 0; bi < nb; bi++) {
                 const int blk = sb + bi;
@@ -3737,6 +3748,11 @@ bool mainMarkerMTGpu(
                         S.MACc[c]  = 0.0;     // per trait below
                         S.AFc[c]   = 0.0;
                         S.flipc[c] = fu.flip ? 1 : 0;
+                        {
+                            double gs = 0.0;
+                            for (int k = 0; k < 4; k++) gs += fu.fd[k] * (double)fsU.counts[k];
+                            S.gsc[c] = gs;
+                        }
                         std::vector<arma::uword>& mv = S.adj.miss[c];
                         mv.clear();
                         if (fu.counts[kMissU] > 0)
@@ -3749,11 +3765,13 @@ bool mainMarkerMTGpu(
                             S.adj.nMiss(c, t) = 0;
                             S.affP[k] = 0;
                             S.VR(c, t) = 1.0;
+                            S.AF(c, t) = 0.0;
                             if (!tq[t]) continue;
                             const double MAC = tMAC[t];
                             S.flipP[k] = tflip[t];
                             S.MACp(c, t) = MAC;
                             S.AFp(c, t)  = tAF[t];
+                            S.AF(c, t)   = tAF[t];
                             S.ACp(c, t)  = tAC[t];
                             S.MRp(c, t)  = tMR[t];
                             S.IIp(c, t)  = tII[t];
@@ -3858,6 +3876,11 @@ bool mainMarkerMTGpu(
                     S.MACc[c]  = MAC;
                     S.AFc[c]   = altFreq;
                     S.flipc[c] = flip ? 1 : 0;
+                    {
+                        double gs = 0.0;
+                        for (int k = 0; k < 4; k++) gs += fs.fd[k] * (double)fs.counts[k];
+                        S.gsc[c] = gs;
+                    }
 
                     for (int t = 0; t < P; t++) {
                         SAIGE::SAIGEClass* obj = g_saigeObjs[t];
@@ -3867,9 +3890,13 @@ bool mainMarkerMTGpu(
                         S.VR(c, t) = isSingleVR[t]
                             ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
                             : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
-                        // gpuDeviceStats: the pair's variance ratio goes up with the slot
-                        if (hVrS && ctx.meta[t].kind == SAIGE::TraitKind::Binary)
-                            hVrS[(slotBase + c) * (std::size_t)nBin + (std::size_t)ctx.meta[t].binIdx] = S.VR(c, t);
+                        S.AF(c, t) = altFreq;
+                        // gpuDeviceStats: the pair's variance ratio and ALT frequency go up with the slot
+                        if (hVrS && ctx.meta[t].kind == SAIGE::TraitKind::Binary) {
+                            const std::size_t o = (slotBase + c) * (std::size_t)nBin + (std::size_t)ctx.meta[t].binIdx;
+                            hVrS[o] = S.VR(c, t);
+                            hAfS[o] = altFreq;
+                        }
                     }
                 }
                 // Slots this block did not fill still reach the device (see the
@@ -4208,12 +4235,6 @@ bool mainMarkerMTGpu(
                             if (!rawP) fmtP();
                         } else {
                             pvalFinal = pd.pno;
-                            if (pd.devP) {
-                                // boost's p for anything printed off it (phase 5's SE)
-                                double b1, b2, b4, b5, b6, b7; bool b8; std::string b3;
-                                SAIGE::format_score_result(pd.Tstat, pd.var1, pd.var2, b1, b2, b3, b4, b8, b5, b6, b7);
-                                pvalFinal = b4;
-                            }
                             if (rawP) {
                                 pvKind = O.pvalNADk[jj];
                                 if (pvKind == 2) pvalStr = O.pvalNA[jj]; else pvRaw = O.pvalNAD[jj];
@@ -5191,7 +5212,7 @@ bool mainMarkerMTGpu(
                     W.scr.G2Mu2.set_size(Bblk, nBin);
                     for (int b = 0; b < nBin; b++)
                         for (int j = 0; j < Bblk; j++) W.scr.G2Mu2(j, b) = SAIGE_GPU_C2(b, j);
-                    if (differ) {
+                    if (needGM) {
                         W.scr.GMu2.set_size(Bblk, nBin);
                         for (int b = 0; b < nBin; b++)
                             for (int j = 0; j < Bblk; j++) W.scr.GMu2(j, b) = SAIGE_GPU_C(oGM + b, j);
@@ -5200,6 +5221,8 @@ bool mainMarkerMTGpu(
                 for (int t = 0; t < P; t++)
                     for (int j = 0; j < Bblk; j++) W.scr.GR(j, t) = SAIGE_GPU_C(oR + t, j);
                 for (int j = 0; j < Bblk; j++) W.scr.Gsq[j] = S.ssc[j];
+                W.scr.Gsum.set_size(Bblk);
+                for (int j = 0; j < Bblk; j++) W.scr.Gsum[j] = S.gsc[j];
                 }
                 #undef SAIGE_GPU_C
                 #undef SAIGE_GPU_C2
@@ -5209,25 +5232,29 @@ bool mainMarkerMTGpu(
                     // own: g_t'g_t per (slot, trait) from the trait's own code
                     // counts and table (exact in double, as Gsq above).
                     W.Qown.set_size(Bblk, P);
+                    W.Sown.set_size(Bblk, P);
                     for (int t : ctx.batchQuantTraits) {
                         if (!ownS[t]) continue;
                         for (int j = 0; j < Bblk; j++) {
                             const std::size_t k = (std::size_t)j * (std::size_t)P + (std::size_t)t;
-                            double ss = 0.0;
-                            for (int c4 = 0; c4 < 4; c4++)
+                            double ss = 0.0, gs = 0.0;
+                            for (int c4 = 0; c4 < 4; c4++) {
                                 ss += S.fdP[k * 4 + c4] * S.fdP[k * 4 + c4] * (double)S.cntP[k * 4 + c4];
+                                gs += S.fdP[k * 4 + c4] * (double)S.cntP[k * 4 + c4];
+                            }
                             W.Qown(j, t) = ss;
+                            W.Sown(j, t) = gs;
                         }
                     }
                     if (nHi > 0)
-                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.adj, W.Qown, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.AF, S.adj, W.Qown, W.Sown, W.scr, W.res);
                     if (nLo > 0)
-                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.adj, W.Qown, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.AF, S.adj, W.Qown, W.Sown, W.scr, W.res);
                 } else if (anyQnt) {
                     if (nHi > 0)
-                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.AF, W.scr, W.res);
                     if (nLo > 0)
-                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.AF, W.scr, W.res);
                 }
                 if (anyBin && nHi > 0 && spAnyFirst) {
                     // isFastTest=false sparse traits: the first pass IS the
@@ -5235,9 +5262,9 @@ bool mainMarkerMTGpu(
                     // emitted exactly as the batch tail emits (emitBlockResults).
                     if (!binTraitsDense.empty() && !devStatsOn) {
                         if (differ)
-                            SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraitsDense, 0, nHi, S.VR, S.adj, W.scr, W.res);
+                            SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraitsDense, 0, nHi, S.VR, S.AF, S.adj, W.scr, W.res);
                         else
-                            SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, W.scr, W.res);
+                            SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, S.AF, W.scr, W.res);
                     }
                     for (int t : binTraits) {
                         if (!spFirst[t]) continue;
@@ -5261,9 +5288,9 @@ bool mainMarkerMTGpu(
                     }
                 } else if (anyBin && nHi > 0 && !devStatsOn) {
                     if (differ)
-                        SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraits, 0, nHi, S.VR, S.adj, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraits, 0, nHi, S.VR, S.AF, S.adj, W.scr, W.res);
                     else
-                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraits, 0, nHi, S.VR, W.scr, W.res);
+                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraits, 0, nHi, S.VR, S.AF, W.scr, W.res);
                 }
                 if (differ && W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
                 // gpuDeviceStats: this superblock's device statistics (pair-major,
@@ -5403,14 +5430,11 @@ bool mainMarkerMTGpu(
 
                         // ---- the pair's batch statistics ----
                         // The host tail's (W.res), or -- gpuDeviceStats, a
-                        // binary trait on the dense first pass -- the device's:
-                        // S and var2 bit for bit as the tail would have formed
-                        // them, var1 / Beta / seBeta / StdStat through
-                        // format_score_result's own expressions, and p either
-                        // the device's erfc (when its guard band says the
-                        // printed string and every decision are the same) or,
-                        // for a pair the device handed back, format_score_result
-                        // itself on the device's S / var1 / var2.
+                        // binary trait on the dense first pass -- the device's
+                        // S / var2 / p and gate bits; Beta / seBeta / StdStat
+                        // from them here. A pair the device handed back
+                        // (degenerate, or p underflowed) goes through
+                        // format_score_result on the device's S / var1 / var2.
                         const bool devPair = devStatsOn && isBin && !(spDev && spFirst[t]);
                         double bBeta = 0.0, bSe = 0.0, bT = 0.0, bV1 = 0.0, bV2 = 0.0, bSd = 0.0, bP = 0.0;
                         bool bLog = false;
@@ -5493,17 +5517,7 @@ bool mainMarkerMTGpu(
                             }
                             useBatch = !needSPA && !needFirth && !needFast;
                         }
-                        if ((hi || !isBin) && affOK) {
-                            if (g_routeDumpDir && *g_routeDumpDir && devPair && !devHost) {
-                                // the route dump records boost's p for every
-                                // gated pair; the device's decided this one
-                                double b1, b2, b4, b5, b6, b7; bool b8; std::string b3;
-                                SAIGE::format_score_result(bT, bV1, bV2, b1, b2, b3, b4, b8, b5, b6, b7);
-                                O.gateP[jj] = b4;
-                            } else {
-                                O.gateP[jj] = bP;
-                            }
-                        }
+                        if ((hi || !isBin) && affOK) O.gateP[jj] = bP;
                         O.route[jj] = (unsigned char)((needSPA ? 1 : 0) | (needFirth ? 2 : 0) |
                                                       (needFast ? 4 : 0) | ((isBin && !hi) ? 8 : 0));
                         if (needSPA)   {
@@ -5577,7 +5591,6 @@ bool mainMarkerMTGpu(
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
                                 pd.stage = 1; pd.vrFast = vrFast;
-                                pd.devP = (devPair && !devHost) ? 1 : 0;
                                 pend[omp_get_thread_num()].push_back(pd);
                                 devFastDone = true;
                             } else {
@@ -5644,7 +5657,6 @@ bool mainMarkerMTGpu(
                                 pd.fast = (!sparseCur && (double)cz / nT >= 0.5) ? 1 : 0;
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
-                                pd.devP = (devPair && !devHost) ? 1 : 0;
                                 pend[omp_get_thread_num()].push_back(pd);
                             } else {
                                 if (toFirthOnly) {
@@ -5652,12 +5664,6 @@ bool mainMarkerMTGpu(
                                     pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
                                     pf.p = bP;
                                     pf.logp = bLog ? 1 : 0;
-                                    if (devPair && !devHost) {
-                                        // phase 5 back-calculates the SE from this p: boost's, not the device's
-                                        double b1, b2, b4, b5, b6, b7; bool b8; std::string b3;
-                                        SAIGE::format_score_result(bT, bV1, bV2, b1, b2, b3, b4, b8, b5, b6, b7);
-                                        pf.p = b4; pf.logp = b8 ? 1 : 0;
-                                    }
                                     pf.flip = flip ? 1 : 0;
                                     for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
                                     pendF[omp_get_thread_num()].push_back(pf);
@@ -6039,11 +6045,8 @@ bool mainMarkerMTGpu(
             long d = 0, h[8] = {0, 0, 0, 0, 0, 0, 0, 0}, ht = 0;
             for (int t = 0; t < P; t++) { d += nDevStat[t]; for (int rr = 0; rr < 8; rr++) { h[rr] += nDevHost[(std::size_t)rr][t]; ht += nDevHost[(std::size_t)rr][t]; } }
             std::cout << "  gpuDeviceStats: " << d << " pairs took the device's statistics, p and gates; " << ht
-                      << " handed back to the host (p < 1e-5: " << h[saige::gpu2::STATS_R_TAIL]
+                      << " handed back to the host (p underflowed: " << h[saige::gpu2::STATS_R_TAIL]
                       << ", degenerate: " << h[saige::gpu2::STATS_R_DEGEN]
-                      << ", 7-digit print boundary: " << h[saige::gpu2::STATS_R_PRINT]
-                      << ", Firth cutoff: " << h[saige::gpu2::STATS_R_FIRTH]
-                      << ", fast-test cutoff: " << h[saige::gpu2::STATS_R_FASTC]
                       << ", not on the device: " << h[saige::gpu2::STATS_R_OFF] << "); stats kernel + D2H "
                       << gStats << " s" << std::endl;
         }
@@ -6551,6 +6554,7 @@ void mainMarkerMT(
                         W.flipP[k] = W.tflip[t];
                         W.MACp(c, t) = MAC;
                         W.AFp(c, t)  = W.tAF[t];
+                        W.AF(c, t)   = W.tAF[t];
                         W.ACp(c, t)  = W.tAC[t];
                         W.MRp(c, t)  = W.tMR[t];
                         W.IIp(c, t)  = W.tII[t];
@@ -6760,6 +6764,7 @@ void mainMarkerMT(
                     W.VR(c, t) = isSingleVR[t]
                         ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
                         : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                    W.AF(c, t) = altFreq;
                 }
             }
 
@@ -6770,14 +6775,14 @@ void mainMarkerMT(
             if (batchOn) {
                 if (nHi > 0)
                     SAIGE::scoreTestBatchMT(ctx, ctx.batchTraits, W.Gb, 0, nHi,
-                                            W.VR, adjPtr, W.scr, W.res);
+                                            W.VR, W.AF, adjPtr, W.scr, W.res);
                 // Low-MAC binary pairs go to ER, never to the kernel
                 // (design 3.2); the quantitative traits on those same markers
                 // stay batched, which is the whole point of splitting by column
                 // instead of dropping the marker.
                 if (nLo > 0 && !ctx.batchQuantTraits.empty())
                     SAIGE::scoreTestBatchMT(ctx, ctx.batchQuantTraits, W.Gb,
-                                            Bblk - nLo, Bblk, W.VR, adjPtr, W.scr, W.res);
+                                            Bblk - nLo, Bblk, W.VR, W.AF, adjPtr, W.scr, W.res);
             }
 
             PT_ADD(S_GEMM, tGeMT);
@@ -9189,6 +9194,47 @@ void mainRegionInCPP(
 // them); they are kept updated so their value still reflects the last model
 // processed, as before.
 // ============================================================
+// The step-2 test settings R keeps as step-2 flags, with R's defaults
+// (step2_SPAtests.R). Resolved once from the config in main() and applied to
+// every model (applyStep2Settings); the model's stored copy (this port's step 1
+// writes one into nullmodel.json) is only reported.
+struct Step2Settings {
+    bool        isnoadjCov = true;              // R: --is_noadjCov=TRUE
+    bool        isFastTest = false;             // R: --is_fastTest=FALSE
+    std::string impute_method = "best_guess";   // R: --impute_method=best_guess
+    double      SPA_Cutoff = 2.0;               // R: --SPAcutoff=2
+    double      pval_cutoff_for_fastTest = 0.05;   // R: SPAGMMATtest(pval_cutoff_for_fastTest = 0.05)
+    bool        is_Firth_beta = false;          // R: --is_Firth_beta=FALSE
+    double      pCutoffforFirth = 0.01;         // R: --pCutoffforFirth=0.01
+};
+
+static void applyStep2Settings(NullModelData& t_nm, const Step2Settings& t_s,
+                               const std::string& t_traitName, bool t_labelTrait)
+{
+    const std::string tag = t_labelTrait ? ("  [" + t_traitName + "] ") : std::string("  ");
+    auto note = [&](const char* k, const std::string& stored, const std::string& used) {
+        if (stored != used)
+            std::cout << tag << k << ": " << used << " (step-2 setting; the model's nullmodel.json says "
+                      << stored << ", which step 2 does not read)" << std::endl;
+    };
+    auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+    auto d = [](double v) { std::ostringstream o; o << v; return o.str(); };
+    note("isnoadjCov", b(t_nm.isnoadjCov), b(t_s.isnoadjCov));
+    note("isFastTest", b(t_nm.isFastTest), b(t_s.isFastTest));
+    note("impute_method", t_nm.impute_method, t_s.impute_method);
+    note("SPA_Cutoff", d(t_nm.SPA_Cutoff), d(t_s.SPA_Cutoff));
+    note("pval_cutoff_for_fastTest", d(t_nm.pval_cutoff_for_fastTest), d(t_s.pval_cutoff_for_fastTest));
+    note("is_Firth_beta", b(t_nm.is_Firth_beta), b(t_s.is_Firth_beta));
+    note("pCutoffforFirth", d(t_nm.pCutoffforFirth), d(t_s.pCutoffforFirth));
+    t_nm.isnoadjCov = t_s.isnoadjCov;
+    t_nm.isFastTest = t_s.isFastTest;
+    t_nm.impute_method = t_s.impute_method;
+    t_nm.SPA_Cutoff = t_s.SPA_Cutoff;
+    t_nm.pval_cutoff_for_fastTest = t_s.pval_cutoff_for_fastTest;
+    t_nm.is_Firth_beta = t_s.is_Firth_beta;
+    t_nm.pCutoffforFirth = t_s.pCutoffforFirth;
+}
+
 static void applyNullModelOverrides(NullModelData& t_nm,
                                     const YAML::Node& t_config,
                                     const SAIGE::ModelOverrides& t_ov,
@@ -9197,22 +9243,11 @@ static void applyNullModelOverrides(NullModelData& t_nm,
 {
     const std::string tag = t_labelTrait ? ("  [" + t_traitName + "]") : std::string("  ");
 
-    // Override Firth settings from null model, then let YAML config override
-    // (mirrors R Step-2's --is_Firth_beta / --pCutoffforFirth CLI behavior).
+    // is_Firth_beta / pCutoffforFirth / isnoadjCov were resolved by
+    // applyStep2Settings (engine default or top-level config key); here only
+    // the per-model `models:` overrides and the variance-ratio categories.
     g_is_Firth_beta = t_nm.is_Firth_beta;
     g_pCutoffforFirth = t_nm.pCutoffforFirth;
-    if (t_config["is_Firth_beta"]) {
-        t_nm.is_Firth_beta = t_config["is_Firth_beta"].as<bool>();
-        g_is_Firth_beta = t_nm.is_Firth_beta;
-        std::cout << tag << " is_Firth_beta overridden from config: "
-                  << std::boolalpha << g_is_Firth_beta << std::endl;
-    }
-    if (t_config["pCutoffforFirth"]) {
-        t_nm.pCutoffforFirth = t_config["pCutoffforFirth"].as<double>();
-        g_pCutoffforFirth = t_nm.pCutoffforFirth;
-        std::cout << tag << " pCutoffforFirth overridden from config: "
-                  << g_pCutoffforFirth << std::endl;
-    }
 
     // ---- Override cateVarRatioMinMACVecExclude / cateVarRatioMaxMACVecInclude ----
     // R SAIGE defaults: cateVarRatioMinMACVecExclude = c(10.5, 20.5)
@@ -9249,15 +9284,6 @@ static void applyNullModelOverrides(NullModelData& t_nm,
             std::cout << t_nm.cateVarRatioMaxMACVecInclude(i);
         }
         std::cout << "]" << std::endl;
-    }
-
-    // ---- Override isnoadjCov from YAML config ----
-    // The JSON null model may have isnoadjCov=false, but the YAML config
-    // can override it (e.g., for testing the scoreTestFast_noadjCov path).
-    if (t_config["isnoadjCov"]) {
-        t_nm.isnoadjCov = t_config["isnoadjCov"].as<bool>();
-        std::cout << tag << " isnoadjCov overridden from config: "
-                  << std::boolalpha << t_nm.isnoadjCov << std::endl;
     }
 
     // ---- Per-model overrides (`models:` form only) ----
@@ -9367,6 +9393,21 @@ int main(int argc, char* argv[])
             std::cerr << "  nThreads:          OpenMP threads for marker loop (default: 1)" << std::endl;
             std::cerr << "  MACCutoffforER:    MAC cutoff for ER (default: 4)" << std::endl;
             std::cerr << "  weights_beta:      [a, b] for Beta weights (default: [1, 25])" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Test settings (R's step-2 flags; defaults are R SAIGE's; the model's stored copy is not read):" << std::endl;
+            std::cerr << "  isnoadjCov:        true/false (default: true). Score and variance without the" << std::endl;
+            std::cerr << "                     covariate projection (R's scoreTestFast_noadjCov), with the" << std::endl;
+            std::cerr << "                     null_noXadj variance ratio; SPA / Firth / ER unchanged." << std::endl;
+            std::cerr << "  isFastTest:        true/false (default: false). Re-test markers with p below" << std::endl;
+            std::cerr << "                     pval_cutoff_for_fastTest with the covariate-adjusted score" << std::endl;
+            std::cerr << "                     (and the sparse GRM when the model has one)." << std::endl;
+            std::cerr << "  pval_cutoff_for_fastTest: (default: 0.05)" << std::endl;
+            std::cerr << "  impute_method:     best_guess (default), mean or minor: missing genotypes" << std::endl;
+            std::cerr << "  SPA_Cutoff:        SPA when |Tstat|/sqrt(var) exceeds it (default: 2; SPAcutoff is an alias)" << std::endl;
+            std::cerr << "  is_Firth_beta:     true/false (default: false). Firth beta for binary traits" << std::endl;
+            std::cerr << "                     with p <= pCutoffforFirth (default: 0.01)." << std::endl;
+            std::cerr << "                     Overridable per model inside models: (is_Firth_beta," << std::endl;
+            std::cerr << "                     pCutoffforFirth, isnoadjCov)." << std::endl;
             std::cerr << "  checkpointDir:     Directory for checkpoint outputs (optional)" << std::endl;
             std::cerr << std::endl;
             std::cerr << "Region/gene-based testing (add groupFile to enable):" << std::endl;
@@ -9375,16 +9416,17 @@ int main(int argc, char* argv[])
             std::cerr << "  maxMAFList:        [0.0001, 0.001, 0.01] (required for region)" << std::endl;
             std::cerr << "  regionTestType:    'SKATO', 'SKAT', or 'BURDEN' (default: 'SKATO')" << std::endl;
             std::cerr << "  MACCutoff_to_CollapseUltraRare: (default: 10)" << std::endl;
-            std::cerr << "  markers_per_chunk_in_groupTest:  (default: 500)" << std::endl;
+            std::cerr << "  markers_per_chunk_in_groupTest:  (default: 100)" << std::endl;
             std::cerr << "  groups_per_chunk:  regions per I/O chunk (default: 100)" << std::endl;
             std::cerr << "  r_corr:            correlation parameter (0=SKAT-O, 1=BURDEN) (default: 0)" << std::endl;
-            std::cerr << "  isSingleInGroupTest:   true/false (default: true)" << std::endl;
+            std::cerr << "  isSingleInGroupTest:   true/false (default: false; always on with r_corr 0)" << std::endl;
             std::cerr << "  isOutputMarkerList:    true/false (default: false)" << std::endl;
             std::cerr << "  max_markers_region:    max markers per region (default: 100000)" << std::endl;
             std::cerr << "  min_gourpmac_for_burdenonly: (default: 5)" << std::endl;
             std::cerr << std::endl;
             std::cerr << "Leave-one-chromosome-out:" << std::endl;
-            std::cerr << "  LOCO:              true/false (default: false)" << std::endl;
+            std::cerr << "  LOCO:              true/false (default: true, as R). A model without LOCO" << std::endl;
+            std::cerr << "                     results stops the run (as R); write LOCO: false for it." << std::endl;
             std::cerr << "  chrom:             chromosome being tested, e.g. \"1\" (required when LOCO=true)" << std::endl;
             std::cerr << std::endl;
             std::cerr << "Sparse-GRM variance solve (only reached with a sparse GRM in the model):" << std::endl;
@@ -9455,17 +9497,16 @@ int main(int argc, char* argv[])
             std::cerr << "                     while the host tail of the current one runs; same output." << std::endl;
             std::cerr << "  gpuOverlapSets:    buffer sets in the overlap ring (default 6, >= 3)" << std::endl;
             std::cerr << "  gpuOverlapLag:     superblocks whose SPA may still be pending (default 3, >= 1)" << std::endl;
-            std::cerr << "  gpuDeviceStats:    true/false (default: false). With useGPU and binary traits, form" << std::endl;
-            std::cerr << "                     each pair's S / var / Beta / SE / p-value and its SPA / Firth /" << std::endl;
-            std::cerr << "                     fast-test gates on the device right after the scan; the host" << std::endl;
-            std::cerr << "                     only formats, routes, and redoes the pairs the device flags" << std::endl;
-            std::cerr << "                     (p < 1e-5, degenerate, or within a guard band of a printed" << std::endl;
-            std::cerr << "                     digit or a cutoff). A start-up self-check against the host tail" << std::endl;
-            std::cerr << "                     must pass or it stays off. Text output is byte-identical." << std::endl;
-            std::cerr << "  sgsRawDouble:      true/false (default: false). outputFormat: sgs only: store the" << std::endl;
-            std::cerr << "                     p-value columns as the computed doubles (plus a per-row kind)" << std::endl;
-            std::cerr << "                     instead of the parsed printed string; the GPU path then" << std::endl;
-            std::cerr << "                     formats no p-value string and tools/sgs2txt formats them." << std::endl;
+            std::cerr << "  gpuDeviceStats:    true/false (default: = useGPU). With binary traits, form each" << std::endl;
+            std::cerr << "                     pair's S / var / p-value and its SPA / Firth / fast-test gates" << std::endl;
+            std::cerr << "                     on the device right after the scan; the host formats, routes," << std::endl;
+            std::cerr << "                     and redoes the pairs the device hands back (degenerate, or p" << std::endl;
+            std::cerr << "                     underflowed to 0 -> the log-domain p). Same algebra as the host" << std::endl;
+            std::cerr << "                     tail in another summation order: results agree to rounding." << std::endl;
+            std::cerr << "  sgsRawDouble:      true/false (default: true with outputFormat: sgs at fp64)." << std::endl;
+            std::cerr << "                     Store the p-value columns as the computed doubles (plus a" << std::endl;
+            std::cerr << "                     per-row kind) instead of the parsed printed string; the GPU" << std::endl;
+            std::cerr << "                     path then formats no p-value string and tools/sgs2txt formats them." << std::endl;
             std::cerr << "  gpuPgen:           true/false (default: = useGPU). genoType: pgen with hard calls" << std::endl;
             std::cerr << "                     only runs on the GPU path: pgenlib decodes each record on the" << std::endl;
             std::cerr << "                     host (LD-compressed ones included) into the .bed row the path" << std::endl;
@@ -9834,15 +9875,17 @@ int main(int argc, char* argv[])
             std::cout << "  gpuOverlap: on -- device scan, host tail and device SPA / Firth of different "
                          "superblocks run at once (" << g_gpuOverlapSets << " buffer sets, lag "
                       << g_gpuOverlapLag << ")" << std::endl;
-        g_gpuDeviceStats = cfgBool("gpuDeviceStats", false);   // S2_DEVSTATS.md
-        if (g_gpuDeviceStats && !g_gpuStep2)
+        g_gpuDeviceStats = cfgBool("gpuDeviceStats", gpuDef);   // default with useGPU (S2_DEVSTATS.md)
+        if (g_gpuDeviceStats && !g_gpuStep2 && cfgSet("gpuDeviceStats"))
             std::cout << "  gpuDeviceStats: ignored, useGPU is false" << std::endl;
-        else if (g_gpuDeviceStats)
+        else if (g_gpuDeviceStats && g_gpuStep2)
             std::cout << "  gpuDeviceStats: on -- the binary traits' per-pair statistics, p-values and gates "
-                         "are formed on the device after the scan (start-up self-check; same text output)" << std::endl;
-        g_sgsRawDouble = cfgBool("sgsRawDouble", false);
+                         "are formed on the device after the scan" << std::endl;
+        // sgsRawDouble: default with outputFormat: sgs at fp64 (the raw p-value
+        // column is a double, so fp32 .sgs keeps the printed-string column).
+        g_sgsRawDouble = cfgBool("sgsRawDouble", g_outputFormatSgs && !g_sgsF32);
         if (g_sgsRawDouble && !g_outputFormatSgs) {
-            std::cout << "  sgsRawDouble: ignored, outputFormat is text" << std::endl;
+            if (cfgSet("sgsRawDouble")) std::cout << "  sgsRawDouble: ignored, outputFormat is text" << std::endl;
             g_sgsRawDouble = false;
         } else if (g_sgsRawDouble && g_sgsF32) {
             throw std::runtime_error("sgsRawDouble needs sgsPrecision: fp64 (the raw p-value column is a double)");
@@ -9866,11 +9909,11 @@ int main(int argc, char* argv[])
             }
         }
         // ---- LOCO (leave-one-chromosome-out) ----
-        // NOTE: R's step 2 defaults LOCO to TRUE. We default to false here
-        // because the C++ step 1 does not yet emit chr<j>/ LOCO output, and
-        // defaulting to true would break every existing config. Flip this to
-        // true (matching R) once step 1 ships LOCO.
-        bool useLOCO = config["LOCO"] ? config["LOCO"].as<bool>() : false;
+        // R's default (step2_SPAtests.R --LOCO=TRUE); with it a model without
+        // LOCO results stops the run, as R's ReadModel does, and `chrom` is
+        // required (null_model_loader.cpp). Write LOCO: false for a model
+        // fitted without LOCO.
+        bool useLOCO = config["LOCO"] ? config["LOCO"].as<bool>() : true;
         std::string locoChrom = config["chrom"] ? config["chrom"].as<std::string>() : "";
         double MACCutoffforER = config["MACCutoffforER"] ? config["MACCutoffforER"].as<double>() : 4.0;
         // R step 2 --relatednessCutoff (default 0): sparse GRM entries below it
@@ -9897,7 +9940,35 @@ int main(int argc, char* argv[])
                           << ", refresh budget " << blk.refreshBudgetS << " s, solve margin "
                           << blk.solveMargin << ")" << std::endl;
         }
-        bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : false;
+        // ---- step-2 test settings: R's step-2 flags, with R's defaults ----
+        // R keeps these as step-2 options (step2_SPAtests.R). This port's step 1
+        // also writes them into nullmodel.json, which step 2 used to read as its
+        // defaults -- so a run inherited the step-1 defaults (isFastTest true,
+        // impute_method mean, is_Firth_beta true for binary traits) instead of
+        // R's. They are step-2 settings: the engine default is R's and a config
+        // key overrides it; the model's stored value is printed when it differs
+        // and not used. (is_Firth_beta / pCutoffforFirth / isnoadjCov may still
+        // be overridden per model inside `models:`, applyNullModelOverrides.)
+        Step2Settings s2;
+        if (config["isnoadjCov"]) s2.isnoadjCov = config["isnoadjCov"].as<bool>();
+        if (config["isFastTest"]) s2.isFastTest = config["isFastTest"].as<bool>();
+        if (config["impute_method"]) {
+            s2.impute_method = config["impute_method"].as<std::string>();
+            if (string_to_case.find(s2.impute_method) == string_to_case.end())
+                throw std::runtime_error("impute_method should be 'best_guess', 'mean' or 'minor', not '" +
+                                         s2.impute_method + "'");
+        }
+        if (config["SPA_Cutoff"] && config["SPAcutoff"] &&
+            config["SPA_Cutoff"].as<double>() != config["SPAcutoff"].as<double>())
+            throw std::runtime_error("SPA_Cutoff and SPAcutoff (the same setting) disagree; give one");
+        if (config["SPA_Cutoff"]) s2.SPA_Cutoff = config["SPA_Cutoff"].as<double>();
+        else if (config["SPAcutoff"]) s2.SPA_Cutoff = config["SPAcutoff"].as<double>();
+        if (config["pval_cutoff_for_fastTest"]) s2.pval_cutoff_for_fastTest = config["pval_cutoff_for_fastTest"].as<double>();
+        if (config["is_Firth_beta"]) s2.is_Firth_beta = config["is_Firth_beta"].as<bool>();
+        if (config["pCutoffforFirth"]) s2.pCutoffforFirth = config["pCutoffforFirth"].as<double>();
+        // isFirth only turns the Firth summary lines of the log on; it follows
+        // is_Firth_beta unless written.
+        bool isFirth = config["isFirth"] ? config["isFirth"].as<bool>() : s2.is_Firth_beta;
 
         // Weights beta parameters (default Beta(1,25))
         arma::vec weights_beta(2);
@@ -9970,14 +10041,17 @@ int main(int argc, char* argv[])
         double MACCutoff_to_CollapseUltraRare = config["MACCutoff_to_CollapseUltraRare"] ?
             config["MACCutoff_to_CollapseUltraRare"].as<double>() : 10.0;
         int markers_per_chunk_in_groupTest = config["markers_per_chunk_in_groupTest"] ?
-            config["markers_per_chunk_in_groupTest"].as<int>() : 500;
+            config["markers_per_chunk_in_groupTest"].as<int>() : 100;   // R: 100
         int groups_per_chunk = config["groups_per_chunk"] ?
             config["groups_per_chunk"].as<int>() : 100;
 
         // r_corr: 0 means SKAT-O (optimal.adj), 1 means BURDEN
         double r_corr_val = config["r_corr"] ? config["r_corr"].as<double>() : 0.0;
+        // R's step2_SPAtests.R default is FALSE; r_corr = 0 (SKAT-O) forces it
+        // on below, as R does, so it only matters for Burden-only runs.
         bool isSingleInGroupTest = config["isSingleInGroupTest"] ?
-            config["isSingleInGroupTest"].as<bool>() : true;
+            config["isSingleInGroupTest"].as<bool>() : false;
+        const bool isSingleInGroupTestCfg = isSingleInGroupTest;   // before the r_corr = 0 forcing, for --print-defaults
         bool isOutputMarkerList = config["isOutputMarkerList"] ?
             config["isOutputMarkerList"].as<bool>() : false;
         unsigned int max_markers_region = config["max_markers_region"] ?
@@ -10064,7 +10138,6 @@ int main(int argc, char* argv[])
             std::ostringstream o;
             auto kv = [&](const char* k, const auto& v) { o << "default\t" << k << "\t" << v << "\n"; };
             auto b = [](bool v) { return v ? "true" : "false"; };
-            const char* fromModel = "the model's (step 1)";
             kv("genoType", genoType);
             kv("AlleleOrder", alleleOrder);
             kv("vcfField", vcfField);
@@ -10080,10 +10153,14 @@ int main(int argc, char* argv[])
             kv("marker_chunksize", marker_chunksize);
             kv("nThreads", g_nThreads);
             kv("LOCO", b(useLOCO));
-            kv("isFirth", b(isFirth));
-            kv("is_Firth_beta", fromModel);
-            kv("pCutoffforFirth", fromModel);
-            kv("isnoadjCov", fromModel);
+            kv("isFirth", "= is_Firth_beta");
+            kv("is_Firth_beta", b(s2.is_Firth_beta));
+            kv("pCutoffforFirth", s2.pCutoffforFirth);
+            kv("isnoadjCov", b(s2.isnoadjCov));
+            kv("isFastTest", b(s2.isFastTest));
+            kv("pval_cutoff_for_fastTest", s2.pval_cutoff_for_fastTest);
+            kv("impute_method", s2.impute_method);
+            kv("SPA_Cutoff", s2.SPA_Cutoff);
             kv("cateVarRatioMinMACVecExclude", "the variance-ratio file's");
             kv("cateVarRatioMaxMACVecInclude", "the variance-ratio file's");
             kv("MACCutoffforER", MACCutoffforER);
@@ -10101,7 +10178,7 @@ int main(int argc, char* argv[])
             kv("MACCutoff_to_CollapseUltraRare", MACCutoff_to_CollapseUltraRare);
             kv("markers_per_chunk_in_groupTest", markers_per_chunk_in_groupTest);
             kv("groups_per_chunk", groups_per_chunk);
-            kv("isSingleInGroupTest", b(isSingleInGroupTest));
+            kv("isSingleInGroupTest", b(isSingleInGroupTestCfg));
             kv("isOutputMarkerList", b(isOutputMarkerList));
             kv("min_gourpmac_for_burdenonly", min_gourpmac_for_burdenonly);
             kv("outputFormat", g_outputFormatSgs ? "sgs" : "text");
@@ -10111,8 +10188,8 @@ int main(int argc, char* argv[])
             kv("gpuPrecisionScan", saige::gpu2::precName(g_precScan));
             kv("gpuPrecisionSPA", saige::gpu2::precName(g_precSPA));
             kv("gpuPrecisionER", saige::gpu2::precName(g_precER));
-            kv("gpuDeviceStats", b(g_gpuDeviceStats));
-            kv("sgsRawDouble", b(g_sgsRawDouble));
+            kv("gpuDeviceStats", "= useGPU");
+            kv("sgsRawDouble", "true with outputFormat: sgs at fp64");
             kv("gpuPrecisionFirth", saige::gpu2::precName(g_precFirth));
             kv("gpuInt8Slices", g_gpuInt8Slices);
             std::cout << o.str();
@@ -10285,6 +10362,9 @@ int main(int argc, char* argv[])
             std::cout << std::endl;
         }
         timing_mark("20_null_model_loaded");  // TIMING_INSTRUMENT_REMOVE_ME
+        // ---- the step-2 test settings onto every model (Step2Settings above) ----
+        for (int ti = 0; ti < numTraits; ti++)
+            applyStep2Settings(nms[ti], s2, modelSpecs[ti].traitName, numTraits > 1);
 
         // Everything downstream that needs "the" model (sample IDs for the
         // genotype reader, the trait type for the region path) reads model 0.
@@ -10405,6 +10485,23 @@ int main(int argc, char* argv[])
                             "but the variance-ratio file has no 'sparse' row for MAC category "
                             + std::to_string(vi) + ". Re-run step 1 with "
                             "use_sparse_grm_for_vr: true, or run step 2 without the sparse GRM.");
+                }
+            }
+            // isnoadjCov scores with the null_noXadj variance ratio (R's
+            // assignVarianceRatio with isnoXadj). A variance-ratio file without
+            // that row (label format, older step 1) leaves -1.0 there; R itself
+            // reads past the end of an empty vector in that case. Refuse up
+            // front whenever the dense first pass would use it (a sparse-GRM
+            // model without the fast test takes the sparse score instead and
+            // never reads it, as in R).
+            if (nm.isnoadjCov && !(nm.flagSparseGRM && !nm.isFastTest)) {
+                for (arma::uword vi = 0; vi < nm.varRatio_null_noXadj.n_elem; vi++) {
+                    if (nm.varRatio_null_noXadj(vi) < 0.0)
+                        throw std::runtime_error(
+                            "trait '" + modelSpecs[ti].traitName + "': isnoadjCov is on (R's default), "
+                            "but the variance-ratio file has no 'null_noXadj' row for MAC category "
+                            + std::to_string(vi) + ". Re-run step 1 (R SAIGE >= 1.1 and this port write "
+                            "that row), or run step 2 with isnoadjCov: false.");
                 }
             }
             // setSAIGEobjInCPP writes the new instance into ptr_gSAIGEobj; grab

@@ -233,74 +233,18 @@ count_codes(const uint8_t* __restrict__ packed, std::size_t bpv, int words,
 
 // ---------------------------------------------------------------------------
 // Per-pair statistics (gpu_step2.hpp "Per-pair statistics on the device").
-// Every operation below goes through the IEEE intrinsics or fma(), so the
-// result does not depend on nvcc's contraction setting; the orders are the
-// ones stats_selfcheck.hpp enumerates and main.cpp identified on the host.
+// Plain fp64: nvcc may contract and reorder as it likes; the host tail is
+// the same algebra in its own order and the two agree to rounding.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ double sdAdd(double a, double b) { return __dadd_rn(a, b); }
-__device__ __forceinline__ double sdSub(double a, double b) { return __dsub_rn(a, b); }
-__device__ __forceinline__ double sdMul(double a, double b) { return __dmul_rn(a, b); }
-__device__ __forceinline__ double sdDiv(double a, double b) { return __ddiv_rn(a, b); }
-
-// sum_k a[k] * b[k], k < p, in order `pat` (stats_selfcheck.hpp: dotPattern)
-__device__ __forceinline__ double sdDot(int pat, const double* a, const double* b, int p)
-{
-    if (p == 1) return (pat == 1) ? fma(a[0], b[0], 0.0) : sdMul(a[0], b[0]);
-    double acc;
-    int k = 2;
-    switch (pat) {
-    case 1:   // accumulator from +0, one fma per term (a BLAS micro-kernel)
-        acc = fma(a[0], b[0], 0.0);
-        acc = fma(a[1], b[1], acc);
-        for (; k < p; ++k) acc = fma(a[k], b[k], acc);
-        break;
-    case 2:   // first product fused into the second: fma(a0, b0, a1 b1), then a chain of fma
-        acc = fma(a[0], b[0], sdMul(a[1], b[1]));
-        for (; k < p; ++k) acc = fma(a[k], b[k], acc);
-        break;
-    case 3:   // (a0 b0 + a1 b1) unfused, then a chain of fma
-        acc = sdAdd(sdMul(a[0], b[0]), sdMul(a[1], b[1]));
-        for (; k < p; ++k) acc = fma(a[k], b[k], acc);
-        break;
-    case 4:   // fma(a0, b0, a1 b1), then unfused adds
-        acc = fma(a[0], b[0], sdMul(a[1], b[1]));
-        for (; k < p; ++k) acc = sdAdd(acc, sdMul(a[k], b[k]));
-        break;
-    default:  // 0: no fma anywhere, left to right
-        acc = sdAdd(sdMul(a[0], b[0]), sdMul(a[1], b[1]));
-        for (; k < p; ++k) acc = sdAdd(acc, sdMul(a[k], b[k]));
-        break;
-    }
-    return acc;
-}
-
-// armadillo's column sum of the Hadamard product x % y over p rows: even rows
-// into val1, odd rows into val2 (both from +0), then val1 + val2. pat 1: the
-// term is fused into the accumulator (fma), pat 0: rounded first.
-__device__ __forceinline__ double sdHadSum(int pat, const double* x, const double* y, int p)
-{
-    double v1 = 0.0, v2 = 0.0;
-    int i = 0;
-    if (pat == 1) {
-        for (; i + 1 < p; i += 2) { v1 = fma(x[i], y[i], v1); v2 = fma(x[i + 1], y[i + 1], v2); }
-        if (i < p) v1 = fma(x[i], y[i], v1);
-    } else {
-        for (; i + 1 < p; i += 2) { v1 = sdAdd(v1, sdMul(x[i], y[i])); v2 = sdAdd(v2, sdMul(x[i + 1], y[i + 1])); }
-        if (i < p) v1 = sdAdd(v1, sdMul(x[i], y[i]));
-    }
-    return sdAdd(v1, v2);
-}
-
-// chi-square(1) upper tail as the host's score_vec.hpp forms it
-__device__ __forceinline__ double sdTailP(double stat) { return erfc(sqrt(sdMul(stat, 0.5))); }
-
-__constant__ double c_p10[20] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
-                                 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19};
+// Register buffer for the covariate block of one pair; a trait with more
+// covariates than this reads its Z / W columns from C1 again per use
+// (correct, slower).
+constexpr int STATS_REG_P = 32;
 
 __global__ void __launch_bounds__(256)
 pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::size_t ld, int nSlots,
-           const StatsTrait* __restrict__ T, int nT, const double* __restrict__ vr,
-           double statCutoff, double tol, int patXZ, int patSaz, int patZxz, int patGwz,
+           const StatsTrait* __restrict__ T, int nT, const double* __restrict__ consts,
+           const double* __restrict__ vr, const double* __restrict__ af,
            double* __restrict__ oS, double* __restrict__ oV, double* __restrict__ oP,
            unsigned char* __restrict__ oF)
 {
@@ -315,69 +259,67 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
         oF[o] = (unsigned char)(STATS_HOST | (STATS_R_OFF << STATS_REASON_SHIFT));
         return;
     }
-    const int p = t.p;
-    double z[STATS_PMAX], w[STATS_PMAX], xz[STATS_PMAX];
-    for (int i = 0; i < p; ++i) {
-        z[i] = C1[(std::size_t)(t.rowZ + i) * ld + slot];
-        w[i] = C1[(std::size_t)(t.rowW + i) * ld + slot];
-    }
     const double gr = C1[(std::size_t)t.rowGR * ld + slot];
     const double g2 = C2[(std::size_t)t.colG2 * ld + slot];
-    for (int i = 0; i < p; ++i) xz[i] = sdDot(patXZ, &t.XVX[i * STATS_PMAX], z, p);
-    const double zxz = sdHadSum(patZxz, z, xz, p);
-    const double saz = sdDot(patSaz, t.Sa, z, p);
-    const double gwz = sdHadSum(patGwz, w, z, p);
-    // S = (GR - saz) / tau0;  var2 = zxz + G2Mu2 - 2.0 * gwz  (the host's expressions)
-    const double S    = sdDiv(sdSub(gr, saz), t.tau0);
-    const double var2 = sdSub(sdAdd(zxz, g2), sdMul(2.0, gwz));
+    double S, var2;
+    if (t.noadj) {
+        // R's scoreTestFast_noadjCov: centre at 2 AF, no covariate block
+        const double c = 2.0 * af[o];
+        const double gm = C1[(std::size_t)t.rowGM * ld + slot];
+        S    = (gr - t.sumR * c) / t.tau0;
+        var2 = (g2 - 2.0 * c * gm + t.sumM * c * c) * t.tau0;
+    } else {
+        const int p = t.p;
+        const double* XVX = consts + t.xvxOff;
+        const double* Sa  = consts + t.saOff;
+        double zxz = 0.0, saz = 0.0, gwz = 0.0;
+        if (p <= STATS_REG_P) {
+            double z[STATS_REG_P];
+            for (int i = 0; i < p; ++i) z[i] = C1[(std::size_t)(t.rowZ + i) * ld + slot];
+            for (int i = 0; i < p; ++i) {
+                const double w = C1[(std::size_t)(t.rowW + i) * ld + slot];
+                double xz = 0.0;
+                for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * z[k];
+                zxz += z[i] * xz;
+                saz += Sa[i] * z[i];
+                gwz += w * z[i];
+            }
+        } else {
+            for (int i = 0; i < p; ++i) {
+                const double zi = C1[(std::size_t)(t.rowZ + i) * ld + slot];
+                const double w  = C1[(std::size_t)(t.rowW + i) * ld + slot];
+                double xz = 0.0;
+                for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * C1[(std::size_t)(t.rowZ + k) * ld + slot];
+                zxz += zi * xz;
+                saz += Sa[i] * zi;
+                gwz += w * zi;
+            }
+        }
+        S    = (gr - saz) / t.tau0;
+        var2 = zxz + g2 - 2.0 * gwz;
+    }
     oS[o] = S; oV[o] = var2;
 
-    const double var1 = sdMul(var2, vr[o]);
-    const double stat = sdDiv(sdMul(S, S), var1);
+    const double var1 = var2 * vr[o];
+    const double stat = S * S / var1;
     unsigned f = 0;
     double pv = 1.0;
     const double tiny = 2.2250738585072014e-308;   // DBL_MIN, format_score_result's test
-    auto host = [&](unsigned reason) { if (!(f & STATS_HOST)) f |= STATS_HOST | (reason << STATS_REASON_SHIFT); };
     if (!(var1 > tiny) || !(stat >= 0.0) || !isfinite(stat)) {
-        host(STATS_R_DEGEN);
-    } else if (!(stat < statCutoff)) {
-        host(STATS_R_TAIL);
+        f = STATS_HOST | (STATS_R_DEGEN << STATS_REASON_SHIFT);
     } else {
-        pv = sdTailP(stat);
-        const double plo = sdMul(pv, 1.0 - tol), phi = sdMul(pv, 1.0 + tol);
-        const double sd = sdDiv(fabs(S), sqrt(var1));            // StdStat
-        if (sd > t.spaCut) f |= STATS_SPA;
-        if (t.isFirth) {
-            if (phi >= t.firthCut && plo <= t.firthCut) host(STATS_R_FIRTH);
-            else if (pv <= t.firthCut) f |= STATS_FIRTH;
-        }
-        // The 7 significant digits "%.6E" prints: m = p * 10^(6-e) in
-        // [1e6, 1e7), rounded to an integer. Flag when p*(1 -+ tol) could
-        // round differently (or cross a power of ten).
-        int e = (int)floor(log10(pv));
-        if (e > 0) e = 0;
-        if (e < -13) e = -13;
-        double m = sdMul(pv, c_p10[6 - e]);
-        if (m < 1e6 && e > -13) { --e; m = sdMul(pv, c_p10[6 - e]); }
-        else if (m >= 1e7 && e < 0) { ++e; m = sdMul(pv, c_p10[6 - e]); }
-        const double mlo = m * (1.0 - tol) - 2e-8, mhi = m * (1.0 + tol) + 2e-8;
-        if (mlo < 1e6 || mhi >= 1e7 || floor(mlo + 0.5) != floor(mhi + 0.5)) {
-            host(STATS_R_PRINT);
-        } else if (t.isFast) {
-            // std::stod of the printed string against pval_cutoff_for_fastTest
-            const double v7 = floor(m + 0.5) / c_p10[6 - e];
-            if (fabs(v7 - t.fastCut) <= t.fastCut * 4e-15) host(STATS_R_FASTC);
-            else if (v7 < t.fastCut) f |= STATS_FAST;
+        pv = erfc(sqrt(stat * 0.5));
+        if (!(pv > 0.0)) {
+            f = STATS_HOST | (STATS_R_TAIL << STATS_REASON_SHIFT);
+        } else {
+            const double sd = fabs(S) / sqrt(var1);            // StdStat
+            if (sd > t.spaCut) f |= STATS_SPA;
+            if (t.isFirth && pv <= t.firthCut) f |= STATS_FIRTH;
+            if (t.isFast && pv < t.fastCut) f |= STATS_FAST;
         }
     }
     oP[o] = pv;
     oF[o] = (unsigned char)f;
-}
-
-__global__ void erfc_tail(const double* __restrict__ stat, int n, double* __restrict__ p)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) p[i] = sdTailP(stat[i]);
 }
 
 }  // namespace
@@ -456,10 +398,11 @@ struct Reducer {
     bool       stats = false;
     int        nStat = 0;                 // binary traits (= nMask)
     StatsTrait* dStatT = nullptr;         // device: nStat
-    double     statCutoff = 0.0, pRelTol = 2e-14;
-    int        patXZ = 0, patSaz = 0, patZxz = 0, patGwz = 0;
+    double*    dStatC = nullptr;          // device: the traits' XVX / S_a
     std::vector<double*> hVr;             // pinned, per staging set: maxSlots x nStat
+    std::vector<double*> hAf;             // pinned, per staging set: maxSlots x nStat
     double*    dVr = nullptr;             // device: maxSlots x nStat
+    double*    dAf = nullptr;             // device: maxSlots x nStat
     double*    dStS = nullptr;            // device: maxSlots x nStat, pair-major
     double*    dStV = nullptr;
     double*    dStP = nullptr;
@@ -794,9 +737,10 @@ void destroy(Reducer* r)
     for (void* p : {(void*)r->hXf, (void*)r->hXn, (void*)r->hXs, (void*)r->hXc,
                     (void*)r->hXd1, (void*)r->hXd2})
         if (p) cudaFreeHost(p);
-    for (void* p : {(void*)r->dStatT, (void*)r->dVr, (void*)r->dStS, (void*)r->dStV, (void*)r->dStP, (void*)r->dStF})
+    for (void* p : {(void*)r->dStatT, (void*)r->dStatC, (void*)r->dVr, (void*)r->dAf, (void*)r->dStS, (void*)r->dStV, (void*)r->dStP, (void*)r->dStF})
         if (p) cudaFree(p);
     for (double* p : r->hVr) if (p) cudaFreeHost(p);
+    for (double* p : r->hAf) if (p) cudaFreeHost(p);
     for (double* p : r->hStS) if (p) cudaFreeHost(p);
     for (double* p : r->hStV) if (p) cudaFreeHost(p);
     for (double* p : r->hStP) if (p) cudaFreeHost(p);
@@ -842,8 +786,7 @@ bool statsLaunch(Reducer* r, int nS, int d, cudaStream_t s)
     if (nPair <= 0) return true;
     const int blocks = (int)((nPair + 255) / 256);
     pair_stats<<<blocks, 256, 0, s>>>((const double*)r->dC1, (const double*)r->dC2, (std::size_t)r->maxSlots, nS,
-                                      r->dStatT, r->nStat, r->dVr, r->statCutoff, r->pRelTol,
-                                      r->patXZ, r->patSaz, r->patZxz, r->patGwz,
+                                      r->dStatT, r->nStat, r->dStatC, r->dVr, r->dAf,
                                       r->dStS, r->dStV, r->dStP, r->dStF);
     CKR(cudaGetLastError());
     const std::size_t n = (std::size_t)nPair;
@@ -866,18 +809,25 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
     if (!r->outD || r->K2 <= 0) { statsErr = "the reducer has no fp64 C2 results"; return false; }
     for (int b = 0; b < a.nTraits; ++b) {
         const StatsTrait& t = a.traits[b];
-        if (t.p < 1 || t.p > STATS_PMAX) { statsErr = "trait p out of range"; return false; }
-        if (t.rowZ < 0 || t.rowZ + t.p > r->K1 || t.rowW < 0 || t.rowW + t.p > r->K1 ||
-            t.rowGR < 0 || t.rowGR >= r->K1 || t.colG2 < 0 || t.colG2 >= r->K2) {
+        if (!t.enabled) continue;
+        if (t.p < 1) { statsErr = "trait p out of range"; return false; }
+        if (t.rowGR < 0 || t.rowGR >= r->K1 || t.colG2 < 0 || t.colG2 >= r->K2) {
             statsErr = "trait column indices outside C1 / C2"; return false;
         }
+        if (t.noadj) {
+            if (t.rowGM < 0 || t.rowGM >= r->K1) { statsErr = "isnoadjCov trait has no g'mu2 column"; return false; }
+        } else {
+            if (t.rowZ < 0 || t.rowZ + t.p > r->K1 || t.rowW < 0 || t.rowW + t.p > r->K1) {
+                statsErr = "trait column indices outside C1 / C2"; return false;
+            }
+            if (a.consts == nullptr || t.xvxOff < 0 || t.xvxOff + t.p * t.p > a.nConsts ||
+                t.saOff < 0 || t.saOff + t.p > a.nConsts) {
+                statsErr = "trait XVX / S_a offsets outside the constants"; return false;
+            }
+        }
     }
-    if (a.patXZ < 0 || a.patXZ > 4 || a.patSaz < 0 || a.patSaz > 4 ||
-        a.patZxz < 0 || a.patZxz > 1 || a.patGwz < 0 || a.patGwz > 1) { statsErr = "pattern id out of range"; return false; }
     const std::size_t nPair = (std::size_t)r->maxSlots * (std::size_t)a.nTraits;
     r->nStat = a.nTraits;
-    r->statCutoff = a.statCutoff; r->pRelTol = a.pRelTol;
-    r->patXZ = a.patXZ; r->patSaz = a.patSaz; r->patZxz = a.patZxz; r->patGwz = a.patGwz;
     auto dev = [&](void** p, std::size_t n) {
         if (cudaMalloc(p, n) != cudaSuccess) { *p = nullptr; statsErr = "cudaMalloc failed"; return false; }
         r->devBytes += n; return true;
@@ -890,15 +840,26 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
     if (cudaMemcpy(r->dStatT, a.traits, (std::size_t)a.nTraits * sizeof(StatsTrait), cudaMemcpyHostToDevice) != cudaSuccess) {
         statsErr = "trait upload failed"; return false;
     }
+    {
+        const std::size_t nc = (std::size_t)std::max(a.nConsts, 1);
+        if (!dev((void**)&r->dStatC, nc * sizeof(double))) return false;
+        if (a.nConsts > 0 &&
+            cudaMemcpy(r->dStatC, a.consts, (std::size_t)a.nConsts * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) {
+            statsErr = "constants upload failed"; return false;
+        }
+    }
     if (!dev((void**)&r->dVr, nPair * sizeof(double))) return false;
+    if (!dev((void**)&r->dAf, nPair * sizeof(double))) return false;
     if (!dev((void**)&r->dStS, nPair * sizeof(double))) return false;
     if (!dev((void**)&r->dStV, nPair * sizeof(double))) return false;
     if (!dev((void**)&r->dStP, nPair * sizeof(double))) return false;
     if (!dev((void**)&r->dStF, nPair)) return false;
     r->hVr.assign((std::size_t)r->nSets, nullptr);
+    r->hAf.assign((std::size_t)r->nSets, nullptr);
     for (int s = 0; s < r->nSets; ++s) {
         if (!pin((void**)&r->hVr[s], nPair * sizeof(double))) return false;
-        for (std::size_t i = 0; i < nPair; ++i) r->hVr[s][i] = 1.0;
+        if (!pin((void**)&r->hAf[s], nPair * sizeof(double))) return false;
+        for (std::size_t i = 0; i < nPair; ++i) { r->hVr[s][i] = 1.0; r->hAf[s][i] = 0.0; }
     }
     r->hStS.assign((std::size_t)r->nDev, nullptr); r->hStV.assign((std::size_t)r->nDev, nullptr);
     r->hStP.assign((std::size_t)r->nDev, nullptr); r->hStF.assign((std::size_t)r->nDev, nullptr);
@@ -918,43 +879,15 @@ double* statsVr(Reducer* r, int s)
 {
     return (r && r->stats && s >= 0 && s < r->nSets) ? r->hVr[(std::size_t)s] : nullptr;
 }
+double* statsAf(Reducer* r, int s)
+{
+    return (r && r->stats && s >= 0 && s < r->nSets) ? r->hAf[(std::size_t)s] : nullptr;
+}
 const double*        statsS(const Reducer* r, int d)     { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStS[(std::size_t)k] : nullptr; }
 const double*        statsVar2(const Reducer* r, int d)  { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStV[(std::size_t)k] : nullptr; }
 const double*        statsP(const Reducer* r, int d)     { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStP[(std::size_t)k] : nullptr; }
 const unsigned char* statsFlags(const Reducer* r, int d) { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStF[(std::size_t)k] : nullptr; }
 double               statsSeconds(const Reducer* r)      { return r ? r->tStats : 0.0; }
-
-bool statsSelfTest(Reducer* r, const double* C1, const double* C2, const double* vr, int nS)
-{
-    if (!r || !r->stats) { statsErr = "stats not set up"; return false; }
-    if (nS <= 0 || nS > r->maxSlots) { statsErr = "nSlots out of range"; return false; }
-    const std::size_t ldb = (std::size_t)r->maxSlots * sizeof(double);
-    if (cudaMemcpy2D(r->dC1, ldb, C1, ldb, (std::size_t)nS * sizeof(double), (std::size_t)r->K1, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy2D(r->dC2, ldb, C2, ldb, (std::size_t)nS * sizeof(double), (std::size_t)r->K2, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(r->dVr, vr, (std::size_t)nS * r->nStat * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) {
-        statsErr = "self-test upload failed"; return false;
-    }
-    r->lastDev = 0;
-    if (!statsLaunch(r, nS, 0, r->st[0])) { statsErr = lastErr; return false; }
-    if (cudaStreamSynchronize(r->st[0]) != cudaSuccess) { statsErr = "self-test kernel failed"; return false; }
-    return true;
-}
-
-bool statsErfcTest(Reducer* r, const double* stat, int n, double* p)
-{
-    if (!r || n <= 0) return false;
-    double* ds = nullptr; double* dp = nullptr;
-    if (cudaMalloc((void**)&ds, (std::size_t)n * sizeof(double)) != cudaSuccess) return false;
-    if (cudaMalloc((void**)&dp, (std::size_t)n * sizeof(double)) != cudaSuccess) { cudaFree(ds); return false; }
-    bool ok = cudaMemcpy(ds, stat, (std::size_t)n * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess;
-    if (ok) {
-        erfc_tail<<<(n + 255) / 256, 256>>>(ds, n, dp);
-        ok = cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
-    }
-    if (ok) ok = cudaMemcpy(p, dp, (std::size_t)n * sizeof(double), cudaMemcpyDeviceToHost) == cudaSuccess;
-    cudaFree(ds); cudaFree(dp);
-    return ok;
-}
 
 
 bool bindDevice(int t_device) { return cudaSetDevice(t_device) == cudaSuccess; }
@@ -1153,9 +1086,12 @@ bool reduce(Reducer* r, int t_nSlots, int t_set, int t_devSet)
             CKR(cudaMemcpyAsync(r->dXd2, r->hXd2, nx * sizeof(double), cudaMemcpyHostToDevice, r->st[0]));
         }
     }
-    if (r->stats)
+    if (r->stats) {
         CKR(cudaMemcpyAsync(r->dVr, r->hVr[(std::size_t)t_set], nS * r->nStat * sizeof(double),
                             cudaMemcpyHostToDevice, r->st[0]));
+        CKR(cudaMemcpyAsync(r->dAf, r->hAf[(std::size_t)t_set], nS * r->nStat * sizeof(double),
+                            cudaMemcpyHostToDevice, r->st[0]));
+    }
     CKR(cudaEventRecord(r->evUp, r->st[0]));
     if (timed) {
         cudaEventRecord(a1, r->st[0]);

@@ -230,88 +230,76 @@ int         deviceSets(const Reducer* t_r);
 // ---------------------------------------------------------------------------
 // After the GEMMs, one thread per (slot, binary trait) forms what the host
 // tail (saige_mt.cpp scoreTestBatchMTBinPre) forms from the same C1 / C2
-// columns: S = (g'res - S_a'Z) / tau0 and var2 = Z'XVX Z + (g^2)'mu2 - 2 W'Z,
-// then var1 = var2 * VR, stat, StdStat, the chi-square(1) upper tail p =
-// erfc(sqrt(stat / 2)), the gate bits and a "host must redo this pair" bit.
+// columns -- with the covariate projection
+//     S = (g'res - S_a'Z) / tau0,   var2 = Z'XVX Z + (g^2)'mu2 - 2 W'Z
+// or, for a trait with isnoadjCov (R's scoreTestFast_noadjCov),
+//     S = (g'res - 2 AF sum res) / tau0,
+//     var2 = tau0 ((g^2)'mu2 - 4 AF g'mu2 + 4 AF^2 sum mu2)
+// -- then var1 = var2 * VR, stat = S^2 / var1, StdStat = |S| / sqrt(var1),
+// the chi-square(1) upper tail p = erfc(sqrt(stat / 2)), and the gate bits
+// the host tail decides from them: SPA (StdStat > SPA_Cutoff), Firth
+// (is_Firth_beta and p <= pCutoffforFirth), fast test (p < the cutoff).
+// Plain fp64 arithmetic; the host's own tail is the same algebra in another
+// summation order, and the two agree to rounding.
 //
-// S and var2 are meant to be BIT-IDENTICAL to the host's. The host's three
-// length-p contractions (OpenBLAS dgemm for XVX Z, OpenBLAS dgemv for S_a'Z,
-// armadillo's two-accumulator column sum for the Hadamard sums) each have a
-// fixed operation order and FMA pattern that depend on the BLAS kernel and
-// on the compiler; main.cpp identifies them at start-up against the real
-// scoreTestBatchMTBinPre on random data (stats_selfcheck.hpp) and passes the
-// pattern ids here. Every arithmetic operation in the kernel is written with
-// the IEEE intrinsics (__dadd_rn / __dmul_rn / fma), so nvcc cannot contract
-// or reorder anything, and the whole kernel is then checked end to end
-// against the host function before the first marker is read. No match ->
-// the switch stays off for the run.
-//
-// Only p is not bit-identical (the host uses boost's long-double tail); the
-// flags carry the guard band: a pair whose p is within pRelTol of a decision
-// (the 7-digit "%.6E" rounding, the Firth cutoff, the fast-test cutoff), with
-// p < 1e-5, or with a degenerate / non-finite statistic, is handed back to
-// the host, which runs format_score_result on the device's S / var2.
+// Two cases are handed back to the host, because the host's
+// format_score_result has the handling for them: a degenerate pair (var1 <=
+// DBL_MIN, a negative / NaN / infinite stat), and a p that underflowed to 0
+// in double, which the host reports in the log domain ("%.1fE%d").
 enum StatsFlag : unsigned {
     STATS_HOST  = 1u,     // the host recomputes this pair (reason in bits 4..7)
     STATS_SPA   = 2u,     // StdStat > SPA_Cutoff
     STATS_FIRTH = 4u,     // is_Firth_beta and p <= pCutoffforFirth
-    STATS_FAST  = 8u,     // the printed p (7 digits) is below pval_cutoff_for_fastTest
+    STATS_FAST  = 8u,     // isFastTest and p < pval_cutoff_for_fastTest (the host still applies its context test)
     STATS_REASON_SHIFT = 4
 };
 enum StatsReason : unsigned {
     STATS_R_NONE = 0,
-    STATS_R_TAIL = 1,     // stat >= the 1e-5 cutoff (p < 1e-5): boost's tail
+    STATS_R_TAIL = 1,     // p underflowed to 0: the host's log-domain p
     STATS_R_DEGEN = 2,    // var1 <= DBL_MIN, stat < 0, NaN or infinite
-    STATS_R_PRINT = 3,    // p within tolerance of a 7-digit rounding boundary
-    STATS_R_FIRTH = 4,    // p within tolerance of pCutoffforFirth
-    STATS_R_FASTC = 5,    // printed p within tolerance of pval_cutoff_for_fastTest
-    STATS_R_OFF = 6       // the trait is not scored on the device (sparse first pass)
+    STATS_R_OFF = 3,      // the trait is not scored on the device (sparse first pass)
+    STATS_R_COUNT = 4
 };
-constexpr int STATS_PMAX = 8;
 struct StatsTrait {
-    int p = 0;              // covariates incl. the intercept, <= STATS_PMAX
+    int p = 0;              // covariates incl. the intercept (any count)
     int rowZ = 0;           // first C1 column (row of C1^T) of this trait's A'g block
     int rowW = 0;           // first C1 column of (mu2 % X)'g
     int rowGR = 0;          // C1 column of g'res
+    int rowGM = -1;         // C1 column of g'mu2 (isnoadjCov traits), -1 when absent
     int colG2 = 0;          // C2 column of (g^2)'mu2
     int enabled = 1;        // 0: every pair of this trait is flagged STATS_HOST / STATS_R_OFF
     int isFirth = 0;        // is_Firth_beta
-    int isFast = 0;         // isFastTest (the host still applies its context test)
+    int isFast = 0;         // isFastTest
+    int noadj = 0;          // isnoadjCov: the centred score, no covariate block
     double tau0 = 1.0, spaCut = 2.0, firthCut = 0.0, fastCut = 0.0;
-    double XVX[STATS_PMAX * STATS_PMAX];   // row-major p x p
-    double Sa[STATS_PMAX];
+    double sumR = 0.0;      // sum res (isnoadjCov)
+    double sumM = 0.0;      // sum mu2 (isnoadjCov)
+    // Offsets into StatsArgs::consts: XVX (row-major p x p) and S_a (p).
+    int xvxOff = 0, saOff = 0;
 };
 struct StatsArgs {
     int nTraits = 0;                       // = CreateArgs::nMask (binary traits), trait b = mask b
     const StatsTrait* traits = nullptr;
-    double statCutoff = 0.0;               // stat >= this -> STATS_R_TAIL (qchisq(1e-5, 1, lower=F))
-    double pRelTol = 2e-14;                // |p_device - p_boost| / p bound used for the guard band
-    // operation-order patterns (stats_selfcheck.hpp): dot products 0..4, sums 0..1
-    int patXZ = 0, patSaz = 0, patZxz = 0, patGwz = 0;
+    const double* consts = nullptr;        // the traits' XVX / S_a, nConsts doubles
+    int nConsts = 0;
 };
 // Allocate the buffers and upload the constants; from then on every reduce()
 // also runs the stats kernel. false (with statsLastError()) on failure.
 bool statsSetup(Reducer* t_r, const StatsArgs& t_args);
-// Stop running the stats kernel in reduce() (after a failed self-test).
+// Stop running the stats kernel in reduce().
 void statsDisable(Reducer* t_r);
 std::string statsLastError();
-// Pinned per-staging-set input: VR[slot * nTraits + b], the pair's variance
-// ratio, written by the caller with the slot's rows (as lut()).
+// Pinned per-staging-set inputs, written by the caller with the slot's rows
+// (as lut()): VR[slot * nTraits + b] the pair's variance ratio, AF[...] the
+// pair's post-imputation ALT frequency (read for isnoadjCov traits).
 double* statsVr(Reducer* t_r, int t_set);
+double* statsAf(Reducer* t_r, int t_set);
 // Results of the last reduce() into device set t_devSet, pair-major: index
 // slot * nTraits + b. nullptr until statsSetup.
 const double*        statsS(const Reducer* t_r, int t_devSet = -1);
 const double*        statsVar2(const Reducer* t_r, int t_devSet = -1);
 const double*        statsP(const Reducer* t_r, int t_devSet = -1);
 const unsigned char* statsFlags(const Reducer* t_r, int t_devSet = -1);
-// Self-test entry: run the stats kernel on caller-supplied C1 / C2 (laid out
-// as outCd / outC2d: element (slot, k) at k * ldC + slot, t_nSlots live rows)
-// and VR, results in device set 0's buffers (the accessors above). Only
-// before the first reduce().
-bool statsSelfTest(Reducer* t_r, const double* t_C1, const double* t_C2, const double* t_vr, int t_nSlots);
-// p = erfc(sqrt(stat / 2)) for each of t_n stats, the device's own erfc, for
-// the start-up comparison with boost.
-bool statsErfcTest(Reducer* t_r, const double* t_stat, int t_n, double* t_p);
 // Cumulative kernel + D2H seconds of the stats stage, for the breakdown line.
 double statsSeconds(const Reducer* t_r);
 

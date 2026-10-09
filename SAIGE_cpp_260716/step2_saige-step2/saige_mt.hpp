@@ -257,6 +257,7 @@ struct MTScratch {
     arma::mat GR;      // B x P
     arma::mat G2Mu2;   // B x nBin
     arma::vec Gsq;     // B
+    arma::vec Gsum;    // B       colsum(G)            quantitative, isnoadjCov
     // Different sample sets only (design 4.7).
     arma::mat GMu2;    // B x nBin   Gb' MU2bin      (flip correction, binary)
     arma::mat GMask1;  // B x nMask  Gb' MASKq       (flip correction, quantitative)
@@ -381,6 +382,16 @@ struct MTBlockResult {
 //               copying or masking the block.
 //   t_traitSet  internal trait indices to score; other columns are untouched
 //   t_VR        B x P, the per-pair variance ratio (only t_traitSet read)
+//   t_AF        B x P, the per-pair ALT allele frequency after imputation and
+//               flip, as imputeGenoAndFlip returns it (the trait's own when
+//               the trait has its own sample list). Read only for traits with
+//               isnoadjCov, whose score and variance are R's
+//               scoreTestFast_noadjCov:
+//                   S    = (g'res - 2 AF sum(res)) / tau0
+//                   var2 = tau0 * sum_i mu2_i (g_i - 2 AF)^2
+//               i.e. the genotype is centred at 2 AF instead of projected off
+//               the covariates, and the variance ratio is the null_noXadj one
+//               (the caller's t_VR carries it).
 //
 // NOT bit-identical to scoreTestFast: the scalar version sums over the carrier
 // samples only, this one sums over all N (the non-carriers contribute exact
@@ -397,6 +408,7 @@ void scoreTestBatchMT(const MTContext& t_ctx,
                       const arma::mat& t_Gb,
                       int t_j0, int t_j1,
                       const arma::mat& t_VR,
+                      const arma::mat& t_AF,
                       const MTBlockAdj* t_adj,
                       MTScratch& t_scr,
                       MTBlockResult& t_out);
@@ -419,16 +431,21 @@ void scoreTestBatchMT(const MTContext& t_ctx,
 //     Gsq    Bblk             colsum(G % G)          quantitative
 //     GWbin  sumPbin x Bblk   WXstack^T G            binary
 //     G2Mu2  Bblk x nBin      (G % G)^T MU2bin       binary
+//     Gsum   Bblk             colsum(G)              quantitative with isnoadjCov
+//     GMu2   Bblk x nBin      G^T MU2bin             binary with isnoadjCov
+//   t_AF as for scoreTestBatchMT.
 void scoreTestBatchMTQuantPre(const MTContext& t_ctx,
                               const std::vector<int>& t_traitSet,
                               int t_j0, int t_j1,
                               const arma::mat& t_VR,
+                              const arma::mat& t_AF,
                               MTScratch& t_scr,
                               MTBlockResult& t_out);
 void scoreTestBatchMTBinPre(const MTContext& t_ctx,
                             const std::vector<int>& t_traitSet,
                             int t_j0, int t_j1,
                             const arma::mat& t_VR,
+                            const arma::mat& t_AF,
                             MTScratch& t_scr,
                             MTBlockResult& t_out);
 
@@ -444,6 +461,7 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
                                const std::vector<int>& t_traitSet,
                                int t_j0, int t_j1,
                                const arma::mat& t_VR,
+                               const arma::mat& t_AF,
                                const MTBlockAdj& t_adj,
                                MTScratch& t_scr,
                                MTBlockResult& t_out);
@@ -458,13 +476,17 @@ void scoreTestBatchMTBinPreAdj(const MTContext& t_ctx,
 // GMask2 / GMask1 / MissMask. The two are algebraically equal (a^2 = 1); they
 // differ only in rounding, as the column's Gsq already does on this path. The
 // missing-cell row sums (MissA / MissWqnt / MissR) are formed here from
-// t_adj.miss exactly as scoreTestBatchMT forms them.
+// t_adj.miss exactly as scoreTestBatchMT forms them. t_Sown (Bblk x P) is the
+// trait's own sum_i g_t,i from the same counts, read for a trait with
+// isnoadjCov and its own list.
 void scoreTestBatchMTQuantPreAdj(const MTContext& t_ctx,
                                  const std::vector<int>& t_traitSet,
                                  int t_j0, int t_j1,
                                  const arma::mat& t_VR,
+                                 const arma::mat& t_AF,
                                  const MTBlockAdj& t_adj,
                                  const arma::mat& t_Qown,
+                                 const arma::mat& t_Sown,
                                  MTScratch& t_scr,
                                  MTBlockResult& t_out);
 
