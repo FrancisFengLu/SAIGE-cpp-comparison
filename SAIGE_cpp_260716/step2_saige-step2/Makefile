@@ -169,7 +169,7 @@ ifeq ($(USE_CUDA),1)
                 -gencode arch=compute_$(lastword $(sort $(SM))),code=compute_$(lastword $(sort $(SM)))
   endif
   NVCCFLAGS ?= -O3 -std=c++17 $(GPU_ARCH) -lineinfo -Xcompiler -fPIC
-  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o gpu/gpu_sparse.cu.o gpu/gpu_er.cu.o
+  GPU_OBJ   := gpu/gpu_step2.cu.o gpu/gpu_spa.cu.o gpu/spa_gpu/spa_gpu.cu.o gpu/gpu_firth.cu.o gpu/gpu_sparse.cu.o gpu/gpu_er.cu.o gpu/gpu_er_fp32.cu.o
   LIBS      += -L$(CUDA_HOME)/lib64 -lcudart -lcublas -Wl,-rpath,$(CUDA_HOME)/lib64
 else
   GPU_OBJ   := gpu/gpu_step2_stub.o gpu/gpu_spa_stub.o gpu/spa_gpu/spa_gpu_stub.o gpu/gpu_firth_stub.o gpu/gpu_sparse_stub.o gpu/gpu_er_stub.o
@@ -263,14 +263,23 @@ gpu/gpu_sparse.cu.o: gpu/gpu_sparse.cu gpu/gpu_sparse.hpp gpu/gpu_step2.hpp gpu/
 # The exact test for binary traits on the device (gpu/gpu_er.hpp, config key
 # gpuER): --fmad=false like the SPA / Firth kernels; the only fused operations are
 # the explicit fma() of the glibc exp / log ports (gpu_er_glibc.cuh).
-gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh gpu/gpu_precision.hpp
+gpu/gpu_er.cu.o: gpu/gpu_er.cu gpu/gpu_er.hpp gpu/gpu_er_glibc.cuh gpu/gpu_er_glibc_tables.cuh gpu/gpu_er_fp32.cuh gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
+
+# gpuPrecisionER: fp32 (gpu/gpu_er_fp32.cu): log-domain enumeration in fp32.
+# Not bit-identical by design, so FMA contraction is left on.
+gpu/gpu_er_fp32.cu.o: gpu/gpu_er_fp32.cu gpu/gpu_er_fp32.cuh gpu/gpu_er.hpp gpu/gpu_precision.hpp
+	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
 
 # Device ER against er_binary.cpp pair by pair, and the device exp / log against
 # the host's bit by bit (USE_CUDA=1 only).
 #   make USE_CUDA=1 SM=70 tools/er_gpu_check
 tools/er_gpu_check: tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. tools/er_gpu_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
+
+# gpuPrecisionER fp32 against er_binary.cpp on the same generated pairs.
+gpu/er_tools/er_fp32_check: gpu/er_tools/er_fp32_check.cpp er_binary.o $(GPU_OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. gpu/er_tools/er_fp32_check.cpp er_binary.o $(GPU_OBJ) $(LIBS) -o $@
 
 # The SPA GPU library (gpu/spa_gpu/, from branch spa-gpu-lib, SPA_GPU_LIB.md):
 # same contract as gpu_spa.hpp, carriers-only scans, one pass per Newton step,
@@ -281,7 +290,7 @@ gpu/spa_gpu/spa_gpu.cu.o: gpu/spa_gpu/spa_gpu.cu gpu/spa_gpu/spa_gpu.hpp gpu/spa
 
 clean:
 	rm -f $(OBJECTS) $(PGENLIB_OBJ) $(DEPS) gpu/*.o gpu/*.d gpu/spa_gpu/*.o gpu/spa_gpu/*.d $(TARGET) tools/sgs2txt \
-	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check
+	      tools/sgs_fidelity tools/out_fieldcmp tools/mtvec_tail_accuracy tools/er_gpu_check gpu/er_tools/er_fp32_check
 
 test_region: $(TARGET)
 	./$(TARGET) config_compare_region.yaml

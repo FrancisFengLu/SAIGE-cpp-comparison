@@ -12,6 +12,7 @@
 
 #include "gpu_er.hpp"
 #include "gpu_er_glibc.cuh"
+#include "gpu_er_fp32.cuh"
 
 #include <cuda_runtime.h>
 
@@ -470,6 +471,8 @@ struct Er {
     ErPrep* dPrep = nullptr;      std::size_t capPrep = 0;
     double* dScr = nullptr;       std::size_t capScr = 0;
     long long* dScrOff = nullptr; std::size_t capScrOff = 0;
+    float* dMuSum = nullptr;      // FP32 only: per trait sum of mu as (hi, lo)
+    unsigned char* dPrep32 = nullptr; std::size_t capPrep32 = 0;   // FP32 large-k records (bytes)
     cudaStream_t st = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     double tKernel = 0.0;
@@ -480,9 +483,7 @@ bool erSupports(Prec t_p)
 {
     switch (t_p) {
         case Prec::FP64: return true;
-        // TODO(precision:ER): return true once the fp32 enumeration is plugged
-        // in at the launches in erRun().
-        case Prec::FP32: return false;
+        case Prec::FP32: return true;    // gpu_er_fp32.cu
         case Prec::INT8: return false;   // not a mode of this stage
     }
     return false;
@@ -528,6 +529,19 @@ Er* erCreate(const ErCreateArgs& a)
         cudaMemcpy(s->dNcase, cv.data(), a.nTraits * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(s->dLT, a.logTable, (std::size_t)(a.maxN + 1) * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess)
         return fail("cudaMemcpy trait tables");
+    if (a.precision == Prec::FP32) {
+        // the non-carriers' mean of mu in the fp32 kernel: trait sum minus carriers
+        std::vector<float> ms(2 * (std::size_t)a.nTraits);
+        for (int t = 0; t < a.nTraits; t++) {
+            double sum = 0.0;
+            for (int i = 0; i < nv[t]; i++) sum += a.traits[t].mu[i];
+            ms[2 * t] = (float)sum;
+            ms[2 * t + 1] = (float)(sum - (double)ms[2 * t]);
+        }
+        if (cudaMalloc(&s->dMuSum, ms.size() * sizeof(float)) != cudaSuccess ||
+            cudaMemcpy(s->dMuSum, ms.data(), ms.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+            return fail("cudaMalloc / cudaMemcpy mu sums");
+    }
     if (cudaStreamCreateWithFlags(&s->st, cudaStreamNonBlocking) != cudaSuccess) return fail("cudaStreamCreate");
     if (cudaEventCreate(&s->e0) != cudaSuccess || cudaEventCreate(&s->e1) != cudaSuccess) return fail("cudaEventCreate");
     return s;
@@ -543,6 +557,7 @@ void erDestroy(Er* s)
     cudaFree(s->dMu); cudaFree(s->dMuOff); cudaFree(s->dN); cudaFree(s->dNcase); cudaFree(s->dLT);
     cudaFree(s->dIn); cudaFree(s->dOut); cudaFree(s->dIdx); cudaFree(s->dG); cudaFree(s->dCase);
     cudaFree(s->dBigSlot); cudaFree(s->dBigPair); cudaFree(s->dPrep); cudaFree(s->dScr); cudaFree(s->dScrOff);
+    cudaFree(s->dMuSum); cudaFree(s->dPrep32);
     delete s;
 }
 
@@ -582,12 +597,18 @@ bool erRun(Er* s, const ErPairIn* in, int nPairs, const uint32_t* carIdx, const 
         CKE(cudaMemcpyAsync(s->dBigPair, bigPair.data(), (std::size_t)nBig * sizeof(int), cudaMemcpyHostToDevice, s->st));
     CKE(cudaEventRecord(s->e0, s->st));
     // ---- precision dispatch: the kernel variant ----
-    if (s->prec != Prec::FP64) {
-        // TODO(precision:ER): launch the fp32 variants of er_pairs / er_big
-        // here (same inputs, ErPairOut::pval as double; see gpu_er.hpp).
+    if (s->prec == Prec::FP32) {
+        // gpu_er_fp32.cu: same pairs, same k > KSMALL split, no scratch
+        if (!growDev(&s->dPrep32, &s->capPrep32, (std::size_t)(nBig > 0 ? nBig : 1) * erfp32::prepBytes())) {
+            lastErrEr = "erRun: cudaMalloc";
+            return false;
+        }
+        CKE(erfp32::launch(s->st, s->dMu, s->dMuOff, s->dN, s->dNcase, s->dMuSum, s->dIn, nPairs,
+                           s->dIdx, s->dG, s->dCase, s->dOut, s->dBigSlot, s->dBigPair, nBig, s->dPrep32));
+    } else if (s->prec != Prec::FP64) {
         lastErrEr = std::string("ER precision ") + precName(s->prec) + " has no kernel";
         return false;
-    }
+    } else {
     const int nt = 32;   // few pairs per call: spread them over the SMs
     const int nb = (nPairs + nt - 1) / nt;
     er_pairs<<<nb, nt, 0, s->st>>>(s->dMu, s->dMuOff, s->dN, s->dNcase, s->dLT, s->dIn, nPairs,
@@ -618,6 +639,7 @@ bool erRun(Er* s, const ErPairIn* in, int nPairs, const uint32_t* carIdx, const 
         }
         (void)kBig;
     }
+    }   // FP64
     CKE(cudaEventRecord(s->e1, s->st));
     CKE(cudaMemcpyAsync(out, s->dOut, (std::size_t)nPairs * sizeof(ErPairOut), cudaMemcpyDeviceToHost, s->st));
     CKE(cudaStreamSynchronize(s->st));
