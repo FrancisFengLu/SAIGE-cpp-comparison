@@ -252,7 +252,7 @@ gpu/gpu_spa.cu.o: gpu/gpu_spa.cu gpu/gpu_spa.hpp gpu/gpu_step2.hpp gpu/gpu_preci
 
 # Firth on the device (gpu/gpu_firth.hpp, config key gpuFirth): the same
 # one-block-per-pair shape as the SPA kernels, --fmad=false for the same reason.
-gpu/gpu_firth.cu.o: gpu/gpu_firth.cu gpu/gpu_firth.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
+gpu/gpu_firth.cu.o: gpu/gpu_firth.cu gpu/gpu_firth_fp32.cuh gpu/gpu_firth.hpp gpu/gpu_step2.hpp gpu/gpu_precision.hpp
 	$(NVCC) $(NVCCFLAGS) --fmad=false -Igpu -c $< -o $@
 
 # The within-block cross terms of g' Sigma^-1 g for sparse-GRM binary traits

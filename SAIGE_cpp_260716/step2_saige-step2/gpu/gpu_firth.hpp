@@ -53,6 +53,10 @@
 // caller's; whether an fp32 fit can reach them is the variant's business,
 // and a fit that cannot must report conv = 0 rather than claim convergence).
 // The host (flip sign, seBeta from p, counters) reads those doubles unchanged.
+// FP32 is gpu_firth_fp32.cuh: per-sample work and inputs in fp32 with
+// compensated per-thread sums; reductions, the 2x2 inverse and the step in
+// fp64; the residual split around a reference point frozen near the root, so
+// the caller's xconv / gconv stay reachable; see there.
 #pragma once
 
 #include <cstddef>

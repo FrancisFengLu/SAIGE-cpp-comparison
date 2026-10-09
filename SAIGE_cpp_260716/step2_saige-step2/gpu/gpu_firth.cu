@@ -13,6 +13,7 @@
 #include <math_constants.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -204,6 +205,8 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
     }
 }
 
+#include "gpu_firth_fp32.cuh"
+
 }  // namespace
 
 struct Firth {
@@ -218,6 +221,9 @@ struct Firth {
     double* dY = nullptr; double* dOff = nullptr; double* dXV = nullptr; double* dXX = nullptr;
     int*    dP  = nullptr;
     double* dScratch = nullptr;
+    // FP32: the per-sample inputs as float (the double ones stay nullptr)
+    float* fY = nullptr; float* fOff = nullptr; float* fXV = nullptr; float* fXX = nullptr;
+    float* fScratch = nullptr;
     int own = 0, maskWords = 0;
     double* hPLut = nullptr; double* dPLut = nullptr; uint64_t* dMask = nullptr;
     cudaStream_t st = nullptr;
@@ -225,15 +231,18 @@ struct Firth {
     double tKernel = 0.0;
     long long nPairsDone = 0;
     std::size_t devBytes = 0;
+    // SAIGE_FIRTH_STATS set in the environment: per-run outcome counts,
+    // printed to stderr by firthDestroy() (a diagnostic for the precision
+    // gate; nothing else reads them)
+    bool stats = false;
+    long long nStrict = 0, nMaxit = 0, nSingular = 0, sumIter = 0;
 };
 
 bool firthSupports(Prec t_p)
 {
     switch (t_p) {
         case Prec::FP64: return true;
-        // TODO(precision:Firth): return true once the fp32 fit is plugged in at
-        // the launch in firthRun().
-        case Prec::FP32: return false;
+        case Prec::FP32: return true;    // firth_pairs_f32 (gpu_firth_fp32.cuh)
         case Prec::INT8: return false;   // not a mode of this stage
     }
     return false;
@@ -257,6 +266,7 @@ Firth* firthCreate(const FirthCreateArgs& a)
     }
     Firth* s = new Firth();
     s->prec = a.precision;
+    s->stats = std::getenv("SAIGE_FIRTH_STATS") != nullptr;
     s->N = a.N; s->nTraits = a.nTraits; s->maxPairs = a.maxPairs;
     s->blocks = a.blocks > 0 ? a.blocks : 256;
     s->maxit = a.maxit; s->maxstep = a.maxstep; s->xconv = a.xconv; s->gconv = a.gconv;
@@ -271,12 +281,24 @@ Firth* firthCreate(const FirthCreateArgs& a)
     if (cudaHostAlloc((void**)&s->hOut, (std::size_t)a.maxPairs * sizeof(FirthPairOut), cudaHostAllocDefault) != cudaSuccess) return fail();
     if (!dev((void**)&s->dIn,  (std::size_t)a.maxPairs * sizeof(FirthPairIn)))  return fail();
     if (!dev((void**)&s->dOut, (std::size_t)a.maxPairs * sizeof(FirthPairOut))) return fail();
+    const bool f32 = (a.precision == Prec::FP32);
+    if (!f32) {
     if (!dev((void**)&s->dY,   (std::size_t)a.nTraits * a.N * sizeof(double))) return fail();
     if (!dev((void**)&s->dOff, (std::size_t)a.nTraits * a.N * sizeof(double))) return fail();
     if (!dev((void**)&s->dXV, (std::size_t)a.nTraits * s->traitStride * sizeof(double))) return fail();
     if (!dev((void**)&s->dXX, (std::size_t)a.nTraits * s->traitStride * sizeof(double))) return fail();
+    } else {
+    if (!dev((void**)&s->fY,   (std::size_t)a.nTraits * a.N * sizeof(float))) return fail();
+    if (!dev((void**)&s->fOff, (std::size_t)a.nTraits * a.N * sizeof(float))) return fail();
+    if (!dev((void**)&s->fXV, (std::size_t)a.nTraits * s->traitStride * sizeof(float))) return fail();
+    if (!dev((void**)&s->fXX, (std::size_t)a.nTraits * s->traitStride * sizeof(float))) return fail();
+    }
     if (!dev((void**)&s->dP,  (std::size_t)a.nTraits * sizeof(int))) return fail();
+    if (!f32) {
     if (!dev((void**)&s->dScratch, (std::size_t)s->blocks * a.N * sizeof(double))) return fail();
+    } else {
+    if (!dev((void**)&s->fScratch, (std::size_t)s->blocks * a.N * sizeof(float))) return fail();
+    }
     if (a.ownSamples) {
         s->own = 1;
         s->maskWords = (a.N + 63) / 64;
@@ -292,9 +314,21 @@ Firth* firthCreate(const FirthCreateArgs& a)
     }
     s->devBytes = db;
     std::vector<int> pv(a.nTraits);
+    std::vector<float> cv;   // FP32: one array converted to float at a time
+    auto up32 = [&](float* dst, const double* src, std::size_t n) {
+        cv.assign(src, src + n);
+        return cudaMemcpy(dst, cv.data(), n * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+    };
     for (int t = 0; t < a.nTraits; ++t) {
         const FirthTraitArgs& T = a.traits[t];
         pv[t] = T.p;
+        if (f32) {
+            if (!up32(s->fY   + (std::size_t)t * a.N, T.y,      (std::size_t)a.N)) return fail();
+            if (!up32(s->fOff + (std::size_t)t * a.N, T.offset, (std::size_t)a.N)) return fail();
+            if (!up32(s->fXV + (std::size_t)t * s->traitStride, T.XV,       (std::size_t)a.N * T.p)) return fail();
+            if (!up32(s->fXX + (std::size_t)t * s->traitStride, T.XXVX_inv, (std::size_t)a.N * T.p)) return fail();
+            continue;
+        }
         if (cudaMemcpy(s->dY   + (std::size_t)t * a.N, T.y,      (std::size_t)a.N * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
         if (cudaMemcpy(s->dOff + (std::size_t)t * a.N, T.offset, (std::size_t)a.N * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
         if (cudaMemcpy(s->dXV + (std::size_t)t * s->traitStride, T.XV, (std::size_t)a.N * T.p * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) return fail();
@@ -309,6 +343,10 @@ Firth* firthCreate(const FirthCreateArgs& a)
 void firthDestroy(Firth* s)
 {
     if (!s) return;
+    if (s->stats)
+        std::fprintf(stderr, "firth stats (%s): pairs %lld, strict %lld, maxit %lld, singular %lld, mean iterations %.4f\n",
+                     precName(s->prec), s->nPairsDone, s->nStrict, s->nMaxit, s->nSingular,
+                     s->nPairsDone > 0 ? (double)s->sumIter / (double)s->nPairsDone : 0.0);
     if (s->e0) cudaEventDestroy(s->e0);
     if (s->e1) cudaEventDestroy(s->e1);
     if (s->st) cudaStreamDestroy(s->st);
@@ -320,6 +358,11 @@ void firthDestroy(Firth* s)
     if (s->dXX) cudaFree(s->dXX);
     if (s->dP) cudaFree(s->dP);
     if (s->dScratch) cudaFree(s->dScratch);
+    if (s->fY) cudaFree(s->fY);
+    if (s->fOff) cudaFree(s->fOff);
+    if (s->fXV) cudaFree(s->fXV);
+    if (s->fXX) cudaFree(s->fXX);
+    if (s->fScratch) cudaFree(s->fScratch);
     if (s->dPLut) cudaFree(s->dPLut);
     if (s->dMask) cudaFree(s->dMask);
     if (s->hPLut) cudaFreeHost(s->hPLut);
@@ -355,13 +398,21 @@ bool firthRun(Firth* s, const Reducer* r, int nPairs, int t_devSet)
     const int grid = nPairs < s->blocks ? nPairs : s->blocks;
     CKF(cudaEventRecord(s->e0, s->st));
     // ---- precision dispatch: the kernel variant ----
-    if (s->prec != Prec::FP64) {
-        // TODO(precision:Firth): launch the fp32 variant of firth_pairs here
-        // (same inputs, same FirthPairOut doubles; see gpu_firth.hpp).
+    if (s->prec == Prec::FP32) {
+        if (s->own)
+            firth_pairs_f32<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dPLut, s->dMask, s->maskWords,
+                                                    s->fY, s->fOff, s->fXV, s->fXX, s->dP,
+                                                    s->traitStride, s->dIn, nPairs, s->fScratch,
+                                                    s->maxit, s->maxstep, s->xconv, s->gconv, s->dOut);
+        else
+            firth_pairs_f32<false><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, nullptr, nullptr, 0,
+                                                     s->fY, s->fOff, s->fXV, s->fXX, s->dP,
+                                                     s->traitStride, s->dIn, nPairs, s->fScratch,
+                                                     s->maxit, s->maxstep, s->xconv, s->gconv, s->dOut);
+    } else if (s->prec != Prec::FP64) {
         lastErrFirth = std::string("Firth precision ") + precName(s->prec) + " has no kernel";
         return false;
-    }
-    if (s->own)
+    } else if (s->own)
         firth_pairs<true><<<grid, NT, 0, s->st>>>(dPk, bytesPerSlot(r), dLut, s->N, s->dPLut, s->dMask, s->maskWords,
                                             s->dY, s->dOff, s->dXV, s->dXX, s->dP,
                                             s->traitStride, s->dIn, nPairs, s->dScratch,
@@ -378,6 +429,12 @@ bool firthRun(Firth* s, const Reducer* r, int nPairs, int t_devSet)
     float ms = 0;
     if (cudaEventElapsedTime(&ms, s->e0, s->e1) == cudaSuccess) s->tKernel += ms * 1e-3;
     s->nPairsDone += nPairs;
+    if (s->stats)
+        for (int k = 0; k < nPairs; ++k) {
+            const FirthPairOut& o = s->hOut[k];
+            s->nStrict += o.strict; s->nSingular += o.singular; s->sumIter += o.niter;
+            s->nMaxit += (o.conv && !o.strict) ? 1 : 0;
+        }
     return true;
 }
 
