@@ -105,12 +105,14 @@ struct CreateArgs {
     // costs about 40% more GEMM time than FP32 and about one extra pass of
     // device bandwidth in the decode -- a few percent of a real step-2 run --
     // and it removes the precision question rather than bounding it. FP32:
-    // float decode + SGEMM, float results (outCf / outC2f). INT8: the
-    // Ozaki-style split (int8 genotypes, B1 / B2 split into int8Slices int8
-    // slices with per-column scaling, int32 GEMMs, recombined in fp64); double
-    // results (outCd / outC2d). Only the modes scanSupports() accepts may be
-    // passed; create() returns nullptr for any other. See PRECISION in
-    // gpu_step2.cu.
+    // float decode (g - rint(mean g) per marker) and SGEMMs over 4096-sample
+    // chunks, the chunks and the exact shift / centring corrections summed in
+    // fp64. INT8: the Ozaki-style split (int8 genotypes plus a 0/1 column
+    // per mean-imputed code, B1 / B2 split into int8Slices int8 slices with
+    // per-column power-of-two scaling, int32 GEMMs, recombined in fp64). Every
+    // mode hands back double results (outCd / outC2d). Only the modes
+    // scanSupports() accepts may be passed; create() returns nullptr for any
+    // other. See PRECISION in gpu_step2.cu and gpu_scan_lowp.cuh.
     Prec precision = Prec::FP64;
     // INT8 only: slices of the trait-side operand, kInt8SlicesMin..Max.
     int int8Slices = kInt8SlicesDefault;
@@ -162,13 +164,14 @@ int maskWords(int t_N);
 //             the caller writes (N+3)/4 bytes and leaves the rest, which the
 //             reducer zeroed once and the kernels never see as a sample.
 //   lut()     t_maxSlots * 4 doubles; slot j's code->dosage table at 4*j.
-//             DOUBLE, not float, in both precision modes: three of its entries
+//             DOUBLE, not float, in every precision mode: three of its entries
 //             are exact small integers but the fourth is the imputed mean
 //             2*altFreq, and narrowing that on the host would put a 6e-8
 //             relative error into every missing cell before the reduction even
 //             starts -- which is a difference from the CPU's INPUT, not from
-//             its arithmetic. In fp32 mode the kernel narrows it itself, so
-//             the two modes still see the same table.
+//             its arithmetic. FP32 narrows g - r in the kernel; INT8 keeps
+//             rint(entry) in the int8 column and applies the fractional rest
+//             exactly, in fp64, through a 0/1 indicator column.
 //   t_set     which staging set (0 .. stagingSets()-1); the single set of a
 //             reducer created with stagingSets = 1 is set 0.
 unsigned char* packed(Reducer* t_r, int t_set = 0);
@@ -190,7 +193,8 @@ bool reduce(Reducer* t_r, int t_nSlots, int t_set = 0, int t_devSet = -1);
 // (slot, k) sits at index (std::size_t)k * ldC() + slot; C2 likewise with K2
 // columns. Pinned, owned here. Exactly one of each pair of accessors is
 // non-null, per isFp64(), which says whether the RESULT buffers are double:
-// true for precision FP64 and INT8 (recombined in fp64), false for FP32.
+// true in every precision mode (FP32 and INT8 recombine in fp64); the float
+// accessors are kept for the interface and return nullptr.
 bool          isFp64(const Reducer* t_r);
 const float*  outCf(const Reducer* t_r, int t_devSet = -1);
 const double* outCd(const Reducer* t_r, int t_devSet = -1);

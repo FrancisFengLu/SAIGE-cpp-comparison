@@ -235,8 +235,14 @@ $(TARGET): $(OBJECTS) $(PGENLIB_OBJ) $(GPU_OBJ)
 third_party/pgenlib/%.o: third_party/pgenlib/%.cc
 	$(CXX) $(PGENLIB_CXXFLAGS) -c $< -o $@
 
-gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp
+gpu/gpu_step2.cu.o: gpu/gpu_step2.cu gpu/gpu_step2.hpp gpu/gpu_precision.hpp gpu/gpu_scan_lowp.cuh
 	$(NVCC) $(NVCCFLAGS) -Igpu -c $< -o $@
+
+# Direct accuracy test of the reducer in each scan precision (fp64 / fp32 /
+# int8) against a long-double reference, simulated data; not part of `all`.
+#   make USE_CUDA=1 SM=70 gpu/scan_prec_test && gpu/scan_prec_test
+gpu/scan_prec_test: gpu/scan_prec_test.cpp gpu/gpu_step2.hpp gpu/gpu_step2.cu.o
+	$(CXX) -O2 -std=c++17 -Igpu gpu/scan_prec_test.cpp gpu/gpu_step2.cu.o $(LIBS) -o $@
 
 # The saddlepoint kernel: no FMA contraction, so a*b+c rounds the way the CPU
 # build's does (gcc -std=c++17 implies -ffp-contract=off); the kernel is exp /

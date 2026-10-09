@@ -39,6 +39,13 @@
 // would cancel badly (var2 is a difference of terms of similar size).
 // main.cpp passes the scan mode as SpQuadCreateArgs::precision; only modes
 // spqSupports() accepts may be passed. Results are double in every mode.
+//   FP64  the kernel above.
+//   FP32  float weights, dosages and products; each thread's float partial
+//         flushed into a double every 64 of its pairs; block sum in double.
+//   INT8  runs the FP64 kernel: the weights are arbitrary reals and this sum
+//         is not a GEMM, so an int8 split has nothing to work on, and the int8
+//         scan's GEMM terms already come back at fp64 level -- the cross term
+//         at fp64 keeps all three terms there.
 #pragma once
 
 #include <cstddef>
