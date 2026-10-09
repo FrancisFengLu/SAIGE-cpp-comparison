@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -155,17 +156,17 @@ inline void drawPair(RandCols& rc, const TraitConst& c, double* z, double* w, do
 
 }  // namespace
 
-std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& traits,
-                                 Patterns& out, std::string& detail)
-{
-    out = Patterns();
-    if (traits.empty()) return "no binary trait";
-    if (ctx.sampleSetsDiffer) return "the models do not share one sample list";
-    std::vector<TraitConst> tc(ctx.P);
-    for (int t : traits) { std::string why; if (!traitConst(ctx, t, tc[t], why)) return why; }
+namespace {
 
+// Run scoreTestBatchMTBinPre on one probe block (B = 128 columns) of `ctx`'s
+// `traits` and count, per candidate order, the pairs whose S / var2 differ
+// from it in any bit.
+std::string probeOrders(const MTContext& ctx, const std::vector<int>& traits, const std::vector<TraitConst>& tc,
+                        uint64_t seed, long mismS[5], long mismV[5][2][2], long& nPairs)
+{
     const int B = 128;
     RandCols rc;
+    rc.rng.seed(seed);
     MTScratch scr;
     scr.Zall.set_size(ctx.sumP, B);
     scr.GWbin.set_size(std::max(ctx.sumPbin, 1), B);
@@ -196,11 +197,9 @@ std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& t
     } catch (const std::exception& e) {
         return std::string("scoreTestBatchMTBinPre refused the probe block: ") + e.what();
     }
-
-    long mismS[5] = {0, 0, 0, 0, 0};
-    long mismV[5][2][2];
-    std::memset(mismV, 0, sizeof(mismV));
-    long nPairs = 0;
+    for (int ps = 0; ps < 5; ++ps) mismS[ps] = 0;
+    std::memset(mismV, 0, sizeof(long) * 20);
+    nPairs = 0;
     for (int t : traits) {
         const TraitMeta& M = ctx.meta[t];
         const TraitConst& c = tc[t];
@@ -227,30 +226,96 @@ std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& t
             }
         }
     }
-    int saz = -1, nSaz = 0;
-    for (int ps = 0; ps < 5; ++ps) if (mismS[ps] == 0) { if (saz < 0) saz = ps; ++nSaz; }
-    int xz = -1, zxz = -1, gwz = -1;
-    for (int px = 0; px < 5 && xz < 0; ++px)
-        for (int pz = 0; pz < 2 && xz < 0; ++pz)
-            for (int pg = 0; pg < 2 && xz < 0; ++pg)
-                if (mismV[px][pz][pg] == 0) { xz = px; zxz = pz; gwz = pg; }
+    return std::string();
+}
+
+std::string mismText(long nPairs, const long mismS[5], const long mismV[5][2][2])
+{
     std::ostringstream d;
-    d << nPairs << " probe pairs; S_a'Z pattern mismatches";
+    d << nPairs << " pairs; S_a'Z order mismatches";
     for (int ps = 0; ps < 5; ++ps) d << " " << mismS[ps];
-    d << "; var2 pattern (XVX Z, Z%XZ sum, W%Z sum) mismatches";
+    d << "; var2 orders (XVX Z, Z%XZ sum, W%Z sum)";
     for (int px = 0; px < 5; ++px) for (int pz = 0; pz < 2; ++pz) for (int pg = 0; pg < 2; ++pg)
         d << " " << px << pz << pg << ":" << mismV[px][pz][pg];
-    detail = d.str();
+    return d.str();
+}
+
+}  // namespace
+
+std::string identifyHostPatterns(const MTContext& ctx, const std::vector<int>& traits,
+                                 Patterns& out, std::string& detail)
+{
+    out = Patterns();
+    if (traits.empty()) return "no binary trait";
+    if (ctx.sampleSetsDiffer) return "the models do not share one sample list";
+    std::vector<TraitConst> tc(ctx.P);
+    for (int t : traits) { std::string why; if (!traitConst(ctx, t, tc[t], why)) return why; }
+
+    // ---- 1. the orders, on a synthetic context ----
+    // The contraction order is a property of the code (OpenBLAS's kernels for
+    // these shapes, this build's compilation of armadillo's sum), not of the
+    // model, so it is read off unit-scale random constants -- one binary
+    // trait per distinct p among the run's traits, XVX a random SPD matrix,
+    // S_a random normal -- where every term's last bit reaches S and var2
+    // and every candidate separates. A model's own S_a can be too lopsided
+    // for that (an intercept component 1000x below the others never shows
+    // whether its product was fused).
+    std::vector<int> ps;
+    for (int t : traits) if (std::find(ps.begin(), ps.end(), ctx.meta[t].p) == ps.end()) ps.push_back(ctx.meta[t].p);
+    MTContext sc;
+    sc.P = (int)ps.size(); sc.nBin = sc.P;
+    sc.meta.resize((std::size_t)sc.P);
+    sc.XVX.resize((std::size_t)sc.P); sc.S_a.resize((std::size_t)sc.P);
+    std::mt19937_64 rng(20261012ull);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    int off = 0;
+    for (int k = 0; k < sc.P; ++k) {
+        TraitMeta& M = sc.meta[(std::size_t)k];
+        M.name = "probe p=" + std::to_string(ps[(std::size_t)k]); M.traitType = "binary";
+        M.kind = TraitKind::Binary; M.p = ps[(std::size_t)k];
+        M.colOff = off; M.binOff = off; M.binIdx = k; M.tau0 = 1.0;
+        off += M.p;
+        arma::mat A(M.p, M.p);
+        for (int i = 0; i < M.p; ++i) for (int j = 0; j < M.p; ++j) A(i, j) = nd(rng);
+        sc.XVX[(std::size_t)k] = A * A.t() + (double)M.p * arma::eye(M.p, M.p);
+        sc.S_a[(std::size_t)k].set_size(M.p);
+        for (int i = 0; i < M.p; ++i) sc.S_a[(std::size_t)k](i) = nd(rng);
+    }
+    sc.sumP = off; sc.sumPbin = off; sc.sumPqnt = 0; sc.qOff = off;
+    std::vector<int> st((std::size_t)sc.P);
+    for (int k = 0; k < sc.P; ++k) st[(std::size_t)k] = k;
+    std::vector<TraitConst> tcS((std::size_t)sc.P);
+    for (int k = 0; k < sc.P; ++k) { std::string why; if (!traitConst(sc, k, tcS[(std::size_t)k], why)) return why; }
+    long mismS[5], mismV[5][2][2], nPairs = 0;
+    {
+        const std::string e = probeOrders(sc, st, tcS, 20261013ull, mismS, mismV, nPairs);
+        if (!e.empty()) return e;
+    }
+    int saz = -1, nSaz = 0;
+    for (int q = 0; q < 5; ++q) if (mismS[q] == 0) { if (saz < 0) saz = q; ++nSaz; }
+    int xz = -1, zxz = -1, gwz = -1, nV = 0;
+    for (int px = 0; px < 5; ++px) for (int pz = 0; pz < 2; ++pz) for (int pg = 0; pg < 2; ++pg)
+        if (mismV[px][pz][pg] == 0) { if (xz < 0) { xz = px; zxz = pz; gwz = pg; } ++nV; }
+    const std::string synth = mismText(nPairs, mismS, mismV);
+    detail = "synthetic probe: " + synth;
     if (saz < 0) return "no candidate order reproduces the host's S_a'Z (" + detail + ")";
     if (xz < 0) return "no candidate order reproduces the host's var2 (" + detail + ")";
-    // p >= 3 separates every candidate on these probes; several matches mean
-    // the probe could not see the last bit, and a guess is not good enough.
-    int nV = 0;
-    for (int px = 0; px < 5; ++px) for (int pz = 0; pz < 2; ++pz) for (int pg = 0; pg < 2; ++pg) if (mismV[px][pz][pg] == 0) ++nV;
+    // p >= 3 separates every candidate on unit-scale data; p <= 2 leaves some
+    // candidates identical by construction, and any of them is then right.
     int pmax = 0;
-    for (int t : traits) pmax = std::max(pmax, ctx.meta[t].p);
+    for (int q : ps) pmax = std::max(pmax, q);
     if (pmax >= 3 && (nSaz > 1 || nV > 1))
-        return "the probe does not separate the candidate orders (" + detail + ")";
+        return "the synthetic probe does not separate the candidate orders (" + detail + ")";
+
+    // ---- 2. the run's own models: the found orders must reproduce them too ----
+    long mismS2[5], mismV2[5][2][2], nPairs2 = 0;
+    {
+        const std::string e = probeOrders(ctx, traits, tc, 20261009ull, mismS2, mismV2, nPairs2);
+        if (!e.empty()) return e;
+    }
+    detail += "; the run's models: " + mismText(nPairs2, mismS2, mismV2);
+    if (mismS2[saz] != 0 || mismV2[xz][zxz][gwz] != 0)
+        return "the orders found on the synthetic probe do not reproduce the run's models (" + detail + ")";
     out.saz = saz; out.xz = xz; out.zxz = zxz; out.gwz = gwz;
     return std::string();
 }
