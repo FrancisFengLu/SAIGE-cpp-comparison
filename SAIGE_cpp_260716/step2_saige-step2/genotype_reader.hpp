@@ -61,6 +61,15 @@ private:
     // decode fast path; otherwise the fused path falls back to a per-sample
     // gather (still single-pass).
     bool m_posIsIdentity = true;
+    // The analysis samples are a subset of the .fam in .fam order (positions
+    // strictly increasing): the packed row of the analysis samples is the
+    // .bed row with the dropped samples' 2-bit fields squeezed out, which
+    // copyFusedPacked_ts does word by word with BMI2 pext against
+    // m_keepMask (one 64-bit mask per .bed row word, 11 in every kept
+    // sample's field) instead of a per-sample gather. Needs BMI2 (m_haveBmi2).
+    bool m_posIsMonotone = false;
+    bool m_haveBmi2 = false;
+    std::vector<uint64_t> m_keepMask;
 
     // https://www.cog-genomics.org/plink/1.9/formats#bed
     // PLINK format
@@ -277,6 +286,8 @@ public:
     // Bits past sample m_N-1 in the last byte are cleared, so the output is a
     // pure function of the analysis samples.
     void copyFusedPacked_ts(const FusedMarkerStats& fs, uint8_t* t_out) const;
+    void packedSubsetPext(const unsigned char* t_row, std::size_t t_rowBytes,
+                          uint8_t* t_out, uint32_t t_nb) const;
 
     // Stage C. Requires the immediately preceding Stage A call on the SAME
     // thread with the same gIndex (packed bytes are cached thread_local).

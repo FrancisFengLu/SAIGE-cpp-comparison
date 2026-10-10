@@ -17,6 +17,10 @@
 #include <sqlite3.h>
 #include <sys/stat.h>
 #include "genotype_reader.hpp"
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#endif
 #include "UTIL.hpp"
 // locoChromLabelsMatch(): the single canonical lenient chromosome-name
 // comparison ("chr1" == "1" == "01"). Reused here so the VCF/BGEN LOCO filters
@@ -291,8 +295,27 @@ void PlinkClass::setPosSampleInPlink(std::vector<std::string>& t_SampleInModel)
     for (uint32_t i = 0; i < m_N; i++) {
         if (m_posSampleInPlink[i] != i) { m_posIsIdentity = false; break; }
     }
+    // A subset in .fam order: the packed row is the .bed row with the dropped
+    // fields squeezed out (copyFusedPacked_ts, pext per word).
+    m_posIsMonotone = !m_posIsIdentity && m_N > 0;
+    for (uint32_t i = 1; i < m_N && m_posIsMonotone; i++)
+        if (m_posSampleInPlink[i] <= m_posSampleInPlink[i - 1]) m_posIsMonotone = false;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    m_haveBmi2 = __builtin_cpu_supports("bmi2");
+#else
+    m_haveBmi2 = false;
+#endif
+    if (m_posIsMonotone) {
+        const std::size_t nW0 = ((std::size_t)m_N0 + 31) / 32;
+        m_keepMask.assign(nW0, 0);
+        for (uint32_t i = 0; i < m_N; i++) {
+            const uint32_t p = m_posSampleInPlink[i];
+            m_keepMask[p >> 5] |= 3ULL << (2 * (p & 31));
+        }
+    }
     std::cout << "  Fused decode fast path (identity sample mapping): "
-              << (m_posIsIdentity ? "yes" : "no (per-sample gather)") << std::endl;
+              << (m_posIsIdentity ? "yes" : (m_posIsMonotone && m_haveBmi2) ? "no (subset in .fam order: packed rows by pext)"
+                                                                            : "no (per-sample gather)") << std::endl;
 
     std::cout << "Number of samples in analysis: " << m_N << std::endl;
 }
@@ -708,7 +731,7 @@ bool PlinkClass::getOneMarkerRow_ts(uint64_t t_gIndex, FusedMarkerStats& fs)
     }
     for (int c = 0; c < 4; c++) fs.dmap[c] = (*genoMaps)[c];
 
-    if (!m_posIsIdentity) {
+    if (!m_posIsIdentity && !(m_posIsMonotone && m_haveBmi2)) {
         // subset / reordered samples: gather the codes once, for copyFusedPacked_ts
         if (tlsFusedCodes.size() < m_N) tlsFusedCodes.resize(m_N);
         uint8_t* codes = tlsFusedCodes.data();
@@ -764,6 +787,46 @@ void PlinkClass::copyFusedCodes_ts(const FusedMarkerStats& fs, uint8_t* t_codes)
     }
 }
 
+// The .bed row with the dropped samples' fields squeezed out: per 64-bit
+// input word, pext against the keep mask compacts the kept fields to the low
+// bits, and the pieces are appended to a bit stream. Same bytes as the gather
+// + repack, 1,563 words per 50,000-sample row instead of 100,000 field moves.
+__attribute__((target("bmi2")))
+void PlinkClass::packedSubsetPext(const unsigned char* t_row, std::size_t t_rowBytes,
+                                  uint8_t* t_out, uint32_t t_nb) const
+{
+    thread_local std::vector<uint64_t> wbuf;
+    const std::size_t nOutW = ((std::size_t)t_nb + 7) / 8;
+    if (wbuf.size() < nOutW + 1) wbuf.resize(nOutW + 1);
+    uint64_t acc = 0;
+    int accBits = 0;
+    std::size_t ow = 0;
+    const std::size_t nW0 = m_keepMask.size();
+    for (std::size_t k = 0; k < nW0; k++) {
+        const uint64_t m = m_keepMask[k];
+        if (m == 0) continue;
+        uint64_t w = 0;
+        const std::size_t off = k * 8;
+        const std::size_t take = (off + 8 <= t_rowBytes) ? 8 : (t_rowBytes > off ? t_rowBytes - off : 0);
+        if (take) std::memcpy(&w, t_row + off, take);
+        const uint64_t v = _pext_u64(w, m);
+        const int nbits = __builtin_popcountll(m);
+        if (accBits == 0) {
+            if (nbits == 64) { wbuf[ow++] = v; continue; }
+            acc = v; accBits = nbits; continue;
+        }
+        acc |= v << accBits;
+        if (accBits + nbits < 64) { accBits += nbits; continue; }
+        wbuf[ow++] = acc;
+        const int used = 64 - accBits;          // 1..63
+        acc = v >> used;
+        accBits = accBits + nbits - 64;
+    }
+    if (accBits > 0) wbuf[ow++] = acc;
+    while (ow < nOutW) wbuf[ow++] = 0;
+    std::memcpy(t_out, wbuf.data(), (std::size_t)t_nb);
+}
+
 void PlinkClass::copyFusedPacked_ts(const FusedMarkerStats& fs, uint8_t* t_out) const
 {
     if (!tlsFusedValid || tlsFusedIdx != fs.gIndex) {
@@ -776,6 +839,8 @@ void PlinkClass::copyFusedPacked_ts(const FusedMarkerStats& fs, uint8_t* t_out) 
         // m_posSampleInPlink[i] == i, so the first nb bytes of the .bed row
         // already ARE the analysis samples in analysis order.
         std::memcpy(t_out, tlsFusedBuf.data(), (size_t)nb);
+    } else if (m_posIsMonotone && m_haveBmi2) {
+        packedSubsetPext(tlsFusedBuf.data(), (std::size_t)m_numBytesofEachMarker0, t_out, nb);
     } else {
         const uint8_t* codes = tlsFusedCodes.data();
         std::memset(t_out, 0, (size_t)nb);
