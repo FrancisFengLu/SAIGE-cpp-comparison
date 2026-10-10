@@ -537,14 +537,71 @@ __device__ __forceinline__ void finishPair(double S, double var2, double VR, int
     pOut = pv; fOut = f;
 }
 
+// The covariate block of the adjusted statistic of one pair: z = A'g and
+// w = (mu2 X)'g (binary) / X'g (quantitative) from C1 -- with the pair's
+// affine map applied for an own-list trait -- and the three contractions
+// z'XVX z, S_a'z and w'z. Shared by the first pass of a trait without
+// isnoadjCov and by the fast-test recompute of one with it.
+__device__ __forceinline__ void covBlock(const double* __restrict__ C1, std::size_t ld, int slot,
+                                         const StatsTrait& t, const double* __restrict__ consts,
+                                         const double* __restrict__ C3,
+                                         bool flip, bool shift, bool miss, double bb, double d,
+                                         double& zxz, double& saz, double& gwz)
+{
+    const int p = t.p;
+    const double* XVX = consts + t.xvxOff;
+    const double* Sa  = consts + t.saOff;
+    zxz = 0.0; saz = 0.0; gwz = 0.0;
+    if (p <= STATS_REG_P) {
+        double z[STATS_REG_P];
+        for (int i = 0; i < p; ++i) z[i] = C1[(std::size_t)(t.rowZ + i) * ld + slot];
+        if (t.own) {
+            const double* sA = consts + t.sumAOff;
+            for (int i = 0; i < p; ++i) {
+                if (flip)  z[i] = -z[i];
+                if (shift) z[i] += bb * sA[i];
+                if (miss)  z[i] += d * C3[(std::size_t)(t.rowZ + i) * ld + slot];
+            }
+        }
+        const double* sW = consts + t.sumWOff;
+        for (int i = 0; i < p; ++i) {
+            double w = C1[(std::size_t)(t.rowW + i) * ld + slot];
+            if (t.own) {
+                if (flip)  w = -w;
+                if (shift) w += bb * sW[i];
+                if (miss)  w += d * C3[(std::size_t)(t.rowW + i) * ld + slot];
+            }
+            double xz = 0.0;
+            for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * z[k];
+            zxz += z[i] * xz;
+            saz += Sa[i] * z[i];
+            gwz += w * z[i];
+        }
+    } else {
+        // own traits are limited to p <= STATS_REG_P (statsSetup)
+        for (int i = 0; i < p; ++i) {
+            const double zi = C1[(std::size_t)(t.rowZ + i) * ld + slot];
+            const double w  = C1[(std::size_t)(t.rowW + i) * ld + slot];
+            double xz = 0.0;
+            for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * C1[(std::size_t)(t.rowZ + k) * ld + slot];
+            zxz += zi * xz;
+            saz += Sa[i] * zi;
+            gwz += w * zi;
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256)
-pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::size_t ld, int nSlots,
+pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::size_t ld, int nSlots, int N,
            const StatsTrait* __restrict__ T, int nT, const double* __restrict__ consts,
            const PrepSlot* __restrict__ slots, const PrepPair* __restrict__ pairs,
            const uint32_t* __restrict__ cnt, int nMask, const PrepTrait* __restrict__ PT,
+           const double* __restrict__ prepC, double macER,
            const double* __restrict__ lut, const double* __restrict__ vr, const double* __restrict__ C3,
            double* __restrict__ oS, double* __restrict__ oV, double* __restrict__ oP,
-           unsigned char* __restrict__ oF)
+           unsigned char* __restrict__ oF,
+           double* __restrict__ rS, double* __restrict__ rV, double* __restrict__ rVr,
+           double* __restrict__ rP, unsigned char* __restrict__ rF)
 {
     const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (long long)nSlots * nT) return;
@@ -554,6 +611,8 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
     const StatsTrait& t = T[b];
     const PrepSlot& ps = slots[slot];
     const bool per = (pairs != nullptr);
+    // no recompute unless formed below
+    if (rF != nullptr) rF[o] = (unsigned char)(STATS_HOST | (STATS_R_OFF << STATS_REASON_SHIFT));
     const bool skip = !t.enabled || !ps.valid || (per ? !pairs[o].qc : !ps.qc);
     if (skip) {
         oS[o] = 0.0; oV[o] = 0.0; oP[o] = 1.0;
@@ -581,9 +640,11 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
         if (miss)  gr += d * C3[(std::size_t)t.rowGR * ld + slot];
     }
     double S, var2;
+    double g2 = 0.0;                        // (g^2)'mu2 (binary, own-corrected)
+    double Gsq = 0.0, Gsum = 0.0;           // g'g, sum g (quantitative)
     if (t.isBin) {
-        double g2 = C2[(std::size_t)t.colG2 * ld + slot];
-        double gm = 0.0;                        // g'mu2 (isnoadjCov or own)
+        g2 = C2[(std::size_t)t.colG2 * ld + slot];
+        double gm = 0.0;                    // g'mu2 (isnoadjCov or own)
         if (t.noadj || t.own) gm = C1[(std::size_t)t.rowGM * ld + slot];
         if (t.own) {
             if (shift) g2 += 2.0 * a * bb * gm + bb * bb * t.sumM;
@@ -600,47 +661,8 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
             S    = (gr - t.sumR * c) / t.tau0;
             var2 = (g2 - 2.0 * c * gm + t.sumM * c * c) * t.tau0;
         } else {
-            const int p = t.p;
-            const double* XVX = consts + t.xvxOff;
-            const double* Sa  = consts + t.saOff;
-            double zxz = 0.0, saz = 0.0, gwz = 0.0;
-            if (p <= STATS_REG_P) {
-                double z[STATS_REG_P];
-                for (int i = 0; i < p; ++i) z[i] = C1[(std::size_t)(t.rowZ + i) * ld + slot];
-                if (t.own) {
-                    const double* sA = consts + t.sumAOff;
-                    for (int i = 0; i < p; ++i) {
-                        if (flip)  z[i] = -z[i];
-                        if (shift) z[i] += bb * sA[i];
-                        if (miss)  z[i] += d * C3[(std::size_t)(t.rowZ + i) * ld + slot];
-                    }
-                }
-                const double* sW = consts + t.sumWOff;
-                for (int i = 0; i < p; ++i) {
-                    double w = C1[(std::size_t)(t.rowW + i) * ld + slot];
-                    if (t.own) {
-                        if (flip)  w = -w;
-                        if (shift) w += bb * sW[i];
-                        if (miss)  w += d * C3[(std::size_t)(t.rowW + i) * ld + slot];
-                    }
-                    double xz = 0.0;
-                    for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * z[k];
-                    zxz += z[i] * xz;
-                    saz += Sa[i] * z[i];
-                    gwz += w * z[i];
-                }
-            } else {
-                // own traits are limited to p <= STATS_REG_P (statsSetup)
-                for (int i = 0; i < p; ++i) {
-                    const double zi = C1[(std::size_t)(t.rowZ + i) * ld + slot];
-                    const double w  = C1[(std::size_t)(t.rowW + i) * ld + slot];
-                    double xz = 0.0;
-                    for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * C1[(std::size_t)(t.rowZ + k) * ld + slot];
-                    zxz += zi * xz;
-                    saz += Sa[i] * zi;
-                    gwz += w * zi;
-                }
-            }
+            double zxz, saz, gwz;
+            covBlock(C1, ld, slot, t, consts, C3, flip, shift, miss, bb, d, zxz, saz, gwz);
             S    = (gr - saz) / t.tau0;
             var2 = zxz + g2 - 2.0 * gwz;
         }
@@ -648,7 +670,6 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
         // Quantitative: g'g and sum g from the code counts and the table --
         // the trait's own when it has its own list (Qown / Sown), else the
         // column's (Gsq / Gsum).
-        double Gsq, Gsum;
         if (per && t.own) {
             const PrepPair& pp = pairs[o];
             const uint32_t* ct = cnt + ((std::size_t)slot * nMask + PT[t.trait].grp) * 4;
@@ -663,46 +684,8 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
             S    = (gr - t.sumR * c) / t.tau0;
             var2 = Gsq - 2.0 * c * Gsum + t.sumM * c * c;
         } else {
-            const int p = t.p;
-            const double* XVX = consts + t.xvxOff;
-            const double* Sa  = consts + t.saOff;
-            double zxz = 0.0, saz = 0.0, gwz = 0.0;
-            if (p <= STATS_REG_P) {
-                double z[STATS_REG_P];
-                for (int i = 0; i < p; ++i) z[i] = C1[(std::size_t)(t.rowZ + i) * ld + slot];
-                if (t.own) {
-                    const double* sA = consts + t.sumAOff;
-                    for (int i = 0; i < p; ++i) {
-                        if (flip)  z[i] = -z[i];
-                        if (shift) z[i] += bb * sA[i];
-                        if (miss)  z[i] += d * C3[(std::size_t)(t.rowZ + i) * ld + slot];
-                    }
-                }
-                const double* sW = consts + t.sumWOff;
-                for (int i = 0; i < p; ++i) {
-                    double w = C1[(std::size_t)(t.rowW + i) * ld + slot];
-                    if (t.own) {
-                        if (flip)  w = -w;
-                        if (shift) w += bb * sW[i];
-                        if (miss)  w += d * C3[(std::size_t)(t.rowW + i) * ld + slot];
-                    }
-                    double xz = 0.0;
-                    for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * z[k];
-                    zxz += z[i] * xz;
-                    saz += Sa[i] * z[i];
-                    gwz += w * z[i];
-                }
-            } else {
-                for (int i = 0; i < p; ++i) {
-                    const double zi = C1[(std::size_t)(t.rowZ + i) * ld + slot];
-                    const double w  = C1[(std::size_t)(t.rowW + i) * ld + slot];
-                    double xz = 0.0;
-                    for (int k = 0; k < p; ++k) xz += XVX[i * p + k] * C1[(std::size_t)(t.rowZ + k) * ld + slot];
-                    zxz += zi * xz;
-                    saz += Sa[i] * zi;
-                    gwz += w * zi;
-                }
-            }
+            double zxz, saz, gwz;
+            covBlock(C1, ld, slot, t, consts, C3, flip, shift, miss, bb, d, zxz, saz, gwz);
             S    = (gr - saz) / t.tau0;
             var2 = zxz * t.tau0 + Gsq - 2.0 * gwz;
         }
@@ -713,6 +696,25 @@ pair_stats(const double* __restrict__ C1, const double* __restrict__ C2, std::si
                t.spaCut, t.firthCut, t.fastCut, pv, f);
     oP[o] = pv;
     oF[o] = (unsigned char)f;
+    // The fast-test recompute (gpu_step2.hpp): the covariate-adjusted
+    // statistic on the null table's ratio for a flagged pair of an isnoadjCov
+    // trait -- binary only above the ER cutoff, as mainMarkerInCPP.
+    if (rS != nullptr && t.fastRc && (f & STATS_FAST)) {
+        const PrepTrait& pt = PT[t.trait];
+        double MAC;
+        if (per) { const double AC = pairs[o].AC; MAC = fmin(AC, 2.0 * (double)pt.nObj - AC); }
+        else     { MAC = fmin(ps.AC, 2.0 * (double)N - ps.AC); }
+        if ((!t.isBin || MAC > macER) && pt.vrAdjOff >= 0) {
+            double zxz, saz, gwz;
+            covBlock(C1, ld, slot, t, consts, C3, flip, shift, miss, bb, d, zxz, saz, gwz);
+            const double S2 = (gr - saz) / t.tau0;
+            const double v2 = t.isBin ? (zxz + g2 - 2.0 * gwz) : (zxz * t.tau0 + Gsq - 2.0 * gwz);
+            const double vr2 = vrLookup(MAC, prepC, pt.vrAdjOff, pt.catMinOff, pt.catMaxOff, pt.nCat, pt.single);
+            double p2; unsigned f2;
+            finishPair(S2, v2, vr2, t.isBin, t.isFirth, 0, t.spaCut, t.firthCut, t.fastCut, p2, f2);
+            rS[o] = S2; rV[o] = v2; rVr[o] = vr2; rP[o] = p2; rF[o] = (unsigned char)f2;
+        }
+    }
 }
 
 // The sparse-GRM statistic (gpu_step2.hpp "Sparse-GRM traits"), one thread
@@ -900,6 +902,7 @@ struct Reducer {
     int        P = 0;
     bool       perTrait = false;
     PrepArgs   prepA;
+    std::vector<PrepTrait> hPrepT;        // the traits as passed (statsSetup reads vrAdjOff)
     PrepTrait* dPrepT = nullptr;          // device: P
     double*    dPrepC = nullptr;          // device: the VR tables
     PrepSlot*  dSlot = nullptr;           // device: maxSlots
@@ -921,6 +924,15 @@ struct Reducer {
     std::vector<double*>        hStS, hStV, hStP;   // pinned, per device set
     std::vector<unsigned char*> hStF;
     double     tStats = 0;
+    // ---- the fast-test recompute (StatsArgs::fastRecompute) ----
+    bool       rc = false;
+    double*    dRcS = nullptr;            // device: maxSlots x nStat, pair-major
+    double*    dRcV = nullptr;
+    double*    dRcVr = nullptr;
+    double*    dRcP = nullptr;
+    unsigned char* dRcF = nullptr;
+    std::vector<double*>        hRcS, hRcV, hRcVr, hRcP;   // pinned, per device set
+    std::vector<unsigned char*> hRcF;
     // ---- own sample lists (StatsArgs::ownSets) ----
     bool       own = false;
     double*    dB1r = nullptr;            // device: B1 row-major, N x K1
@@ -1280,6 +1292,13 @@ void destroy(Reducer* r)
     for (double* p : r->hStV) if (p) cudaFreeHost(p);
     for (double* p : r->hStP) if (p) cudaFreeHost(p);
     for (unsigned char* p : r->hStF) if (p) cudaFreeHost(p);
+    for (void* p : {(void*)r->dRcS, (void*)r->dRcV, (void*)r->dRcVr, (void*)r->dRcP, (void*)r->dRcF})
+        if (p) cudaFree(p);
+    for (double* p : r->hRcS) if (p) cudaFreeHost(p);
+    for (double* p : r->hRcV) if (p) cudaFreeHost(p);
+    for (double* p : r->hRcVr) if (p) cudaFreeHost(p);
+    for (double* p : r->hRcP) if (p) cudaFreeHost(p);
+    for (unsigned char* p : r->hRcF) if (p) cudaFreeHost(p);
     for (void* p : {(void*)r->dSpT, (void*)r->dSpC, (void*)r->dSpS, (void*)r->dSpV, (void*)r->dSpP,
                     (void*)r->dSpVr, (void*)r->dSpF, (void*)r->dSpTl})
         if (p) cudaFree(p);
@@ -1340,6 +1359,7 @@ bool prepSetup(Reducer* r, const PrepArgs& a)
         const int need = T.single ? 1 : T.nCat;
         if (need < 1 || a.consts == nullptr || T.vrOff < 0 || T.vrOff + need > a.nConsts ||
             (T.vrSpOff >= 0 && T.vrSpOff + need > a.nConsts) ||
+            (T.vrAdjOff >= 0 && T.vrAdjOff + need > a.nConsts) ||
             (!T.single && (T.catMinOff < 0 || T.catMinOff + T.nCat > a.nConsts ||
                            T.catMaxOff < 0 || T.catMaxOff + T.nCat > a.nConsts))) {
             prepErr = "trait variance-ratio table offsets outside the constants"; return false;
@@ -1348,6 +1368,7 @@ bool prepSetup(Reducer* r, const PrepArgs& a)
     }
     if (a.imputeCase < 1 || a.imputeCase > 3) { prepErr = "imputeCase must be 1..3"; return false; }
     r->P = a.P; r->perTrait = (a.perTrait != 0); r->prepA = a;
+    r->hPrepT.assign(a.traits, a.traits + a.P);
     const std::size_t nSlots = (std::size_t)r->maxSlots;
     const std::size_t nPair = nSlots * (std::size_t)a.P;
     auto dev = [&](void** p, std::size_t n) {
@@ -1404,17 +1425,28 @@ bool statsLaunch(Reducer* r, int nS, int d, cudaStream_t s)
         CKR(cudaGetLastError());
     }
     const int blocks = (int)((nPair + 255) / 256);
-    pair_stats<<<blocks, 256, 0, s>>>((const double*)r->dC1, (const double*)r->dC2, (std::size_t)r->maxSlots, nS,
+    pair_stats<<<blocks, 256, 0, s>>>((const double*)r->dC1, (const double*)r->dC2, (std::size_t)r->maxSlots, nS, r->N,
                                       r->dStatT, r->nStat, r->dStatC,
                                       r->dSlot, r->dPair, r->dCnt, r->nMask, r->dPrepT,
+                                      r->dPrepC, r->prepA.macER,
                                       r->dLut[(std::size_t)d], r->dVr, r->dC3,
-                                      r->dStS, r->dStV, r->dStP, r->dStF);
+                                      r->dStS, r->dStV, r->dStP, r->dStF,
+                                      r->rc ? r->dRcS : nullptr, r->rc ? r->dRcV : nullptr,
+                                      r->rc ? r->dRcVr : nullptr, r->rc ? r->dRcP : nullptr,
+                                      r->rc ? r->dRcF : nullptr);
     CKR(cudaGetLastError());
     const std::size_t n = (std::size_t)nPair;
     CKR(cudaMemcpyAsync(r->hStS[d], r->dStS, n * sizeof(double), cudaMemcpyDeviceToHost, s));
     CKR(cudaMemcpyAsync(r->hStV[d], r->dStV, n * sizeof(double), cudaMemcpyDeviceToHost, s));
     CKR(cudaMemcpyAsync(r->hStP[d], r->dStP, n * sizeof(double), cudaMemcpyDeviceToHost, s));
     CKR(cudaMemcpyAsync(r->hStF[d], r->dStF, n, cudaMemcpyDeviceToHost, s));
+    if (r->rc) {
+        CKR(cudaMemcpyAsync(r->hRcS[d], r->dRcS, n * sizeof(double), cudaMemcpyDeviceToHost, s));
+        CKR(cudaMemcpyAsync(r->hRcV[d], r->dRcV, n * sizeof(double), cudaMemcpyDeviceToHost, s));
+        CKR(cudaMemcpyAsync(r->hRcVr[d], r->dRcVr, n * sizeof(double), cudaMemcpyDeviceToHost, s));
+        CKR(cudaMemcpyAsync(r->hRcP[d], r->dRcP, n * sizeof(double), cudaMemcpyDeviceToHost, s));
+        CKR(cudaMemcpyAsync(r->hRcF[d], r->dRcF, n, cudaMemcpyDeviceToHost, s));
+    }
     return true;
 }
 }  // namespace
@@ -1441,7 +1473,15 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
                 statsErr = "isnoadjCov / own-list binary trait has no g'mu2 column"; return false;
             }
         }
-        if (!t.noadj) {
+        // the covariate block: the first pass without isnoadjCov, or the
+        // fast-test recompute with it
+        const bool cov = !t.noadj || t.fastRc;
+        if (t.fastRc) {
+            if (!t.noadj) { statsErr = "fastRc on a trait without isnoadjCov"; return false; }
+            if (!a.fastRecompute) { statsErr = "fastRc trait without fastRecompute"; return false; }
+            if (r->hPrepT[(std::size_t)t.trait].vrAdjOff < 0) { statsErr = "fastRc trait has no null variance-ratio table"; return false; }
+        }
+        if (cov) {
             if (t.rowZ < 0 || t.rowZ + t.p > r->K1 || t.rowW < 0 || t.rowW + t.p > r->K1) {
                 statsErr = "trait column indices outside C1 / C2"; return false;
             }
@@ -1453,8 +1493,8 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
         if (t.own) {
             if (!a.ownSets || !r->perTrait) { statsErr = "own-list trait without ownSets / perTrait"; return false; }
             if (t.p > STATS_REG_P) { statsErr = "own-list trait with more than 32 covariates"; return false; }
-            if (!t.noadj && (a.consts == nullptr || t.sumAOff < 0 || t.sumAOff + t.p > a.nConsts ||
-                             t.sumWOff < 0 || t.sumWOff + t.p > a.nConsts)) {
+            if (cov && (a.consts == nullptr || t.sumAOff < 0 || t.sumAOff + t.p > a.nConsts ||
+                        t.sumWOff < 0 || t.sumWOff + t.p > a.nConsts)) {
                 statsErr = "trait sumA / sumW offsets outside the constants"; return false;
             }
         }
@@ -1494,6 +1534,24 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
         if (!pin((void**)&r->hStP[d], nPair * sizeof(double))) return false;
         if (!pin((void**)&r->hStF[d], nPair)) return false;
     }
+    if (a.fastRecompute) {
+        if (!dev((void**)&r->dRcS, nPair * sizeof(double))) return false;
+        if (!dev((void**)&r->dRcV, nPair * sizeof(double))) return false;
+        if (!dev((void**)&r->dRcVr, nPair * sizeof(double))) return false;
+        if (!dev((void**)&r->dRcP, nPair * sizeof(double))) return false;
+        if (!dev((void**)&r->dRcF, nPair)) return false;
+        r->hRcS.assign((std::size_t)r->nDev, nullptr); r->hRcV.assign((std::size_t)r->nDev, nullptr);
+        r->hRcVr.assign((std::size_t)r->nDev, nullptr); r->hRcP.assign((std::size_t)r->nDev, nullptr);
+        r->hRcF.assign((std::size_t)r->nDev, nullptr);
+        for (int d = 0; d < r->nDev; ++d) {
+            if (!pin((void**)&r->hRcS[d], nPair * sizeof(double))) return false;
+            if (!pin((void**)&r->hRcV[d], nPair * sizeof(double))) return false;
+            if (!pin((void**)&r->hRcVr[d], nPair * sizeof(double))) return false;
+            if (!pin((void**)&r->hRcP[d], nPair * sizeof(double))) return false;
+            if (!pin((void**)&r->hRcF[d], nPair)) return false;
+        }
+        r->rc = true;
+    }
     if (a.ownSets) {
         // B1 row-major (one transpose, cuBLAS geam) and the missing-cell sums
         // in C1's layout
@@ -1521,6 +1579,11 @@ const double*        statsVar2(const Reducer* r, int d)  { const int k = (r && r
 const double*        statsP(const Reducer* r, int d)     { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStP[(std::size_t)k] : nullptr; }
 const unsigned char* statsFlags(const Reducer* r, int d) { const int k = (r && r->stats) ? devSetOf(r, d) : -1; return k >= 0 ? r->hStF[(std::size_t)k] : nullptr; }
 double               statsSeconds(const Reducer* r)      { return r ? r->tStats : 0.0; }
+const double*        statsRcS(const Reducer* r, int d)     { const int k = (r && r->stats && r->rc) ? devSetOf(r, d) : -1; return k >= 0 ? r->hRcS[(std::size_t)k] : nullptr; }
+const double*        statsRcVar2(const Reducer* r, int d)  { const int k = (r && r->stats && r->rc) ? devSetOf(r, d) : -1; return k >= 0 ? r->hRcV[(std::size_t)k] : nullptr; }
+const double*        statsRcVr(const Reducer* r, int d)    { const int k = (r && r->stats && r->rc) ? devSetOf(r, d) : -1; return k >= 0 ? r->hRcVr[(std::size_t)k] : nullptr; }
+const double*        statsRcP(const Reducer* r, int d)     { const int k = (r && r->stats && r->rc) ? devSetOf(r, d) : -1; return k >= 0 ? r->hRcP[(std::size_t)k] : nullptr; }
+const unsigned char* statsRcFlags(const Reducer* r, int d) { const int k = (r && r->stats && r->rc) ? devSetOf(r, d) : -1; return k >= 0 ? r->hRcF[(std::size_t)k] : nullptr; }
 
 // ---------------------------------------------------------------------------
 // Sparse-GRM statistics

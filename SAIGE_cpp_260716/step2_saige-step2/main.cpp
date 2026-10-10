@@ -2543,6 +2543,12 @@ struct PendSpa {
     // sparse variance. vrFast is the recompute's variance ratio.
     char   stage = 0;
     double vrFast = 1.0;
+    // the recompute of a stage-1 pair: 1 = the sparse kernel's statistic
+    // (spRecompute, vrFast), 2 = the dense covariate-adjusted statistic the
+    // stats kernel formed (statsRc*), captured here: S, var2, VR, p, flags
+    char   rcKind = 0;
+    double rS = 0.0, rV2 = 0.0, rVr = 1.0, rP = 1.0;
+    unsigned char rF = 0;
 };
 
 // Per-block state that has to survive the barrier between the read phase and
@@ -3040,6 +3046,9 @@ bool mainMarkerMTGpu(
             const int nEnt = T.single ? 1 : std::max(T.nCat, 1);
             T.vrOff = push(act, nEnt);
             T.vrSpOff = obj->m_flagSparseGRM ? push(obj->m_varRatio_sparse, nEnt) : -1;
+            // the fast-test recompute of an isnoadjCov trait: the null table
+            // (computeVarianceRatio(MAC, false, false))
+            T.vrAdjOff = (noadjCur && obj->m_isFastTest) ? push(obj->m_varRatio_null, nEnt) : -1;
             T.catMinOff = push(obj->m_cateVarRatioMinMACVecExclude, std::max(T.nCat, 1));
             T.catMaxOff = push(obj->m_cateVarRatioMaxMACVecInclude, std::max(T.nCat, 1));
         }
@@ -3233,8 +3242,9 @@ bool mainMarkerMTGpu(
     if (anyBin)
         std::cout << "  gpuBinary: " << nBin << " binary trait(s) on the device; SPA "
                   << (spaDev ? (SL ? "on the device (gpuSpa, gpu/spa_gpu library)" : "on the device (gpuSpa, gpu/gpu_spa.cu)") : "on the CPU scalar path")
-                  << (g_gpuFirth ? ", Firth see gpuFirth below; ER / fast-test recompute on the CPU scalar path"
-                                 : ", Firth / ER / fast-test recompute on the CPU scalar path") << std::endl;
+                  << (g_gpuFirth ? ", Firth see gpuFirth below; ER on the CPU scalar path"
+                                 : ", Firth / ER on the CPU scalar path")
+                  << "; the fast-test recompute see gpuDeviceStats / gpuSparse below" << std::endl;
     // ---- device Firth (gpuFirth): per-trait y / offset / XV / XXVX_inv resident ----
     saige::gpu2::Firth* FP = nullptr;
     if (anyBin && g_gpuFirth && spaDev) {
@@ -3360,6 +3370,7 @@ bool mainMarkerMTGpu(
     bool devStatsOn = false;
     std::vector<char> devStatsEnabled((std::size_t)P, 0);
     int nDevOwn = 0, nDevBin = 0, nDevQnt = 0;
+    int nDevFastRc = 0;   // isnoadjCov + fast-test traits whose recompute the stats kernel forms
     if (g_gpuDeviceStats) {
         std::string why;
         int nEn = 0;
@@ -3387,6 +3398,10 @@ bool mainMarkerMTGpu(
                 T.isFirth = (isBin && M.is_Firth_beta) ? 1 : 0;
                 T.isFast = M.isFastTest ? 1 : 0;
                 T.noadj = M.isnoadjCov ? 1 : 0;
+                // fast test on with isnoadjCov: the recompute (the adjusted
+                // statistic on the null table) for the flagged pairs
+                T.fastRc = (T.enabled && M.isnoadjCov && M.isFastTest) ? 1 : 0;
+                if (T.fastRc) nDevFastRc++;
                 T.tau0 = M.tau0; T.spaCut = M.SPA_Cutoff; T.firthCut = M.pCutoffforFirth; T.fastCut = M.pval_cutoff_for_fastTest;
                 T.sumR = ctx.sumR[t]; T.sumM = ctx.sumM[t];
                 T.xvxOff = (int)consts.size();
@@ -3408,13 +3423,15 @@ bool mainMarkerMTGpu(
             sa.nTraits = P; sa.traits = st.data();
             sa.consts = consts.data(); sa.nConsts = (int)consts.size();
             sa.ownSets = (differ && nDevOwn > 0) ? 1 : 0;
+            sa.fastRecompute = (nDevFastRc > 0) ? 1 : 0;
             if (!saige::gpu2::statsSetup(R, sa)) why = "device setup failed (" + saige::gpu2::statsLastError() + ")";
         }
         if (!why.empty()) {
             saige::gpu2::statsDisable(R);
-            nDevOwn = 0;
+            nDevOwn = 0; nDevFastRc = 0;
             std::cout << "  gpuDeviceStats: off (" << why << "); the host tail computes every pair" << std::endl;
         } else if (nEn == 0) {
+            nDevFastRc = 0;
             std::cout << "  gpuDeviceStats: every trait takes the sparse first pass (the sparse kernel scores them)";
             if (nDevOwn > 0) std::cout << "; the missing-cell sums of " << nDevOwn << " own-list traits are formed on the device";
             std::cout << std::endl;
@@ -3424,6 +3441,9 @@ bool mainMarkerMTGpu(
                       << " quantitative traits formed on the device after the scan";
             if (differ)
                 std::cout << "; " << nDevOwn << " own-list traits' affine maps and missing-cell sums on the device";
+            if (nDevFastRc > 0)
+                std::cout << "; the fast-test recompute (covariate-adjusted statistic, null variance ratio) of "
+                          << nDevFastRc << " isnoadjCov traits' flagged pairs on the device";
             std::cout << std::endl;
         }
     } else {
@@ -3586,6 +3606,29 @@ bool mainMarkerMTGpu(
         r.spa = ctx.meta[t].kind == SAIGE::TraitKind::Binary && !std::isnan(sd) && sd > ctx.meta[t].SPA_Cutoff;
         return r;
     };
+    // The dense fast-test recompute of one pair (gpu_step2.hpp statsRc*):
+    // format_score_result's arithmetic on the device's S / var2 / VR / p and
+    // flags, as the batch result of a device pair is taken in phase 3.
+    auto rcFromVals = [&](double S, double v2, double vr, double p, unsigned char f, bool isBin) -> SpRc {
+        SpRc r;
+        const double v1 = v2 * vr;
+        double stat = S * S / v1;
+        if (f & saige::gpu2::STATS_STAT0) stat = 0.0;
+        r.Beta = S / v1;
+        r.seBeta = std::fabs(r.Beta) / std::sqrt(std::fabs(stat));
+        r.Tstat = S; r.var1 = v1; r.var2 = v2; r.pno = p;
+        r.islog = (f & saige::gpu2::STATS_LOGP) != 0;
+        char buf[100];
+        if (r.islog) { SAIGE::format_logp_e1(p, buf); r.str.assign(buf); }
+        else { const int len = SAIGE::mtVecFormatE6(p, buf); r.str.assign(buf, (std::size_t)len); }
+        r.spa = isBin && (f & saige::gpu2::STATS_SPA) != 0;
+        return r;
+    };
+    const bool fastRcDev = devStatsOn && nDevFastRc > 0;
+    // dense fast-test recompute pairs finished on the device, and the fast-test
+    // pairs (needFast) handed to the CPU scalar path, by reason
+    enum FastHostWhy { FH_NONE = 0, FH_NOSPA = 1, FH_FIRTH = 2, FH_NOSTATS = 3, FH_AFF = 4, FH_NOSPARSE = 5, FH_COUNT = 6 };
+    std::vector<long> nDevFastDense(P, 0), nFastHost((std::size_t)FH_COUNT * P, 0);
     bool spAnyFirst = false;
     std::vector<int> binTraitsDense;
     for (int t : binTraits) {
@@ -4112,17 +4155,28 @@ bool mainMarkerMTGpu(
                                 O.seBeta[jj] = seBeta;
                                 O.isSPAConverge[jj] = conv ? 1 : 0;
                                 O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
-                                #pragma omp atomic
-                                nDevFast[t]++;
+                                if (pd.rcKind == 2) {
+                                    #pragma omp atomic
+                                    nDevFastDense[t]++;
+                                } else {
+                                    #pragma omp atomic
+                                    nDevFast[t]++;
+                                }
                                 continue;
                             }
-                            const SpRc rc = spRecompute((std::size_t)pd.bi * Bblk + c, t, pd.vrFast);
+                            // the recompute: the sparse kernel's statistic, or
+                            // the dense adjusted one the stats kernel formed
+                            const SpRc rc = (pd.rcKind == 2)
+                                ? rcFromVals(pd.rS, pd.rV2, pd.rVr, pd.rP, pd.rF, true)
+                                : spRecompute((std::size_t)pd.bi * Bblk + c, t, pd.vrFast);
                             bool wantF = false;
                             if (!rc.spa && M.is_Firth_beta)
                                 wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
                                                  : (rc.pno <= M.pCutoffforFirth);
                             if (!rc.spa && wantF && !firthDev) {
                                 forceCpu = true;          // the whole pair on the CPU, below
+                                #pragma omp atomic
+                                nFastHost[(std::size_t)FH_FIRTH * P + t]++;
                             } else {
                                 O.Beta[jj]   = rc.Beta * (1 - 2 * flip);
                                 O.seBeta[jj] = rc.seBeta;
@@ -4139,7 +4193,9 @@ bool mainMarkerMTGpu(
                                 O.route[jj] = (unsigned char)(O.route[jj] & 0x0F);
                                 if (rc.spa) {
                                     PendSpa p2 = pd;
-                                    p2.stage = 2; p2.fast = 0;
+                                    // the sparse recompute takes the full-N SPA; the
+                                    // dense one the same variant as its first pass
+                                    p2.stage = 2; p2.fast = (pd.rcKind == 2) ? pd.fast : 0;
                                     p2.Tstat = rc.Tstat; p2.var1 = rc.var1; p2.var2 = rc.var2;
                                     p2.pno = rc.pno; p2.logp = rc.islog ? 1 : 0;
                                     pend2[omp_get_thread_num()].push_back(p2);
@@ -4152,8 +4208,13 @@ bool mainMarkerMTGpu(
                                         for (int k = 0; k < 4; k++) pf.fd[k] = pd.fd[k];
                                         pendF[omp_get_thread_num()].push_back(pf);
                                     }
-                                    #pragma omp atomic
-                                    nDevFast[t]++;
+                                    if (pd.rcKind == 2) {
+                                        #pragma omp atomic
+                                        nDevFastDense[t]++;
+                                    } else {
+                                        #pragma omp atomic
+                                        nDevFast[t]++;
+                                    }
                                 }
                                 continue;
                             }
@@ -4321,7 +4382,10 @@ bool mainMarkerMTGpu(
                             O.seBeta[jj] = seBeta;
                             O.isSPAConverge[jj] = conv ? 1 : 0;
                             O.route[jj] = (unsigned char)((O.route[jj] & 0x0F) | (conv ? 16 : 0));
-                            if (pd.stage == 2) {
+                            if (pd.stage == 2 && pd.rcKind == 2) {
+                                #pragma omp atomic
+                                nDevFastDense[t]++;
+                            } else if (pd.stage == 2) {
                                 #pragma omp atomic
                                 nDevFast[t]++;
                             } else {
@@ -5019,6 +5083,12 @@ bool mainMarkerMTGpu(
             const double* dvV = devStatsOn ? saige::gpu2::statsVar2(R, ds) : nullptr;
             const double* dvP = devStatsOn ? saige::gpu2::statsP(R, ds) : nullptr;
             const unsigned char* dvF = devStatsOn ? saige::gpu2::statsFlags(R, ds) : nullptr;
+            // the dense fast-test recompute of the flagged pairs (fastRcDev)
+            const double* rcS = fastRcDev ? saige::gpu2::statsRcS(R, ds) : nullptr;
+            const double* rcV = fastRcDev ? saige::gpu2::statsRcVar2(R, ds) : nullptr;
+            const double* rcVr = fastRcDev ? saige::gpu2::statsRcVr(R, ds) : nullptr;
+            const double* rcP = fastRcDev ? saige::gpu2::statsRcP(R, ds) : nullptr;
+            const unsigned char* rcF = fastRcDev ? saige::gpu2::statsRcFlags(R, ds) : nullptr;
             const double* spS = spDev ? saige::gpu2::statsSpS(R, ds) : nullptr;
             const double* spV = spDev ? saige::gpu2::statsSpVar2(R, ds) : nullptr;
             const double* spP = spDev ? saige::gpu2::statsSpP(R, ds) : nullptr;
@@ -5455,16 +5525,38 @@ bool mainMarkerMTGpu(
                         // recompute on the device variance (+ device SPA /
                         // Firth for a binary trait; a quantitative pair is done).
                         const bool spT = spDev && spIdx[t] >= 0;
+                        // The recompute's context (mainMarkerInCPP): the sparse
+                        // variance when the MAC is within the sparse category of
+                        // a sparse-GRM trait, else the dense adjusted statistic.
+                        const bool rcCtxSparse = obj->m_flagSparseGRM &&
+                                                 !(MAC > obj->m_cateVarRatioMinMACVecExclude.back());
                         bool devFast = false;
                         double vrFast = 1.0;
-                        if (spT && (!isBin || spaDev) && (hi || !isBin) && needFast &&
-                            !(MAC > obj->m_cateVarRatioMinMACVecExclude.back()) && obj->m_flagSparseGRM) {
+                        if (spT && (!isBin || spaDev) && (hi || !isBin) && needFast && rcCtxSparse) {
                             devFast = true;
                             vrFast = spVrD[spOff(slot, t)];   // the sparse table's ratio of this MAC
                         }
+                        // fast test on with isnoadjCov: the dense recompute is the
+                        // stats kernel's (statsRc*), for the pairs it flagged.
+                        bool rcDense = false;
+                        int fastHostWhy = FH_NONE;
+                        if (needFast && !devFast && (hi || !isBin)) {
+                            if (rcCtxSparse)                          fastHostWhy = (!spT) ? FH_NOSPARSE : FH_NOSPA;
+                            else if (!fastRcDev || !devPair || devHost || spPair ||
+                                     rcF == nullptr || (rcF[oP] & saige::gpu2::STATS_HOST)) fastHostWhy = FH_NOSTATS;
+                            else if (!affOK)                          fastHostWhy = FH_AFF;
+                            else if (isBin && !spaDev)                fastHostWhy = FH_NOSPA;
+                            else                                      rcDense = true;
+                        }
                         bool devFastDone = false;
-                        if (devFast) {
+                        if (devFast || rcDense) {
+                            const char rcKind = devFast ? 1 : 2;
+                            uint64_t cz = 0;
+                            for (int k = 0; k < 4; k++) if (fdt[k] == 0.0) cz += cntt[k];
+                            const char spaFastDense = ((double)cz / nT >= 0.5) ? 1 : 0;
                             if (needSPA) {
+                                // first pass with the device SPA (stage 1); phase 4
+                                // takes the recompute when the SPA p is below the cutoff
                                 Beta       = bBeta;
                                 seBeta     = bSe;
                                 Tstat      = bT;
@@ -5477,19 +5569,20 @@ bool mainMarkerMTGpu(
                                 pd.Tstat = Tstat; pd.var1 = varT; pd.var2 = bV2;
                                 pd.pno = bP;
                                 pd.logp = bLog ? 1 : 0;
-                                uint64_t cz = 0;
-                                for (int k = 0; k < 4; k++) if (fdt[k] == 0.0) cz += cntt[k];
-                                pd.fast = ((double)cz / nT >= 0.5) ? 1 : 0;   // first pass: dense ctx
+                                pd.fast = spaFastDense;   // first pass: dense ctx
                                 pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                 for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
-                                pd.stage = 1; pd.vrFast = vrFast;
+                                pd.stage = 1; pd.vrFast = vrFast; pd.rcKind = rcKind;
+                                if (rcKind == 2) { pd.rS = rcS[oP]; pd.rV2 = rcV[oP]; pd.rVr = rcVr[oP]; pd.rP = rcP[oP]; pd.rF = rcF[oP]; }
                                 pend[omp_get_thread_num()].push_back(pd);
                                 devFastDone = true;
                             } else {
                                 // First pass p (the batch's, no SPA) is below the
                                 // cutoff -- that is what needFast tested -- so the
                                 // recompute happens now.
-                                const SpRc rc = spRecompute(slot, t, vrFast);
+                                const SpRc rc = (rcKind == 2)
+                                    ? rcFromVals(rcS[oP], rcV[oP], rcVr[oP], rcP[oP], rcF[oP], isBin)
+                                    : spRecompute(slot, t, vrFast);
                                 bool wantF = false;
                                 if (!rc.spa && isBin && M.is_Firth_beta)
                                     wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
@@ -5503,10 +5596,12 @@ bool mainMarkerMTGpu(
                                         pd.bi = bi; pd.jj = jj; pd.c = c; pd.t = t;
                                         pd.Tstat = rc.Tstat; pd.var1 = rc.var1; pd.var2 = rc.var2;
                                         pd.pno = rc.pno; pd.logp = rc.islog ? 1 : 0;
-                                        pd.fast = 0;   // sparse ctx: getMarkerPval takes the full-N SPA
+                                        // sparse ctx: getMarkerPval takes the full-N SPA;
+                                        // dense ctx: the variant of the first pass
+                                        pd.fast = (rcKind == 2) ? spaFastDense : 0;
                                         pd.MAC = MAC; pd.AF = altFreq; pd.flip = flip ? 1 : 0;
                                         for (int k = 0; k < 4; k++) pd.fd[k] = fdt[k];
-                                        pd.stage = 2; pd.vrFast = vrFast;
+                                        pd.stage = 2; pd.vrFast = vrFast; pd.rcKind = rcKind;
                                         pend[omp_get_thread_num()].push_back(pd);
                                     } else {
                                         if (wantF) {
@@ -5517,12 +5612,23 @@ bool mainMarkerMTGpu(
                                             for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
                                             pendF[omp_get_thread_num()].push_back(pf);
                                         }
-                                        #pragma omp atomic
-                                        nDevFast[t]++;
+                                        if (rcKind == 2) {
+                                            #pragma omp atomic
+                                            nDevFastDense[t]++;
+                                        } else {
+                                            #pragma omp atomic
+                                            nDevFast[t]++;
+                                        }
                                     }
                                     devFastDone = true;
+                                } else {
+                                    fastHostWhy = FH_FIRTH;
                                 }
                             }
+                        }
+                        if (!devFastDone && fastHostWhy != FH_NONE) {
+                            #pragma omp atomic
+                            nFastHost[(std::size_t)fastHostWhy * P + t]++;
                         }
                         if (devFastDone) {
                             isSPAConverge = false;   // set by phase 4 when SPA runs
@@ -5905,7 +6011,7 @@ bool mainMarkerMTGpu(
                   << ", " << nFallback[t] << " via the scalar CPU path"
                   << (firthDev ? "; " + std::to_string(nDevFirth[t]) + " Firth fits on the device" : std::string())
                   << ")." << std::endl;
-        totBatch += nBatched[t] + nDevSpa[t] + nDevFast[t];
+        totBatch += nBatched[t] + nDevSpa[t] + nDevFast[t] + nDevFastDense[t];
         totFall  += nFallback[t];
         if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
             std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
@@ -5983,6 +6089,31 @@ bool mainMarkerMTGpu(
                 std::cout << "    [" << g_traitMeta[t].name << "] fast-test recompute on the device "
                           << nDevFast[t] << ", device variance handed to the CPU " << nSpPreset[t]
                           << (spFirst[t] ? ", sparse first pass" : "") << std::endl;
+    }
+    {
+        // fast test on: the dense (covariate-adjusted) recompute pairs the stats
+        // kernel finished, and the fast-test pairs that went to the CPU scalar
+        // path, by reason
+        long dd = 0, hb[FH_COUNT] = {0, 0, 0, 0, 0, 0}, ht = 0;
+        for (int t = 0; t < P; t++) {
+            dd += nDevFastDense[t];
+            for (int w = 1; w < FH_COUNT; w++) { hb[w] += nFastHost[(std::size_t)w * P + t]; ht += nFastHost[(std::size_t)w * P + t]; }
+        }
+        if (fastRcDev || dd > 0 || ht > 0) {
+            std::cout << "  fast-test recompute (dense, covariate-adjusted on the null variance ratio): " << dd
+                      << " pairs finished on the device; " << ht << " fast-test pairs handed to the CPU scalar path"
+                      << " (no device SPA: " << hb[FH_NOSPA] << ", Firth without gpuFirth: " << hb[FH_FIRTH]
+                      << ", no device statistics / recompute for the pair: " << hb[FH_NOSTATS]
+                      << ", inexact affine map: " << hb[FH_AFF]
+                      << ", sparse variance not on the device: " << hb[FH_NOSPARSE] << ")" << std::endl;
+            for (int t = 0; t < P; t++) {
+                long h = 0;
+                for (int w = 1; w < FH_COUNT; w++) h += nFastHost[(std::size_t)w * P + t];
+                if (nDevFastDense[t] > 0 || h > 0)
+                    std::cout << "    [" << g_traitMeta[t].name << "] dense recompute on the device " << nDevFastDense[t]
+                              << ", fast-test pairs on the CPU " << h << std::endl;
+            }
+        }
     }
     if (nSlotsTotal > 0) {
         std::cout << "  device slots: " << nSlotsUsed << " / " << nSlotsTotal

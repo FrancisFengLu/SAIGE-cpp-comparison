@@ -60,6 +60,11 @@ const double*        statsVar2(const Reducer*, int)          { return nullptr; }
 const double*        statsP(const Reducer*, int)             { return nullptr; }
 const unsigned char* statsFlags(const Reducer*, int)         { return nullptr; }
 double               statsSeconds(const Reducer*)            { return 0.0; }
+const double*        statsRcS(const Reducer*, int)           { return nullptr; }
+const double*        statsRcVar2(const Reducer*, int)        { return nullptr; }
+const double*        statsRcVr(const Reducer*, int)          { return nullptr; }
+const double*        statsRcP(const Reducer*, int)           { return nullptr; }
+const unsigned char* statsRcFlags(const Reducer*, int)       { return nullptr; }
 
 bool                 statsSparseSetup(Reducer*, const StatsSparseArgs&) { return false; }
 bool                 statsSparseRun(Reducer*, int, int, const void*)     { return false; }
