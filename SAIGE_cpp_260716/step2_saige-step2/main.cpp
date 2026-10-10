@@ -3290,21 +3290,23 @@ bool mainMarkerMTGpu(
     }
 
     // ---------------- per-pair statistics on the device (gpuDeviceStats) ----------------
-    // The per-trait constants (XVX / S_a, the isnoadjCov sums) go up once;
-    // from then on every reduce() also forms S / var2 / p / gates per (slot,
-    // binary trait) (gpu_step2.hpp "Per-pair statistics"). Not with different
-    // sample lists (the adjusted tail is not on the device) nor for a sparse
-    // first pass (its statistic is spStats'); such traits keep the host path
-    // pair by pair.
+    // The per-trait constants (XVX / S_a, the isnoadjCov sums, the own-list
+    // column sums) go up once; from then on every reduce() also forms S /
+    // var2 / p / gates per (slot, binary trait) (gpu_step2.hpp "Per-pair
+    // statistics"). A trait with its own sample list (differ) takes its
+    // affine map and the missing-cell sums on the device too (the pair's a /
+    // d / q go up with the slot, statsAdj). Not for a sparse first pass (its
+    // statistic is spStats'); such traits keep the host path pair by pair.
     bool devStatsOn = false;
     std::vector<char> devStatsEnabled((std::size_t)std::max(nBin, 1), 0);
+    int nDevOwn = 0;
     if (g_gpuDeviceStats && anyBin) {
         std::string why;
         std::vector<int> devTraits;
         for (int t : binTraits)
             if (!(spDev && spFirst[t])) { devStatsEnabled[(std::size_t)ctx.meta[t].binIdx] = 1; devTraits.push_back(t); }
-        if (differ) why = "the models do not share one sample list (gpuOwnSampleSets); the adjusted tail stays on the host";
-        else if (!saige::gpu2::isFp64(R)) why = "the scan results are not fp64";
+        if (!saige::gpu2::isFp64(R)) why = "the scan results are not fp64";
+        else if (differ && g_precScan != saige::gpu2::Prec::FP64) why = "own sample lists need the fp64 scan";
         else if (devTraits.empty()) why = "every binary trait takes the sparse first pass";
         if (why.empty()) {
             std::vector<saige::gpu2::StatsTrait> st((std::size_t)nBin);
@@ -3325,10 +3327,19 @@ bool mainMarkerMTGpu(
                     for (int k = 0; k < M.p; k++) consts.push_back(ctx.XVX[t](i, k));
                 T.saOff = (int)consts.size();
                 for (int i = 0; i < M.p; i++) consts.push_back(ctx.S_a[t](i));
+                if (differ && ownS[t]) {
+                    T.own = 1;
+                    T.sumAOff = (int)consts.size();
+                    for (int i = 0; i < M.p; i++) consts.push_back(ctx.sumA[t](i));
+                    T.sumWOff = (int)consts.size();
+                    for (int i = 0; i < M.p; i++) consts.push_back(ctx.sumW[t](i));
+                    if (T.enabled) nDevOwn++;
+                }
             }
             saige::gpu2::StatsArgs sa;
             sa.nTraits = nBin; sa.traits = st.data();
             sa.consts = consts.data(); sa.nConsts = (int)consts.size();
+            sa.ownSets = (differ && nDevOwn > 0) ? 1 : 0;
             if (!saige::gpu2::statsSetup(R, sa)) why = "device setup failed (" + saige::gpu2::statsLastError() + ")";
         }
         if (!why.empty()) {
@@ -3337,11 +3348,18 @@ bool mainMarkerMTGpu(
         } else {
             devStatsOn = true;
             std::cout << "  gpuDeviceStats: on -- S / var2 / p / gates of " << devTraits.size() << " of " << nBin
-                      << " binary traits formed on the device after the scan" << std::endl;
+                      << " binary traits formed on the device after the scan";
+            if (differ)
+                std::cout << "; " << nDevOwn << " of them on their own sample list (affine map and missing-cell sums on the device)";
+            std::cout << std::endl;
         }
     } else if (g_gpuDeviceStats) {
         std::cout << "  gpuDeviceStats: no binary trait; nothing to do" << std::endl;
     }
+    // The host still needs each column's missing-cell index list (MTBlockAdj::miss)
+    // where a host tail reads it: the adjusted batch tail (gpuDeviceStats off),
+    // the sparse variance (spStats) and the quantitative own-list tail.
+    const bool hostMissLists = differ && (!devStatsOn || spDev || qntOwn);
     // sgsRawDouble: the p-value columns leave as doubles (MTTraitChunk::pvalD)
     const bool rawP = g_sgsRawDouble && g_outputFormatSgs;
     static const std::string kNAstr("NA");
@@ -3615,6 +3633,7 @@ bool mainMarkerMTGpu(
         double*        hLuS = hLuSet[s];
         double* const  hVrS = devStatsOn ? saige::gpu2::statsVr(R, s) : nullptr;   // gpuDeviceStats: VR per (slot, binary trait)
         double* const  hAfS = devStatsOn ? saige::gpu2::statsAf(R, s) : nullptr;   // gpuDeviceStats: AF per (slot, binary trait)
+        double* const  hAdjS = devStatsOn ? saige::gpu2::statsAdj(R, s) : nullptr; // gpuDeviceStats + own lists: a / d / q per pair
             #pragma omp parallel for schedule(dynamic, 1) num_threads(nThr)
             for (int bi = 0; bi < nb; bi++) {
                 const int blk = sb + bi;
@@ -3755,7 +3774,7 @@ bool mainMarkerMTGpu(
                         }
                         std::vector<arma::uword>& mv = S.adj.miss[c];
                         mv.clear();
-                        if (fu.counts[kMissU] > 0)
+                        if (hostMissLists && fu.counts[kMissU] > 0)
                             for (int u = 0; u < n; u++) if (codes[u] == kMissU) mv.push_back((arma::uword)u);
                         for (int t = 0; t < P; t++) {
                             const std::size_t k = (std::size_t)c * (std::size_t)P + (std::size_t)t;
@@ -3766,6 +3785,15 @@ bool mainMarkerMTGpu(
                             S.affP[k] = 0;
                             S.VR(c, t) = 1.0;
                             S.AF(c, t) = 0.0;
+                            // gpuDeviceStats: the pair's inputs go up with the
+                            // slot; a pair that failed QC keeps the identity map
+                            // (its row is never read)
+                            const bool devBin = hVrS && ctx.meta[t].kind == SAIGE::TraitKind::Binary;
+                            const std::size_t oD = devBin ? (slotBase + c) * (std::size_t)nBin + (std::size_t)ctx.meta[t].binIdx : 0;
+                            if (devBin) {
+                                hVrS[oD] = 1.0; hAfS[oD] = 0.0;
+                                if (hAdjS) { hAdjS[3 * oD] = 1.0; hAdjS[3 * oD + 1] = 0.0; hAdjS[3 * oD + 2] = 0.0; }
+                            }
                             if (!tq[t]) continue;
                             const double MAC = tMAC[t];
                             S.flipP[k] = tflip[t];
@@ -3802,6 +3830,15 @@ bool mainMarkerMTGpu(
                             S.VR(c, t) = isSingleVR[t]
                                 ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
                                 : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
+                            if (devBin) {
+                                hVrS[oD] = S.VR(c, t);
+                                hAfS[oD] = tAF[t];
+                                if (hAdjS && ownS[t]) {
+                                    hAdjS[3 * oD]     = a;
+                                    hAdjS[3 * oD + 1] = S.adj.d(c, t);
+                                    hAdjS[3 * oD + 2] = S.adj.q(c, t);
+                                }
+                            }
                         }
                         continue;
                     }

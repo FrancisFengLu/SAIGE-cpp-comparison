@@ -51,6 +51,7 @@ void                 statsDisable(Reducer*)                  {}
 std::string          statsLastError()                        { return "built without CUDA"; }
 double*              statsVr(Reducer*, int)                  { return nullptr; }
 double*              statsAf(Reducer*, int)                  { return nullptr; }
+double*              statsAdj(Reducer*, int)                 { return nullptr; }
 const double*        statsS(const Reducer*, int)             { return nullptr; }
 const double*        statsVar2(const Reducer*, int)          { return nullptr; }
 const double*        statsP(const Reducer*, int)             { return nullptr; }

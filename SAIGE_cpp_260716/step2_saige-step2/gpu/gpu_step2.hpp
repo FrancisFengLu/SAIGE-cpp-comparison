@@ -246,6 +246,21 @@ int         deviceSets(const Reducer* t_r);
 // format_score_result has the handling for them: a degenerate pair (var1 <=
 // DBL_MIN, a negative / NaN / infinite stat), and a p that underflowed to 0
 // in double, which the host reports in the log domain ("%.1fE%d").
+//
+// Traits with their own sample list (gpuOwnSampleSets, StatsTrait::own): the
+// GEMMs ran on the union column g, and the trait's own vector is the exact
+// affine image g_t = a g + b 1_t + d m (m = the column's missing-call
+// indicator; saige_mt.hpp MTBlockAdj). The kernel applies the map term for
+// term, as the host's scoreTestBatchMTBinPreAdj does:
+//     L(g_t) = a L(g) + b L(1_t) + d L(m)          L = A', W', res', mu2'
+//     Q(g_t) = Q(g) + 2ab mu2'g + b^2 sum mu2 + q mu2'm
+// where L(1_t) are the per-trait constants (sumA / sumW / sumR / sumM) and
+// L(m) -- the stack columns summed over the column's missing calls -- come
+// from a second device pass: for every slot some pair of which has d != 0
+// or q != 0, one block walks the slot's packed codes, and for every missing
+// call adds that sample's row of B1 (kept row-major on the device for this)
+// into a K1-wide sum (miss_sums, same column indexing as C1). a / d / q go
+// up per pair with the slot (statsAdj), as VR and AF do.
 enum StatsFlag : unsigned {
     STATS_HOST  = 1u,     // the host recomputes this pair (reason in bits 4..7)
     STATS_SPA   = 2u,     // StdStat > SPA_Cutoff
@@ -272,16 +287,26 @@ struct StatsTrait {
     int isFast = 0;         // isFastTest
     int noadj = 0;          // isnoadjCov: the centred score, no covariate block
     double tau0 = 1.0, spaCut = 2.0, firthCut = 0.0, fastCut = 0.0;
-    double sumR = 0.0;      // sum res (isnoadjCov)
-    double sumM = 0.0;      // sum mu2 (isnoadjCov)
+    double sumR = 0.0;      // sum res (isnoadjCov, own)
+    double sumM = 0.0;      // sum mu2 (isnoadjCov, own)
     // Offsets into StatsArgs::consts: XVX (row-major p x p) and S_a (p).
     int xvxOff = 0, saOff = 0;
+    // The trait's sample list is not the union's (gpuOwnSampleSets): apply
+    // the pair's affine map (statsAdj) and the missing-cell sums. Needs
+    // rowGM >= 0 and p <= 32. sumAOff / sumWOff: offsets into consts of the
+    // trait's A / W columns summed over its samples (p each).
+    int own = 0;
+    int sumAOff = 0, sumWOff = 0;
 };
 struct StatsArgs {
     int nTraits = 0;                       // = CreateArgs::nMask (binary traits), trait b = mask b
     const StatsTrait* traits = nullptr;
-    const double* consts = nullptr;        // the traits' XVX / S_a, nConsts doubles
+    const double* consts = nullptr;        // the traits' XVX / S_a / sumA / sumW, nConsts doubles
     int nConsts = 0;
+    // Some trait has own = 1: allocate the per-pair map, the row-major copy
+    // of B1 (N x K1 doubles on the device) and the missing-cell sums, and run
+    // miss_sums before the stats kernel. Needs the FP64 scan.
+    int ownSets = 0;
 };
 // Allocate the buffers and upload the constants; from then on every reduce()
 // also runs the stats kernel. false (with statsLastError()) on failure.
@@ -294,6 +319,10 @@ std::string statsLastError();
 // pair's post-imputation ALT frequency (read for isnoadjCov traits).
 double* statsVr(Reducer* t_r, int t_set);
 double* statsAf(Reducer* t_r, int t_set);
+// StatsArgs::ownSets only: ADJ[3 * (slot * nTraits + b) + {0, 1, 2}] = the
+// pair's a (+1 / -1; b = 2 when a < 0), d and q (MTBlockAdj). Initialised to
+// (1, 0, 0) = the identity map; nullptr without ownSets.
+double* statsAdj(Reducer* t_r, int t_set);
 // Results of the last reduce() into device set t_devSet, pair-major: index
 // slot * nTraits + b. nullptr until statsSetup.
 const double*        statsS(const Reducer* t_r, int t_devSet = -1);
