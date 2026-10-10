@@ -66,3 +66,21 @@ statistic on the device (branch `gpuprep`, write-up `S2_GPUPREP.md`):
   runs with 128 distinct sample lists (not a consistent fit; timing only).
 - `timing_gpuprep.sh` — g200k P = 128 (same list / 4 lists / 128 lists) and the quantitative
   sparse first pass, before (ownstats) vs after.
+
+Covariate count on the device SPA / Firth (branch `covlimit`, write-up `S2_COVLIMIT.md`): the device
+SPA (lib and own, fp64 and fp32), the device Firth (fp64 and fp32) and the own-list device statistics
+take up to 64 covariate columns incl. the intercept (were 8 / 8 / 32).
+
+- `gen_covp.py OUTDIR [N] [M] [seed]` -- covp: N = M = 5,000, 40 covariates (sex, age-like, 38 PC-like),
+  4 binary traits (prevalence 5-40%), b1 / b2 complete, b3 / b4 with their own missing-phenotype
+  patterns; covt is the same at N = M = 20,000 (timing).
+- `r_runs_covp.sh [s1|s2|all]` -- R step 1 with the first p - 1 covariates, p = 4 9 13 24 40 (covp
+  b1..b4, covt b1 / b2), and R step 2 on covp for every p x def / defF / adj / adjF x trait.
+- `cpp_runs_covp.sh <bin> <OUT> [variants]` -- converts the models and runs, per p x configuration:
+  `single` (CPU scalar, per trait), `same` (GPU, b1 + b2, one list), `own` (GPU, b1..b4, own lists),
+  `sameown` (same with `gpuSpaImpl: own`), `same32` / `own32` (`gpuPrecisionSPA` / `gpuPrecisionFirth`
+  fp32). `gate_table_covp.py <OUT>` prints the tables (vs R, vs single, markers tested, the device
+  log lines with the SPA / Firth pair counts and us per pair).
+- `timing_covp.sh <new> <base> <OUT>` -- covt, defF, device SPA / Firth us per pair: base (gpuprep)
+  at p = 4, new at every p (lib fp64 / own fp64 / lib fp32), n = 2, CUDA_MODULE_LOADING=EAGER;
+  `timing_table_covp.py <OUT>` prints the table.
