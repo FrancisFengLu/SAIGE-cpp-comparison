@@ -30,3 +30,16 @@ Scripts:
 - `gate_table.py` — the Markdown tables (C++ vs R, and multi / GPU vs single).
 
 Write-up with the numbers: `SAIGE-work/optimization/torchgwas2/S2_RDEFAULTS.md`.
+
+Own sample lists on the device (`gpuDeviceStats` with `gpuOwnSampleSets`, write-up
+`S2_OWNSTATS.md`):
+
+- `gate_bm.sh <new-bin> <base-bin>` — bingpu_test bm (8 binary traits, 4 distinct
+  missing-phenotype patterns, N = 50,000, 26,060 markers, 3,640 with missing calls)
+  under the four configurations: the new binary's GPU multi-trait run against its own
+  CPU single-trait runs and against the base binary's GPU run (host tail), route dumps on.
+  `bm_table.py` prints the table. (bm's models come from this port's step 1, so there is
+  no R reference; the R comparison for own sample lists is bvs and qt12 above.)
+- `timing_ownstats.sh` — g200k x the bm_full models cycled to P = 128 (own sample
+  lists), before / after, cold cache, n = 2, TIMING_LOCK; then bt under mean imputation,
+  where the missing-cell sums run on the device for every marker with missing calls.
