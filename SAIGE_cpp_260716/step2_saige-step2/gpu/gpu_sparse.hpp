@@ -96,8 +96,15 @@ bool          spqRun(SpQuad* t_q, const Reducer* t_r, int t_nSlots, int t_set = 
 // samples, so samples outside the trait contribute nothing. t_lut is host
 // memory, nSlots x nTraits x 4, copied in by the call.
 bool          spqRunOwn(SpQuad* t_q, const Reducer* t_r, int t_nSlots, const double* t_lut, int t_set = -1);
+// The same with the tables already on the device (gpu_step2.hpp
+// sparseTables): t_dlut is a device address, nSlots x nTraits x 4 doubles.
+bool          spqRunOwnDev(SpQuad* t_q, const Reducer* t_r, int t_nSlots, const void* t_dlut, int t_set = -1);
 // t_set -1 = the set of the last call.
 const double* spqOut(const SpQuad* t_q, int t_set = -1);
+// The device address of the last call's results (slot * nTraits + t), for
+// the sparse statistics kernel (gpu_step2.hpp statsSparseRun). Valid until
+// the next call.
+const void*   spqDeviceOut(const SpQuad* t_q);
 
 // Cumulative device seconds in the kernel, and slots processed.
 void        spqTimings(const SpQuad* t_q, double* t_kernel, long long* t_slots);

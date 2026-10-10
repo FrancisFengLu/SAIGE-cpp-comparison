@@ -14,30 +14,40 @@ std::string build(const SAIGE::MTContext& ctx,
                   double refreshBudget_s, long long maxPairs, Plan& out)
 {
     const auto t0 = std::chrono::steady_clock::now();
-    const int P = ctx.P, N = ctx.N, nBin = ctx.nBin;
+    const int P = ctx.P, N = ctx.N;
     out = Plan();
-    out.N = N; out.nBin = nBin;
-    out.on.assign(std::max(nBin, 1), 0);
+    out.N = N; out.P = P;
+    out.spIdx.assign(P, -1);
     out.YBY.assign(P, arma::mat());
     out.Yres.assign(P, arma::vec());
     out.sumXV.assign(P, arma::vec());
     out.sumBY.assign(P, arma::vec());
     out.trB.assign(P, 0.0);
-    if (nBin <= 0) return "no binary traits";
-    out.XVt.zeros(N, ctx.sumPbin);
-    out.BY.zeros(N, ctx.sumPbin);
-    out.Bdiag.zeros(N, nBin);
+    for (int t = 0; t < P; t++) {
+        const SAIGE::TraitMeta& M = ctx.meta[t];
+        if (M.kind != SAIGE::TraitKind::Binary && M.kind != SAIGE::TraitKind::Quantitative) continue;
+        if (!objs[t]->m_flagSparseGRM) continue;
+        out.spIdx[t] = out.nSp;
+        out.spTrait.push_back(t);
+        out.spOff.push_back(out.sumPsp);
+        out.sumPsp += M.p;
+        out.nSp++;
+    }
+    const int nSp = out.nSp;
+    if (nSp <= 0) return "no trait carries a sparse GRM";
+    out.XVt.zeros(N, out.sumPsp);
+    out.BY.zeros(N, out.sumPsp);
+    out.Bdiag.zeros(N, nSp);
 
     // Per-trait pair weights, keyed by (i << 32 | j), merged into one list.
     std::unordered_map<uint64_t, long long> pairIdx;
-    std::vector<std::vector<std::pair<long long, double>>> tw(nBin);
+    std::vector<std::vector<std::pair<long long, double>>> tw(nSp);
 
     for (int t = 0; t < P; t++) {
         const SAIGE::TraitMeta& M = ctx.meta[t];
-        if (M.kind != SAIGE::TraitKind::Binary) continue;
+        if (out.spIdx[t] < 0) continue;
         SAIGE::SAIGEClass* obj = objs[t];
-        if (!obj->m_flagSparseGRM) continue;
-        const int b = M.binIdx;
+        const int b = out.spIdx[t];
         const arma::sp_mat& S = obj->m_spSigmaMat;
         // own: the trait's sample list differs from the union's; its Sigma,
         // XV, XXVX_inv are over its own nt samples, and own index k sits at
@@ -112,7 +122,7 @@ std::string build(const SAIGE::MTContext& ctx,
         const int p = M.p;
         if ((int)Y.n_rows != nt || (int)Y.n_cols != p || (int)XV.n_rows != p || (int)XV.n_cols != nt)
             return "trait '" + M.name + "': XV / XXVX_inv have unexpected shapes";
-        const arma::uword w0 = (arma::uword)M.binOff;
+        const arma::uword w0 = (arma::uword)out.spOff[(size_t)b];
         arma::mat BYo;                              // own: B XXVX_inv over the trait's samples
         if (own) BYo.zeros((arma::uword)nt, (arma::uword)p);
         for (int c = 0; c < p; c++) {
@@ -164,13 +174,11 @@ std::string build(const SAIGE::MTContext& ctx,
             out.YBY[t]  = Y.t() * out.BY.cols(w0, w0 + p - 1);
             out.Yres[t] = Y.t() * ctx.RES.col((arma::uword)t);
         }
-        out.on[b] = 1;
         out.nOn++;
     }
-    if (out.nOn == 0) return "no binary trait carries a sparse GRM";
     out.nPairs = (long long)pairIdx.size();
-    out.w.assign((size_t)nBin * (size_t)out.nPairs, 0.0);
-    for (int b = 0; b < nBin; b++)
+    out.w.assign((size_t)nSp * (size_t)out.nPairs, 0.0);
+    for (int b = 0; b < nSp; b++)
         for (const auto& e : tw[b]) out.w[(size_t)b * out.nPairs + e.first] += e.second;
     out.secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return "";

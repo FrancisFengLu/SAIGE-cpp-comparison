@@ -665,6 +665,64 @@ bool PlinkClass::getOneMarkerFusedStats_ts(uint64_t t_gIndex,
     return true;
 }
 
+bool PlinkClass::getOneMarkerRow_ts(uint64_t t_gIndex, FusedMarkerStats& fs)
+{
+    if (tlsFusedBuf.size() < m_numBytesofEachMarker0) {
+        tlsFusedBuf.resize(m_numBytesofEachMarker0);
+    }
+    tlsFusedValid = false;
+
+    if (m_rowSource) {
+        if (t_gIndex >= m_M0) return false;
+        if (!m_rowSource(t_gIndex, tlsFusedBuf.data())) return false;
+    } else {
+        if (tlsFusedFin == nullptr) {
+            tlsFusedFin = fopen(m_bedFile.c_str(), "rb");
+            if (!tlsFusedFin) {
+                throw std::runtime_error(
+                    "PlinkClass::getOneMarkerRow_ts: cannot open .bed file: "
+                    + m_bedFile);
+            }
+        }
+        uint64_t posSeek = 3 + m_numBytesofEachMarker0 * t_gIndex;
+        fseek(tlsFusedFin, posSeek, SEEK_SET);
+        if (fread((char*)tlsFusedBuf.data(), 1, m_numBytesofEachMarker0, tlsFusedFin)
+            != m_numBytesofEachMarker0) {
+            return false;
+        }
+    }
+
+    fs = FusedMarkerStats();
+    fs.gIndex = t_gIndex;
+    fs.N = m_N;
+    fs.marker = m_MarkerInPlink[t_gIndex];
+    fs.pd     = m_pd[t_gIndex];
+    fs.chr    = m_chr[t_gIndex];
+    const std::vector<int8_t>* genoMaps;
+    if (m_AlleleOrder == "ref-first") {
+        fs.ref = m_alt[t_gIndex]; fs.alt = m_ref[t_gIndex];
+        genoMaps = &m_genoMaps_ref_first;
+    } else {
+        fs.ref = m_ref[t_gIndex]; fs.alt = m_alt[t_gIndex];
+        genoMaps = &m_genoMaps_alt_first;
+    }
+    for (int c = 0; c < 4; c++) fs.dmap[c] = (*genoMaps)[c];
+
+    if (!m_posIsIdentity) {
+        // subset / reordered samples: gather the codes once, for copyFusedPacked_ts
+        if (tlsFusedCodes.size() < m_N) tlsFusedCodes.resize(m_N);
+        uint8_t* codes = tlsFusedCodes.data();
+        const unsigned char* buf = tlsFusedBuf.data();
+        for (uint32_t i = 0; i < m_N; ++i) {
+            const uint32_t ind = m_posSampleInPlink[i];
+            codes[i] = (buf[ind >> 2] >> ((ind & 3u) * 2)) & 3u;
+        }
+    }
+    tlsFusedIdx = t_gIndex;
+    tlsFusedValid = true;
+    return true;
+}
+
 // Moved verbatim out of getOneMarkerFusedStats_ts (m_N -> t_N) so the
 // multi-trait path evaluates the same expressions on one trait's counts.
 void PlinkClass::fusedPreStatsFromCounts(FusedMarkerStats& fs, uint32_t t_N) const

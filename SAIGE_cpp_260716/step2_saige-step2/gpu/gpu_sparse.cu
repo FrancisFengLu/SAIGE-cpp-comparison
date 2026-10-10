@@ -439,9 +439,27 @@ bool spqRun(SpQuad* q, const Reducer* r, int nSlots, int t_set)
     return true;
 }
 
+const void* spqDeviceOut(const SpQuad* q) { return q ? (const void*)q->dOut : nullptr; }
+
+namespace {
+bool spqRunOwnImpl(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, const void* dlut, int t_set);
+}
+
+bool spqRunOwnDev(SpQuad* q, const Reducer* r, int nSlots, const void* dlut, int t_set)
+{
+    if (!q || !r || !dlut) return false;
+    return spqRunOwnImpl(q, r, nSlots, nullptr, dlut, t_set);
+}
+
 bool spqRunOwn(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, int t_set)
 {
     if (!q || !r || !tlut) return false;
+    return spqRunOwnImpl(q, r, nSlots, tlut, nullptr, t_set);
+}
+
+namespace {
+bool spqRunOwnImpl(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, const void* dlut, int t_set)
+{
     if (t_set >= (int)q->hOut.size()) { lastErrSpq = "result set out of range"; return false; }
     double* const hOut = q->hOut[(std::size_t)(t_set < 0 ? 0 : t_set)];
     q->lastOut = t_set < 0 ? 0 : t_set;
@@ -454,20 +472,24 @@ bool spqRunOwn(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, int 
     }
     const unsigned char* dPk = (const unsigned char*)devicePacked(r, t_set);
     if (!dPk) { lastErrSpq = "reducer has no resident packed rows"; return false; }
-    if (!q->dTl) {
-        const std::size_t nb = (std::size_t)q->maxSlots * q->nTr * 4 * sizeof(double);
-        CKQ(cudaMalloc((void**)&q->dTl, nb));
-        q->devBytes += nb;
+    const double* tl = (const double*)dlut;
+    if (!dlut) {
+        if (!q->dTl) {
+            const std::size_t nb = (std::size_t)q->maxSlots * q->nTr * 4 * sizeof(double);
+            CKQ(cudaMalloc((void**)&q->dTl, nb));
+            q->devBytes += nb;
+        }
+        CKQ(cudaMemcpyAsync(q->dTl, tlut, nOut * 4 * sizeof(double), cudaMemcpyHostToDevice, q->st));
+        tl = q->dTl;
     }
     const std::size_t bpv = bytesPerSlot(r);
     const int useShared = (bpv <= SHMAX) ? 1 : 0;
-    CKQ(cudaMemcpyAsync(q->dTl, tlut, nOut * 4 * sizeof(double), cudaMemcpyHostToDevice, q->st));
     CKQ(cudaEventRecord(q->e0, q->st));
     if (q->prec == Prec::FP32)
-        spq_kernel_own_f32<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, q->dTl, q->nPairs, q->dI, q->dJ,
+        spq_kernel_own_f32<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, tl, q->nPairs, q->dI, q->dJ,
                                                                       q->dWf, q->nTr, useShared, q->dOut);
     else
-    spq_kernel_own<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, q->dTl, q->nPairs, q->dI, q->dJ,
+    spq_kernel_own<<<nSlots, NT, useShared ? bpv : 0, q->st>>>(dPk, bpv, tl, q->nPairs, q->dI, q->dJ,
                                                               q->dW, q->nTr, useShared, q->dOut);
     CKQ(cudaGetLastError());
     CKQ(cudaEventRecord(q->e1, q->st));
@@ -478,6 +500,7 @@ bool spqRunOwn(SpQuad* q, const Reducer* r, int nSlots, const double* tlut, int 
     q->nSlotsDone += nSlots;
     return true;
 }
+}  // namespace
 
 }  // namespace gpu2
 }  // namespace saige

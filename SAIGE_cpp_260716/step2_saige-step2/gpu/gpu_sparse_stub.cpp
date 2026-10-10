@@ -11,7 +11,9 @@ SpQuad*       spqCreate(const SpQuadCreateArgs&)                   { return null
 void          spqDestroy(SpQuad*)                                  {}
 bool          spqRun(SpQuad*, const Reducer*, int, int)            { return false; }
 bool          spqRunOwn(SpQuad*, const Reducer*, int, const double*, int) { return false; }
+bool          spqRunOwnDev(SpQuad*, const Reducer*, int, const void*, int) { return false; }
 const double* spqOut(const SpQuad*, int)                           { return nullptr; }
+const void*   spqDeviceOut(const SpQuad*)                          { return nullptr; }
 void          spqTimings(const SpQuad*, double*, long long*)       {}
 std::size_t   spqDeviceBytes(const SpQuad*)                        { return 0; }
 const char*   spqLastError()                                       { return "no CUDA build"; }

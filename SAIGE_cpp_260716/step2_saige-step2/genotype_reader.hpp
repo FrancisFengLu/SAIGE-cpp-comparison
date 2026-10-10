@@ -244,6 +244,14 @@ public:
 
     bool getOneMarkerFusedStats_ts(uint64_t t_gIndex, FusedMarkerStats& fs);
 
+    // Stage A without the counting: the row is read into the thread-local
+    // cache (gathered into analysis order when the sample mapping is not the
+    // identity) and the marker meta filled, so copyFusedPacked_ts may follow;
+    // fs.counts and the pre-impute statistics are left zero. For the GPU
+    // path (gpu/gpu_step2.hpp), which derives everything from the column on
+    // the device.
+    bool getOneMarkerRow_ts(uint64_t t_gIndex, FusedMarkerStats& fs);
+
     // The pre-impute half of Stage A, as a function of the 2-bit code counts
     // alone: fills nMissing / missingRate / imputeInfo / altFreq / altCounts
     // of `fs` from fs.counts over a sample set of size t_N. Stage A calls this
@@ -323,6 +331,7 @@ public:
 
     uint32_t getN0() { return m_N0; }
     uint32_t getN() { return m_N; }
+    const std::string& alleleOrder() const { return m_AlleleOrder; }
     uint32_t getM0() { return m_M0; }
     uint32_t getM() { return m_M; }
     uint32_t getnumBytesofEachMarker0() { return m_numBytesofEachMarker0; }

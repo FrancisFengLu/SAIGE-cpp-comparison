@@ -25,8 +25,10 @@ bool     scanSupports(Prec t_p) { return t_p == Prec::FP64; }
 Reducer* create(const CreateArgs&) { return nullptr; }
 void     destroy(Reducer*) {}
 
+bool            prepSetup(Reducer*, const PrepArgs&) { return false; }
+std::string     prepLastError()               { return "built without CUDA"; }
 unsigned char*  packed(Reducer*, int)         { return nullptr; }
-double*         lut(Reducer*, int)            { return nullptr; }
+unsigned char*  valid(Reducer*, int)          { return nullptr; }
 std::size_t     bytesPerSlot(const Reducer*)  { return 0; }
 int             stagingSets(const Reducer*)   { return 0; }
 bool            reduce(Reducer*, int, int, int) { return false; }
@@ -37,6 +39,10 @@ const float*    outC2f(const Reducer*, int)   { return nullptr; }
 const double*   outC2d(const Reducer*, int)   { return nullptr; }
 std::size_t     ldC(const Reducer*)           { return 0; }
 const uint32_t* outCounts(const Reducer*, int) { return nullptr; }
+const double*   lutOut(const Reducer*, int)    { return nullptr; }
+const PrepSlot* prepSlots(const Reducer*, int) { return nullptr; }
+const PrepPair* prepPairs(const Reducer*, int) { return nullptr; }
+const double*   prepVr(const Reducer*, int)    { return nullptr; }
 std::size_t     deviceBytes(const Reducer*)   { return 0; }
 void            timings(const Reducer*, double*, double*, double*, double*, double*) {}
 const void*     devicePacked(const Reducer*, int) { return nullptr; }
@@ -49,14 +55,20 @@ std::string     setBlockingSync(int)          { return "built without CUDA"; }
 bool                 statsSetup(Reducer*, const StatsArgs&)  { return false; }
 void                 statsDisable(Reducer*)                  {}
 std::string          statsLastError()                        { return "built without CUDA"; }
-double*              statsVr(Reducer*, int)                  { return nullptr; }
-double*              statsAf(Reducer*, int)                  { return nullptr; }
-double*              statsAdj(Reducer*, int)                 { return nullptr; }
 const double*        statsS(const Reducer*, int)             { return nullptr; }
 const double*        statsVar2(const Reducer*, int)          { return nullptr; }
 const double*        statsP(const Reducer*, int)             { return nullptr; }
 const unsigned char* statsFlags(const Reducer*, int)         { return nullptr; }
 double               statsSeconds(const Reducer*)            { return 0.0; }
+
+bool                 statsSparseSetup(Reducer*, const StatsSparseArgs&) { return false; }
+bool                 statsSparseRun(Reducer*, int, int, const void*)     { return false; }
+const void*          sparseTables(Reducer*, int, int)                    { return nullptr; }
+const double*        statsSpS(const Reducer*, int)           { return nullptr; }
+const double*        statsSpVar2(const Reducer*, int)        { return nullptr; }
+const double*        statsSpP(const Reducer*, int)           { return nullptr; }
+const unsigned char* statsSpFlags(const Reducer*, int)       { return nullptr; }
+const double*        statsSpVr(const Reducer*, int)          { return nullptr; }
 
 }  // namespace gpu2
 }  // namespace saige

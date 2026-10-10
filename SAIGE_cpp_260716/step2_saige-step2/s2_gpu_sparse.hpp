@@ -1,9 +1,9 @@
 // s2_gpu_sparse.hpp -- host half of the step-2 GPU path's sparse-GRM variance
-// (config key gpuSparse, default off; gpu/gpu_sparse.hpp has the math).
+// (config key gpuSparse; gpu/gpu_sparse.hpp has the math).
 //
-// Built once per run, before the reducer is created: for every binary trait
-// whose model carries a sparse GRM, Sigma (as SAIGEClass holds it, tau1*K with
-// 1/mu2 on the diagonal) is partitioned into its connected components and
+// Built once per run, before the reducer is created: for every trait whose
+// model carries a sparse GRM, Sigma (as SAIGEClass holds it, tau1*K with
+// 1/mu2 -- binary -- or tau0 -- quantitative -- on the diagonal) is partitioned into its connected components and
 // every block is inverted densely with the same class the CPU's
 // blockSparseSigma switch uses (block_sigma.hpp, fp64), so B = Sigma^-1 is
 // held explicitly.
@@ -39,15 +39,18 @@
 namespace s2gs {
 
 struct Plan {
-    int N = 0, nBin = 0;
-    std::vector<char> on;          // [nBin] this binary trait has the device sparse variance
-    arma::mat XVt;                 // N x sumPbin, trait block at binOff: XV'; zeros when off
-    arma::mat BY;                  // N x sumPbin, trait block at binOff: B XXVX_inv; zeros when off
-    arma::mat Bdiag;               // N x nBin; zeros when off
-    std::vector<arma::vec> Yres;   // [P] p: XXVX_inv' res; empty when off
-    std::vector<arma::mat> YBY;    // [P] p x p: XXVX_inv' B XXVX_inv; empty when off
+    int N = 0, P = 0, nSp = 0, sumPsp = 0;
+    // Sparse traits, binary or quantitative, in internal trait order: spIdx[t]
+    // is the trait's sparse index s (-1 without a sparse GRM), spTrait[s] the
+    // trait, spOff[s] the first column of its p-block inside XVt / BY.
+    std::vector<int> spIdx, spTrait, spOff;
+    arma::mat XVt;                 // N x sumPsp, trait block at spOff: XV'
+    arma::mat BY;                  // N x sumPsp, trait block at spOff: B XXVX_inv
+    arma::mat Bdiag;               // N x nSp
+    std::vector<arma::vec> Yres;   // [P] p: XXVX_inv' res; empty when not sparse
+    std::vector<arma::mat> YBY;    // [P] p x p: XXVX_inv' B XXVX_inv; empty when not sparse
     std::vector<int> pi, pj;       // within-block pairs, i < j, union over traits
-    std::vector<double> w;         // nBin x nPairs, trait-major, 2 B_ij (0 where absent)
+    std::vector<double> w;         // nSp x nPairs, sparse-trait-major, 2 B_ij (0 where absent)
     long long nPairs = 0;
     int nBlocksMax = 0, maxBlock = 0, nOn = 0;
     // Different sample lists (gpuOwnSampleSets) only. Every per-sample array
@@ -61,7 +64,9 @@ struct Plan {
     double secs = 0.0;
 };
 
-// Builds the plan for every binary trait with flagSparseGRM. Returns "" on
+// Builds the plan for every binary or quantitative trait with flagSparseGRM
+// (the quantitative Sigma carries tau0 on its diagonal, the binary one 1/mu2;
+// both come from the loader as SAIGEClass holds them). Returns "" on
 // success, otherwise the reason the device sparse variance is not available
 // (the caller then refuses or keeps the CPU path). refreshBudget_s is the
 // block inverse's one-refresh cost gate (blockSparseSigmaRefreshBudget_s).

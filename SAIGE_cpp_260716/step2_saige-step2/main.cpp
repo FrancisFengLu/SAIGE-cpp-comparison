@@ -2546,52 +2546,16 @@ struct PendSpa {
 };
 
 // Per-block state that has to survive the barrier between the read phase and
-// the finalize phase.
+// the finalize phase. Everything per (marker, trait) lives in the device's
+// prep records (gpu_step2.hpp PrepSlot / PrepPair, pinned per device set);
+// here is only the marker -> slot map, and the inputs the CPU batch tails
+// take when the device statistics are off (rebuilt from those records).
 struct GpuBlk {
-    std::vector<int>      colOf;     // block-local marker index -> slot in block
-    std::vector<char>     isHi;      // per slot: MAC > MACCutoffforER
-    std::vector<double>   MACc, AFc, ssc, gsc;   // gsc: sum_i g_i from the counts (isnoadjCov, quantitative)
-    std::vector<double>   fdc;       // 4 per slot: code -> final dosage
-    std::vector<uint64_t> cntc;      // 4 per slot: the column's code counts
-    std::vector<char>     flipc;
-    arma::mat             VR;        // Bblk x P
-    arma::mat             AF;        // Bblk x P, the pair's post-imputation ALT frequency (saige_mt.hpp t_AF)
-    int nHi = 0, nLo = 0;
-    // ---- gpuOwnSampleSets only: per (slot, trait), as MTBlockWork holds them ----
-    std::vector<char>     qcP, flipP, affP;   // [B*P]
-    arma::mat             MACp, AFp, ACp, MRp, IIp;   // B x P
-    std::vector<double>   fdP;       // [B*P*4] the trait's code -> final dosage table
-    std::vector<uint64_t> cntP;      // [B*P*4] the trait's code counts
-    SAIGE::MTBlockAdj     adj;       // the map from the union column to each trait's vector
-    void ensureDiffer(int B, int P) {
-        const std::size_t BP = (std::size_t)B * (std::size_t)P;
-        qcP.assign(BP, 0); flipP.assign(BP, 0); affP.assign(BP, 0);
-        if (MACp.n_rows != (arma::uword)B || MACp.n_cols != (arma::uword)P) {
-            MACp.set_size(B, P); AFp.set_size(B, P); ACp.set_size(B, P);
-            MRp.set_size(B, P); IIp.set_size(B, P);
-        }
-        fdP.assign(BP * 4, 0.0); cntP.assign(BP * 4, 0);
-        adj.resize(B, P);
-        adj.a.ones(); adj.b.zeros(); adj.d.zeros(); adj.q.zeros(); adj.nMiss.zeros();
-        for (auto& m : adj.miss) m.clear();
-    }
-    void ensure(int B, int P) {
-        colOf.assign(B, -1);
-        isHi.assign(B, 0);
-        MACc.assign(B, 0.0);
-        AFc.assign(B, 0.0);
-        ssc.assign(B, 0.0);
-        gsc.assign(B, 0.0);
-        fdc.assign((std::size_t)B * 4, 0.0);
-        cntc.assign((std::size_t)B * 4, 0);
-        flipc.assign(B, 0);
-        if (VR.n_rows != (arma::uword)B || VR.n_cols != (arma::uword)P) {
-            VR.set_size(B, P);
-            AF.set_size(B, P);
-        }
-        AF.zeros();
-        nHi = nLo = 0;
-    }
+    std::vector<int>      colOf;     // block-local marker index -> slot in block, -1 when not read
+    arma::mat             VR;        // Bblk x P (host tails only)
+    arma::mat             AF;        // Bblk x P (host tails only)
+    SAIGE::MTBlockAdj     adj;       // the map from the union column to each trait's vector (host tails only)
+    void ensure(int B) { colOf.assign(B, -1); }
 };
 
 }  // namespace
@@ -2721,17 +2685,16 @@ bool mainMarkerMTGpu(
             if (M.kind != SAIGE::TraitKind::Quantitative && M.kind != SAIGE::TraitKind::Binary) {
                 why = "trait '" + M.name + "' is neither quantitative nor binary"; break;
             }
-            // gpuSparse: a binary trait refused only because its first pass is
-            // the sparse variance (isFastTest=false) is batchable here -- the
-            // tail takes g~' Sigma^-1 g~ from the device (s2_gpu_sparse.hpp).
-            // Whether the device data could actually be built is checked below.
-            const bool sparseFirstOK = g_gpuSparse && M.kind == SAIGE::TraitKind::Binary &&
-                                       M.flagSparseGRM && !M.isFastTest && !M.isCondition;
+            // gpuSparse: a trait refused only because its first pass is the
+            // sparse variance (isFastTest=false) is batchable here -- the
+            // sparse statistic is formed on the device (gpu/gpu_step2.hpp
+            // statsSparse*, s2_gpu_sparse.hpp). Whether the device data could
+            // actually be built is checked below.
+            const bool sparseFirstOK = g_gpuSparse && M.flagSparseGRM && !M.isFastTest && !M.isCondition;
             if (!M.batchable && !sparseFirstOK) {
                 why = "trait '" + M.name + "': " + SAIGE::batchableReason(M);
-                if (M.kind == SAIGE::TraitKind::Quantitative && M.flagSparseGRM && !M.isFastTest &&
-                    !M.isCondition)
-                    why += " (gpuSparse covers binary traits only)";
+                if (M.flagSparseGRM && !M.isFastTest && !M.isCondition && !g_gpuSparse)
+                    why += " (gpuSparse: true runs the sparse first pass on the device)";
                 break;
             }
             if (M.isCondition)  { why = "trait '" + M.name + "' runs conditional analysis"; break; }
@@ -2824,31 +2787,28 @@ bool mainMarkerMTGpu(
         return false;
     }
 
-    // ---- gpuSparse: block-diagonal Sigma^-1 per sparse-GRM binary trait ----
+    // ---- gpuSparse: block-diagonal Sigma^-1 per sparse-GRM trait ----
     // Built before the reducer, whose operands it extends:
-    //   B1 += [XV' | B XXVX_inv] (2 x N x sumPbin)      -> z = XV g, (B XXVX_inv)'g
-    //   B2 += diag(B) (N x nBin)                        -> sum_i B_ii g_i^2
-    // and the cross terms 2 B_ij g_i g_j come from gpu/gpu_sparse.cu.
+    //   B1 += [XV' | B XXVX_inv] (2 x N x sumPsp)      -> z = XV g, (B XXVX_inv)'g
+    //   B2 += diag(B) (N x nSp)                        -> sum_i B_ii g_i^2
+    // and the cross terms 2 B_ij g_i g_j come from gpu/gpu_sparse.cu; the
+    // statistic itself is formed by the sparse kernel of gpu/gpu_step2.cu.
     s2gs::Plan spPlan;
     bool spDev = false;
     std::vector<char> spFirst(P, 0);   // trait's first pass is the sparse variance (isFastTest=false)
     {
-        bool needFirst = false;
+        bool needFirst = false, anySparse = false;
         for (int t = 0; t < P; t++) {
             const SAIGE::TraitMeta& M = ctx.meta[t];
-            if (M.kind == SAIGE::TraitKind::Binary && M.flagSparseGRM && !M.isFastTest) {
-                spFirst[t] = 1; needFirst = true;
-            }
+            if (M.flagSparseGRM) anySparse = true;
+            if (M.flagSparseGRM && !M.isFastTest) { spFirst[t] = 1; needFirst = true; }
         }
-        if (g_gpuSparse && anyBin) {
+        if (g_gpuSparse && anySparse) {
             // The sparse-GRM variance belongs to the scan stage (its terms ride
             // in the reducer's GEMMs and in gpu_sparse.cu's cross terms), so it
             // takes the scan's precision; a mode the cross-term kernel does not
             // implement stops the run like any other.
-            bool anySparse = false;
-            for (int t = 0; t < P; t++)
-                if (ctx.meta[t].kind == SAIGE::TraitKind::Binary && ctx.meta[t].flagSparseGRM) anySparse = true;
-            if (anySparse && !saige::gpu2::spqSupports(g_precScan))
+            if (!saige::gpu2::spqSupports(g_precScan))
                 throw std::runtime_error(std::string("useGPU: scan precision ") + saige::gpu2::precName(g_precScan) +
                                          " is not implemented yet (sparse-GRM variance, gpu/gpu_sparse.cu; "
                                          "gpuSparse: false keeps that variance on the CPU)");
@@ -2856,7 +2816,7 @@ bool mainMarkerMTGpu(
                                             g_gpuSparseMaxPairs, spPlan);
             if (spWhy.empty()) {
                 for (int t = 0; t < P; t++)
-                    if (spFirst[t] && !spPlan.on[ctx.meta[t].binIdx]) {
+                    if (spFirst[t] && spPlan.spIdx[t] < 0) {
                         spWhy = "trait '" + ctx.meta[t].name + "' has no device sparse variance"; break;
                     }
             }
@@ -2869,7 +2829,7 @@ bool mainMarkerMTGpu(
                           << std::endl;
             } else {
                 spDev = true;
-                std::cout << "  gpuSparse: " << spPlan.nOn << " of " << nBin << " binary traits carry a sparse GRM; "
+                std::cout << "  gpuSparse: " << spPlan.nSp << " of " << P << " traits carry a sparse GRM; "
                           << "block-diagonal Sigma^-1 built in " << spPlan.secs << " s (largest block "
                           << spPlan.maxBlock << ", " << spPlan.nBlocksMax << " blocks, " << spPlan.nPairs
                           << " within-block pairs)" << std::endl;
@@ -2881,13 +2841,15 @@ bool mainMarkerMTGpu(
             return false;
         }
     }
+    const int nSp = spDev ? spPlan.nSp : 0;
+    const int sumPsp = spDev ? spPlan.sumPsp : 0;
     const int oXV = K1;                          // first XV' column in C1 (spDev)
-    const int oBY = K1 + sumPbin;                // first B XXVX_inv column in C1 (spDev)
+    const int oBY = K1 + sumPsp;                 // first B XXVX_inv column in C1 (spDev)
     // differ: G' diag(B) too (the flip correction of the diagonal term of a
-    // trait with its own list, as G' MU2bin for the dense variance), nBin more.
-    const int oGB = K1 + 2 * sumPbin;            // first diag(B) column in C1 (spDev && differ)
-    const int K1x = spDev ? K1 + 2 * sumPbin + (differ ? nBin : 0) : K1;
-    const int K2x = spDev ? K2 + nBin : K2;
+    // trait with its own list, as G' MU2bin for the dense variance), nSp more.
+    const int oGB = K1 + 2 * sumPsp;             // first diag(B) column in C1 (spDev && differ)
+    const int K1x = spDev ? K1 + 2 * sumPsp + (differ ? nSp : 0) : K1;
+    const int K2x = spDev ? K2 + nSp : K2;
     int Bblk = g_mtBlockSize;
     if (Bblk <= 0) {
         const double budget = g_mtMemBudgetGB * 1024.0 * 1024.0 * 1024.0;
@@ -2903,14 +2865,6 @@ bool mainMarkerMTGpu(
     if (nSub * Bblk > chunkSize) { nSub = chunkSize / Bblk; if (nSub < 1) nSub = 1; }
     const int slots = nSub * Bblk;
 
-    // Case masks (device, for the code counts) and case + control masks (host,
-    // for the exact replay of a mean-imputed sum, popcount_af.hpp), one per
-    // binary trait, row = binIdx. The replay needs the gather's index order to
-    // be ascending; arma::find's case_indices are, and pcAsc records it.
-    const int words = saige::gpu2::maskWords(n);
-    std::vector<uint64_t> caseMasks((std::size_t)std::max(nBin, 1) * words, 0);
-    std::vector<std::vector<uint64_t>> ctrlMask(std::max(nBin, 1));
-    std::vector<char> pcAsc(std::max(nBin, 1), 0);
     // differ: a trait with its own list has its cases / controls at their union
     // positions, caseU[t][k] = the union index of its k-th case (mainMarkerMT's).
     std::vector<arma::uvec> caseU(P), ctrlU(P);
@@ -2928,21 +2882,72 @@ bool mainMarkerMTGpu(
             for (arma::uword k = 0; k < oi.n_elem; k++) ctrlU[t][k] = S.pos.at(oi[k]);
         }
     }
-    // a quantitative trait with its own list: its tail is the adjusted one
-    bool qntOwn = false;
-    for (int t : ctx.batchQuantTraits) if (ownS[t]) qntOwn = true;
+    // Traits with the same sample list share one group mask, and so one code
+    // count per marker on the device: sampleGrp[t] = the mask index of the
+    // trait's list (0 = the union; the others in order of first appearance).
+    // PheWAS-style sets often have a few missing patterns across many traits,
+    // but the device counts cost the same per mask either way.
+    std::vector<int> sampleGrp(P, 0);
+    int nGrp = 1;
+    if (differ) {
+        std::vector<int> rep;   // group k >= 1 -> representative trait
+        for (int t = 0; t < P; t++) {
+            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+            if (TS.sameAsUnion) continue;
+            int g = -1;
+            for (int k = 0; k < (int)rep.size(); k++) {
+                const SAIGE::MTTraitSamples& RS = ctx.samp[(std::size_t)rep[(std::size_t)k]];
+                if (RS.n == TS.n && RS.pos == TS.pos) { g = k; break; }
+            }
+            if (g < 0) { g = (int)rep.size(); rep.push_back(t); }
+            sampleGrp[t] = g + 1;
+        }
+        nGrp = 1 + (int)rep.size();
+    }
+    // Masks for the device's code counts (popcount_af.hpp layout): the nGrp
+    // sample groups first (the union = every analysis sample), then one case
+    // mask per binary trait (row = binIdx). The host keeps the case and
+    // control masks of each binary trait for the exact replay of a
+    // mean-imputed sum (pcSumPairFromCounts), which needs the gather's index
+    // order to be ascending; arma::find's case_indices are, and pcAsc records it.
+    const int words = saige::gpu2::maskWords(n);
+    const int nMask = nGrp + nBin;
+    std::vector<uint64_t> allMasks((std::size_t)nMask * words, 0);
+    {
+        std::vector<arma::uword> all((std::size_t)n);
+        for (int u = 0; u < n; u++) all[(std::size_t)u] = (arma::uword)u;
+        SAIGE::pcBuildMask(all.data(), all.size(), &allMasks[0]);
+        if (differ) {
+            for (int t = 0; t < P; t++) {
+                const int g = sampleGrp[t];
+                if (g == 0) continue;
+                uint64_t* m = &allMasks[(std::size_t)g * words];
+                bool filled = false;
+                for (int w = 0; w < words && !filled; w++) filled = (m[w] != 0);
+                if (!filled) SAIGE::pcBuildMask(ctx.samp[t].pos.data(), ctx.samp[t].pos.size(), m);
+            }
+        }
+    }
+    std::vector<uint64_t> caseMasks((std::size_t)std::max(nBin, 1) * words, 0);
+    std::vector<std::vector<uint64_t>> ctrlMask(std::max(nBin, 1));
+    std::vector<char> pcAsc(std::max(nBin, 1), 0);
     for (int t : binTraits) {
         const int b = ctx.meta[t].binIdx;
         const arma::uvec& ci = ownS[t] ? caseU[t] : g_saigeObjs[t]->m_case_indices;
         const arma::uvec& oi = ownS[t] ? ctrlU[t] : g_saigeObjs[t]->m_ctrl_indices;
         SAIGE::pcBuildMask(ci.memptr(), ci.n_elem, &caseMasks[(std::size_t)b * words]);
+        std::memcpy(&allMasks[(std::size_t)(nGrp + b) * words], &caseMasks[(std::size_t)b * words],
+                    (std::size_t)words * sizeof(uint64_t));
         ctrlMask[b].assign((std::size_t)words, 0);
         SAIGE::pcBuildMask(oi.memptr(), oi.n_elem, ctrlMask[b].data());
         pcAsc[b] = (SAIGE::pcAscending(ci.memptr(), ci.n_elem) &&
                     SAIGE::pcAscending(oi.memptr(), oi.n_elem)) ? 1 : 0;
     }
+    // a quantitative trait with its own list: its tail is the adjusted one
+    bool qntOwn = false;
+    for (int t : ctx.batchQuantTraits) if (ownS[t]) qntOwn = true;
 
-    // gpuPrefetch: a ring of staging sets (pinned rows + tables, per-block
+    // gpuPrefetch: a ring of staging sets (pinned rows + flags, per-block
     // state) so the reader can fill one while the device and the host tail
     // work on another. 1 without it.
     const bool prefetch = g_gpuPrefetch;
@@ -2971,16 +2976,17 @@ bool mainMarkerMTGpu(
         if (spDev) {
             Bf.resize((std::size_t)n * K1x);
             std::memcpy(Bf.data() + (std::size_t)n * oXV, spPlan.XVt.memptr(),
-                        (std::size_t)n * sumPbin * sizeof(double));
+                        (std::size_t)n * sumPsp * sizeof(double));
             std::memcpy(Bf.data() + (std::size_t)n * oBY, spPlan.BY.memptr(),
-                        (std::size_t)n * sumPbin * sizeof(double));
+                        (std::size_t)n * sumPsp * sizeof(double));
             if (differ)
                 std::memcpy(Bf.data() + (std::size_t)n * oGB, spPlan.Bdiag.memptr(),
-                            (std::size_t)n * nBin * sizeof(double));
+                            (std::size_t)n * nSp * sizeof(double));
             B2x.resize((std::size_t)n * K2x);
-            std::memcpy(B2x.data(), ctx.MU2bin.memptr(), (std::size_t)n * nBin * sizeof(double));
+            if (nBin > 0)
+                std::memcpy(B2x.data(), ctx.MU2bin.memptr(), (std::size_t)n * nBin * sizeof(double));
             std::memcpy(B2x.data() + (std::size_t)n * nBin, spPlan.Bdiag.memptr(),
-                        (std::size_t)n * nBin * sizeof(double));
+                        (std::size_t)n * nSp * sizeof(double));
         }
         saige::gpu2::CreateArgs a;
         a.device = g_gpuDevice; a.N = n;
@@ -2988,7 +2994,7 @@ bool mainMarkerMTGpu(
         a.K2 = K2x; a.B2 = spDev ? B2x.data() : (anyBin ? ctx.MU2bin.memptr() : nullptr);
         a.maxSlots = slots; a.precision = g_precScan; a.int8Slices = g_gpuInt8Slices;
         a.stagingSets = nSets;
-        a.nMask = nBin; a.masks = anyBin ? caseMasks.data() : nullptr;
+        a.nMask = nMask; a.masks = allMasks.data(); a.nGrp = nGrp;
         a.decodeX2 = g_gpuDecodeX2;
         a.deviceSets = overlap ? nSets : 1;
         R = saige::gpu2::create(a);
@@ -2998,29 +3004,92 @@ bool mainMarkerMTGpu(
         return false;
     }
     const std::size_t bpv = saige::gpu2::bytesPerSlot(R);
-    const std::size_t nbRow = (std::size_t)(n + 3) / 4;   // bytes the reader writes per row
+    (void)n;   // the reader writes (n + 3) / 4 bytes per row; the padding beyond stays zero
+
+    // ---------------- per-marker preprocessing on the device ----------------
+    // Per trait: its group mask, its sample count and the variance-ratio
+    // table the run's context selects (SAIGEClass::computeVarianceRatio /
+    // computeSingleVarianceRatio: sparse, null or null_noXadj; single-row
+    // tables use their one entry), plus the sparse table for the sparse
+    // kernel. The QC thresholds, the imputation rule and the allele map are
+    // the reader's.
+    std::vector<char> isSingleVR(P, 0);
+    {
+        std::vector<saige::gpu2::PrepTrait> pt((std::size_t)P);
+        std::vector<double> pc;
+        auto push = [&](const arma::vec& v, int n_) {   // n_ entries, the last repeated if short
+            const int off = (int)pc.size();
+            for (int i = 0; i < n_; i++)
+                pc.push_back(v.n_elem > 0 ? v((arma::uword)std::min<int>(i, (int)v.n_elem - 1)) : 1.0);
+            return off;
+        };
+        for (int t = 0; t < P; t++) {
+            SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+            saige::gpu2::PrepTrait& T = pt[(std::size_t)t];
+            T.grp = sampleGrp[t];
+            T.nObj = differ ? ctx.samp[t].n : n;
+            T.isBin = (ctx.meta[t].kind == SAIGE::TraitKind::Binary) ? 1 : 0;
+            isSingleVR[t] = (obj->m_varRatio_null.n_elem == 1) ? 1 : 0;
+            T.single = isSingleVR[t];
+            const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
+            const bool noadjCur  = obj->m_isnoadjCov;
+            const arma::vec& act = sparseCur ? obj->m_varRatio_sparse
+                                             : (noadjCur ? obj->m_varRatio_null_noXadj : obj->m_varRatio_null);
+            T.nCat = (int)obj->m_cateVarRatioMaxMACVecInclude.n_elem;
+            if ((int)obj->m_cateVarRatioMinMACVecExclude.n_elem < T.nCat) T.nCat = (int)obj->m_cateVarRatioMinMACVecExclude.n_elem;
+            const int nEnt = T.single ? 1 : std::max(T.nCat, 1);
+            T.vrOff = push(act, nEnt);
+            T.vrSpOff = obj->m_flagSparseGRM ? push(obj->m_varRatio_sparse, nEnt) : -1;
+            T.catMinOff = push(obj->m_cateVarRatioMinMACVecExclude, std::max(T.nCat, 1));
+            T.catMaxOff = push(obj->m_cateVarRatioMaxMACVecInclude, std::max(T.nCat, 1));
+        }
+        saige::gpu2::PrepArgs pa;
+        pa.P = P; pa.traits = pt.data(); pa.consts = pc.data(); pa.nConsts = (int)pc.size();
+        pa.perTrait = differ ? 1 : 0;
+        pa.refFirst = (PR->alleleOrder() == "ref-first") ? 1 : 0;
+        if (pa.refFirst) { pa.dmap[0] = 0.0; pa.dmap[1] = -1.0; pa.dmap[2] = 1.0; pa.dmap[3] = 2.0; }
+        else             { pa.dmap[0] = 2.0; pa.dmap[1] = -1.0; pa.dmap[2] = 1.0; pa.dmap[3] = 0.0; }
+        pa.imputeCase = string_to_case.at(g_impute_method);
+        pa.zerodCutoff = g_dosage_zerod_cutoff; pa.zerodMacCutoff = g_dosage_zerod_MAC_cutoff;
+        pa.missCut = g_missingRate_cutoff; pa.minMAF = g_marker_minMAF_cutoff;
+        pa.minMAC = g_marker_minMAC_cutoff; pa.minINFO = g_marker_minINFO_cutoff;
+        pa.macER = g_MACCutoffforER;
+        if (!saige::gpu2::prepSetup(R, pa)) {
+            std::cout << "  useGPU: refused, running on the CPU (device preprocessing setup failed: "
+                      << saige::gpu2::prepLastError() << ")" << std::endl;
+            saige::gpu2::destroy(R);
+            return false;
+        }
+    }
 
     std::cout << "  useGPU: " << saige::gpu2::describe(g_gpuDevice)
               << "; scan " << saige::gpu2::precName(g_precScan)
               << (g_precScan == saige::gpu2::Prec::INT8 ? " (" + std::to_string(g_gpuInt8Slices) + " slices)" : std::string())
               << ", K1 = " << K1 << " (" << sumP << " + " << sumPbin << " + " << sumPqnt
               << " + " << P << ")" << ", K2 = " << K2
-              << ", " << nBin << " case masks"
+              << ", " << nMask << " masks (" << nGrp << " sample list" << (nGrp == 1 ? "" : "s") << " + " << nBin
+              << " case mask" << (nBin == 1 ? "" : "s") << ")"
               << ", " << slots << " markers per device batch (" << nSub
               << " x " << Bblk << "), "
               << (saige::gpu2::deviceBytes(R) >> 20) << " MiB on the device"
               << (g_gpuDecodeX2 ? ", decode x2" : "")
               << std::endl;
+    std::cout << "  gpuPrep: the reader stages packed rows only; code counts over " << nMask
+              << " masks, QC, allele flip, imputation, the dosage tables and the variance ratios of "
+              << P << " traits are formed on the device"
+              << (differ ? " (per trait: its own sample list's counts, table and affine map)" : "")
+              << std::endl;
     if (differ) {
         int nOwn = 0;
         for (int t = 0; t < P; t++) nOwn += ownS[t] ? 1 : 0;
         std::cout << "  gpuOwnSampleSets: the reader and the device work on the union of " << n
-                  << " samples; " << nOwn << " of " << P << " traits have their own sample list "
-                     "(zero-embedded stacks, per-trait masks on the device)" << std::endl;
+                  << " samples; " << nOwn << " of " << P << " traits have their own sample list ("
+                  << (nGrp - 1) << " distinct list" << (nGrp - 1 == 1 ? "" : "s")
+                  << " besides the union; zero-embedded stacks, per-list masks on the device)" << std::endl;
     }
     if (prefetch)
         std::cout << "  gpuPrefetch: " << nSets << " staging sets of " << slots << " markers ("
-                  << ((std::size_t)nSets * slots * (bpv + 4 * sizeof(double)) >> 20)
+                  << ((std::size_t)nSets * slots * (bpv + 1) >> 20)
                   << " MiB pinned), " << g_gpuPrefetchThreads << " reader thread(s)" << std::endl;
     if (overlap)
         std::cout << "  gpuOverlap: " << nSets << " buffer sets (staging, device rows, results) of "
@@ -3032,7 +3101,7 @@ bool mainMarkerMTGpu(
     saige::gpu2::SpQuad* SQ = nullptr;
     if (spDev) {
         saige::gpu2::SpQuadCreateArgs qa;
-        qa.device = g_gpuDevice; qa.N = n; qa.nTraits = nBin; qa.nPairs = spPlan.nPairs;
+        qa.device = g_gpuDevice; qa.N = n; qa.nTraits = nSp; qa.nPairs = spPlan.nPairs;
         qa.pi = spPlan.pi.data(); qa.pj = spPlan.pj.data(); qa.w = spPlan.w.data();
         qa.maxSlots = slots;
         qa.outSets = overlap ? nSets : 1;
@@ -3050,18 +3119,13 @@ bool mainMarkerMTGpu(
             spDev = false;
         } else {
             std::cout << "  gpuSparse: XV' and Sigma^-1 XXVX_inv in C1 columns [" << oXV << ", " << K1x << "), diag(Sigma^-1) in C2 columns ["
-                      << K2 << ", " << K2x << "), " << spPlan.nPairs << " cross-term pairs x " << nBin
+                      << K2 << ", " << K2x << "), " << spPlan.nPairs << " cross-term pairs x " << nSp
                       << " traits resident (" << (saige::gpu2::spqDeviceBytes(SQ) >> 20) << " MiB)" << std::endl;
+            if (differ)
+                std::cout << "  gpuSparse: per-trait sample lists -- Sigma^-1 blocks mapped onto union indices, "
+                             "G' diag(Sigma^-1) in C1 columns [" << oGB << ", " << oGB + nSp
+                          << "), cross terms on each trait's own dosages (tables formed on the device)" << std::endl;
         }
-    }
-    // gpuSparse + gpuOwnSampleSets: per (slot, binary trait) code -> dosage
-    // tables for the cross-term kernel, filled before each superblock's call.
-    std::vector<double> spTl;
-    if (spDev && differ) {
-        spTl.assign((std::size_t)slots * nBin * 4, 0.0);
-        std::cout << "  gpuSparse: per-trait sample lists -- Sigma^-1 blocks mapped onto union indices, "
-                     "G' diag(Sigma^-1) in C1 columns [" << oGB << ", " << oGB + nBin
-                  << "), cross terms on each trait's own dosages" << std::endl;
     }
     // ---- device SPA (gpuSpa): per-trait mu / XV / XXVX_inv resident ----
     saige::gpu2::Spa* SP = nullptr;        // gpuSpaImpl: own
@@ -3280,44 +3344,47 @@ bool mainMarkerMTGpu(
     const bool erDev = (EP != nullptr);
 
     // ---------------- per-trait one-time setup (as mainMarkerMT) ----------------
-    std::vector<char> isSingleVR(P, 0);
     for (int t = 0; t < P; t++) {
         SAIGE::SAIGEClass* obj = g_saigeObjs[t];
-        if ((obj->m_varRatio_null).n_elem == 1) {
-            obj->assignSingleVarianceRatio(obj->m_flagSparseGRM, obj->m_isnoadjCov);
-            isSingleVR[t] = 1;
-        }
+        if (isSingleVR[t]) obj->assignSingleVarianceRatio(obj->m_flagSparseGRM, obj->m_isnoadjCov);
     }
 
     // ---------------- per-pair statistics on the device (gpuDeviceStats) ----------------
     // The per-trait constants (XVX / S_a, the isnoadjCov sums, the own-list
     // column sums) go up once; from then on every reduce() also forms S /
-    // var2 / p / gates per (slot, binary trait) (gpu_step2.hpp "Per-pair
-    // statistics"). A trait with its own sample list (differ) takes its
-    // affine map and the missing-cell sums on the device too (the pair's a /
-    // d / q go up with the slot, statsAdj). Not for a sparse first pass (its
-    // statistic is spStats'); such traits keep the host path pair by pair.
+    // var2 / p / gates per (slot, trait) -- binary and quantitative -- from
+    // the GEMM columns, the device's code counts and tables (gpu_step2.hpp
+    // "Per-pair statistics"). A trait with its own sample list (differ) takes
+    // its affine map and the missing-cell sums on the device too. Not for a
+    // sparse first pass (its statistic is the sparse kernel's, below).
     bool devStatsOn = false;
-    std::vector<char> devStatsEnabled((std::size_t)std::max(nBin, 1), 0);
-    int nDevOwn = 0;
-    if (g_gpuDeviceStats && anyBin) {
+    std::vector<char> devStatsEnabled((std::size_t)P, 0);
+    int nDevOwn = 0, nDevBin = 0, nDevQnt = 0;
+    if (g_gpuDeviceStats) {
         std::string why;
-        std::vector<int> devTraits;
-        for (int t : binTraits)
-            if (!(spDev && spFirst[t])) { devStatsEnabled[(std::size_t)ctx.meta[t].binIdx] = 1; devTraits.push_back(t); }
+        int nEn = 0;
+        for (int t = 0; t < P; t++)
+            if (!(spDev && spFirst[t])) { devStatsEnabled[(std::size_t)t] = 1; nEn++; }
+        // Set up even when every trait takes the sparse first pass (nEn ==
+        // 0): the missing-cell sums of the own-list traits, which the sparse
+        // kernel reads too, are formed with it.
         if (!saige::gpu2::isFp64(R)) why = "the scan results are not fp64";
         else if (differ && g_precScan != saige::gpu2::Prec::FP64) why = "own sample lists need the fp64 scan";
-        else if (devTraits.empty()) why = "every binary trait takes the sparse first pass";
         if (why.empty()) {
-            std::vector<saige::gpu2::StatsTrait> st((std::size_t)nBin);
+            std::vector<saige::gpu2::StatsTrait> st((std::size_t)P);
             std::vector<double> consts;
-            for (int t : binTraits) {
+            for (int t = 0; t < P; t++) {
                 const SAIGE::TraitMeta& M = ctx.meta[t];
-                saige::gpu2::StatsTrait& T = st[(std::size_t)M.binIdx];
-                T.p = M.p; T.rowZ = M.colOff; T.rowW = oW + M.binOff; T.rowGR = oR + t; T.colG2 = M.binIdx;
-                T.rowGM = needGM ? oGM + M.binIdx : -1;
-                T.enabled = devStatsEnabled[(std::size_t)M.binIdx] ? 1 : 0;
-                T.isFirth = M.is_Firth_beta ? 1 : 0;
+                const bool isBin = (M.kind == SAIGE::TraitKind::Binary);
+                saige::gpu2::StatsTrait& T = st[(std::size_t)t];
+                T.trait = t; T.isBin = isBin ? 1 : 0;
+                T.p = M.p; T.rowZ = M.colOff;
+                T.rowW = isBin ? oW + M.binOff : oXq + (M.colOff - qOff);
+                T.rowGR = oR + t;
+                T.rowGM = (isBin && needGM) ? oGM + M.binIdx : -1;
+                T.colG2 = isBin ? M.binIdx : -1;
+                T.enabled = devStatsEnabled[(std::size_t)t] ? 1 : 0;
+                T.isFirth = (isBin && M.is_Firth_beta) ? 1 : 0;
                 T.isFast = M.isFastTest ? 1 : 0;
                 T.noadj = M.isnoadjCov ? 1 : 0;
                 T.tau0 = M.tau0; T.spaCut = M.SPA_Cutoff; T.firthCut = M.pCutoffforFirth; T.fastCut = M.pval_cutoff_for_fastTest;
@@ -3333,56 +3400,102 @@ bool mainMarkerMTGpu(
                     for (int i = 0; i < M.p; i++) consts.push_back(ctx.sumA[t](i));
                     T.sumWOff = (int)consts.size();
                     for (int i = 0; i < M.p; i++) consts.push_back(ctx.sumW[t](i));
-                    if (T.enabled) nDevOwn++;
+                    nDevOwn++;
                 }
+                if (T.enabled) { if (isBin) nDevBin++; else nDevQnt++; }
             }
             saige::gpu2::StatsArgs sa;
-            sa.nTraits = nBin; sa.traits = st.data();
+            sa.nTraits = P; sa.traits = st.data();
             sa.consts = consts.data(); sa.nConsts = (int)consts.size();
             sa.ownSets = (differ && nDevOwn > 0) ? 1 : 0;
             if (!saige::gpu2::statsSetup(R, sa)) why = "device setup failed (" + saige::gpu2::statsLastError() + ")";
         }
         if (!why.empty()) {
             saige::gpu2::statsDisable(R);
+            nDevOwn = 0;
             std::cout << "  gpuDeviceStats: off (" << why << "); the host tail computes every pair" << std::endl;
+        } else if (nEn == 0) {
+            std::cout << "  gpuDeviceStats: every trait takes the sparse first pass (the sparse kernel scores them)";
+            if (nDevOwn > 0) std::cout << "; the missing-cell sums of " << nDevOwn << " own-list traits are formed on the device";
+            std::cout << std::endl;
         } else {
             devStatsOn = true;
-            std::cout << "  gpuDeviceStats: on -- S / var2 / p / gates of " << devTraits.size() << " of " << nBin
-                      << " binary traits formed on the device after the scan";
+            std::cout << "  gpuDeviceStats: on -- S / var2 / p / gates of " << nDevBin << " binary and " << nDevQnt
+                      << " quantitative traits formed on the device after the scan";
             if (differ)
-                std::cout << "; " << nDevOwn << " of them on their own sample list (affine map and missing-cell sums on the device)";
+                std::cout << "; " << nDevOwn << " own-list traits' affine maps and missing-cell sums on the device";
             std::cout << std::endl;
         }
-    } else if (g_gpuDeviceStats) {
-        std::cout << "  gpuDeviceStats: no binary trait; nothing to do" << std::endl;
+    } else {
+        std::cout << "  gpuDeviceStats: off; the host tail computes every pair" << std::endl;
     }
-    // The host still needs each column's missing-cell index list (MTBlockAdj::miss)
-    // where a host tail reads it: the adjusted batch tail (gpuDeviceStats off),
-    // the sparse variance (spStats) and the quantitative own-list tail.
-    const bool hostMissLists = differ && (!devStatsOn || spDev || qntOwn);
-    // Traits with the same sample list share one code count per marker:
-    // sampleGrp[t] = the group (first trait with that list), counted once per
-    // marker in phase 1 and copied to the others (same loop, same numbers).
-    // PheWAS-style sets often have a few missing patterns across many traits.
-    std::vector<int> sampleGrp(P, -1);
-    int nSampleGrp = 0;
-    if (differ) {
-        std::vector<int> rep;   // group -> representative trait
-        for (int t = 0; t < P; t++) {
-            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
-            if (TS.sameAsUnion) continue;
-            int g = -1;
-            for (int k = 0; k < (int)rep.size(); k++) {
-                const SAIGE::MTTraitSamples& RS = ctx.samp[(std::size_t)rep[(std::size_t)k]];
-                if (RS.n == TS.n && RS.pos == TS.pos) { g = k; break; }
+    // ---- the sparse statistic on the device (gpuSparse) ----
+    // Needs the own-list missing-cell sums when the traits have their own
+    // lists, i.e. the device statistics above with ownSets.
+    if (spDev) {
+        std::string why;
+        if (differ && nDevOwn == 0) why = "own sample lists need the device statistics' missing-cell sums (gpuDeviceStats)";
+        if (why.empty()) {
+            std::vector<saige::gpu2::StatsSparse> ss((std::size_t)nSp);
+            std::vector<double> consts;
+            for (int s = 0; s < nSp; s++) {
+                const int t = spPlan.spTrait[(std::size_t)s];
+                const SAIGE::TraitMeta& M = ctx.meta[t];
+                saige::gpu2::StatsSparse& T = ss[(std::size_t)s];
+                T.trait = t; T.p = M.p;
+                T.rowZ = oXV + spPlan.spOff[(std::size_t)s];
+                T.rowGW = oBY + spPlan.spOff[(std::size_t)s];
+                T.rowGR = oR + t;
+                T.rowGB = differ ? oGB + s : -1;
+                T.colQ = K2 + s;
+                T.isBin = (M.kind == SAIGE::TraitKind::Binary) ? 1 : 0;
+                T.isFirth = (T.isBin && M.is_Firth_beta) ? 1 : 0;
+                T.tau0 = M.tau0; T.spaCut = M.SPA_Cutoff; T.firthCut = M.pCutoffforFirth;
+                T.trB = spPlan.trB[(std::size_t)t]; T.sumR = ctx.sumR[t];
+                T.ybyOff = (int)consts.size();
+                for (int r = 0; r < M.p; r++)
+                    for (int c = 0; c < M.p; c++) consts.push_back(spPlan.YBY[(std::size_t)t](r, c));
+                T.yresOff = (int)consts.size();
+                for (int r = 0; r < M.p; r++) consts.push_back(spPlan.Yres[(std::size_t)t](r));
+                if (differ && ownS[t]) {
+                    T.own = 1;
+                    T.sumXVOff = (int)consts.size();
+                    for (int r = 0; r < M.p; r++) consts.push_back(spPlan.sumXV[(std::size_t)t](r));
+                    T.sumBYOff = (int)consts.size();
+                    for (int r = 0; r < M.p; r++) consts.push_back(spPlan.sumBY[(std::size_t)t](r));
+                }
             }
-            if (g < 0) { g = (int)rep.size(); rep.push_back(t); }
-            sampleGrp[t] = g;
+            saige::gpu2::StatsSparseArgs a;
+            a.nSparse = nSp; a.traits = ss.data(); a.consts = consts.data(); a.nConsts = (int)consts.size();
+            if (!saige::gpu2::statsSparseSetup(R, a)) why = "device setup failed (" + saige::gpu2::statsLastError() + ")";
         }
-        nSampleGrp = (int)rep.size();
-        std::cout << "  gpuOwnSampleSets: " << nSampleGrp << " distinct sample list(s) besides the union among " << P
-                  << " traits; each is counted once per marker" << std::endl;
+        if (!why.empty()) {
+            bool needFirst = false;
+            for (int t = 0; t < P; t++) if (spFirst[t]) needFirst = true;
+            if (needFirst) {
+                saige::gpu2::spqDestroy(SQ);
+                saige::gpu2::destroy(R);
+                std::cout << "  useGPU: refused, running on the CPU (gpuSparse: " << why << ")" << std::endl;
+                return false;
+            }
+            std::cout << "  gpuSparse: not active (" << why << "); the sparse variance stays on the CPU" << std::endl;
+            saige::gpu2::spqDestroy(SQ);
+            SQ = nullptr;
+            spDev = false;
+        } else {
+            int nf = 0;
+            for (int t = 0; t < P; t++) nf += spFirst[t] ? 1 : 0;
+            std::cout << "  gpuSparse: the sparse statistic (S / var2 / p / gates on g~' Sigma^-1 g~) of " << nSp
+                      << " traits is formed on the device after the cross terms; " << nf
+                      << " trait(s) take it as their first pass, the others for the fast-test recompute" << std::endl;
+        }
     }
+    // Host batch tails (gpuDeviceStats off): the block's per-pair inputs
+    // (VR / AF / the affine map / the missing-cell index lists) are rebuilt
+    // from the device's prep records in phase 3.
+    const bool hostTail = !devStatsOn;
+    std::vector<int> spIdx(P, -1);
+    if (spDev) spIdx = spPlan.spIdx;
     // sgsRawDouble: the p-value columns leave as doubles (MTTraitChunk::pvalD)
     const bool rawP = g_sgsRawDouble && g_outputFormatSgs;
     static const std::string kNAstr("NA");
@@ -3447,97 +3560,29 @@ bool mainMarkerMTGpu(
     long nSlotsUsed = 0, nSlotsTotal = 0;
 
     // ---- gpuSparse helpers ----
-    // scoreTest's S and var2 for one (slot, binary trait) of the current
-    // superblock, from the device's columns, with z = XV g:
-    //   S    = (g'res - z'(XXVX_inv' res)) / tau0
-    //   var2 = z'(Y'BY)z + g'Bg - 2 z'(BY)'g        (Y = XXVX_inv, B = Sigma^-1)
-    // var2 in the order the batch tail forms its dense var2.
-    // Different sample lists (gpuOwnSampleSets): a trait with its own list is
-    // scored on g_t = a g + b 1_t + d m (MTBlockAdj of the slot's block), the
-    // map scoreTestBatchMTBinPreAdj applies to the dense columns:
-    //   z    = a XV g + b XV 1_t + d XV m
-    //   (BY)'g_t, g_t'res  likewise
-    //   sum_i B_ii g_t,i^2 = G2B + 2ab G'diag(B) + b^2 tr B + q sum_m B_ii
-    // and the cross terms come from the kernel on g_t itself (spqRunOwn).
+    // The sparse statistic of one (slot, trait) of the current superblock is
+    // the device's (gpu_step2.hpp statsSp*): S and var2 as scoreTest forms
+    // them, and the sparse-table variance ratio of the pair's MAC. The
+    // fast-test recompute of getMarkerPval on the sparse variance is
+    // format_score_result on those, then the SPA gate, as getMarkerPval.
     std::vector<GpuBlk>* spBlks = nullptr;   // the superblock in phase 3 / 4
     int spSet = 0;                            // its device / result set
-    auto spStats = [&](std::size_t slot, int t, double& S, double& var2) {
-        const SAIGE::TraitMeta& M = ctx.meta[t];
-        const double* Cd1 = saige::gpu2::outCd(R, spSet);
-        const double* Cd2 = saige::gpu2::outC2d(R, spSet);
-        const std::size_t ldc = saige::gpu2::ldC(R);
-        const int p = M.p, b = M.binIdx;
-        double z[64], gw[64];
-        for (int r = 0; r < p; r++) {
-            z[r]  = Cd1[(std::size_t)(oXV + M.binOff + r) * ldc + slot];
-            gw[r] = Cd1[(std::size_t)(oBY + M.binOff + r) * ldc + slot];
-        }
-        double Rg = Cd1[(std::size_t)(oR + t) * ldc + slot];
-        double Qd = Cd2[(std::size_t)(K2 + b) * ldc + slot];
-        if (differ && ownS[t]) {
-            const GpuBlk& Sb = (*spBlks)[slot / (std::size_t)Bblk];
-            const int c = (int)(slot % (std::size_t)Bblk);
-            const double a = Sb.adj.a(c, t), bb = Sb.adj.b(c, t);
-            const double d = Sb.adj.d(c, t), q = Sb.adj.q(c, t);
-            const bool flip = (a < 0.0), shift = (bb != 0.0);
-            const bool miss = (Sb.adj.nMiss(c, t) > 0);
-            const arma::vec& sX = spPlan.sumXV[t];
-            const arma::vec& sB = spPlan.sumBY[t];
-            double mX[64], mB[64], mR = 0.0, mD = 0.0;
-            if (miss) {
-                const std::vector<arma::uword>& mv = Sb.adj.miss[c];
-                const arma::uword w0 = (arma::uword)M.binOff;
-                for (int r = 0; r < p; r++) {
-                    const double* xv = spPlan.XVt.colptr(w0 + r);
-                    const double* by = spPlan.BY.colptr(w0 + r);
-                    double sx = 0.0, sb = 0.0;
-                    for (arma::uword u : mv) { sx += xv[u]; sb += by[u]; }
-                    mX[r] = sx; mB[r] = sb;
-                }
-                const double* rc = ctx.RES.colptr((arma::uword)t);
-                const double* bd = spPlan.Bdiag.colptr((arma::uword)b);
-                for (arma::uword u : mv) { mR += rc[u]; mD += bd[u]; }
-            }
-            for (int r = 0; r < p; r++) {
-                if (flip)  { z[r] = -z[r]; gw[r] = -gw[r]; }
-                if (shift) { z[r] += bb * sX[r]; gw[r] += bb * sB[r]; }
-                if (miss)  { z[r] += d * mX[r]; gw[r] += d * mB[r]; }
-            }
-            if (flip)  Rg = -Rg;
-            if (shift) Rg += bb * ctx.sumR[t];
-            if (miss)  Rg += d * mR;
-            if (shift) Qd += 2.0 * a * bb * Cd1[(std::size_t)(oGB + b) * ldc + slot] + bb * bb * spPlan.trB[t];
-            if (miss)  Qd += q * mD;
-        }
-        const arma::mat& X = spPlan.YBY[t];
-        const arma::vec& yr = spPlan.Yres[t];
-        double zxz = 0.0, gwz = 0.0, zyr = 0.0;
-        for (int r = 0; r < p; r++) {
-            double a = 0.0;
-            for (int q2 = 0; q2 < p; q2++) a += X(r, q2) * z[q2];
-            zxz += z[r] * a;
-            gwz += gw[r] * z[r];
-            zyr += z[r] * yr[r];
-        }
-        const double Q = Qd + saige::gpu2::spqOut(SQ, spSet)[slot * (std::size_t)nBin + b];
-        var2 = zxz + Q - 2.0 * gwz;
-        S = (Rg - zyr) / M.tau0;
+    auto spOff = [&](std::size_t slot, int t) -> std::size_t {
+        return slot * (std::size_t)nSp + (std::size_t)spIdx[t];
     };
     auto var2sp = [&](std::size_t slot, int t) -> double {
-        double S, v2; spStats(slot, t, S, v2); return v2;
+        return saige::gpu2::statsSpVar2(R, spSet)[spOff(slot, t)];
     };
-    // The fast-test recompute of getMarkerPval on the sparse variance: S and
-    // var2 as scoreTest forms them, var1 = var2 * the recompute's variance
-    // ratio, then format_score_result and the SPA gate, as getMarkerPval.
     struct SpRc { double Beta, seBeta, Tstat, var1, var2, pno; std::string str; bool islog, spa; };
     auto spRecompute = [&](std::size_t slot, int t, double vr) -> SpRc {
         SpRc r;
-        double S, v2;
-        spStats(slot, t, S, v2);
+        const std::size_t o = spOff(slot, t);
+        const double S  = saige::gpu2::statsSpS(R, spSet)[o];
+        const double v2 = saige::gpu2::statsSpVar2(R, spSet)[o];
         SAIGE::format_score_result(S, v2 * vr, v2, r.Beta, r.seBeta, r.str, r.pno, r.islog,
                                    r.Tstat, r.var1, r.var2);
         const double sd = std::abs(r.Tstat) / std::sqrt(r.var1);
-        r.spa = !std::isnan(sd) && sd > ctx.meta[t].SPA_Cutoff;
+        r.spa = ctx.meta[t].kind == SAIGE::TraitKind::Binary && !std::isnan(sd) && sd > ctx.meta[t].SPA_Cutoff;
         return r;
     };
     bool spAnyFirst = false;
@@ -3546,6 +3591,9 @@ bool mainMarkerMTGpu(
         if (spDev && spFirst[t]) spAnyFirst = true;
         else binTraitsDense.push_back(t);
     }
+    std::vector<int> qntTraitsDense;
+    for (int t : ctx.batchQuantTraits)
+        if (!(spDev && spFirst[t])) qntTraitsDense.push_back(t);
     std::vector<long> nDevFast(P, 0), nSpPreset(P, 0);
     std::vector<std::vector<PendSpa>> pend2(std::max(1, omp_get_max_threads()));
 
@@ -3608,19 +3656,20 @@ bool mainMarkerMTGpu(
     const int K = (int)sched.size();
 
     // ---------------- staging ring ----------------
-    // Set s holds superblock k's pinned packed rows + tables (the reducer's)
-    // and its per-block state; chunk ci's marker columns live in meta[ci %
-    // nSets]. nSets = 1 without gpuPrefetch: exactly the single buffers the
-    // serial loop used. With it, the reader may be at most nSets - 1
-    // superblocks ahead, so a chunk's columns are reset only after the chunk
-    // nSets chunks back has been written (every chunk is >= 1 superblock, and
-    // a set is released only after the write that follows its superblock).
+    // Set s holds superblock k's pinned packed rows + valid flags (the
+    // reducer's) and its per-block state; chunk ci's marker columns live in
+    // meta[ci % nSets]. nSets = 1 without gpuPrefetch: exactly the single
+    // buffers the serial loop used. With it, the reader may be at most nSets
+    // - 1 superblocks ahead, so a chunk's columns are reset only after the
+    // chunk nSets chunks back has been written (every chunk is >= 1
+    // superblock, and a set is released only after the write that follows
+    // its superblock).
     std::vector<unsigned char*> hPkSet(nSets, nullptr);
-    std::vector<double*>        hLuSet(nSets, nullptr);
+    std::vector<unsigned char*> hVaSet(nSets, nullptr);
     for (int s = 0; s < nSets; s++) {
         hPkSet[s] = saige::gpu2::packed(R, s);
-        hLuSet[s] = saige::gpu2::lut(R, s);
-        if (hPkSet[s] == nullptr || hLuSet[s] == nullptr) {
+        hVaSet[s] = saige::gpu2::valid(R, s);
+        if (hPkSet[s] == nullptr || hVaSet[s] == nullptr) {
             saige::gpu2::destroy(R);
             throw std::runtime_error("mainMarkerMTGpu: the reducer has fewer staging sets than requested");
         }
@@ -3628,52 +3677,44 @@ bool mainMarkerMTGpu(
     std::vector<std::vector<GpuBlk>> blks(nSets, std::vector<GpuBlk>(nSub));
     struct ChunkMeta {
         std::vector<std::string> markerVec, chrVec, posVec, refVec, altVec;
-        std::vector<double> altFreqVec, altCountsVec, imputationInfoVec, missingRateVec;
         void reset(int qc) {
             markerVec.assign(qc, std::string()); chrVec.assign(qc, std::string());
             posVec.assign(qc, std::string()); refVec.assign(qc, std::string());
             altVec.assign(qc, std::string());
-            altFreqVec.assign(qc, 0.0); altCountsVec.assign(qc, 0.0);
-            imputationInfoVec.assign(qc, 0.0); missingRateVec.assign(qc, 0.0);
         }
     };
     std::vector<ChunkMeta> meta(nSets);
 
     std::atomic<int> firstEndIdx{q};
-    const int imputeCase = string_to_case.at(g_impute_method);
     static const uint8_t kMissU = 0x1;   // PLINK 2-bit code 01 = missing genotype
+    // The marker's MAC / AF / missing rate per (slot, trait) from the
+    // device's prep records: the trait's own (differ) or the column's, as
+    // finalizeFusedStats forms them (MAC = min(AC, 2n - AC), MR = nMiss / n).
+    auto pairMAC = [](double AC, int nObj) -> double { return std::min(AC, 2.0 * (double)nObj - AC); };
 
-    // ---------------- phase 1: read + QC + stage one superblock ----------------
+    // ---------------- phase 1: read + stage one superblock ----------------
     // Into staging set s, on nThr OpenMP threads of the calling thread's team.
-    // The body is the serial loop's phase 1 unchanged; only where it writes
-    // (set s, the chunk's own marker columns) is parameterised.
+    // The reader only reads: each marker's packed row goes verbatim into its
+    // slot (slot = the marker's position in the block) with the valid flag
+    // set, and its names into the chunk's columns. Code counts, QC, the
+    // allele flip, imputation, the dosage tables, the variance ratios and
+    // the per-trait statistics are all derived on the device (gpuPrep).
     auto readSuperblock = [&](const SbDesc& d, int s, int nThr) {
         const int chunkStart = d.chunkStart, qc = d.qc, sb = d.sb, nb = d.nb;
         ChunkMeta& CM = meta[d.ci % nSets];
         if (d.first) CM.reset(qc);
         std::vector<GpuBlk>& B = blks[s];
         unsigned char* hPkS = hPkSet[s];
-        double*        hLuS = hLuSet[s];
-        double* const  hVrS = devStatsOn ? saige::gpu2::statsVr(R, s) : nullptr;   // gpuDeviceStats: VR per (slot, binary trait)
-        double* const  hAfS = devStatsOn ? saige::gpu2::statsAf(R, s) : nullptr;   // gpuDeviceStats: AF per (slot, binary trait)
-        double* const  hAdjS = devStatsOn ? saige::gpu2::statsAdj(R, s) : nullptr; // gpuDeviceStats + own lists: a / d / q per pair
+        unsigned char* hVaS = hVaSet[s];
             #pragma omp parallel for schedule(dynamic, 1) num_threads(nThr)
             for (int bi = 0; bi < nb; bi++) {
                 const int blk = sb + bi;
                 GpuBlk& S = B[bi];
-                S.ensure(Bblk, P);
-                if (differ) S.ensureDiffer(Bblk, P);
+                S.ensure(Bblk);
                 const int jj0 = blk * Bblk;
                 const int jj1 = std::min(jj0 + Bblk, qc);
                 const std::size_t slotBase = (std::size_t)bi * Bblk;
-                // differ: the marker's union codes and the per-trait scratch
-                std::vector<uint8_t> codesU(differ ? (std::size_t)n : 0);
-                std::vector<char> tq(P, 0), tflip(P, 0);
-                std::vector<double> tMAC(P), tAF(P), tAC(P), tMR(P), tII(P), tfd((std::size_t)P * 4);
-                std::vector<uint64_t> tcnt((std::size_t)P * 4);
-                std::vector<uint64_t> grpCnt((std::size_t)std::max(nSampleGrp, 1) * 4, 0);
-                std::vector<char>     grpDone((std::size_t)std::max(nSampleGrp, 1), 0);
-
+                std::memset(hVaS + slotBase, 0, (std::size_t)Bblk);
                 for (int jj = jj0; jj < jj1; jj++) {
                     const int i = chunkStart + jj;
                     if (i >= firstEndIdx.load(std::memory_order_relaxed)) continue;
@@ -3682,206 +3723,9 @@ bool mainMarkerMTGpu(
                         std::cout << "Completed " << (i + 1) << "/" << q
                                   << " markers in the chunk." << std::endl;
                     }
-
-                    if (differ) {
-                        // ---- own sample lists: mainMarkerMT's union read and
-                        // per-trait stats, statement for statement ----
-                        const uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
-                        PLINK::PlinkClass::FusedMarkerStats fsU;
-                        if (!PR->getOneMarkerFusedStats_ts(gIndex, fsU)) {
-                            #pragma omp critical(endflag)
-                            {
-                                if (i < firstEndIdx.load(std::memory_order_relaxed))
-                                    firstEndIdx.store(i, std::memory_order_relaxed);
-                                g_markerTestEnd = true;
-                            }
-                            continue;
-                        }
-                        CM.chrVec[jj]    = fsU.chr;
-                        CM.posVec[jj]    = std::to_string(fsU.pd);
-                        CM.refVec[jj]    = fsU.ref;
-                        CM.altVec[jj]    = fsU.alt;
-                        CM.markerVec[jj] = fsU.marker;
-                        const uint8_t* codes = codesU.data();
-                        PR->copyFusedCodes_ts(fsU, codesU.data());
-
-                        // the union column's own table
-                        PLINK::PlinkClass::FusedMarkerStats fu;
-                        for (int c4 = 0; c4 < 4; c4++) { fu.counts[c4] = fsU.counts[c4]; fu.dmap[c4] = fsU.dmap[c4]; }
-                        fu.N = (uint32_t)n;
-                        fu.gIndex = gIndex;
-                        PR->fusedPreStatsFromCounts(fu, (uint32_t)n);
-                        {
-                            const double MAFu = std::min(fu.altFreq, 1 - fu.altFreq);
-                            const double MACu = MAFu * n * (1 - fu.missingRate) * 2;
-                            PLINK::finalizeFusedStats(fu, imputeCase, g_dosage_zerod_cutoff,
-                                                      g_dosage_zerod_MAC_cutoff, MACu);
-                        }
-                        bool anyQC = false;
-                        std::fill(grpDone.begin(), grpDone.end(), 0);
-                        for (int t = 0; t < P; t++) {
-                            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
-                            const int nObj = g_saigeObjs[t]->m_n;
-                            tq[t] = 0;
-                            PLINK::PlinkClass::FusedMarkerStats ft;
-                            for (int c4 = 0; c4 < 4; c4++) ft.dmap[c4] = fsU.dmap[c4];
-                            if (TS.sameAsUnion) {
-                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = fsU.counts[c4];
-                            } else {
-                                // counted once per distinct sample list (sampleGrp)
-                                uint64_t* gc = &grpCnt[(std::size_t)sampleGrp[t] * 4];
-                                if (!grpDone[(std::size_t)sampleGrp[t]]) {
-                                    if (TS.comp.size() <= TS.pos.size()) {
-                                        uint64_t cnt[4] = {fsU.counts[0], fsU.counts[1], fsU.counts[2], fsU.counts[3]};
-                                        for (arma::uword u : TS.comp) cnt[codes[u]]--;
-                                        for (int c4 = 0; c4 < 4; c4++) gc[c4] = cnt[c4];
-                                    } else {
-                                        uint64_t cnt[4] = {0, 0, 0, 0};
-                                        for (arma::uword u : TS.pos) cnt[codes[u]]++;
-                                        for (int c4 = 0; c4 < 4; c4++) gc[c4] = cnt[c4];
-                                    }
-                                    grpDone[(std::size_t)sampleGrp[t]] = 1;
-                                }
-                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = gc[c4];
-                            }
-                            ft.N = (uint32_t)TS.n;
-                            ft.gIndex = gIndex;
-                            PR->fusedPreStatsFromCounts(ft, (uint32_t)TS.n);
-                            double altFreq = ft.altFreq;
-                            const double missingRate = ft.missingRate;
-                            const double imputeInfo = ft.imputeInfo;
-                            tMR[t] = missingRate;
-                            tII[t] = imputeInfo;
-                            double MAF = std::min(altFreq, 1 - altFreq);
-                            double MAC = MAF * nObj * (1 - missingRate) * 2;
-                            if ((missingRate > g_missingRate_cutoff) ||
-                                (MAF < g_marker_minMAF_cutoff) ||
-                                (MAC < g_marker_minMAC_cutoff) ||
-                                (imputeInfo < g_marker_minINFO_cutoff)) {
-                                continue;
-                            }
-                            PLINK::finalizeFusedStats(ft, imputeCase, g_dosage_zerod_cutoff,
-                                                      g_dosage_zerod_MAC_cutoff, MAC);
-                            const bool flip = ft.flip;
-                            altFreq = ft.altFreq_post;
-                            const double altCounts = ft.altCounts_post;
-                            MAC = std::min(altCounts, 2.0 * nObj - altCounts);
-                            MAF = std::min(altFreq, 1 - altFreq);
-                            if ((MAF < g_marker_minMAF_cutoff) || (MAC < g_marker_minMAC_cutoff)) continue;
-                            tq[t] = 1;
-                            anyQC = true;
-                            tflip[t] = flip ? 1 : 0;
-                            tMAC[t] = MAC;
-                            tAF[t] = altFreq;
-                            tAC[t] = altCounts;
-                            for (int c4 = 0; c4 < 4; c4++) {
-                                tfd[(std::size_t)t * 4 + c4] = ft.fd[c4];
-                                tcnt[(std::size_t)t * 4 + c4] = ft.counts[c4];
-                            }
-                        }
-                        if (!anyQC) continue;
-                        // high-MAC column iff some binary trait scores it with
-                        // the normal approximation (every trait is batchable here)
-                        bool hi = false;
-                        for (int t = 0; t < P; t++)
-                            if (tq[t] && ctx.meta[t].kind == SAIGE::TraitKind::Binary &&
-                                tMAC[t] > g_MACCutoffforER) { hi = true; break; }
-                        const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
-                        PR->copyFusedPacked_ts(fsU, hPkS + (slotBase + c) * bpv);
-                        double ss = 0.0;
-                        for (int k = 0; k < 4; k++) {
-                            S.fdc[(std::size_t)c * 4 + k]  = fu.fd[k];
-                            S.cntc[(std::size_t)c * 4 + k] = fsU.counts[k];
-                            hLuS[(slotBase + c) * 4 + k]    = fu.fd[k];
-                            ss += fu.fd[k] * fu.fd[k] * (double)fsU.counts[k];
-                        }
-                        S.ssc[c]   = ss;
-                        S.colOf[jj - jj0] = c;
-                        S.isHi[c]  = hi ? 1 : 0;
-                        S.MACc[c]  = 0.0;     // per trait below
-                        S.AFc[c]   = 0.0;
-                        S.flipc[c] = fu.flip ? 1 : 0;
-                        {
-                            double gs = 0.0;
-                            for (int k = 0; k < 4; k++) gs += fu.fd[k] * (double)fsU.counts[k];
-                            S.gsc[c] = gs;
-                        }
-                        std::vector<arma::uword>& mv = S.adj.miss[c];
-                        mv.clear();
-                        if (hostMissLists && fu.counts[kMissU] > 0)
-                            for (int u = 0; u < n; u++) if (codes[u] == kMissU) mv.push_back((arma::uword)u);
-                        for (int t = 0; t < P; t++) {
-                            const std::size_t k = (std::size_t)c * (std::size_t)P + (std::size_t)t;
-                            S.qcP[k] = tq[t];
-                            S.adj.a(c, t) = 1.0; S.adj.b(c, t) = 0.0;
-                            S.adj.d(c, t) = 0.0; S.adj.q(c, t) = 0.0;
-                            S.adj.nMiss(c, t) = 0;
-                            S.affP[k] = 0;
-                            S.VR(c, t) = 1.0;
-                            S.AF(c, t) = 0.0;
-                            // gpuDeviceStats: the pair's inputs go up with the
-                            // slot; a pair that failed QC keeps the identity map
-                            // (its row is never read)
-                            const bool devBin = hVrS && ctx.meta[t].kind == SAIGE::TraitKind::Binary;
-                            const std::size_t oD = devBin ? (slotBase + c) * (std::size_t)nBin + (std::size_t)ctx.meta[t].binIdx : 0;
-                            if (devBin) {
-                                hVrS[oD] = 1.0; hAfS[oD] = 0.0;
-                                if (hAdjS) { hAdjS[3 * oD] = 1.0; hAdjS[3 * oD + 1] = 0.0; hAdjS[3 * oD + 2] = 0.0; }
-                            }
-                            if (!tq[t]) continue;
-                            const double MAC = tMAC[t];
-                            S.flipP[k] = tflip[t];
-                            S.MACp(c, t) = MAC;
-                            S.AFp(c, t)  = tAF[t];
-                            S.AF(c, t)   = tAF[t];
-                            S.ACp(c, t)  = tAC[t];
-                            S.MRp(c, t)  = tMR[t];
-                            S.IIp(c, t)  = tII[t];
-                            const double* fdt = &tfd[(std::size_t)t * 4];
-                            for (int c4 = 0; c4 < 4; c4++) {
-                                S.fdP[k * 4 + c4] = fdt[c4];
-                                S.cntP[k * 4 + c4] = tcnt[(std::size_t)t * 4 + c4];
-                            }
-                            const bool sameFlip = ((tflip[t] != 0) == fu.flip);
-                            const double a = sameFlip ? 1.0 : -1.0;
-                            const double b = sameFlip ? 0.0 : 2.0;
-                            bool aff = true;
-                            for (int c4 = 0; c4 < 4; c4++) {
-                                if ((uint8_t)c4 == kMissU) continue;
-                                if (fdt[c4] != a * fu.fd[c4] + b) aff = false;
-                            }
-                            const double gm = a * fu.fd[kMissU] + b;
-                            S.adj.a(c, t) = a;
-                            S.adj.b(c, t) = b;
-                            S.adj.d(c, t) = fdt[kMissU] - gm;
-                            S.adj.q(c, t) = fdt[kMissU] * fdt[kMissU] - gm * gm;
-                            S.adj.nMiss(c, t) = (arma::uword)tcnt[(std::size_t)t * 4 + kMissU];
-                            S.affP[k] = aff ? 1 : 0;
-                            SAIGE::SAIGEClass* obj = g_saigeObjs[t];
-                            const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
-                            const bool noadjCur  = obj->m_isnoadjCov;
-                            bool dummyHas;
-                            S.VR(c, t) = isSingleVR[t]
-                                ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
-                                : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
-                            if (devBin) {
-                                hVrS[oD] = S.VR(c, t);
-                                hAfS[oD] = tAF[t];
-                                if (hAdjS && ownS[t]) {
-                                    hAdjS[3 * oD]     = a;
-                                    hAdjS[3 * oD + 1] = S.adj.d(c, t);
-                                    hAdjS[3 * oD + 2] = S.adj.q(c, t);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    char* end;
-                    const uint64_t gIndex =
-                        std::strtoull(t_genoIndex.at(i).c_str(), &end, 10);
+                    const uint64_t gIndex = std::strtoull(t_genoIndex.at(i).c_str(), nullptr, 10);
                     PLINK::PlinkClass::FusedMarkerStats fs;
-                    if (!PR->getOneMarkerFusedStats_ts(gIndex, fs)) {
+                    if (!PR->getOneMarkerRow_ts(gIndex, fs)) {
                         #pragma omp critical(endflag)
                         {
                             if (i < firstEndIdx.load(std::memory_order_relaxed))
@@ -3890,92 +3734,15 @@ bool mainMarkerMTGpu(
                         }
                         continue;
                     }
-
                     CM.chrVec[jj]    = fs.chr;
                     CM.posVec[jj]    = std::to_string(fs.pd);
                     CM.refVec[jj]    = fs.ref;
                     CM.altVec[jj]    = fs.alt;
                     CM.markerVec[jj] = fs.marker;
-                    double altFreq   = fs.altFreq;
-                    double altCounts = fs.altCounts;
-                    CM.altFreqVec[jj]        = altFreq;
-                    CM.missingRateVec[jj]    = fs.missingRate;
-                    CM.imputationInfoVec[jj] = fs.imputeInfo;
-
-                    // Pre-impute QC -- the same four tests, the same order.
-                    double MAF = std::min(altFreq, 1 - altFreq);
-                    double MAC = MAF * n * (1 - fs.missingRate) * 2;
-                    if ((fs.missingRate > g_missingRate_cutoff) ||
-                        (MAF < g_marker_minMAF_cutoff) ||
-                        (MAC < g_marker_minMAC_cutoff) ||
-                        (fs.imputeInfo < g_marker_minINFO_cutoff)) {
-                        continue;
-                    }
-
-                    PLINK::finalizeFusedStats(fs, imputeCase, g_dosage_zerod_cutoff,
-                                              g_dosage_zerod_MAC_cutoff, MAC);
-                    const bool flip = fs.flip;
-                    altFreq   = fs.altFreq_post;
-                    altCounts = fs.altCounts_post;
-
-                    MAC = std::min(altCounts, 2.0 * n - altCounts);
-                    MAF = std::min(altFreq, 1 - altFreq);
-                    if ((MAF < g_marker_minMAF_cutoff) ||
-                        (MAC < g_marker_minMAC_cutoff)) {
-                        continue;
-                    }
-                    CM.altFreqVec[jj]   = altFreq;
-                    CM.altCountsVec[jj] = altCounts;
-
-                    // ---- stage the marker for the device ----
-                    // High MAC from the block's base up, low MAC (ER for a
-                    // binary trait) from its top down, as mainMarkerMT packs
-                    // its block, so each tail call gets a contiguous range.
-                    const bool hi = (MAC > g_MACCutoffforER);
-                    const int c = hi ? (S.nHi++) : (Bblk - 1 - (S.nLo++));
+                    const int c = jj - jj0;
                     PR->copyFusedPacked_ts(fs, hPkS + (slotBase + c) * bpv);
-                    double ss = 0.0;
-                    for (int k = 0; k < 4; k++) {
-                        S.fdc[(std::size_t)c * 4 + k]  = fs.fd[k];
-                        S.cntc[(std::size_t)c * 4 + k] = fs.counts[k];
-                        hLuS[(slotBase + c) * 4 + k]    = fs.fd[k];
-                        ss += fs.fd[k] * fs.fd[k] * (double)fs.counts[k];
-                    }
-                    S.ssc[c]   = ss;
-                    S.colOf[jj - jj0] = c;
-                    S.isHi[c]  = hi ? 1 : 0;
-                    S.MACc[c]  = MAC;
-                    S.AFc[c]   = altFreq;
-                    S.flipc[c] = flip ? 1 : 0;
-                    {
-                        double gs = 0.0;
-                        for (int k = 0; k < 4; k++) gs += fs.fd[k] * (double)fs.counts[k];
-                        S.gsc[c] = gs;
-                    }
-
-                    for (int t = 0; t < P; t++) {
-                        SAIGE::SAIGEClass* obj = g_saigeObjs[t];
-                        const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
-                        const bool noadjCur  = obj->m_isnoadjCov;
-                        bool dummyHas;
-                        S.VR(c, t) = isSingleVR[t]
-                            ? obj->computeSingleVarianceRatio(sparseCur, noadjCur)
-                            : obj->computeVarianceRatio(MAC, sparseCur, noadjCur, dummyHas);
-                        S.AF(c, t) = altFreq;
-                        // gpuDeviceStats: the pair's variance ratio and ALT frequency go up with the slot
-                        if (hVrS && ctx.meta[t].kind == SAIGE::TraitKind::Binary) {
-                            const std::size_t o = (slotBase + c) * (std::size_t)nBin + (std::size_t)ctx.meta[t].binIdx;
-                            hVrS[o] = S.VR(c, t);
-                            hAfS[o] = altFreq;
-                        }
-                    }
-                }
-                // Slots this block did not fill still reach the device (see the
-                // header comment). Give them an all-zero table so they decode to
-                // zeros and cannot produce a NaN that would poison a GEMM tile.
-                for (int c = S.nHi; c < Bblk - S.nLo; c++) {
-                    std::memset(hPkS + (slotBase + c) * bpv, 0, nbRow);
-                    for (int k = 0; k < 4; k++) hLuS[(slotBase + c) * 4 + k] = 0.0;
+                    hVaS[slotBase + c] = 1;
+                    S.colOf[c] = c;
                 }
             }
     };
@@ -4153,36 +3920,38 @@ bool mainMarkerMTGpu(
     // the scan worker; failPhase2 below turns a failure into the exception.
     auto phase2 = [&](const SbDesc& d, int s, int ds, std::string* t_err) -> int {
             const int nb = d.nb;
-            std::vector<GpuBlk>& blksS = blks[s];
             double t0 = omp_get_wtime();
             const int nSlotsThis = nb * Bblk;
             if (!saige::gpu2::reduce(R, nSlotsThis, s, ds)) return 1;
-            if (spDev && differ) {
-                // each trait's own code -> dosage table per slot (zeros where
-                // the pair failed QC or the slot is unused)
-                std::fill(spTl.begin(), spTl.begin() + (std::size_t)nSlotsThis * nBin * 4, 0.0);
-                for (int bi = 0; bi < nb; bi++) {
-                    const GpuBlk& Sb = blksS[bi];
-                    for (int c = 0; c < Bblk; c++) {
-                        const std::size_t slot = (std::size_t)bi * Bblk + c;
-                        for (int t : binTraits) {
-                            const std::size_t kP = (std::size_t)c * P + t;
-                            if (Sb.qcP.size() <= kP || !Sb.qcP[kP]) continue;
-                            const double* src = ownS[t] ? &Sb.fdP[kP * 4] : &Sb.fdc[(std::size_t)c * 4];
-                            double* dst = &spTl[(slot * nBin + ctx.meta[t].binIdx) * 4];
-                            for (int k = 0; k < 4; k++) dst[k] = src[k];
-                        }
-                    }
+            if (spDev) {
+                // the cross terms (on each trait's own dosages when the lists
+                // differ: tables formed on the device from the prep records),
+                // then the sparse statistic
+                bool ok;
+                if (differ) {
+                    const void* tl = saige::gpu2::sparseTables(R, nSlotsThis, ds);
+                    ok = (tl != nullptr) && saige::gpu2::spqRunOwnDev(SQ, R, nSlotsThis, tl, ds);
+                } else {
+                    ok = saige::gpu2::spqRun(SQ, R, nSlotsThis, ds);
                 }
-            }
-            if (spDev && !(differ ? saige::gpu2::spqRunOwn(SQ, R, nSlotsThis, spTl.data(), ds)
-                                  : saige::gpu2::spqRun(SQ, R, nSlotsThis, ds))) {
-                if (t_err) *t_err = saige::gpu2::spqLastError();
-                return 2;
+                if (!ok) {
+                    if (t_err) *t_err = saige::gpu2::spqLastError();
+                    return 2;
+                }
+                if (!saige::gpu2::statsSparseRun(R, nSlotsThis, ds, saige::gpu2::spqDeviceOut(SQ))) {
+                    if (t_err) *t_err = "the sparse statistics kernel failed";
+                    return 2;
+                }
             }
             tGpu += omp_get_wtime() - t0;
             busyAdd(t0, omp_get_wtime());
-            for (int bi = 0; bi < nb; bi++) nSlotsUsed += blksS[bi].nHi + blksS[bi].nLo;
+            {
+                const saige::gpu2::PrepSlot* ps = saige::gpu2::prepSlots(R, ds);
+                long used = 0;
+                for (int k = 0; k < nSlotsThis; k++)
+                    if (ps[k].valid && (differ || ps[k].qc)) used++;
+                nSlotsUsed += used;
+            }
             nSlotsTotal += nSlotsThis;
             return 0;
     };
@@ -4259,6 +4028,8 @@ bool mainMarkerMTGpu(
                         const bool flip = (pd.flip != 0);
                         const double* fdc = pd.fd;
                         (void)S;
+                        const double VRpair4 = saige::gpu2::prepVr(R, ds)[((std::size_t)pd.bi * Bblk + c) * (std::size_t)P + (std::size_t)t];
+                        const bool spT4 = spDev && spIdx[t] >= 0;
                         const unsigned char* pk = hPkS + ((std::size_t)pd.bi * Bblk + c) * bpv;
 
                         // ---- getMarkerPval's post-SPA rules, on the device's p ----
@@ -4446,7 +4217,7 @@ bool mainMarkerMTGpu(
                                     : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
                                 fastRecomputeSameCtx = (probeSparse == sparseCur) &&
                                                        (noadjCur == false) &&
-                                                       (probeVR == S.VR(c, t));
+                                                       (probeVR == VRpair4);
                             }
                             double Beta = arma::datum::nan, seB = arma::datum::nan;
                             double Tstat = arma::datum::nan, varT = arma::datum::nan, gy = 0.0;
@@ -4461,9 +4232,9 @@ bool mainMarkerMTGpu(
                             ctx_first.flagSparseGRM_cur = sparseCur;
                             ctx_first.isnoadjCov_cur    = noadjCur;
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
-                            ctx_first.varRatioVal       = S.VR(c, t);
+                            ctx_first.varRatioVal       = VRpair4;
                             g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
-                            if (spDev && spPlan.on[M.binIdx] && sparseCur) {
+                            if (spT4 && sparseCur) {
                                 ctx_first.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
                                 #pragma omp atomic
                                 nSpPreset[t]++;
@@ -4503,7 +4274,7 @@ bool mainMarkerMTGpu(
                                               ctx_fast.isnoadjCov_cur, dummyHas);
                                 }
                                 g_firthDefer = false;
-                                if (spDev && spPlan.on[M.binIdx] && ctx_fast.flagSparseGRM_cur) {
+                                if (spT4 && ctx_fast.flagSparseGRM_cur) {
                                     ctx_fast.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
                                     #pragma omp atomic
                                     nSpPreset[t]++;
@@ -5236,6 +5007,22 @@ bool mainMarkerMTGpu(
             const double* C2d = saige::gpu2::outC2d(R, ds);
             const uint32_t* cntDev = saige::gpu2::outCounts(R, ds);
             const std::size_t ld = saige::gpu2::ldC(R);
+            // the device's per-marker preprocessing of this superblock
+            const double* lutD = saige::gpu2::lutOut(R, ds);
+            const saige::gpu2::PrepSlot* psl = saige::gpu2::prepSlots(R, ds);
+            const saige::gpu2::PrepPair* ppr = saige::gpu2::prepPairs(R, ds);   // differ only
+            const double* vrD = saige::gpu2::prepVr(R, ds);
+            // gpuDeviceStats: this superblock's device statistics (pair-major,
+            // slot * P + t); gpuSparse: the sparse statistics (slot * nSp + s)
+            const double* dvS = devStatsOn ? saige::gpu2::statsS(R, ds) : nullptr;
+            const double* dvV = devStatsOn ? saige::gpu2::statsVar2(R, ds) : nullptr;
+            const double* dvP = devStatsOn ? saige::gpu2::statsP(R, ds) : nullptr;
+            const unsigned char* dvF = devStatsOn ? saige::gpu2::statsFlags(R, ds) : nullptr;
+            const double* spS = spDev ? saige::gpu2::statsSpS(R, ds) : nullptr;
+            const double* spV = spDev ? saige::gpu2::statsSpVar2(R, ds) : nullptr;
+            const double* spP = spDev ? saige::gpu2::statsSpP(R, ds) : nullptr;
+            const unsigned char* spF = spDev ? saige::gpu2::statsSpFlags(R, ds) : nullptr;
+            const double* spVrD = spDev ? saige::gpu2::statsSpVr(R, ds) : nullptr;
 
             #pragma omp parallel for schedule(dynamic, 1)
             for (int bi = 0; bi < nb; bi++) {
@@ -5245,132 +5032,123 @@ bool mainMarkerMTGpu(
                 const int jj0 = blk * Bblk;
                 const int jj1 = std::min(jj0 + Bblk, qc);
                 const std::size_t slotBase = (std::size_t)bi * Bblk;
-                const int nHi = S.nHi, nLo = S.nLo;
-                if (nHi + nLo <= 0) continue;
+                if (jj1 <= jj0) continue;
 
-                W.res.resize(Bblk, P);
                 if (W.tmpG.n_elem != (arma::uword)n) {
                     W.tmpG.set_size(n); W.gtilde.set_size(n);
                 }
 
-                // Unpack the device result into the whole-block scratch the
-                // tails read (unused slots carry exact zeros). gpuDeviceStats:
-                // the binary traits' S / var2 / p / gates came back with the
-                // result (statsS / statsVar2 / ...), so only what the
-                // quantitative tail still reads is unpacked.
-                const bool unpackBin = anyBin && !devStatsOn;
-                #define SAIGE_GPU_C(k, j) \
-                    (fp64 ? Cd[(std::size_t)(k) * ld + slotBase + (j)] \
-                          : (double)Cf[(std::size_t)(k) * ld + slotBase + (j)])
-                #define SAIGE_GPU_C2(k, j) \
-                    (fp64 ? C2d[(std::size_t)(k) * ld + slotBase + (j)] \
-                          : (double)C2f[(std::size_t)(k) * ld + slotBase + (j)])
-                if (anyQnt || unpackBin) {
-                W.scr.Zall.set_size(sumP, Bblk);
-                W.scr.GR.set_size(Bblk, P);
-                W.scr.Gsq.set_size(Bblk);
-                for (int r = 0; r < sumP; r++)
-                    for (int j = 0; j < Bblk; j++) W.scr.Zall(r, j) = SAIGE_GPU_C(r, j);
-                if (anyQnt) {
-                    W.scr.GWqnt.set_size(sumP, Bblk);
-                    for (int r = qOff; r < sumP; r++)
-                        for (int j = 0; j < Bblk; j++) W.scr.GWqnt(r, j) = SAIGE_GPU_C(oXq + (r - qOff), j);
-                }
-                if (unpackBin) {
-                    W.scr.GWbin.set_size(sumPbin, Bblk);
-                    for (int r = 0; r < sumPbin; r++)
-                        for (int j = 0; j < Bblk; j++) W.scr.GWbin(r, j) = SAIGE_GPU_C(oW + r, j);
-                    W.scr.G2Mu2.set_size(Bblk, nBin);
-                    for (int b = 0; b < nBin; b++)
-                        for (int j = 0; j < Bblk; j++) W.scr.G2Mu2(j, b) = SAIGE_GPU_C2(b, j);
-                    if (needGM) {
-                        W.scr.GMu2.set_size(Bblk, nBin);
+                // ---- host batch tails (gpuDeviceStats off) ----
+                // The CPU batch tails on the block's columns, fed with the
+                // device's GEMM columns and prep records: VR / AF per pair,
+                // the affine map and the missing-cell index lists of the
+                // own-list traits, g'g / sum g from the counts.
+                if (hostTail && (!qntTraitsDense.empty() || !binTraitsDense.empty())) {
+                    W.res.resize(Bblk, P);
+                    if (S.VR.n_rows != (arma::uword)Bblk || S.VR.n_cols != (arma::uword)P) {
+                        S.VR.set_size(Bblk, P); S.AF.set_size(Bblk, P);
+                    }
+                    S.VR.ones(); S.AF.zeros();
+                    if (differ) {
+                        S.adj.resize(Bblk, P);
+                        S.adj.a.ones(); S.adj.b.zeros(); S.adj.d.zeros(); S.adj.q.zeros(); S.adj.nMiss.zeros();
+                        for (auto& m : S.adj.miss) m.clear();
+                    }
+                    for (int c = 0; c < Bblk; c++) {
+                        const std::size_t slot = slotBase + c;
+                        const saige::gpu2::PrepSlot& ps = psl[slot];
+                        if (!ps.valid) continue;
+                        if (differ && ps.MR > 0.0) {
+                            // the column's missing calls, in sample order
+                            const unsigned char* pk = hPkS + slot * bpv;
+                            std::vector<arma::uword>& mv = S.adj.miss[(std::size_t)c];
+                            for (int u = 0; u < n; u++)
+                                if (((pk[u >> 2] >> ((u & 3) * 2)) & 3u) == kMissU) mv.push_back((arma::uword)u);
+                        }
+                        for (int t = 0; t < P; t++) {
+                            S.VR(c, t) = vrD[slot * (std::size_t)P + (std::size_t)t];
+                            if (!differ) { S.AF(c, t) = ps.AF; continue; }
+                            const saige::gpu2::PrepPair& pp = ppr[slot * (std::size_t)P + (std::size_t)t];
+                            if (!pp.qc) continue;
+                            S.AF(c, t) = pp.AF;
+                            if (!ownS[t]) continue;
+                            const double a = (pp.flip == ps.flip) ? 1.0 : -1.0;
+                            S.adj.a(c, t) = a;
+                            S.adj.b(c, t) = (a < 0.0) ? 2.0 : 0.0;
+                            S.adj.d(c, t) = pp.d;
+                            S.adj.q(c, t) = pp.q;
+                            S.adj.nMiss(c, t) = (arma::uword)cntDev[(slot * (std::size_t)nMask + (std::size_t)sampleGrp[t]) * 4 + kMissU];
+                        }
+                    }
+                    #define SAIGE_GPU_C(k, j) \
+                        (fp64 ? Cd[(std::size_t)(k) * ld + slotBase + (j)] \
+                              : (double)Cf[(std::size_t)(k) * ld + slotBase + (j)])
+                    #define SAIGE_GPU_C2(k, j) \
+                        (fp64 ? C2d[(std::size_t)(k) * ld + slotBase + (j)] \
+                              : (double)C2f[(std::size_t)(k) * ld + slotBase + (j)])
+                    W.scr.Zall.set_size(sumP, Bblk);
+                    W.scr.GR.set_size(Bblk, P);
+                    W.scr.Gsq.set_size(Bblk);
+                    W.scr.Gsum.set_size(Bblk);
+                    for (int r = 0; r < sumP; r++)
+                        for (int j = 0; j < Bblk; j++) W.scr.Zall(r, j) = SAIGE_GPU_C(r, j);
+                    if (anyQnt) {
+                        W.scr.GWqnt.set_size(sumP, Bblk);
+                        for (int r = qOff; r < sumP; r++)
+                            for (int j = 0; j < Bblk; j++) W.scr.GWqnt(r, j) = SAIGE_GPU_C(oXq + (r - qOff), j);
+                    }
+                    if (anyBin) {
+                        W.scr.GWbin.set_size(sumPbin, Bblk);
+                        for (int r = 0; r < sumPbin; r++)
+                            for (int j = 0; j < Bblk; j++) W.scr.GWbin(r, j) = SAIGE_GPU_C(oW + r, j);
+                        W.scr.G2Mu2.set_size(Bblk, nBin);
                         for (int b = 0; b < nBin; b++)
-                            for (int j = 0; j < Bblk; j++) W.scr.GMu2(j, b) = SAIGE_GPU_C(oGM + b, j);
+                            for (int j = 0; j < Bblk; j++) W.scr.G2Mu2(j, b) = SAIGE_GPU_C2(b, j);
+                        if (needGM) {
+                            W.scr.GMu2.set_size(Bblk, nBin);
+                            for (int b = 0; b < nBin; b++)
+                                for (int j = 0; j < Bblk; j++) W.scr.GMu2(j, b) = SAIGE_GPU_C(oGM + b, j);
+                        }
                     }
-                }
-                for (int t = 0; t < P; t++)
-                    for (int j = 0; j < Bblk; j++) W.scr.GR(j, t) = SAIGE_GPU_C(oR + t, j);
-                for (int j = 0; j < Bblk; j++) W.scr.Gsq[j] = S.ssc[j];
-                W.scr.Gsum.set_size(Bblk);
-                for (int j = 0; j < Bblk; j++) W.scr.Gsum[j] = S.gsc[j];
-                }
-                #undef SAIGE_GPU_C
-                #undef SAIGE_GPU_C2
-
-                if (anyQnt && qntOwn) {
-                    // Different sample lists, some quantitative trait has its
-                    // own: g_t'g_t per (slot, trait) from the trait's own code
-                    // counts and table (exact in double, as Gsq above).
-                    W.Qown.set_size(Bblk, P);
-                    W.Sown.set_size(Bblk, P);
-                    for (int t : ctx.batchQuantTraits) {
-                        if (!ownS[t]) continue;
-                        for (int j = 0; j < Bblk; j++) {
-                            const std::size_t k = (std::size_t)j * (std::size_t)P + (std::size_t)t;
-                            double ss = 0.0, gs = 0.0;
-                            for (int c4 = 0; c4 < 4; c4++) {
-                                ss += S.fdP[k * 4 + c4] * S.fdP[k * 4 + c4] * (double)S.cntP[k * 4 + c4];
-                                gs += S.fdP[k * 4 + c4] * (double)S.cntP[k * 4 + c4];
+                    for (int t = 0; t < P; t++)
+                        for (int j = 0; j < Bblk; j++) W.scr.GR(j, t) = SAIGE_GPU_C(oR + t, j);
+                    for (int j = 0; j < Bblk; j++) { W.scr.Gsq[j] = psl[slotBase + j].ss; W.scr.Gsum[j] = psl[slotBase + j].gs; }
+                    #undef SAIGE_GPU_C
+                    #undef SAIGE_GPU_C2
+                    if (!qntTraitsDense.empty() && qntOwn) {
+                        // g_t'g_t and sum g_t per (slot, trait) from the
+                        // trait's own code counts and table (exact in double)
+                        W.Qown.set_size(Bblk, P);
+                        W.Sown.set_size(Bblk, P);
+                        for (int t : qntTraitsDense) {
+                            if (!ownS[t]) continue;
+                            for (int j = 0; j < Bblk; j++) {
+                                const std::size_t slot = slotBase + j;
+                                const saige::gpu2::PrepPair& pp = ppr[slot * (std::size_t)P + (std::size_t)t];
+                                const uint32_t* ct = cntDev + (slot * (std::size_t)nMask + (std::size_t)sampleGrp[t]) * 4;
+                                double ss = 0.0, gs = 0.0;
+                                for (int c4 = 0; c4 < 4; c4++) {
+                                    ss += pp.fd[c4] * pp.fd[c4] * (double)ct[c4];
+                                    gs += pp.fd[c4] * (double)ct[c4];
+                                }
+                                W.Qown(j, t) = ss;
+                                W.Sown(j, t) = gs;
                             }
-                            W.Qown(j, t) = ss;
-                            W.Sown(j, t) = gs;
                         }
+                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, qntTraitsDense, 0, Bblk, S.VR, S.AF, S.adj, W.Qown, W.Sown, W.scr, W.res);
+                    } else if (!qntTraitsDense.empty()) {
+                        SAIGE::scoreTestBatchMTQuantPre(ctx, qntTraitsDense, 0, Bblk, S.VR, S.AF, W.scr, W.res);
                     }
-                    if (nHi > 0)
-                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.AF, S.adj, W.Qown, W.Sown, W.scr, W.res);
-                    if (nLo > 0)
-                        SAIGE::scoreTestBatchMTQuantPreAdj(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.AF, S.adj, W.Qown, W.Sown, W.scr, W.res);
-                } else if (anyQnt) {
-                    if (nHi > 0)
-                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, 0, nHi, S.VR, S.AF, W.scr, W.res);
-                    if (nLo > 0)
-                        SAIGE::scoreTestBatchMTQuantPre(ctx, ctx.batchQuantTraits, Bblk - nLo, Bblk, S.VR, S.AF, W.scr, W.res);
-                }
-                if (anyBin && nHi > 0 && spAnyFirst) {
-                    // isFastTest=false sparse traits: the first pass IS the
-                    // sparse score test, formed from the device's columns and
-                    // emitted exactly as the batch tail emits (emitBlockResults).
-                    if (!binTraitsDense.empty() && !devStatsOn) {
+                    if (!binTraitsDense.empty()) {
                         if (differ)
-                            SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraitsDense, 0, nHi, S.VR, S.AF, S.adj, W.scr, W.res);
+                            SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraitsDense, 0, Bblk, S.VR, S.AF, S.adj, W.scr, W.res);
                         else
-                            SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, nHi, S.VR, S.AF, W.scr, W.res);
+                            SAIGE::scoreTestBatchMTBinPre(ctx, binTraitsDense, 0, Bblk, S.VR, S.AF, W.scr, W.res);
                     }
-                    for (int t : binTraits) {
-                        if (!spFirst[t]) continue;
-                        for (int j = 0; j < nHi; j++) {
-                            double Sv, v2;
-                            spStats(slotBase + j, t, Sv, v2);
-                            const double v1 = v2 * S.VR(j, t);
-                            double Beta_, seBeta_, pval_, T_, v1o, v2o;
-                            bool islogp = false;
-                            std::string pvalStr_;
-                            SAIGE::format_score_result(Sv, v1, v2, Beta_, seBeta_, pvalStr_, pval_,
-                                                       islogp, T_, v1o, v2o);
-                            W.res.Beta(j, t) = Beta_;   W.res.seBeta(j, t) = seBeta_;
-                            W.res.Tstat(j, t) = T_;     W.res.var1(j, t) = v1o;
-                            W.res.var2(j, t) = v2o;
-                            W.res.StdStat(j, t) = std::fabs(Sv) / std::sqrt(v1);
-                            W.res.pvalRaw(j, t) = pval_;
-                            W.res.pvalStr[t][j] = pvalStr_;
-                            W.res.pvalIsLog[t][j] = islogp ? 1 : 0;
-                        }
-                    }
-                } else if (anyBin && nHi > 0 && !devStatsOn) {
-                    if (differ)
-                        SAIGE::scoreTestBatchMTBinPreAdj(ctx, binTraits, 0, nHi, S.VR, S.AF, S.adj, W.scr, W.res);
-                    else
-                        SAIGE::scoreTestBatchMTBinPre(ctx, binTraits, 0, nHi, S.VR, S.AF, W.scr, W.res);
                 }
                 if (differ && W.gT.n_elem < (arma::uword)n) W.gT.set_size(n);
-                // gpuDeviceStats: this superblock's device statistics (pair-major,
-                // slot * nBin + binIdx) and this thread's tallies of the per-pair
-                // counters that used to be atomics on shared counters.
-                const double* dvS = devStatsOn ? saige::gpu2::statsS(R, ds) : nullptr;
-                const double* dvV = devStatsOn ? saige::gpu2::statsVar2(R, ds) : nullptr;
-                const double* dvP = devStatsOn ? saige::gpu2::statsP(R, ds) : nullptr;
-                const unsigned char* dvF = devStatsOn ? saige::gpu2::statsFlags(R, ds) : nullptr;
+                // this thread's tallies of the per-pair counters that used to
+                // be atomics on shared counters
                 long* tlBatched = &tlCnt[(std::size_t)omp_get_thread_num()][0];
                 long* tlPcCounts = tlBatched + P;
                 long* tlDevStat = tlBatched + 2 * P;      // pairs decided on the device
@@ -5380,14 +5158,21 @@ bool mainMarkerMTGpu(
                 for (int jj = jj0; jj < jj1; jj++) {
                     const int c = S.colOf[jj - jj0];
                     if (c < 0) continue;
-                    const int i = chunkStart + jj;
-                    const double MACcol = S.MACc[c];
-                    const double AFcol = S.AFc[c];
-                    const bool   flipCol = (S.flipc[c] != 0);
-                    const bool   hiCol = (S.isHi[c] != 0);
-                    const double* fdc = &S.fdc[(std::size_t)c * 4];
-                    const uint64_t* cntc = &S.cntc[(std::size_t)c * 4];
                     const std::size_t slot = slotBase + c;
+                    const saige::gpu2::PrepSlot& ps = psl[slot];
+                    if (!ps.valid) continue;
+                    if (!differ && !ps.qc) continue;   // failed QC: no row
+                    const int i = chunkStart + jj;
+                    const double MACcol = pairMAC(ps.AC, n);
+                    const double AFcol = ps.AF;
+                    const bool   flipCol = (ps.flip != 0);
+                    const bool   hiCol = (ps.hi != 0);
+                    const double* fdc = lutD + 4 * slot;
+                    uint64_t cntc[4];
+                    {
+                        const uint32_t* cu = cntDev + (slot * (std::size_t)nMask) * 4;
+                        for (int k = 0; k < 4; k++) cntc[k] = cu[k];
+                    }
                     const unsigned char* pk = hPkS + slot * bpv;
                     bool gReady = false;       // dense column + index vectors built on demand
                     auto buildDense = [&]() {
@@ -5418,29 +5203,32 @@ bool mainMarkerMTGpu(
                         MTTraitChunk& O = out[t];
 
                         // The pair's marker statistics: the column's, or with
-                        // different sample lists the trait's own (mainMarkerMT).
-                        const std::size_t kP = (std::size_t)c * (std::size_t)P + (std::size_t)t;
-                        if (differ && !S.qcP[kP]) continue;   // failed QC for this trait: row stays NA
+                        // different sample lists the trait's own (the device's
+                        // prep record on its sample list).
+                        const std::size_t oP = slot * (std::size_t)P + (std::size_t)t;
+                        const saige::gpu2::PrepPair* pp = differ ? &ppr[oP] : nullptr;
+                        if (differ && !pp->qc) continue;   // failed QC for this trait: row stays NA
                         const bool own = differ && ownS[t];
-                        const double MAC = differ ? S.MACp(c, t) : MACcol;
-                        const double altFreq = differ ? S.AFp(c, t) : AFcol;
-                        const bool   flip = differ ? (S.flipP[kP] != 0) : flipCol;
+                        const int nObj = differ ? ctx.samp[t].n : n;
+                        const double MAC = differ ? pairMAC(pp->AC, nObj) : MACcol;
+                        const double altFreq = differ ? pp->AF : AFcol;
+                        const bool   flip = differ ? (pp->flip != 0) : flipCol;
                         const bool   hi = differ ? (MAC > g_MACCutoffforER) : hiCol;
-                        const double* fdt = differ ? &S.fdP[kP * 4] : fdc;
-                        const uint64_t* cntt = differ ? &S.cntP[kP * 4] : cntc;
-                        const bool   affOK = !differ || (S.affP[kP] != 0);
-                        const double nT = differ ? (double)obj->m_n : (double)n;
+                        const double* fdt = differ ? pp->fd : fdc;
+                        uint64_t cntt[4];
                         if (differ) {
-                            O.altFreq[jj]     = S.AFp(c, t);
-                            O.altCounts[jj]   = S.ACp(c, t);
-                            O.missingRate[jj] = S.MRp(c, t);
-                            O.imputeInfo[jj]  = S.IIp(c, t);
+                            const uint32_t* ct = cntDev + (slot * (std::size_t)nMask + (std::size_t)sampleGrp[t]) * 4;
+                            for (int k = 0; k < 4; k++) cntt[k] = ct[k];
                         } else {
-                            O.altFreq[jj]     = CM.altFreqVec[jj];
-                            O.altCounts[jj]   = CM.altCountsVec[jj];
-                            O.missingRate[jj] = CM.missingRateVec[jj];
-                            O.imputeInfo[jj]  = CM.imputationInfoVec[jj];
+                            for (int k = 0; k < 4; k++) cntt[k] = cntc[k];
                         }
+                        const bool   affOK = !differ || (pp->aff != 0);
+                        const double nT = (double)nObj;
+                        const double VRpair = vrD[oP];
+                        O.altFreq[jj]     = altFreq;
+                        O.altCounts[jj]   = differ ? pp->AC : ps.AC;
+                        O.missingRate[jj] = differ ? (double)cntt[kMissU] / nT : ps.MR;
+                        O.imputeInfo[jj]  = 1.0;
                         // The genotype vector a fallback hands getMarkerPval:
                         // the column, or the trait's own vector over its
                         // samples (mainMarkerMT's gOwn), built on demand.
@@ -5472,10 +5260,9 @@ bool mainMarkerMTGpu(
 
                         // Fast-test recompute context, exactly as mainMarkerMT
                         // computes it (main.cpp, "W1-1"). probeFast() evaluates
-                        // it once per pair; without gpuDeviceStats it runs here
-                        // for every pair, as before; with it, only for a pair
-                        // whose printed p is below the fast-test cutoff or that
-                        // takes the scalar path (the only readers).
+                        // it once per pair, only for a pair whose printed p is
+                        // below the fast-test cutoff or that takes the scalar
+                        // path (the only readers).
                         const bool sparseCur = obj->m_isFastTest ? false : obj->m_flagSparseGRM;
                         const bool noadjCur  = obj->m_isnoadjCov;
                         const bool fastEligible =
@@ -5496,23 +5283,24 @@ bool mainMarkerMTGpu(
                                 : obj->computeVarianceRatio(MAC, probeSparse, false, dummyHas2);
                             fastRecomputeSameCtx = (probeSparse == sparseCur) &&
                                                    (noadjCur == false) &&
-                                                   (probeVR == S.VR(c, t));
+                                                   (probeVR == VRpair);
                         };
 
                         // ---- the pair's batch statistics ----
-                        // The host tail's (W.res), or -- gpuDeviceStats, a
-                        // binary trait on the dense first pass -- the device's
-                        // S / var2 / p and gate bits; Beta / seBeta / StdStat
-                        // from them here. A pair the device handed back
-                        // (degenerate, or p underflowed) goes through
-                        // format_score_result on the device's S / var1 / var2.
-                        const bool devPair = devStatsOn && isBin && !(spDev && spFirst[t]);
+                        // The device's (dense kernel: gpuDeviceStats; sparse
+                        // kernel: a sparse first pass) S / var2 / p and gate
+                        // bits, with Beta / seBeta / StdStat from them here;
+                        // or the host tail's (W.res) when the device
+                        // statistics are off.
+                        const bool spPair  = spDev && spFirst[t];
+                        const bool devPair = spPair || (devStatsOn && devStatsEnabled[(std::size_t)t]);
                         double bBeta = 0.0, bSe = 0.0, bT = 0.0, bV1 = 0.0, bV2 = 0.0, bSd = 0.0, bP = 0.0;
                         bool bLog = false;
                         const std::string* bStr = &kNAstr;
                         std::string bStrBuf;
                         unsigned dflags = 0;
                         bool devHost = false;
+                        double VRused = VRpair;
                         if ((hi || !isBin) && affOK) {
                             if (!devPair) {
                                 bBeta = W.res.Beta(c, t);  bSe = W.res.seBeta(c, t);
@@ -5522,26 +5310,36 @@ bool mainMarkerMTGpu(
                                 bLog  = (W.res.pvalIsLog[t][c] != 0);
                                 bStr  = &W.res.pvalStr[t][c];
                             } else {
-                                const std::size_t o = slot * (std::size_t)nBin + (std::size_t)M.binIdx;
-                                dflags = dvF[o];
-                                const double S_ = dvS[o], v2_ = dvV[o];
-                                const double v1_ = v2_ * S.VR(c, t);          // emitBlockResults: v1 = v2 * t_VR(jo, t)
+                                double S_, v2_;
+                                if (spPair) {
+                                    const std::size_t o = spOff(slot, t);
+                                    dflags = spF[o]; S_ = spS[o]; v2_ = spV[o]; bP = spP[o];
+                                    VRused = spVrD[o];
+                                } else {
+                                    dflags = dvF[oP]; S_ = dvS[oP]; v2_ = dvV[oP]; bP = dvP[oP];
+                                }
+                                const double v1_ = v2_ * VRused;          // emitBlockResults: v1 = v2 * t_VR(jo, t)
                                 if (dflags & saige::gpu2::STATS_HOST) {
+                                    // not formed on the device: format_score_result on its S / var1 / var2
                                     devHost = true;
                                     SAIGE::format_score_result(S_, v1_, v2_, bBeta, bSe, bStrBuf, bP, bLog, bT, bV1, bV2);
                                     bSd = std::fabs(S_) / std::sqrt(v1_);
                                     bStr = &bStrBuf;
                                     tlDevHost[(std::size_t)((dflags >> saige::gpu2::STATS_REASON_SHIFT) & 7u) * P + t]++;
                                 } else {
-                                    const double stat = S_ * S_ / v1_;
+                                    // format_score_result's arithmetic on the device's numbers:
+                                    // stat = S^2 / var1 (0 for a non-finite one), Beta = S / var1,
+                                    // seBeta = |Beta| / sqrt(|stat|); p linear, or log p (STATS_LOGP)
+                                    double stat = S_ * S_ / v1_;
+                                    if (dflags & saige::gpu2::STATS_STAT0) stat = 0.0;
                                     bBeta = S_ / v1_;
                                     bSe   = std::fabs(bBeta) / std::sqrt(std::fabs(stat));
                                     bT = S_; bV1 = v1_; bV2 = v2_;
                                     bSd = std::fabs(S_) / std::sqrt(v1_);
-                                    bP = dvP[o]; bLog = false;
+                                    bLog = (dflags & saige::gpu2::STATS_LOGP) != 0;
                                     if (!rawP) {
-                                        const int len = SAIGE::mtVecFormatE6(bP, fbuf);
-                                        bStrBuf.assign(fbuf, (std::size_t)len);
+                                        if (bLog) { SAIGE::format_logp_e1(bP, fbuf); bStrBuf.assign(fbuf); }
+                                        else { const int len = SAIGE::mtVecFormatE6(bP, fbuf); bStrBuf.assign(fbuf, (std::size_t)len); }
                                         bStr = &bStrBuf;
                                     }
                                     tlDevStat[t]++;
@@ -5557,8 +5355,7 @@ bool mainMarkerMTGpu(
                         bool needSPA = false, needFirth = false, needFast = false;
                         if ((hi || !isBin) && affOK) {
                             if (devPair && !devHost) {
-                                // the device's decisions, from the same StdStat
-                                // and from a p far enough from the cutoffs
+                                // the device's decisions, from the same StdStat and p
                                 needSPA   = (dflags & saige::gpu2::STATS_SPA) != 0;
                                 needFirth = (dflags & saige::gpu2::STATS_FIRTH) != 0;
                                 if (dflags & saige::gpu2::STATS_FAST) {
@@ -5580,9 +5377,14 @@ bool mainMarkerMTGpu(
                                 // The scalar path compares std::stod of the
                                 // printed p-value, so this one does too.
                                 double pnum;
-                                try { pnum = std::stod(*bStr); }
-                                catch (const std::invalid_argument&) { pnum = 0; }
-                                catch (const std::out_of_range&)     { pnum = 0; }
+                                if (rawP && bStr == &kNAstr) {
+                                    // (device p never formatted) p < cutoff on the double itself
+                                    pnum = isLog ? 0.0 : pRaw;
+                                } else {
+                                    try { pnum = std::stod(*bStr); }
+                                    catch (const std::invalid_argument&) { pnum = 0; }
+                                    catch (const std::out_of_range&)     { pnum = 0; }
+                                }
                                 needFast = (pnum < obj->m_pval_cutoff_for_fastTest);
                             }
                             }
@@ -5629,20 +5431,18 @@ bool mainMarkerMTGpu(
                         // is the sparse variance, which the device holds. First
                         // pass = this batch result (+ device SPA when flagged;
                         // Firth deferred, as g_firthDefer does), then the
-                        // recompute on the device variance (+ device SPA / Firth).
-                        const bool spT = spDev && isBin && spPlan.on[M.binIdx];
+                        // recompute on the device variance (+ device SPA /
+                        // Firth for a binary trait; a quantitative pair is done).
+                        const bool spT = spDev && spIdx[t] >= 0;
                         bool devFast = false;
                         double vrFast = 1.0;
-                        if (spT && spaDev && hi && needFast &&
+                        if (spT && (!isBin || spaDev) && (hi || !isBin) && needFast &&
                             !(MAC > obj->m_cateVarRatioMinMACVecExclude.back()) && obj->m_flagSparseGRM) {
                             devFast = true;
-                            bool dummyHas3;
-                            vrFast = isSingleVR[t] ? obj->computeSingleVarianceRatio(true, false)
-                                                   : obj->computeVarianceRatio(MAC, true, false, dummyHas3);
+                            vrFast = spVrD[spOff(slot, t)];   // the sparse table's ratio of this MAC
                         }
                         bool devFastDone = false;
                         if (devFast) {
-                            const std::size_t slotG = slotBase + c;
                             if (needSPA) {
                                 Beta       = bBeta;
                                 seBeta     = bSe;
@@ -5668,9 +5468,9 @@ bool mainMarkerMTGpu(
                                 // First pass p (the batch's, no SPA) is below the
                                 // cutoff -- that is what needFast tested -- so the
                                 // recompute happens now.
-                                const SpRc rc = spRecompute(slotG, t, vrFast);
+                                const SpRc rc = spRecompute(slot, t, vrFast);
                                 bool wantF = false;
-                                if (!rc.spa && M.is_Firth_beta)
+                                if (!rc.spa && isBin && M.is_Firth_beta)
                                     wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
                                                      : (rc.pno <= M.pCutoffforFirth);
                                 if (rc.spa || !wantF || firthDev) {
@@ -5752,9 +5552,9 @@ bool mainMarkerMTGpu(
                             ctx_first.flagSparseGRM_cur = sparseCur;
                             ctx_first.isnoadjCov_cur    = noadjCur;
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
-                            ctx_first.varRatioVal       = S.VR(c, t);
+                            ctx_first.varRatioVal       = VRpair;
                             if (spT && sparseCur && affOK) {   // gpuSparse: the device variance, no CPU solve
-                                ctx_first.presetVar2 = var2sp(slotBase + c, t);
+                                ctx_first.presetVar2 = var2sp(slot, t);
                                 #pragma omp atomic
                                 nSpPreset[t]++;
                             }
@@ -5822,7 +5622,7 @@ bool mainMarkerMTGpu(
                                 }
                                 g_firthDefer = false;   // Firth runs once, here
                                 if (spT && ctx_fast.flagSparseGRM_cur && affOK) {
-                                    ctx_fast.presetVar2 = var2sp(slotBase + c, t);
+                                    ctx_fast.presetVar2 = var2sp(slot, t);
                                     #pragma omp atomic
                                     nSpPreset[t]++;
                                 }
@@ -5882,7 +5682,7 @@ bool mainMarkerMTGpu(
                             double sum_case = 0.0, sum_ctrl = 0.0;
                             uint32_t case_hom_cnt = 0, case_het_cnt = 0;
                             uint32_t ctrl_hom_cnt = 0, ctrl_het_cnt = 0;
-                            const uint32_t* dc = cntDev + (slot * (std::size_t)nBin + (std::size_t)b) * 4;
+                            const uint32_t* dc = cntDev + (slot * (std::size_t)nMask + (std::size_t)(nGrp + b)) * 4;
                             uint64_t nc[4], no[4];
                             for (int k = 0; k < 4; k++) { nc[k] = dc[k]; no[k] = cntt[k] - nc[k]; }
                             const int pcPath = SAIGE::pcSumPairFromCounts(
@@ -5961,7 +5761,7 @@ bool mainMarkerMTGpu(
                                 }
                             }
                         } else {
-                            O.N[jj] = differ ? obj->m_n : n;
+                            O.N[jj] = nObj;
                         }
                         (void)traitType;
                     }
