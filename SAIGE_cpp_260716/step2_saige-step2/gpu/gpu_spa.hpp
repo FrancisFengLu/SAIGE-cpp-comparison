@@ -78,10 +78,15 @@ struct SpaTraitArgs {
     const double* mu       = nullptr;   // N
     const double* XV       = nullptr;   // p x N column-major
     const double* XXVX_inv = nullptr;   // N x p column-major
-    int p = 0;                          // covariate count incl. intercept, <= SPA_PMAX
+    int p = 0;                          // covariate count incl. intercept, 1..SPA_PMAX
 };
 
-constexpr int SPA_PMAX = 8;
+// Covariate columns per trait, incl. the intercept. The kernel's only
+// per-p storage is the block's shared copy of b = XV g (SPA_PMAX doubles);
+// pass A forms b SPA_PTILE columns at a time (gpu_spa.cu), so p does not
+// touch the register budget. spaCreate() refuses a trait with p > SPA_PMAX
+// (main.cpp then says so and keeps SPA on the CPU).
+constexpr int SPA_PMAX = 64;
 
 struct SpaCreateArgs {
     int device = 0;
@@ -132,6 +137,8 @@ bool spaRun(Spa* t_s, const Reducer* t_r, int t_nPairs, int t_devSet = -1);  // 
 // Cumulative device seconds in the kernel, and pairs solved, since spaCreate().
 void spaTimings(const Spa* t_s, double* t_kernel, long long* t_pairs);
 std::size_t spaDeviceBytes(const Spa* t_s);
+// Why the last spaCreate() / spaRun() on this thread failed ("" if it did not).
+const char* spaLastError();
 
 }  // namespace gpu2
 }  // namespace saige

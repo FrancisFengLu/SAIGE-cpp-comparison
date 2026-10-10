@@ -78,6 +78,17 @@ __device__ __forceinline__ void blockReduceF(NSum (&v)[K], float* shf)
 // Only carriers need it: their g~ feed NAsigma = var2 - sum_c mu(1-mu) g~^2,
 // which cancels by up to ~1e3 for rare markers (see addVarTerm), so a
 // float-accurate g~ there moves the root.
+__device__ __forceinline__ void carrierGtFinish(float g, const NSum& pr, float* vh, float* vl)
+{
+    const float ph = pr.s + pr.c, pl = pr.c - (ph - pr.s);
+    // (g - ph) exactly, then - pl, renormalised
+    const float d = g - ph, bp = d - g;
+    const float e = ((g - (d - bp)) + (-ph - bp)) - pl;
+    const float r = d + e;
+    *vh = r;
+    *vl = e - (r - d);
+}
+// b in registers, p <= PMAXT (the unrolled form).
 template <int PMAXT>
 __device__ __forceinline__ void carrierGt(float g, const float* xh, const float* xl, std::size_t ld,
                                           const float (&bh)[PMAXT], const float (&bl)[PMAXT], int p,
@@ -90,13 +101,20 @@ __device__ __forceinline__ void carrierGt(float g, const float* xh, const float*
         pr.addProd(h, bh[j]);
         pr.c += h * bl[j] + l * bh[j];
     }
-    const float ph = pr.s + pr.c, pl = pr.c - (ph - pr.s);
-    // (g - ph) exactly, then - pl, renormalised
-    const float d = g - ph, bp = d - g;
-    const float e = ((g - (d - bp)) + (-ph - bp)) - pl;
-    const float r = d + e;
-    *vh = r;
-    *vl = e - (r - d);
+    carrierGtFinish(g, pr, vh, vl);
+}
+// b in memory (the block's shared copy), any p: the same operations in the
+// same order, so the result is that of carrierGt.
+__device__ __forceinline__ void carrierGtP(float g, const float* xh, const float* xl, std::size_t ld,
+                                           const float* bh, const float* bl, int p, float* vh, float* vl)
+{
+    NSum pr;
+    for (int j = 0; j < p; ++j) {
+        const float h = xh[(std::size_t)j * ld], l = xl[(std::size_t)j * ld];
+        pr.addProd(h, bh[j]);
+        pr.c += h * bl[j] + l * bh[j];
+    }
+    carrierGtFinish(g, pr, vh, vl);
 }
 
 // sum += mu (1 - mu) v^2 to about float^2 accuracy, all float instructions:

@@ -23,6 +23,12 @@ namespace gpu2 {
 namespace {
 
 #define NT 256
+// Covariate columns of b = XV g formed per pass over the samples (pass A):
+// SPA_PTILE per-thread accumulators, p / SPA_PTILE passes. One pass for
+// p <= SPA_PTILE, which is the loop as it was before p > 8 was allowed; for
+// any p, column j is summed over the same samples in the same order, so b
+// does not depend on the tiling.
+constexpr int SPA_PTILE = 8;
 
 thread_local std::string lastErrSpa;
 #define CKS(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -302,34 +308,36 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
             const float* xx32lo = XX32lo + (std::size_t)t * traitStride;
             P.L32 = make_float4((float)P.L.x, (float)P.L.y, (float)P.L.z, (float)P.L.w);
             __shared__ float bsh32[SPA_PMAX], bsh32lo[SPA_PMAX];   // b = hi + lo
-            // pass A: b = XV g over carriers
-            NSum a[SPA_PMAX];
-            for (int i = threadIdx.x; i < N; i += NT) {
-                const float g = dose32(P.col, P.L32, i);
-                if (g == 0.0f) continue;
-                const float* x = xv32 + (std::size_t)i * p;
-                const float* xl = xv32lo + (std::size_t)i * p;
-                for (int j = 0; j < p; ++j) { a[j].addProd(x[j], g); a[j].c += xl[j] * g; }
-            }
-            for (int j = 0; j < p; ++j) {
-                const NSum s = blockSumF(a[j], sh);
-                if (threadIdx.x == 0) { bsh32[j] = s.s + s.c; bsh32lo[j] = s.c - (bsh32[j] - s.s); }
+            // pass A: b = XV g over carriers, SPA_PTILE columns per pass
+            for (int j0 = 0; j0 < p; j0 += SPA_PTILE) {
+                const int pt = (p - j0 < SPA_PTILE) ? p - j0 : SPA_PTILE;
+                NSum a[SPA_PTILE];
+                for (int i = threadIdx.x; i < N; i += NT) {
+                    const float g = dose32(P.col, P.L32, i);
+                    if (g == 0.0f) continue;
+                    const float* x = xv32 + (std::size_t)i * p + j0;
+                    const float* xl = xv32lo + (std::size_t)i * p + j0;
+                    for (int j = 0; j < pt; ++j) { a[j].addProd(x[j], g); a[j].c += xl[j] * g; }
+                }
+                for (int j = 0; j < pt; ++j) {
+                    const NSum s = blockSumF(a[j], sh);
+                    if (threadIdx.x == 0) { bsh32[j0 + j] = s.s + s.c; bsh32lo[j0 + j] = s.c - (bsh32[j0 + j] - s.s); }
+                }
             }
             __syncthreads();
             // pass B: g~, gpos / gneg, m1 = sum mu g~ from exactly the stored
             // floats (error-free products; also the centring of kpass32), the
             // fast variant's carrier sums; store (s g~, s min(mu, 1 - mu)).
+            // b is read from the block's shared copy (any p).
             NSum sp, sn, sm, snbmu, snbsig;
-            float bh[SPA_PMAX], bl[SPA_PMAX];
-            for (int j = 0; j < SPA_PMAX; ++j) { bh[j] = j < p ? bsh32[j] : 0.0f; bl[j] = j < p ? bsh32lo[j] : 0.0f; }
             for (int i = threadIdx.x; i < N; i += NT) {
                 const float g = dose32(P.col, P.L32, i);
                 float v, vl = 0.0f;
                 if (g != 0.0f) {
-                    spa_fp32::carrierGt<SPA_PMAX>(g, xx32 + i, xx32lo + i, (std::size_t)N, bh, bl, p, &v, &vl);
+                    spa_fp32::carrierGtP(g, xx32 + i, xx32lo + i, (std::size_t)N, bsh32, bsh32lo, p, &v, &vl);
                 } else {
                     float proj = 0.0f;
-                    for (int j = 0; j < p; ++j) proj += xx32[(std::size_t)j * N + i] * bh[j];
+                    for (int j = 0; j < p; ++j) proj += xx32[(std::size_t)j * N + i] * bsh32[j];
                     v = g - proj;
                 }
                 const float ms = mu32[i], m = fabsf(ms);
@@ -352,18 +360,22 @@ spa_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const doubl
             P.gt32 = reinterpret_cast<const float2*>(gt);
             P.m1 = m1;
         } else {
-            // pass A: b = XV g over carriers (getadjGFast's loop over iIndex)
-            double a[SPA_PMAX];
-            for (int j = 0; j < SPA_PMAX; ++j) a[j] = 0.0;
-            for (int i = threadIdx.x; i < N; i += NT) {
-                const double g = dose(P.col, P.L, i);
-                if (g == 0.0) continue;
-                const double* x = xv + (std::size_t)i * p;
-                for (int j = 0; j < p; ++j) a[j] += x[j] * g;
-            }
-            for (int j = 0; j < p; ++j) {
-                const double s = blockSum(a[j], sh);
-                if (threadIdx.x == 0) bsh[j] = s;
+            // pass A: b = XV g over carriers (getadjGFast's loop over iIndex),
+            // SPA_PTILE columns per pass
+            for (int j0 = 0; j0 < p; j0 += SPA_PTILE) {
+                const int pt = (p - j0 < SPA_PTILE) ? p - j0 : SPA_PTILE;
+                double a[SPA_PTILE];
+                for (int j = 0; j < SPA_PTILE; ++j) a[j] = 0.0;
+                for (int i = threadIdx.x; i < N; i += NT) {
+                    const double g = dose(P.col, P.L, i);
+                    if (g == 0.0) continue;
+                    const double* x = xv + (std::size_t)i * p + j0;
+                    for (int j = 0; j < pt; ++j) a[j] += x[j] * g;
+                }
+                for (int j = 0; j < pt; ++j) {
+                    const double s = blockSum(a[j], sh);
+                    if (threadIdx.x == 0) bsh[j0 + j] = s;
+                }
             }
             __syncthreads();
 
@@ -457,7 +469,8 @@ bool spaSupports(Prec t_p)
 
 Spa* spaCreate(const SpaCreateArgs& a)
 {
-    if (a.N <= 0 || a.nTraits <= 0 || a.traits == nullptr || a.maxPairs <= 0) return nullptr;
+    lastErrSpa.clear();
+    if (a.N <= 0 || a.nTraits <= 0 || a.traits == nullptr || a.maxPairs <= 0) { lastErrSpa = "bad arguments"; return nullptr; }
     // ---- precision dispatch ----
     if (!spaSupports(a.precision)) {
         lastErrSpa = std::string("SPA precision ") + precName(a.precision) + " is not implemented yet";
@@ -466,7 +479,11 @@ Spa* spaCreate(const SpaCreateArgs& a)
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
     int pMax = 0;
     for (int t = 0; t < a.nTraits; ++t) {
-        if (a.traits[t].p <= 0 || a.traits[t].p > SPA_PMAX) return nullptr;
+        if (a.traits[t].p <= 0 || a.traits[t].p > SPA_PMAX) {
+            lastErrSpa = "trait " + std::to_string(t) + " has p = " + std::to_string(a.traits[t].p) +
+                         " covariate columns; the device SPA takes 1.." + std::to_string(SPA_PMAX);
+            return nullptr;
+        }
         if (!a.traits[t].mu || !a.traits[t].XV || !a.traits[t].XXVX_inv) return nullptr;
         if (a.traits[t].p > pMax) pMax = a.traits[t].p;
     }
@@ -561,6 +578,7 @@ void spaDestroy(Spa* s)
 SpaPairIn*  spaIn(Spa* s)  { return s ? s->hIn : nullptr; }
 SpaPairOut* spaOut(Spa* s) { return s ? s->hOut : nullptr; }
 std::size_t spaDeviceBytes(const Spa* s) { return s ? s->devBytes : 0; }
+const char* spaLastError() { return lastErrSpa.c_str(); }
 void spaTimings(const Spa* s, double* t_kernel, long long* t_pairs)
 {
     if (!s) return;

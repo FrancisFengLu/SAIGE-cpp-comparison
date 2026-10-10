@@ -48,7 +48,13 @@ namespace {
 
 constexpr int NT    = 256;
 constexpr int NWARP = NT / 32;
-constexpr int NACC  = PMAX + 1;   // widest reduction: p partial dot products + the carrier count
+// Covariate columns of b = XV g formed per pass over the samples (pass A):
+// PTILE per-thread accumulators, p / PTILE passes. One pass for p <= PTILE,
+// which is the loop as it was before p > 8 was allowed; for any p, column j
+// is summed over the same samples in the same order, so b does not depend on
+// the tiling. b itself lives in the block's shared memory (PMAX entries).
+constexpr int PTILE = 8;
+constexpr int NACC  = PTILE + 1;  // widest reduction: a tile's partial dot products + the carrier count
 // gpuPrecisionSPA fp32: floor of the Newton |dt| tolerance (spa_gpu.hpp).
 constexpr double kTolFp32 = 1e-5;
 
@@ -768,30 +774,46 @@ __device__ __forceinline__ void spaBody(const KParams& P)
             const float* xx32lo = P.XX32lo + (std::size_t)t * P.traitStride;
             float* shf = reinterpret_cast<float*>(&sh[0][0]);
             __shared__ int shC[NWARP];
-            // pass A: b = XV g over carriers, carrier count
-            NSum accA[PMAX];
-            int cnt = 0;
-            for (int i = segLo + lane; i < segHi; i += 32) {
-                const float g = G.template dose32<OWN>(i);
-                if (g != 0.0f) {
-                    const float* x = xv32 + (std::size_t)i * p;
-                    const float* xl = xv32lo + (std::size_t)i * p;
-                    #pragma unroll
-                    for (int j = 0; j < PMAX; ++j) if (j < p) { accA[j].addProd(x[j], g); accA[j].c += xl[j] * g; }
-                    ++cnt;
+            __shared__ float bsh[PMAX], bshl[PMAX];   // b = bsh + bshl (float-float), every column
+            // pass A: b = XV g over carriers, carrier count; PTILE columns per
+            // pass over this warp's samples
+            for (int j0 = 0; j0 < p; j0 += PTILE) {
+                const int pt = (p - j0 < PTILE) ? p - j0 : PTILE;
+                NSum accA[PTILE];
+                int cnt = 0;
+                for (int i = segLo + lane; i < segHi; i += 32) {
+                    const float g = G.template dose32<OWN>(i);
+                    if (g != 0.0f) {
+                        const float* x = xv32 + (std::size_t)i * p + j0;
+                        const float* xl = xv32lo + (std::size_t)i * p + j0;
+                        #pragma unroll
+                        for (int j = 0; j < PTILE; ++j) if (j < pt) { accA[j].addProd(x[j], g); accA[j].c += xl[j] * g; }
+                        ++cnt;
+                    }
                 }
+                if (j0 == 0) {
+                    cnt = spa_fp32::warpSumI(cnt);
+                    if (lane == 0) shC[warp] = cnt;
+                }
+                blockReduceF<PTILE, NWARP>(accA, shf);   // its barriers publish shC
+                if (tid == 0) {
+                    for (int j = 0; j < pt; ++j) {
+                        const float h = accA[j].s + accA[j].c;
+                        bsh[j0 + j] = h; bshl[j0 + j] = accA[j].c - (h - accA[j].s);
+                    }
+                }
+                __syncthreads();   // bsh / bshl visible; shf free for the next tile
             }
-            cnt = spa_fp32::warpSumI(cnt);
-            if (lane == 0) shC[warp] = cnt;
-            blockReduceF<PMAX, NWARP>(accA, shf);   // its barriers publish shC
             int wbase = 0;
             nnz = 0;
             for (int w = 0; w < NWARP; ++w) { if (w < warp) wbase += shC[w]; nnz += shC[w]; }
             // the CPU's rule |{g==0}| / N >= 0.5, in integers
             fast = (pin.fast > 0) || (pin.fast < 0 && 2LL * (N - nnz) >= (long long)N);
-            float b[PMAX], bl[PMAX];   // b = b + bl (float-float), for the carriers' g~
+            // p <= PTILE: b in registers, the unrolled pass B as it was
+            const bool small = (p <= PTILE);
+            float b[PTILE], bl[PTILE];
             #pragma unroll
-            for (int j = 0; j < PMAX; ++j) { b[j] = accA[j].s + accA[j].c; bl[j] = accA[j].c - (b[j] - accA[j].s); }
+            for (int j = 0; j < PTILE; ++j) { b[j] = (small && j < p) ? bsh[j] : 0.0f; bl[j] = (small && j < p) ? bshl[j] : 0.0f; }
 
             // pass B: g~ = g - XXVX_inv b; gpos, gneg, m1 = sum mu g~, the fast
             // variant's carrier sums; store (s g~, s min(mu, 1 - mu)). m1 is summed
@@ -807,11 +829,16 @@ __device__ __forceinline__ void spaBody(const KParams& P)
                     g = G.template dose32<OWN>(i);
                     float vl = 0.0f;
                     if (g != 0.0f) {
-                        spa_fp32::carrierGt<PMAX>(g, xx32 + i, xx32lo + i, (std::size_t)N, b, bl, p, &v, &vl);
+                        if (small) spa_fp32::carrierGt<PTILE>(g, xx32 + i, xx32lo + i, (std::size_t)N, b, bl, p, &v, &vl);
+                        else       spa_fp32::carrierGtP(g, xx32 + i, xx32lo + i, (std::size_t)N, bsh, bshl, p, &v, &vl);
                     } else {
                         float proj = 0.0f;
-                        #pragma unroll
-                        for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx32[(std::size_t)j * N + i] * b[j];
+                        if (small) {
+                            #pragma unroll
+                            for (int j = 0; j < PTILE; ++j) if (j < p) proj += xx32[(std::size_t)j * N + i] * b[j];
+                        } else {
+                            for (int j = 0; j < p; ++j) proj += xx32[(std::size_t)j * N + i] * bsh[j];
+                        }
                         v = g - proj;
                     }
                     ms = mu32[i];
@@ -841,47 +868,56 @@ __device__ __forceinline__ void spaBody(const KParams& P)
             NAsigma = fast ? (pin.var2 - sB[4].val()) : 0.0;
             cen = m1;
         } else {
-            // ---- pass A: b = XV g over carriers (getadjGFast's loop), carrier count
+            // ---- pass A: b = XV g over carriers (getadjGFast's loop), carrier
+            //      count; PTILE columns per pass over this warp's samples
+            __shared__ double bsh[PMAX];   // b, every column
             double acc[NACC];
-            #pragma unroll
-            for (int j = 0; j < NACC; ++j) acc[j] = 0.0;
-            for (int i = segLo + lane; i < segHi; i += 32) {
-                const double g = G.template dose<OWN>(i);
-                if (g != 0.0) {
-                    const double* x = xv + (std::size_t)i * p;
-                    #pragma unroll
-                    for (int j = 0; j < PMAX; ++j) if (j < p) acc[j] += x[j] * g;
-                    acc[PMAX] += 1.0;
-                }
-            }
-            // reduce; keep this warp's exclusive carrier prefix for the compaction
-            {
-                #pragma unroll
-                for (int j = 0; j < NACC; ++j) acc[j] = warpSum(acc[j]);
-                if (lane == 0) {
-                    #pragma unroll
-                    for (int j = 0; j < NACC; ++j) sh[j][warp] = acc[j];
-                }
-            }
-            __syncthreads();
             int wbase = 0;
-            {
+            for (int j0 = 0; j0 < p; j0 += PTILE) {
+                const int pt = (p - j0 < PTILE) ? p - j0 : PTILE;
                 #pragma unroll
-                for (int j = 0; j < NACC; ++j) {
+                for (int j = 0; j < NACC; ++j) acc[j] = 0.0;
+                for (int i = segLo + lane; i < segHi; i += 32) {
+                    const double g = G.template dose<OWN>(i);
+                    if (g != 0.0) {
+                        const double* x = xv + (std::size_t)i * p + j0;
+                        #pragma unroll
+                        for (int j = 0; j < PTILE; ++j) if (j < pt) acc[j] += x[j] * g;
+                        acc[PTILE] += 1.0;
+                    }
+                }
+                // reduce; keep this warp's exclusive carrier prefix for the compaction
+                {
+                    #pragma unroll
+                    for (int j = 0; j < NACC; ++j) acc[j] = warpSum(acc[j]);
+                    if (lane == 0) {
+                        #pragma unroll
+                        for (int j = 0; j < NACC; ++j) sh[j][warp] = acc[j];
+                    }
+                }
+                __syncthreads();
+                if (j0 == 0) {
                     double s = 0.0;
                     #pragma unroll
-                    for (int w = 0; w < NWARP; ++w) s += sh[j][w];
-                    acc[j] = s;
+                    for (int w = 0; w < NWARP; ++w) s += sh[PTILE][w];
+                    nnz = (int)s;
+                    for (int w = 0; w < warp; ++w) wbase += (int)sh[PTILE][w];
                 }
-                for (int w = 0; w < warp; ++w) wbase += (int)sh[PMAX][w];
+                if (tid < pt) {
+                    double s = 0.0;
+                    #pragma unroll
+                    for (int w = 0; w < NWARP; ++w) s += sh[tid][w];
+                    bsh[j0 + tid] = s;
+                }
+                __syncthreads();   // bsh visible; sh free for the next tile
             }
-            __syncthreads();
-            nnz = (int)acc[PMAX];
             // the CPU's rule: p_iIndexComVecSize = double(|{g==0}|) / m_n >= 0.5
             fast = (pin.fast > 0) || (pin.fast < 0 && ((double)(N - nnz) / (double)N) >= 0.5);
-            double b[PMAX];
+            // p <= PTILE: b in registers, the unrolled pass B as it was
+            const bool small = (p <= PTILE);
+            double b[PTILE];
             #pragma unroll
-            for (int j = 0; j < PMAX; ++j) b[j] = acc[j];
+            for (int j = 0; j < PTILE; ++j) b[j] = (small && j < p) ? bsh[j] : 0.0;
 
             // ---- pass B: g~, its positive / negative sums, m1, the fast variant's
             //      carrier sums; store (g~, mu)
@@ -894,8 +930,12 @@ __device__ __forceinline__ void spaBody(const KParams& P)
                 if (valid) {
                     g = G.template dose<OWN>(i);
                     double proj = 0.0;
-                    #pragma unroll
-                    for (int j = 0; j < PMAX; ++j) if (j < p) proj += xx[(std::size_t)j * N + i] * b[j];
+                    if (small) {
+                        #pragma unroll
+                        for (int j = 0; j < PTILE; ++j) if (j < p) proj += xx[(std::size_t)j * N + i] * b[j];
+                    } else {
+                        for (int j = 0; j < p; ++j) proj += xx[(std::size_t)j * N + i] * bsh[j];
+                    }
                     v = g - proj;
                     m = mu[i];
                     if (v > 0) s[0] += v; else if (v < 0) s[1] += v;
@@ -1077,8 +1117,13 @@ Spa* create(const CreateArgs& a)
     int pMax = 0;
     for (int t = 0; t < a.nTraits; ++t) {
         const TraitArgs& T = a.traits[t];
-        if (T.p <= 0 || T.p > PMAX || !T.mu || !T.XV || !T.XXVX_inv) {
-            g_lastErr = "create: trait " + std::to_string(t) + " malformed (p, mu, XV, XXVX_inv)";
+        if (T.p <= 0 || T.p > PMAX) {
+            g_lastErr = "create: trait " + std::to_string(t) + " has p = " + std::to_string(T.p) +
+                        " covariate columns; the device SPA takes 1.." + std::to_string(PMAX);
+            return nullptr;
+        }
+        if (!T.mu || !T.XV || !T.XXVX_inv) {
+            g_lastErr = "create: trait " + std::to_string(t) + " malformed (mu, XV, XXVX_inv)";
             return nullptr;
         }
         if (T.p > pMax) pMax = T.p;
