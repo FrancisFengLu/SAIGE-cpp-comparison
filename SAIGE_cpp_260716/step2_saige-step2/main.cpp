@@ -3360,6 +3360,29 @@ bool mainMarkerMTGpu(
     // where a host tail reads it: the adjusted batch tail (gpuDeviceStats off),
     // the sparse variance (spStats) and the quantitative own-list tail.
     const bool hostMissLists = differ && (!devStatsOn || spDev || qntOwn);
+    // Traits with the same sample list share one code count per marker:
+    // sampleGrp[t] = the group (first trait with that list), counted once per
+    // marker in phase 1 and copied to the others (same loop, same numbers).
+    // PheWAS-style sets often have a few missing patterns across many traits.
+    std::vector<int> sampleGrp(P, -1);
+    int nSampleGrp = 0;
+    if (differ) {
+        std::vector<int> rep;   // group -> representative trait
+        for (int t = 0; t < P; t++) {
+            const SAIGE::MTTraitSamples& TS = ctx.samp[t];
+            if (TS.sameAsUnion) continue;
+            int g = -1;
+            for (int k = 0; k < (int)rep.size(); k++) {
+                const SAIGE::MTTraitSamples& RS = ctx.samp[(std::size_t)rep[(std::size_t)k]];
+                if (RS.n == TS.n && RS.pos == TS.pos) { g = k; break; }
+            }
+            if (g < 0) { g = (int)rep.size(); rep.push_back(t); }
+            sampleGrp[t] = g;
+        }
+        nSampleGrp = (int)rep.size();
+        std::cout << "  gpuOwnSampleSets: " << nSampleGrp << " distinct sample list(s) besides the union among " << P
+                  << " traits; each is counted once per marker" << std::endl;
+    }
     // sgsRawDouble: the p-value columns leave as doubles (MTTraitChunk::pvalD)
     const bool rawP = g_sgsRawDouble && g_outputFormatSgs;
     static const std::string kNAstr("NA");
@@ -3648,6 +3671,8 @@ bool mainMarkerMTGpu(
                 std::vector<char> tq(P, 0), tflip(P, 0);
                 std::vector<double> tMAC(P), tAF(P), tAC(P), tMR(P), tII(P), tfd((std::size_t)P * 4);
                 std::vector<uint64_t> tcnt((std::size_t)P * 4);
+                std::vector<uint64_t> grpCnt((std::size_t)std::max(nSampleGrp, 1) * 4, 0);
+                std::vector<char>     grpDone((std::size_t)std::max(nSampleGrp, 1), 0);
 
                 for (int jj = jj0; jj < jj1; jj++) {
                     const int i = chunkStart + jj;
@@ -3693,6 +3718,7 @@ bool mainMarkerMTGpu(
                                                       g_dosage_zerod_MAC_cutoff, MACu);
                         }
                         bool anyQC = false;
+                        std::fill(grpDone.begin(), grpDone.end(), 0);
                         for (int t = 0; t < P; t++) {
                             const SAIGE::MTTraitSamples& TS = ctx.samp[t];
                             const int nObj = g_saigeObjs[t]->m_n;
@@ -3701,14 +3727,22 @@ bool mainMarkerMTGpu(
                             for (int c4 = 0; c4 < 4; c4++) ft.dmap[c4] = fsU.dmap[c4];
                             if (TS.sameAsUnion) {
                                 for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = fsU.counts[c4];
-                            } else if (TS.comp.size() <= TS.pos.size()) {
-                                uint64_t cnt[4] = {fsU.counts[0], fsU.counts[1], fsU.counts[2], fsU.counts[3]};
-                                for (arma::uword u : TS.comp) cnt[codes[u]]--;
-                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
                             } else {
-                                uint64_t cnt[4] = {0, 0, 0, 0};
-                                for (arma::uword u : TS.pos) cnt[codes[u]]++;
-                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = cnt[c4];
+                                // counted once per distinct sample list (sampleGrp)
+                                uint64_t* gc = &grpCnt[(std::size_t)sampleGrp[t] * 4];
+                                if (!grpDone[(std::size_t)sampleGrp[t]]) {
+                                    if (TS.comp.size() <= TS.pos.size()) {
+                                        uint64_t cnt[4] = {fsU.counts[0], fsU.counts[1], fsU.counts[2], fsU.counts[3]};
+                                        for (arma::uword u : TS.comp) cnt[codes[u]]--;
+                                        for (int c4 = 0; c4 < 4; c4++) gc[c4] = cnt[c4];
+                                    } else {
+                                        uint64_t cnt[4] = {0, 0, 0, 0};
+                                        for (arma::uword u : TS.pos) cnt[codes[u]]++;
+                                        for (int c4 = 0; c4 < 4; c4++) gc[c4] = cnt[c4];
+                                    }
+                                    grpDone[(std::size_t)sampleGrp[t]] = 1;
+                                }
+                                for (int c4 = 0; c4 < 4; c4++) ft.counts[c4] = gc[c4];
                             }
                             ft.N = (uint32_t)TS.n;
                             ft.gIndex = gIndex;
