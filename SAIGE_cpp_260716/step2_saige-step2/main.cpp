@@ -3511,7 +3511,8 @@ bool mainMarkerMTGpu(
     // batched, [P,2P) counts-formula AF, [2P,3P) decided on the device,
     // [3P + reason*P + t] handed back for `reason` (gpu_step2.hpp StatsReason).
     std::vector<std::vector<long>> tlCnt((std::size_t)std::max(1, omp_get_max_threads()),
-                                         std::vector<long>((std::size_t)P * 11, 0));
+                                         std::vector<long>((std::size_t)P * 12, 0));
+    std::vector<long> nErBatch(P, 0);   // low-MAC pairs that kept the device's score result (no scalar call)
     std::vector<long> nDevStat(P, 0);
     std::vector<std::vector<long>> nDevHost(8, std::vector<long>(P, 0));
     // one per ring set (gpuOverlap parks superblock k's pairs while an
@@ -5153,6 +5154,7 @@ bool mainMarkerMTGpu(
                 long* tlPcCounts = tlBatched + P;
                 long* tlDevStat = tlBatched + 2 * P;      // pairs decided on the device
                 long* tlDevHost = tlBatched + 3 * P;      // pairs the device handed back, by reason: [reason * P + t]
+                long* tlErBatch = tlBatched + 11 * P;     // low-MAC pairs that kept the device's score result
                 char fbuf[40];
 
                 for (int jj = jj0; jj < jj1; jj++) {
@@ -5301,7 +5303,11 @@ bool mainMarkerMTGpu(
                         unsigned dflags = 0;
                         bool devHost = false;
                         double VRused = VRpair;
-                        if ((hi || !isBin) && affOK) {
+                        // The device scored every slot, low-MAC pairs included
+                        // (their score result is what the scalar path's ER
+                        // branch starts from); the host tails only the pairs
+                        // they were called on.
+                        if (affOK && ((hi || !isBin) || devPair)) {
                             if (!devPair) {
                                 bBeta = W.res.Beta(c, t);  bSe = W.res.seBeta(c, t);
                                 bT    = W.res.Tstat(c, t); bV1 = W.res.var1(c, t);
@@ -5353,6 +5359,20 @@ bool mainMarkerMTGpu(
                         // would have left the normal approximation.
                         bool useBatch = false;
                         bool needSPA = false, needFirth = false, needFast = false;
+                        // A low-MAC binary pair (MAC <= MACCutoffforER): the scalar
+                        // path takes the exact test only when |StdStat| > SPA_Cutoff
+                        // (or StdStat is NaN); otherwise its score result stands,
+                        // Firth on its p. With the device statistics that decision
+                        // is the kernel's SPA bit, so such a pair keeps the device's
+                        // score result (and its Firth goes to the device fit) without
+                        // the scalar call; the ER pairs proper still take the scalar
+                        // path, which records the carriers for the device ER.
+                        bool erBatch = false;
+                        if (isBin && !hi && affOK && devPair && !devHost &&
+                            !(dflags & (saige::gpu2::STATS_SPA | saige::gpu2::STATS_DEGEN))) {
+                            const bool wantF = (dflags & saige::gpu2::STATS_FIRTH) != 0;
+                            if (!wantF || firthDev) { erBatch = true; needFirth = wantF; }
+                        }
                         if ((hi || !isBin) && affOK) {
                             if (devPair && !devHost) {
                                 // the device's decisions, from the same StdStat and p
@@ -5391,7 +5411,8 @@ bool mainMarkerMTGpu(
                             useBatch = !needSPA && !needFirth && !needFast;
                         }
                         if ((hi || !isBin) && affOK) O.gateP[jj] = bP;
-                        O.route[jj] = (unsigned char)((needSPA ? 1 : 0) | (needFirth ? 2 : 0) |
+                        // (an erBatch pair's byte is the scalar path's: bit 3 only, Firth bits from phase 5)
+                        O.route[jj] = (unsigned char)((needSPA ? 1 : 0) | ((needFirth && !erBatch) ? 2 : 0) |
                                                       (needFast ? 4 : 0) | ((isBin && !hi) ? 8 : 0));
                         if (needSPA)   {
                             #pragma omp atomic
@@ -5505,6 +5526,25 @@ bool mainMarkerMTGpu(
                         }
                         if (devFastDone) {
                             isSPAConverge = false;   // set by phase 4 when SPA runs
+                        } else if (erBatch) {
+                            Beta       = bBeta;
+                            seBeta     = bSe;
+                            Tstat      = bT;
+                            varT       = bV1;
+                            if (!rawP) { pval = *bStr; pval_noSPA = pval; }
+                            pvRaw = pvRawNA = bP; pvKind = pvKindNA = bLog ? 1 : 0;
+                            isSPAConverge = false;
+                            if (needFirth) {
+                                PendFirth pf;
+                                pf.bi = bi; pf.jj = jj; pf.c = c; pf.t = t;
+                                pf.p = bP;
+                                pf.logp = bLog ? 1 : 0;
+                                pf.flip = flip ? 1 : 0;
+                                for (int k = 0; k < 4; k++) pf.fd[k] = fdt[k];
+                                pendF[omp_get_thread_num()].push_back(pf);
+                            }
+                            tlBatched[t]++;
+                            tlErBatch[t]++;
                         } else if (useBatch || toDev || toFirthOnly) {
                             Beta       = bBeta;
                             seBeta     = bSe;
@@ -5855,6 +5895,7 @@ bool mainMarkerMTGpu(
             nPcCounts[t] += tc[(std::size_t)P + t];
             nDevStat[t]  += tc[(std::size_t)2 * P + t];
             for (int rr = 0; rr < 8; rr++) nDevHost[(std::size_t)rr][t] += tc[(std::size_t)(3 + rr) * P + t];
+            nErBatch[t]  += tc[(std::size_t)11 * P + t];
         }
     long totBatch = 0, totFall = 0;
     for (int t = 0; t < P; t++) {
@@ -5883,8 +5924,11 @@ bool mainMarkerMTGpu(
             a += nPcCounts[t]; b += nPcReplay[t]; g += nPcGather[t];
             s += nGateSPA[t]; f += nGateFirth[t]; fa += nGateFast[t]; e += nGateER[t];
         }
+        long eb = 0;
+        for (int t = 0; t < P; t++) eb += nErBatch[t];
         std::cout << "  gate: needSPA " << s << ", needFirth " << f << ", needFast " << fa
-                  << ", ER (MAC <= " << g_MACCutoffforER << ") " << e << " pairs" << std::endl;
+                  << ", ER (MAC <= " << g_MACCutoffforER << ") " << e << " pairs (" << eb
+                  << " of them kept the device's score result: |StdStat| <= SPA_Cutoff, no exact test)" << std::endl;
         if (spaDev) {
             long d = 0, df = 0;
             for (int t = 0; t < P; t++) { d += nDevSpa[t]; df += nDevSpaFirth[t]; }
