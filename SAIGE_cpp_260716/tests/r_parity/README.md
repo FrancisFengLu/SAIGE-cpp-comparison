@@ -43,3 +43,26 @@ Own sample lists on the device (`gpuDeviceStats` with `gpuOwnSampleSets`, write-
 - `timing_ownstats.sh` — g200k x the bm_full models cycled to P = 128 (own sample
   lists), before / after, cold cache, n = 2, TIMING_LOCK; then bt under mean imputation,
   where the missing-cell sums run on the device for every marker with missing calls.
+
+Per-marker preprocessing on the device, quantitative device statistics, the sparse
+statistic on the device (branch `gpuprep`, write-up `S2_GPUPREP.md`):
+
+- `cpp_gpu_runs.sh <bin> <OUT>` / `gate_table_gpu.py <OUT>` — the GPU path of one binary on
+  the rdefaults datasets x configurations, against R and against the rdefaults single-trait
+  outputs, with the per-trait marker counts and the device log lines.
+- `gen_fam32.py OUTDIR` — fam32: N = 4,000 in 1,000 families of 4 (Mendelian transmission, so a
+  sparse GRM has 4 x 4 blocks), M = 5,000, 1% missing genotypes, 12 covariates, 16 binary + 16
+  quantitative traits, EVERY trait with its own missing-phenotype pattern (5–25% NA).
+- `r_runs_fam32.sh` — R step 1 (full GRM for the 32; createSparseGRM + sparse step 1 with the
+  sparse and categorical variance ratios for b1–b4 / q1–q4) and R step 2 (full: def / adj /
+  defF / adjF; sparse: fast test off and on, Firth).
+- `cpp_runs_fam32.sh <bin>` — converts the models (`rda_to_arma.R`, with the sparse GRM for the
+  sparse ones) and runs the three paths; `gate_table_fam32.py` prints the tables.
+- `sparse_gate.sh <bin>` / `sparse_table.py` — the sparse-GRM cases of bingpu_test (bt: 10
+  binary, one list; bm: 8 binary own lists; qm: 8 quantitative own lists; mix), fast test off /
+  on, Firth, noadjCov both: the GPU path against the CPU block-inverse path of the same binary
+  (`blockSparseSigmaSolveMargin: 0.01`, so the CPU never falls back to the 2%-tolerance PCG).
+- `subset_model.py` — a model directory with a random subset of its samples dropped, for timing
+  runs with 128 distinct sample lists (not a consistent fit; timing only).
+- `timing_gpuprep.sh` — g200k P = 128 (same list / 4 lists / 128 lists) and the quantitative
+  sparse first pass, before (ownstats) vs after.
