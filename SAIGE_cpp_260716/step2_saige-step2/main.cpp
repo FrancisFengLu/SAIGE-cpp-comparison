@@ -5541,11 +5541,13 @@ bool mainMarkerMTGpu(
                         bool rcDense = false;
                         int fastHostWhy = FH_NONE;
                         if (needFast && !devFast && (hi || !isBin)) {
+                            // (a binary pair without the device SPA: only when neither
+                            // the first pass nor the recompute asks for one)
                             if (rcCtxSparse)                          fastHostWhy = (!spT) ? FH_NOSPARSE : FH_NOSPA;
                             else if (!fastRcDev || !devPair || devHost || spPair ||
                                      rcF == nullptr || (rcF[oP] & saige::gpu2::STATS_HOST)) fastHostWhy = FH_NOSTATS;
                             else if (!affOK)                          fastHostWhy = FH_AFF;
-                            else if (isBin && !spaDev)                fastHostWhy = FH_NOSPA;
+                            else if (isBin && !spaDev && needSPA)     fastHostWhy = FH_NOSPA;
                             else                                      rcDense = true;
                         }
                         bool devFastDone = false;
@@ -5587,7 +5589,9 @@ bool mainMarkerMTGpu(
                                 if (!rc.spa && isBin && M.is_Firth_beta)
                                     wantF = rc.islog ? (rc.pno <= std::log(M.pCutoffforFirth))
                                                      : (rc.pno <= M.pCutoffforFirth);
-                                if (rc.spa || !wantF || firthDev) {
+                                if (rc.spa && !spaDev) {
+                                    fastHostWhy = FH_NOSPA;   // the recompute's SPA: the scalar path
+                                } else if (rc.spa || !wantF || firthDev) {
                                     Beta = rc.Beta; seBeta = rc.seBeta; Tstat = rc.Tstat; varT = rc.var1;
                                     pval = rc.str; pval_noSPA = rc.str;
                                     pvRaw = pvRawNA = rc.pno; pvKind = pvKindNA = rc.islog ? 1 : 0;
