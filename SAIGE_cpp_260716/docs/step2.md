@@ -149,7 +149,7 @@ flags, with R's defaults) and prints a note when the two differ.
 | `--MACCutoff_to_CollapseUltraRare X` | `MACCutoff_to_CollapseUltraRare` | 10 | collapse variants with MAC <= X |
 | `--markers_per_chunk_in_groupTest N` | `markers_per_chunk_in_groupTest` | 100 (R: 100) | markers per chunk |
 | `--groups_per_chunk N` | `groups_per_chunk` | 100 | regions per I/O chunk |
-| `--is_single_in_groupTest[=TRUE\|FALSE]` | `isSingleInGroupTest` | TRUE (R: FALSE) | also write single-variant results |
+| `--is_single_in_groupTest[=TRUE\|FALSE]` | `isSingleInGroupTest` | FALSE (R: FALSE) | also write single-variant results |
 | `--is_output_markerList_in_groupTest[=TRUE\|FALSE]` | `isOutputMarkerList` | FALSE | write the marker list of each region |
 | `--minGroupMAC_in_BurdenTest X` | `min_gourpmac_for_burdenonly` | 5 | min group MAC for Burden-only tests |
 
