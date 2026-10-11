@@ -442,6 +442,41 @@ bool g_gpuDeviceStats = false;
 // at all; tools/sgs2txt formats them on the way out with the same code the
 // text writer uses (sgs_format.hpp E_PVALRAW, header flag H_PRAW).
 bool g_sgsRawDouble   = false;
+// Config key outputFirthStatus (default false): a Firth.Status column after
+// Is.SPA for binary traits -- not_fitted / converged / maxit / singular
+// (saige_test.hpp FirthStatus) -- in the text and .sgs output. Off, the
+// output format is R's. The per-trait counts are in the log either way.
+bool g_outputFirthStatus = false;
+// The status bookkeeping behind it, shared by the three marker loops: the
+// per-trait counts (updated from inside the parallel loops), the device
+// Firth's mapping, and the two summary lines.
+static inline void firthStatusCount(FirthStatusCounts& c, unsigned char s) {
+    if (s == FIRTH_CONVERGED) {
+        #pragma omp atomic
+        c.strict++;
+    } else if (s == FIRTH_MAXIT) {
+        #pragma omp atomic
+        c.maxit++;
+    } else if (s == FIRTH_SINGULAR) {
+        #pragma omp atomic
+        c.singular++;
+    }
+}
+static inline unsigned char firthStatusOfDevice(const saige::gpu2::FirthPairOut& o) {
+    // Both device kernels (gpu_firth.cu, gpu_firth_fp32.cuh) end with conv = 0
+    // only on the singular exit; maxit ends with conv = 1, strict = 0.
+    if (o.singular || !o.conv) return FIRTH_SINGULAR;
+    return o.strict ? FIRTH_CONVERGED : FIRTH_MAXIT;
+}
+// R's line, then the breakdown. "fits" is R's "applied to" count; R counts a
+// maxit exit as converged (its isfirthconverge), and so does the first line.
+static void printFirthSummary(const std::string& prefix, int mFirth, int mFirthConverge,
+                              const FirthStatusCounts& c) {
+    std::cout << prefix << "Firth approx was applied to " << mFirth
+              << " markers. " << mFirthConverge << " successfully converged." << std::endl;
+    std::cout << prefix << "Firth fits: " << mFirth << "; strictly converged " << c.strict
+              << ", stopped at maxit (50) " << c.maxit << ", singular " << c.singular << std::endl;
+}
 // Config key gpuPgen (default: = useGPU): let the GPU path take genoType: pgen
 // when the .pgen holds hard calls only (no dosages, no multiallelic
 // variants). The host decodes each record with pgenlib (LD-compressed
@@ -886,6 +921,10 @@ bool openOutfile_single(std::ofstream& OutFile_single,
             if (t_traitType == "binary" || t_traitType == "survival") {
                 OutFile_single << "p.value.NA\tIs.SPA\t";
             }
+            // outputFirthStatus (the same column header_line gives the .sgs header)
+            if (t_meta.outputFirthStatus && t_traitType == "binary") {
+                OutFile_single << "Firth.Status\t";
+            }
 
             if (t_meta.isCondition) {
                 OutFile_single << "BETA_c\tSE_c\tTstat_c\tvar_c\tp.value_c\t";
@@ -966,7 +1005,11 @@ void writeOutfile_single(std::ofstream& OutFile_single,
                           // accumulated by the caller instead. Defaulted, so the
                           // single-trait call site and its output are unchanged.
                           bool t_printSummary = true,
-                          int* t_numtestOut = nullptr)
+                          int* t_numtestOut = nullptr,
+                          // outputFirthStatus: the rows' Firth status (binary traits) and
+                          // the per-trait counts for the summary line. Null = none.
+                          const std::vector<unsigned char>* t_firthStatus = nullptr,
+                          const FirthStatusCounts* t_firthCounts = nullptr)
 {
     // Unpacked from TraitMeta so the body below is untouched.
     const bool         t_isMoreOutput = t_meta.isMoreOutput;
@@ -1003,6 +1046,7 @@ void writeOutfile_single(std::ofstream& OutFile_single,
             spaChar[i] = isSPAConvergeVec[i] ? 1 : 0;
         OT.isSPAConverge = &spaChar;
     }
+    OT.firthStatus = t_firthStatus;
     // thread_local: the multi-trait call sites write the P traits in parallel.
     thread_local std::string rowbuf;
     rowbuf.clear();
@@ -1018,9 +1062,8 @@ void writeOutfile_single(std::ofstream& OutFile_single,
     std::cout << numtest << " markers were tested." << std::endl;
     if (t_traitType == "binary") {
         if (t_isFirth) {
-            std::cout << "Firth approx was applied to " << mFirth
-                      << " markers. " << mFirthConverge
-                      << " successfully converged." << std::endl;
+            printFirthSummary("", mFirth, mFirthConverge,
+                              t_firthCounts ? *t_firthCounts : FirthStatusCounts());
             std::cout << "[A3] Firth fit calls: " << g_firthFitCalls.load()
                       << " (equals candidate count when no duplicate execution)" << std::endl;
         }
@@ -1122,6 +1165,8 @@ void mainMarkerInCPP(
 
     int mFirth = 0;
     int mFirthConverge = 0;
+    FirthStatusCounts mFirthSt;              // strict / maxit / singular
+    std::vector<unsigned char> firthStatusVec(q, 0);   // per row (outputFirthStatus)
     // Phase B: end-of-stream flag (some readers signal EOF mid-iteration). With
     // OpenMP we cannot 'break' out of a parallel for, so we record the lowest
     // failing index and skip work for i >= that index.
@@ -1616,6 +1661,9 @@ void mainMarkerInCPP(
                     #pragma omp atomic
                     mFirthConverge = mFirthConverge + 1;
                 }
+                const unsigned char fs = g_firthLastStatus;
+                firthStatusVec[i] = fs;
+                firthStatusCount(mFirthSt, fs);
             }
             BetaVec.at(i) = Beta * (1 - 2 * flip);
             seBetaVec.at(i) = seBeta;
@@ -1951,6 +1999,7 @@ void mainMarkerInCPP(
                 // g_firthDefer stays false and Firth runs inline for ER.
                 // W1-1: when the recompute is skipped (same ctx), Firth must run
                 // inline in the first pass — hence !fastRecomputeSameCtx.
+                g_firthLastStatus = FIRTH_NONE;
                 g_firthDefer = (ptr_gSAIGEobj->m_isFastTest &&
                                 t_traitType == "binary" &&
                                 MAC > g_MACCutoffforER &&
@@ -2062,6 +2111,9 @@ void mainMarkerInCPP(
                             #pragma omp atomic
                             mFirthConverge = mFirthConverge + 1;
                         }
+                        const unsigned char fs = g_firthLastStatus;
+                        firthStatusVec[i] = fs;
+                        firthStatusCount(mFirthSt, fs);
                     }
                 }
 
@@ -2209,7 +2261,11 @@ void mainMarkerInCPP(
                          N_ctrl_hetVec,
                          N_case_hetVec,
                          N_ctrl_homVec,
-                         N_Vec);
+                         N_Vec,
+                         /*printSummary*/ true,
+                         nullptr,
+                         &firthStatusVec,
+                         &mFirthSt);
     timing_mark("70_output_written");  // TIMING_INSTRUMENT_REMOVE_ME
 }
 
@@ -2270,6 +2326,7 @@ struct MTTraitChunk {
     std::vector<double>      Beta_c, seBeta_c, Tstat_c, varT_c;
     std::vector<std::string> pval_c, pvalNA_c;
     std::vector<char>        isSPAConverge;   // char, not bool: see above
+    std::vector<unsigned char> firthStatus;   // saige_test.hpp FirthStatus (outputFirthStatus)
     std::vector<double>      AF_case, AF_ctrl;
     std::vector<uint32_t>    N_case, N_ctrl;
     std::vector<double>      N_case_hom, N_ctrl_het, N_case_het, N_ctrl_hom;
@@ -2308,6 +2365,7 @@ struct MTTraitChunk {
         Tstat_c.assign(qc, nan); varT_c.assign(qc, nan);
         pval_c.assign(qc, "NA"); pvalNA_c.assign(qc, "NA");
         isSPAConverge.assign(qc, 0);
+        firthStatus.assign(qc, 0);
         AF_case.assign(qc, 0.0); AF_ctrl.assign(qc, 0.0);
         N_case.assign(qc, 0); N_ctrl.assign(qc, 0);
         N_case_hom.assign(qc, 0.0); N_ctrl_het.assign(qc, 0.0);
@@ -3540,6 +3598,7 @@ bool mainMarkerMTGpu(
     static const std::string kNAstr("NA");
 
     std::vector<int>  mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
+    std::vector<FirthStatusCounts> mFirthSt(P);   // strict / maxit / singular per trait
     std::vector<long> nBatched(P, 0), nFallback(P, 0), nPcCounts(P, 0), nPcReplay(P, 0), nPcGather(P, 0);
     std::vector<long> nGateSPA(P, 0), nGateFirth(P, 0), nGateFast(P, 0), nGateER(P, 0);
     std::vector<long> nDevSpa(P, 0), nDevSpaFirth(P, 0);
@@ -4314,6 +4373,7 @@ bool mainMarkerMTGpu(
                             ctx_first.isnoadjCov_cur    = noadjCur;
                             ctx_first.erSeedStream      = (uint64_t)i + 1;
                             ctx_first.varRatioVal       = VRpair4;
+                            g_firthLastStatus = FIRTH_NONE;
                             g_firthDefer = (obj->m_isFastTest && MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
                             if (spT4 && sparseCur) {
                                 ctx_first.presetVar2 = var2sp((std::size_t)pd.bi * Bblk + c, t);
@@ -4382,6 +4442,9 @@ bool mainMarkerMTGpu(
                                     #pragma omp atomic
                                     mFirthConverge[t] += 1;
                                 }
+                                const unsigned char fs = g_firthLastStatus;
+                                O.firthStatus[jj] = fs;
+                                firthStatusCount(mFirthSt[t], fs);
                             }
                             O.Beta[jj]   = Beta * (1 - 2 * flip);
                             O.seBeta[jj] = seB;
@@ -4592,6 +4655,7 @@ bool mainMarkerMTGpu(
                         W.P2Vec.clear();
                         bool is_gtilde = false;
                         SAIGE::PerMarkerCtx cx = pe.ctx;
+                        g_firthLastStatus = FIRTH_NONE;
                         g_firthDefer = false;   // as phase 3 set it for an ER pair (MAC <= the ER cutoff)
                         obj->getMarkerPval(
                             *gUse, *inzUse, *izUse,
@@ -4614,6 +4678,9 @@ bool mainMarkerMTGpu(
                                 #pragma omp atomic
                                 mFirthConverge[t] += 1;
                             }
+                            const unsigned char fs = g_firthLastStatus;
+                            O.firthStatus[jj] = fs;
+                            firthStatusCount(mFirthSt[t], fs);
                         }
                         O.Beta[jj]   = Beta * (1 - 2 * flip);
                         O.seBeta[jj] = seBr;
@@ -4707,6 +4774,11 @@ bool mainMarkerMTGpu(
                             #pragma omp atomic
                             mFirthConverge[t] += 1;
                         }
+                        {
+                            const unsigned char fs = firthStatusOfDevice(o);
+                            O.firthStatus[jj] = fs;
+                            firthStatusCount(mFirthSt[t], fs);
+                        }
                         #pragma omp atomic
                         nDevFirth[t]++;
                     }
@@ -4739,6 +4811,7 @@ bool mainMarkerMTGpu(
                     C.pvalNARaw = &O.pvalNAD; C.pvalNARawKind = &O.pvalNADk;
                 }
                 C.isSPAConverge = &O.isSPAConverge;
+                C.firthStatus = &O.firthStatus;
                 C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
                 C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
                 C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
@@ -4779,7 +4852,8 @@ bool mainMarkerMTGpu(
                                     O.N_case_het, O.N_ctrl_hom,
                                     O.N,
                                     /*printSummary*/ false,
-                                    &numtestChunk);
+                                    &numtestChunk,
+                                    &O.firthStatus);
                 ntChunk[t] = numtestChunk;
             }
             for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
@@ -5728,6 +5802,7 @@ bool mainMarkerMTGpu(
                                 nSpPreset[t]++;
                             }
                             // A3: thread_local, set before every call.
+                            g_firthLastStatus = FIRTH_NONE;
                             g_firthDefer = (obj->m_isFastTest && isBin &&
                                             MAC > g_MACCutoffforER && !fastRecomputeSameCtx);
                             const bool isER = (MAC <= g_MACCutoffforER && isBin);
@@ -5817,6 +5892,9 @@ bool mainMarkerMTGpu(
                                     #pragma omp atomic
                                     mFirthConverge[t] += 1;
                                 }
+                                const unsigned char fs = g_firthLastStatus;
+                                O.firthStatus[jj] = fs;
+                                firthStatusCount(mFirthSt[t], fs);
                             }
                             #pragma omp atomic
                             nFallback[t]++;
@@ -6036,11 +6114,8 @@ bool mainMarkerMTGpu(
                   << ")." << std::endl;
         totBatch += nBatched[t] + nDevSpa[t] + nDevFast[t] + nDevFastDense[t];
         totFall  += nFallback[t];
-        if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
-            std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
-                      << mFirth[t] << " markers. " << mFirthConverge[t]
-                      << " successfully converged." << std::endl;
-        }
+        if (g_traitMeta[t].traitType == "binary" && t_isFirth)
+            printFirthSummary("[" + g_traitMeta[t].name + "] ", mFirth[t], mFirthConverge[t], mFirthSt[t]);
     }
     if (totBatch + totFall > 0) {
         std::cout << "  GPU coverage: " << totBatch << " / " << (totBatch + totFall)
@@ -6326,6 +6401,7 @@ void mainMarkerMT(
     std::vector<long> nPcCounts(P, 0), nPcReplay(P, 0), nPcGather(P, 0);
 
     std::vector<int> mFirth(P, 0), mFirthConverge(P, 0), numtestTotal(P, 0);
+    std::vector<FirthStatusCounts> mFirthSt(P);   // strict / maxit / singular per trait
     std::vector<long> nBatched(P, 0), nFallback(P, 0);
     // Different sample sets, coverage diagnostics only: pairs whose flip is the
     // opposite of the union column's (and how many of those stayed batched),
@@ -7078,6 +7154,7 @@ void mainMarkerMT(
                         // A3: g_firthDefer is thread_local and this thread runs
                         // many pairs in a row, so it must be set -- not just
                         // cleared -- before every call (design 3.4 note 1).
+                        g_firthLastStatus = FIRTH_NONE;
                         g_firthDefer = (obj->m_isFastTest &&
                                         traitType == "binary" &&
                                         MAC > g_MACCutoffforER &&
@@ -7153,6 +7230,9 @@ void mainMarkerMT(
                                 #pragma omp atomic
                                 mFirthConverge[t] += 1;
                             }
+                            const unsigned char fs = g_firthLastStatus;
+                            O.firthStatus[jj] = fs;
+                            firthStatusCount(mFirthSt[t], fs);
                         }
                         #pragma omp atomic
                         nFallback[t]++;
@@ -7317,6 +7397,7 @@ void mainMarkerMT(
                 C.Tstat = &O.Tstat; C.varT = &O.varT;
                 C.pval = &O.pval; C.pvalNA = &O.pvalNA;
                 C.isSPAConverge = &O.isSPAConverge;
+                C.firthStatus = &O.firthStatus;
                 C.Beta_c = &O.Beta_c; C.seBeta_c = &O.seBeta_c;
                 C.Tstat_c = &O.Tstat_c; C.varT_c = &O.varT_c;
                 C.pval_c = &O.pval_c; C.pvalNA_c = &O.pvalNA_c;
@@ -7357,7 +7438,8 @@ void mainMarkerMT(
                                 O.N_case_het, O.N_ctrl_hom,
                                 O.N,
                                 /*printSummary*/ false,
-                                &numtestChunk);
+                                &numtestChunk,
+                                &O.firthStatus);
             ntChunk[t] = numtestChunk;
         }
         for (int t = 0; t < P; t++) numtestTotal[t] += ntChunk[t];
@@ -7408,11 +7490,8 @@ void mainMarkerMT(
         std::cout << "." << std::endl;
         totBatch += nBatched[t];
         totFall  += nFallback[t];
-        if (g_traitMeta[t].traitType == "binary" && t_isFirth) {
-            std::cout << "[" << g_traitMeta[t].name << "] Firth approx was applied to "
-                      << mFirth[t] << " markers. " << mFirthConverge[t]
-                      << " successfully converged." << std::endl;
-        }
+        if (g_traitMeta[t].traitType == "binary" && t_isFirth)
+            printFirthSummary("[" + g_traitMeta[t].name + "] ", mFirth[t], mFirthConverge[t], mFirthSt[t]);
     }
     if (differ) {
         std::cout << "  Own-sample-set traits: markers passing QC for only some traits: "
@@ -9572,6 +9651,10 @@ int main(int argc, char* argv[])
             std::cerr << "                     and redoes the pairs the device hands back (degenerate, or p" << std::endl;
             std::cerr << "                     underflowed to 0 -> the log-domain p). Same algebra as the host" << std::endl;
             std::cerr << "                     tail in another summation order: results agree to rounding." << std::endl;
+            std::cerr << "  outputFirthStatus: true/false (default false). Binary traits: a Firth.Status" << std::endl;
+            std::cerr << "                     column after Is.SPA -- not_fitted / converged / maxit / singular" << std::endl;
+            std::cerr << "                     (how the Firth fit stopped; R counts maxit as converged and so" << std::endl;
+            std::cerr << "                     does the 'successfully converged' line). Text and sgs output." << std::endl;
             std::cerr << "  sgsRawDouble:      true/false (default: true with outputFormat: sgs at fp64)." << std::endl;
             std::cerr << "                     Store the p-value columns as the computed doubles (plus a" << std::endl;
             std::cerr << "                     per-row kind) instead of the parsed printed string; the GPU" << std::endl;
@@ -9959,6 +10042,12 @@ int main(int argc, char* argv[])
         } else if (g_sgsRawDouble && g_sgsF32) {
             throw std::runtime_error("sgsRawDouble needs sgsPrecision: fp64 (the raw p-value column is a double)");
         }
+        // outputFirthStatus: the Firth.Status column (binary traits), off by
+        // default so the output columns stay R's.
+        g_outputFirthStatus = cfgBool("outputFirthStatus", false);
+        if (g_outputFirthStatus)
+            std::cout << "  outputFirthStatus: on -- a Firth.Status column (not_fitted / converged / maxit / "
+                         "singular) after Is.SPA for binary traits" << std::endl;
         g_gpuPgen = cfgBool("gpuPgen", gpuDef);   // default with useGPU (S2_GPU_PGEN.md)
         if (g_gpuPgen && !g_gpuStep2 && cfgSet("gpuPgen"))
             std::cout << "  gpuPgen: ignored, useGPU is false" << std::endl;
@@ -10259,6 +10348,7 @@ int main(int argc, char* argv[])
             kv("gpuPrecisionER", saige::gpu2::precName(g_precER));
             kv("gpuDeviceStats", "= useGPU");
             kv("sgsRawDouble", "true with outputFormat: sgs at fp64");
+            kv("outputFirthStatus", b(g_outputFirthStatus));
             kv("gpuPrecisionFirth", saige::gpu2::precName(g_precFirth));
             kv("gpuInt8Slices", g_gpuInt8Slices);
             std::cout << o.str();
@@ -10642,6 +10732,7 @@ int main(int argc, char* argv[])
             tm.flagSparseGRM            = nm.flagSparseGRM;
             tm.isCondition              = objsCfgOrder[ti]->m_isCondition;
             tm.isMoreOutput             = isMoreOutput;
+            tm.outputFirthStatus        = g_outputFirthStatus;
             // loco_applied, not useLOCO: loadNullModel silently falls back to
             // the genome-wide fit when `chrom` is absent from loco_chroms
             // (null_model_loader.cpp guard 3). validateMTModels warns when P

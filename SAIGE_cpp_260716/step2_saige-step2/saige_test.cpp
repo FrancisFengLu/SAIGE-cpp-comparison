@@ -16,6 +16,7 @@
 // A3 globals (declared extern in saige_test.hpp)
 thread_local bool g_firthDefer = false;
 std::atomic<std::uint64_t> g_firthFitCalls{0};
+thread_local unsigned char g_firthLastStatus = FIRTH_NONE;
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -1733,6 +1734,7 @@ void SAIGEClass::fast_logistf_fit_simple(arma::mat & x,
         double & sebeta_G,
 	bool & isfirthconverge){
   isfirthconverge = false;
+  g_firthLastStatus = FIRTH_NONE;
   int n = x.n_rows;
   int k = x.n_cols;
   arma::vec beta = init;
@@ -1783,6 +1785,7 @@ void SAIGEClass::fast_logistf_fit_simple(arma::mat & x,
         bool isinv = arma::inv_sympd (XX_covs, XX_Fisher);
 
 	if(!isinv){
+                g_firthLastStatus = FIRTH_SINGULAR;
                 break;
         }
         arma::vec delta = XX_covs * U_star;
@@ -1797,8 +1800,12 @@ void SAIGEClass::fast_logistf_fit_simple(arma::mat & x,
         ws_pi_0 = -x * beta - offset;
         ws_pi_0 = arma::exp(ws_pi_0) + 1;
         ws_pi = 1/ws_pi_0;
-        if((iter == maxit) || ( (arma::max(arma::abs(delta)) <= xconv) & (abs(U_star).is_zero(gconv)))){
+        // R's stopping rule, unchanged: the tolerances or maxit, both "converged".
+        // The status records which one (the tolerances win when both hold).
+        const bool small = (arma::max(arma::abs(delta)) <= xconv) & (abs(U_star).is_zero(gconv));
+        if((iter == maxit) || small){
 		isfirthconverge = true;
+                g_firthLastStatus = small ? FIRTH_CONVERGED : FIRTH_MAXIT;
                 break;
         }
   }

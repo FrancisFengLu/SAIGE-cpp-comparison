@@ -286,6 +286,9 @@ int main(int argc, char** argv) {
         TraitMeta meta;
         meta.name = name; meta.traitType = ttype;
         meta.isCondition = isCond; meta.isMoreOutput = isMore;
+        // outputFirthStatus: the file carries the column (and its header
+        // already names it); format_text emits it when the meta asks.
+        for (uint32_t i = 0; i < nc; i++) if (cols[i] == C_FIRTHST) meta.outputFirthStatus = true;
 
         const std::string outPath = outOverride.empty() ? textPath : outOverride;
         FILE* fo = fopen(outPath.c_str(), "wb");
@@ -298,6 +301,7 @@ int main(int argc, char** argv) {
         std::vector<double> AF_case, AF_ctrl, Nch, Nche, Ncth, Nctt;
         std::vector<std::string> pval, pvalNA, pval_c, pvalNA_c;
         std::vector<char> isSPA;
+        std::vector<unsigned char> firthSt;
         std::vector<uint32_t> N_case, N_ctrl, N;
         std::vector<double> ac, af, info;
         std::string buf;
@@ -336,6 +340,7 @@ int main(int argc, char** argv) {
                     case C_PVAL:   get_col_pval(r, pval, n); break;
                     case C_PVALNA: get_col_pval(r, pvalNA, n); break;
                     case C_ISSPA:  get_col_pod (r, isSPA, n); break;
+                    case C_FIRTHST: get_col_pod(r, firthSt, n); break;
                     case C_BETA_C: get_col_f64 (r, Beta_c, n); break;
                     case C_SE_C:   get_col_f64 (r, seBeta_c, n); break;
                     case C_TSTAT_C:get_col_f64 (r, Tstat_c, n); break;
@@ -370,6 +375,7 @@ int main(int argc, char** argv) {
             TC.imputeInfo = &info; TC.missingRate = &info;
             TC.Beta = &Beta; TC.seBeta = &seBeta; TC.Tstat = &Tstat; TC.varT = &varT;
             TC.pval = &pval; TC.pvalNA = &pvalNA; TC.isSPAConverge = &isSPA;
+            TC.firthStatus = &firthSt;
             TC.Beta_c = &Beta_c; TC.seBeta_c = &seBeta_c;
             TC.Tstat_c = &Tstat_c; TC.varT_c = &varT_c;
             TC.pval_c = &pval_c; TC.pvalNA_c = &pvalNA_c;

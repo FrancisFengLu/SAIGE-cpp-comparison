@@ -2,6 +2,7 @@
 
 #include "out_fast.hpp"
 #include "sgs_format.hpp"
+#include "saige_test.hpp"   // FirthStatus / firthStatusName (outputFirthStatus)
 
 #include <cerrno>
 #include <cmath>
@@ -41,6 +42,7 @@ std::string header_line(const TraitMeta& meta, bool isImputation) {
     h += "BETA\tSE\tTstat\tvar\tp.value\t";
     const bool spa = (meta.traitType == "binary" || meta.traitType == "survival");
     if (spa) h += "p.value.NA\tIs.SPA\t";
+    if (meta.outputFirthStatus && meta.traitType == "binary") h += "Firth.Status\t";
     if (meta.isCondition) {
         h += "BETA_c\tSE_c\tTstat_c\tvar_c\tp.value_c\t";
         if (spa) h += "p.value.NA_c\t";
@@ -66,6 +68,9 @@ int format_text(std::string& buf, const TraitMeta& meta, bool isImputation,
     const bool isSurv      = (meta.traitType == "survival");
     const bool cond        = meta.isCondition;
     const bool more        = meta.isMoreOutput;
+    // outputFirthStatus: one word per row after Is.SPA ("not_fitted" is the
+    // longest, 10 bytes, inside the 1024-byte allowance below).
+    const bool firthCol    = meta.outputFirthStatus && isBin;
 
     // Longest possible row: 22 numeric fields at <= 24 chars plus five marker
     // strings. Grown, not guessed, for the marker id.
@@ -109,6 +114,12 @@ int format_text(std::string& buf, const TraitMeta& meta, bool isImputation,
             p = put_s(p, (*T.pvalNA)[k]); *p++ = '\t';
             const bool b = (*T.isSPAConverge)[k] != 0;
             p = put_s(p, b ? std::string("true") : std::string("false")); *p++ = '\t';
+        }
+        if (firthCol) {
+            const unsigned char s = T.firthStatus ? (*T.firthStatus)[k] : (unsigned char)FIRTH_NONE;
+            const char* w = firthStatusName(s);
+            const std::size_t n = std::strlen(w);
+            std::memcpy(p, w, n); p += n; *p++ = '\t';
         }
         if (cond) {
             p = put_g(p, (*T.Beta_c)[k]);   *p++ = '\t';
@@ -276,6 +287,7 @@ static std::vector<uint8_t> col_list(const TraitMeta& meta) {
     const bool spa = (meta.traitType == "binary" || meta.traitType == "survival");
     std::vector<uint8_t> c{C_BETA, C_SE, C_TSTAT, C_VAR, C_PVAL};
     if (spa) { c.push_back(C_PVALNA); c.push_back(C_ISSPA); }
+    if (meta.outputFirthStatus && meta.traitType == "binary") c.push_back(C_FIRTHST);
     if (meta.isCondition) {
         c.push_back(C_BETA_C); c.push_back(C_SE_C); c.push_back(C_TSTAT_C);
         c.push_back(C_VAR_C);  c.push_back(C_PVAL_C);
@@ -465,6 +477,10 @@ bool SgsSink::writeChunk(const MarkerCols& M, const std::vector<TraitCols>& cols
                 case C_PVALNA: if (rawT) put_col_pval_raw(b, *C.pvalNARaw, *C.pvalNARawKind, *C.pvalNA, present, nRows);
                                else      put_col_pval(b, *C.pvalNA, nRows, f32); break;
                 case C_ISSPA:  put_col_pod (b, C.isSPAConverge->data(), nRows); break;
+                case C_FIRTHST:
+                    if (C.firthStatus) put_col_pod(b, C.firthStatus->data(), nRows);
+                    else { const unsigned char z = 0; put_u8(b, E_CONST); put_bytes(b, &z, 1); }
+                    break;
                 case C_BETA_C: put_col_f64 (b, C.Beta_c->data(), nRows, f32); break;
                 case C_SE_C:   put_col_f64 (b, C.seBeta_c->data(), nRows, f32); break;
                 case C_TSTAT_C:put_col_f64 (b, C.Tstat_c->data(), nRows, f32); break;

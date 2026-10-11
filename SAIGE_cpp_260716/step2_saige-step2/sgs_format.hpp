@@ -54,14 +54,20 @@ static const uint32_t VERSION   = 1;
 static const uint32_t BLK_MAGIC = 0x314B4C42u;   // "BLK1"
 static const uint32_t END_MAGIC = 0x21444E45u;   // "END!"
 
-// Per-trait column codes, in the order the text writer emits them.
+// Per-trait column codes, in the order the text writer emits them (C_FIRTHST
+// sits after C_ISSPA in that order; it was added last and keeps the older
+// codes' values).
 enum ColCode : uint8_t {
     C_BETA = 1, C_SE, C_TSTAT, C_VAR, C_PVAL,
     C_PVALNA, C_ISSPA,
     C_BETA_C, C_SE_C, C_TSTAT_C, C_VAR_C, C_PVAL_C, C_PVALNA_C,
     C_AFCASE, C_AFCTRL, C_NCASE, C_NCTRL,
     C_NCASEHOM, C_NCASEHET, C_NCTRLHOM, C_NCTRLHET,
-    C_N
+    C_N,
+    // outputFirthStatus: u8 per row (saige_test.hpp FirthStatus: 0 not fitted,
+    // 1 converged, 2 maxit, 3 singular), printed as Firth.Status. Only in a
+    // file written with the switch on; the default column list is unchanged.
+    C_FIRTHST
 };
 
 // Column encodings. The 32-bit forms appear only under sgsPrecision: fp32, and

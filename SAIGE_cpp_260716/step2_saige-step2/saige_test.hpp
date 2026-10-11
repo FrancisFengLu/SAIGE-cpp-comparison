@@ -23,6 +23,37 @@
 extern thread_local bool g_firthDefer;
 extern std::atomic<std::uint64_t> g_firthFitCalls;
 
+// Firth fit status (2026-10-11). fast_logistf_fit_simple's isfirthconverge --
+// R SAIGE 1.5.2's too (SAIGE_test.cpp fast_logistf_fit_simple) -- is true both
+// when the fit stopped on its tolerances (max|delta| <= xconv and max|U*| <=
+// gconv) and when it stopped at maxit (50), and false only when the information
+// matrix could not be inverted. R prints only the count of "converged" fits and
+// no per-row flag, and its beta at maxit is the 50th iterate; this port keeps
+// both. The classification below is carried next to that flag: every
+// fast_logistf_fit_simple call sets g_firthLastStatus (thread_local; the fit
+// runs on the calling thread), the device Firth maps FirthPairOut's
+// strict / singular to it, the marker loops count it per trait and -- config
+// key outputFirthStatus, default false -- print it as a column.
+enum FirthStatus : unsigned char {
+    FIRTH_NONE      = 0,   // no Firth fit for the row
+    FIRTH_CONVERGED = 1,   // stopped on the tolerances (strict)
+    FIRTH_MAXIT     = 2,   // stopped at maxit; isfirthconverge is still true, as in R
+    FIRTH_SINGULAR  = 3    // the information matrix could not be inverted; isfirthconverge false
+};
+extern thread_local unsigned char g_firthLastStatus;
+inline const char* firthStatusName(unsigned char s) {
+    switch (s) {
+        case FIRTH_CONVERGED: return "converged";
+        case FIRTH_MAXIT:     return "maxit";
+        case FIRTH_SINGULAR:  return "singular";
+        default:              return "not_fitted";
+    }
+}
+// Per-trait counts of the three exits, next to mFirth / mFirthConverge.
+struct FirthStatusCounts {
+    int strict = 0, maxit = 0, singular = 0;
+};
+
 
 namespace SAIGE{
 

@@ -677,6 +677,9 @@ std::vector<Section> step2_sections() {
       }, true));
   md.flags.push_back(F("is_output_moreDetails", Kind::Bool, "", "",
       "extra output columns", "isMoreOutput"));
+  md.flags.push_back(F("outputFirthStatus", Kind::Bool, "", "",
+      "binary traits: a Firth.Status column (not_fitted / converged / maxit / singular) after Is.SPA",
+      "outputFirthStatus", true));
   md.flags.push_back(FX("is_overwrite_output", Kind::Bool, "", "TRUE",
       "FALSE: refuse to run when a result file exists",
       [](Ctx& c, const std::string& v) { c.overwriteOutput = bool_of("is_overwrite_output", v); }));

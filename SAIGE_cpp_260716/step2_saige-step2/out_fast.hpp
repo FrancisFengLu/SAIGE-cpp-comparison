@@ -160,6 +160,10 @@ struct TraitCols {
     const std::vector<double>*        pvalNARaw     = nullptr;
     const std::vector<unsigned char>* pvalNARawKind = nullptr;
     const std::vector<char>*        isSPAConverge = nullptr;   // 0/1
+    // outputFirthStatus (TraitMeta::outputFirthStatus, binary traits): the
+    // Firth.Status column, saige_test.hpp FirthStatus per row; null = every
+    // row not_fitted.
+    const std::vector<unsigned char>* firthStatus = nullptr;
     const std::vector<double>*      Beta_c      = nullptr;
     const std::vector<double>*      seBeta_c    = nullptr;
     const std::vector<double>*      Tstat_c     = nullptr;

@@ -112,6 +112,10 @@ struct TraitMeta {
     bool   flagSparseGRM   = false;
     bool   isCondition     = false;
     bool   isMoreOutput    = false;
+    // Config key outputFirthStatus (default false): a Firth.Status column after
+    // Is.SPA for binary traits (saige_test.hpp FirthStatus). The output
+    // writers (out_fast.hpp) branch on this like on isMoreOutput.
+    bool   outputFirthStatus = false;
     bool   locoApplied     = false;   // did this trait really read chr<N>/ ?
     bool   batchable = false;         // static gating result, design section 3.1
     int    outIdx = 0;                // position in the config's `models:` order
