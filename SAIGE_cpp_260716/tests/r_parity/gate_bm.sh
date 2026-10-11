@@ -5,7 +5,7 @@
 #   and vs the base binary's GPU multi-trait (host tail). Route bytes of the two GPU runs are compared too.
 set -u
 NEW=$1; BASE=$2
-B=/opt/saige/logs/ownstats/bm
+B=${OWNB:-/opt/saige/logs/ownstats/bm}
 D=/opt/saige/data/bingpu_test
 source /opt/saige/logs/tg2_step2/scripts/env_cpp.sh
 export OPENBLAS_NUM_THREADS=1

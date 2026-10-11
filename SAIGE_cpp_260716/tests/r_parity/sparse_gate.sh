@@ -5,7 +5,7 @@
 set -u
 BIN=$1
 D=/opt/saige/data/bingpu_test
-S=/opt/saige/logs/gpuprep/sparse
+S=${SPARSEB:-/opt/saige/logs/gpuprep/sparse}
 source /opt/saige/logs/tg2_step2/scripts/env_cpp.sh
 export OPENBLAS_NUM_THREADS=1
 log(){ echo "$(date '+%F %T') $*"; }

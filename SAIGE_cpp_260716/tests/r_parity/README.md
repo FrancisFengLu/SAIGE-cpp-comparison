@@ -81,6 +81,25 @@ The fast-test recompute on the device (branch `fastrecomp`, write-up `S2_FASTREC
 - `timing_fastrecomp.sh` — g200k P = 128 (one sample list) with `isFastTest: true`, before (gpuprep) vs
   after, one run each, hot cache (not timing grade): the host tail and the fast-test lines.
 
+The Firth-status gate (branch `integrate`; the `Firth.Status` column of `outputFirthStatus`, the
+per-trait `Firth fits:` counts, R's behaviour at maxit, Is.SPA on the exact-test rows):
+
+- `gen_firthstress.py OUTDIR` -- firthstress: N = 20,000, 2,000 common + 5,000 rare (MAC 1..30)
+  markers, 8 binary traits with 86-272 cases (b7 / b8 with their own missing phenotypes), 40% of
+  the rare markers with carriers drawn from one trait's cases (quasi-separation).
+- `r_runs_firth.sh` -- R step 1 (b1..b8) and R step 2 with `--is_Firth_beta=TRUE --pCutoffforFirth=0.05`.
+- `cpp_runs_firth.sh <bin>` -- the same models and settings with `outputFirthStatus: true` on the
+  CPU single-trait, CPU multi-trait, GPU fp64 and GPU `gpuPrecisionFirth: fp32` paths, the GPU run
+  as `.sgs` (converted back), and single-trait runs without the switch (the default format).
+- `firth_table.py` -- the counts per path and R's, the per-row status across paths, BETA / SE vs R
+  on the converged and the maxit rows separately (sign flips), fp32 vs fp64 likewise, Is.SPA on the
+  MAC <= 4 rows vs R, the default header vs R's. Paths: FIRTHB (default
+  /opt/saige/logs/integrate/firth).
+
+Environment overrides so the gates can run into another root without touching the branches'
+stored outputs: `RDEF`, `GPB` (as above), `OWNB` (gate_bm.sh / bm_table.py), `SPARSEB`
+(sparse_gate.sh / sparse_table.py), `CMP_R` (the comparator path of the tables).
+
 Covariate count on the device SPA / Firth (branch `covlimit`, write-up `S2_COVLIMIT.md`): the device
 SPA (lib and own, fp64 and fp32), the device Firth (fp64 and fp32) and the own-list device statistics
 take up to 64 covariate columns incl. the intercept (were 8 / 8 / 32).

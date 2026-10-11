@@ -5,7 +5,7 @@ and the multi-trait / GPU paths against the single-trait path (worst over the tr
 marker counts, and the device log lines. Paths: GPB (default /opt/saige/logs/gpuprep)."""
 import sys, os, json, subprocess, re
 B = os.environ.get("GPB", "/opt/saige/logs/gpuprep")
-CMP = "/opt/saige/logs/rdefaults/cmp_r.py"
+CMP = os.environ.get("CMP_R", "/opt/saige/logs/rdefaults/cmp_r.py")
 BIN = ["b%d" % k for k in range(1, 17)]; QNT = ["q%d" % k for k in range(1, 17)]
 SP = ["b1", "b2", "b3", "b4", "q1", "q2", "q3", "q4"]
 cases = [("fam32", "def", BIN + QNT), ("fam32", "adj", BIN + QNT), ("fam32", "defF", BIN), ("fam32", "adjF", BIN),

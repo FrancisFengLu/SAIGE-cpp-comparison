@@ -4,8 +4,8 @@ Per configuration (worst over the 8 traits): the new binary's GPU multi-trait ru
 runs, and vs the base (origin/rdefaults) binary's GPU multi-trait run (host tail); plus the route-byte
 comparison of the two GPU runs and the device-stats log lines."""
 import os, sys, json, subprocess, glob
-B = "/opt/saige/logs/ownstats/bm"
-CMP = "/opt/saige/logs/ownstats/rparity/cmp_r.py"
+B = os.environ.get("OWNB", "/opt/saige/logs/ownstats/bm")
+CMP = os.environ.get("CMP_R", "/opt/saige/logs/ownstats/rparity/cmp_r.py")
 traits = ["bm%d" % k for k in range(1, 9)]
 cfgs = ["def", "defF", "adj", "adjF"]
 def cmp(a, b, label):

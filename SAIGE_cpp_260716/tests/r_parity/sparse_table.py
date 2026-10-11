@@ -2,9 +2,9 @@
 """sparse_table.py: every case under /opt/saige/logs/gpuprep/sparse, the GPU run against the CPU run of the
 same binary (block inverse), worst over the traits; route bytes compared exactly; the device log lines."""
 import os, sys, json, subprocess, struct, math, re
-S = "/opt/saige/logs/gpuprep/sparse"
+S = os.environ.get("SPARSEB", "/opt/saige/logs/gpuprep/sparse")
 GD = os.environ.get("GDIR", "gpu")
-CMP = "/opt/saige/logs/rdefaults/cmp_r.py"
+CMP = os.environ.get("CMP_R", "/opt/saige/logs/rdefaults/cmp_r.py")
 def cmp(a, b, label):
     if not (os.path.exists(a) and os.path.exists(b)): return None
     return json.loads(subprocess.check_output([sys.executable, CMP, a, b, "--label", label, "--json"]).decode())
