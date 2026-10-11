@@ -192,6 +192,8 @@ struct PrepTrait {
     int single = 0;         // the table has one entry: always vr[0]
     int vrOff = 0;          // consts: the active table (nCat entries)
     int vrSpOff = -1;       // consts: the sparse table (nCat entries), -1 = none
+    int vrAdjOff = -1;      // consts: the null (covariate-adjusted, dense) table (nCat entries) for the
+                            // fast-test recompute of an isnoadjCov trait (StatsTrait::fastRc), -1 = none
     int catMinOff = 0;      // consts: cateVarRatioMinMACVecExclude (nCat)
     int catMaxOff = 0;      // consts: cateVarRatioMaxMACVecInclude (nCat)
     int nCat = 0;
@@ -359,6 +361,21 @@ int         deviceSets(const Reducer* t_r);
 // call adds that sample's row of B1 (kept row-major on the device for this)
 // into a K1-wide sum (miss_sums, same column indexing as C1).
 //
+// The fast-test recompute (StatsTrait::fastRc, StatsArgs::fastRecompute):
+// with isFastTest and isnoadjCov, the scalar path rescored a pair whose
+// first-pass p is below pval_cutoff_for_fastTest (binary: MAC above the ER
+// cutoff) with the covariate-adjusted statistic above and the NULL
+// variance-ratio table (R's mainMarkerInCPP: isnoadjCov_cur = false, and
+// flagSparseGRM_cur = false when the MAC is above the sparse category -- or
+// there is no sparse GRM). The kernel forms that statistic for exactly the
+// pairs it flagged STATS_FAST, from the same C1 / C2 columns, with var1 from
+// the null table of the pair's MAC category (PrepTrait::vrAdjOff), and its
+// p and SPA / Firth gate bits (no fast bit: the recompute is not retested),
+// into the statsRc* buffers; a pair without one carries STATS_HOST there.
+// The host then routes it (SPA / Firth on the device) as the scalar path
+// routes its recompute; a pair whose recompute context is the sparse
+// variance takes the sparse kernel's result instead (below).
+//
 // Sparse-GRM traits (StatsSparse, statsSparseSetup): a second kernel, run
 // after the cross-term kernel (gpu_sparse.hpp), forms the exact sparse
 // statistic of SAIGEClass::scoreTest with z = XV g (s2_gpu_sparse.hpp):
@@ -400,6 +417,8 @@ struct StatsTrait {
     int isFirth = 0;        // is_Firth_beta
     int isFast = 0;         // isFastTest
     int noadj = 0;          // isnoadjCov: the centred score, no covariate block
+    int fastRc = 0;         // isnoadjCov and isFastTest: the covariate-adjusted recompute of the pairs
+                            // flagged STATS_FAST (needs rowZ / rowW / xvxOff / saOff and PrepTrait::vrAdjOff)
     double tau0 = 1.0, spaCut = 2.0, firthCut = 0.0, fastCut = 0.0;
     double sumR = 0.0;      // sum res (isnoadjCov, own)
     double sumM = 0.0;      // sum mu2 (binary) / n_t (quantitative) (isnoadjCov, own)
@@ -421,6 +440,8 @@ struct StatsArgs {
     // doubles on the device) and the missing-cell sums, and run miss_sums
     // before the stats kernel. Needs the FP64 scan and PrepArgs::perTrait.
     int ownSets = 0;
+    // Some trait has fastRc = 1: allocate the recompute buffers (statsRc*).
+    int fastRecompute = 0;
 };
 // Allocate the buffers and upload the constants; from then on every reduce()
 // also runs the stats kernel. false (with statsLastError()) on failure.
@@ -435,6 +456,15 @@ const double*        statsS(const Reducer* t_r, int t_devSet = -1);
 const double*        statsVar2(const Reducer* t_r, int t_devSet = -1);
 const double*        statsP(const Reducer* t_r, int t_devSet = -1);
 const unsigned char* statsFlags(const Reducer* t_r, int t_devSet = -1);
+// The fast-test recompute of the last reduce() (StatsArgs::fastRecompute),
+// same indexing: S, var2, the null-table variance ratio, p and the flags
+// (STATS_HOST where the kernel formed no recompute for the pair). nullptr
+// without fastRecompute.
+const double*        statsRcS(const Reducer* t_r, int t_devSet = -1);
+const double*        statsRcVar2(const Reducer* t_r, int t_devSet = -1);
+const double*        statsRcVr(const Reducer* t_r, int t_devSet = -1);
+const double*        statsRcP(const Reducer* t_r, int t_devSet = -1);
+const unsigned char* statsRcFlags(const Reducer* t_r, int t_devSet = -1);
 // Cumulative kernel + D2H seconds of the stats stage, for the breakdown line.
 double statsSeconds(const Reducer* t_r);
 

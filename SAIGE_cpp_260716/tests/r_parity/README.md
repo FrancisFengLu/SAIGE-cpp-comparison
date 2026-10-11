@@ -66,3 +66,17 @@ statistic on the device (branch `gpuprep`, write-up `S2_GPUPREP.md`):
   runs with 128 distinct sample lists (not a consistent fit; timing only).
 - `timing_gpuprep.sh` — g200k P = 128 (same list / 4 lists / 128 lists) and the quantitative
   sparse first pass, before (ownstats) vs after.
+
+The fast-test recompute on the device (branch `fastrecomp`, write-up `S2_FASTRECOMP.md`):
+
+- `r_runs_fast.sh` — R step 2 with `--is_fastTest=TRUE` on audit / bvs / qt12 (`RDEF`) and fam32 (`GPB`):
+  `defT` = R defaults + fast test, `defTF` = + Firth, `adjT` / `adjTF` = `is_noadjCov FALSE` + mean (+ Firth);
+  without a sparse GRM R turns the fast test off under `is_noadjCov FALSE`, so adjT = adj there.
+- `cpp_fast_runs.sh <bin> <OUT>` — the single-trait scalar path and the GPU multi-trait path of one binary
+  on the same datasets x configurations, plus fam32sp (sparse GRM) x defT / adjT / defTF;
+  `gate_table_fast.py <OUT>` prints the tables (vs R, vs single, marker counts, the device log lines with
+  the dense recompute pairs finished on the device and the hand-backs by reason).
+- `gate_fastrecomp.sh` — the driver: the fast-test runs, the default configurations byte-compared with the
+  gpuprep outputs, the bingpu_test sparse cases (GPU only, `GDIR=gpu_fastrecomp`), the tables.
+- `timing_fastrecomp.sh` — g200k P = 128 (one sample list) with `isFastTest: true`, before (gpuprep) vs
+  after, one run each, hot cache (not timing grade): the host tail and the fast-test lines.
