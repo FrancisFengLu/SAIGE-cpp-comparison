@@ -105,18 +105,21 @@ firth_pairs_f32(const unsigned char* __restrict__ packed, std::size_t bpv, const
         const float* xv  = XV + (std::size_t)t * traitStride;   // sample i: xv[i*p + j]
         const float* xx  = XX + (std::size_t)t * traitStride;   // xx[j*N + i]
 
-        // pass A: b = XV g over carriers
-        float as[FIRTH_PMAX], ac[FIRTH_PMAX];
-        for (int j = 0; j < FIRTH_PMAX; ++j) { as[j] = 0.f; ac[j] = 0.f; }
-        for (int i = threadIdx.x; i < N; i += NT) {
-            const float g = in(i) ? dose32(col, L, i) : 0.f;
-            if (g == 0.f) continue;
-            const float* x = xv + (std::size_t)i * p;
-            for (int j = 0; j < p; ++j) nadd(as[j], ac[j], x[j] * g);
-        }
-        for (int j = 0; j < p; ++j) {
-            const double s = blockSum((double)as[j] + (double)ac[j], sh);
-            if (threadIdx.x == 0) bsh[j] = (float)s;
+        // pass A: b = XV g over carriers, FIRTH_PTILE columns per pass
+        for (int j0 = 0; j0 < p; j0 += FIRTH_PTILE) {
+            const int pt = (p - j0 < FIRTH_PTILE) ? p - j0 : FIRTH_PTILE;
+            float as[FIRTH_PTILE], ac[FIRTH_PTILE];
+            for (int j = 0; j < FIRTH_PTILE; ++j) { as[j] = 0.f; ac[j] = 0.f; }
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const float g = in(i) ? dose32(col, L, i) : 0.f;
+                if (g == 0.f) continue;
+                const float* x = xv + (std::size_t)i * p + j0;
+                for (int j = 0; j < pt; ++j) nadd(as[j], ac[j], x[j] * g);
+            }
+            for (int j = 0; j < pt; ++j) {
+                const double s = blockSum((double)as[j] + (double)ac[j], sh);
+                if (threadIdx.x == 0) bsh[j0 + j] = (float)s;
+            }
         }
         __syncthreads();
         // pass B: g~ = g - XXVX_inv b

@@ -419,8 +419,9 @@ prep_pairs(const uint32_t* __restrict__ cnt, int nMask, int nS, int N, int P,
 // ---------------------------------------------------------------------------
 // Register buffer for the covariate block of one pair; a trait with more
 // covariates than this reads its Z / W columns from C1 again per use
-// (correct, slower).
-constexpr int STATS_REG_P = 32;
+// (correct, slower). An own-list trait needs the buffer (its columns are
+// remapped in place), so STATS_REG_P is also the own-list maximum.
+constexpr int STATS_REG_P = 64;
 
 // Missing-cell sums of a slot (StatsArgs::ownSets): for every slot some pair
 // of which has d != 0 or q != 0, C3(slot, k) = sum over the slot's missing
@@ -1492,7 +1493,7 @@ bool statsSetup(Reducer* r, const StatsArgs& a)
         }
         if (t.own) {
             if (!a.ownSets || !r->perTrait) { statsErr = "own-list trait without ownSets / perTrait"; return false; }
-            if (t.p > STATS_REG_P) { statsErr = "own-list trait with more than 32 covariates"; return false; }
+            if (t.p > STATS_REG_P) { statsErr = "own-list trait with more than " + std::to_string(STATS_REG_P) + " covariates"; return false; }
             if (cov && (a.consts == nullptr || t.sumAOff < 0 || t.sumAOff + t.p > a.nConsts ||
                         t.sumWOff < 0 || t.sumWOff + t.p > a.nConsts)) {
                 statsErr = "trait sumA / sumW offsets outside the constants"; return false;

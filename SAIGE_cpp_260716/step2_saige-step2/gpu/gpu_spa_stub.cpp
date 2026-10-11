@@ -14,6 +14,7 @@ SpaPairOut* spaOut(Spa*)                                 { return nullptr; }
 bool        spaRun(Spa*, const Reducer*, int, int)            { return false; }
 void        spaTimings(const Spa*, double*, long long*)  {}
 std::size_t spaDeviceBytes(const Spa*)                   { return 0; }
+const char* spaLastError()                               { return "built without CUDA"; }
 
 }  // namespace gpu2
 }  // namespace saige

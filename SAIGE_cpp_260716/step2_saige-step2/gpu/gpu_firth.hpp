@@ -75,7 +75,7 @@ struct FirthTraitArgs {
     const double* offset   = nullptr;   // N
     const double* XV       = nullptr;   // p x N column-major
     const double* XXVX_inv = nullptr;   // N x p column-major
-    int p = 0;                          // covariate count incl. intercept, <= FIRTH_PMAX
+    int p = 0;                          // covariate count incl. intercept, 1..FIRTH_PMAX
     // FirthCreateArgs::ownSamples only: the trait's samples among the N (1 bit
     // per sample, bit i of word i >> 6); nullptr = all. y / offset / XV /
     // XXVX_inv are embedded at N with zeros outside; a sample outside the
@@ -83,7 +83,12 @@ struct FirthTraitArgs {
     const uint64_t* mask   = nullptr;
 };
 
-constexpr int FIRTH_PMAX = 8;
+// Covariate columns per trait, incl. the intercept. The kernel's only per-p
+// storage is the block's shared copy of b = XV g (FIRTH_PMAX doubles / floats);
+// pass A forms b FIRTH_PTILE columns at a time (gpu_firth.cu), so p does not
+// touch the register budget. firthCreate() refuses a trait with p > FIRTH_PMAX
+// (main.cpp then says so and keeps Firth on the CPU).
+constexpr int FIRTH_PMAX = 64;
 
 struct FirthCreateArgs {
     int device = 0;

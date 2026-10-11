@@ -3171,16 +3171,25 @@ bool mainMarkerMTGpu(
         std::cout << "  gpuSpa: gpuSpaImpl: own does not take per-trait sample lists "
                      "(gpuOwnSampleSets needs gpuSpaImpl: lib); SPA stays on the CPU scalar path" << std::endl;
     else if (anyBin && g_gpuSpa) {
+        // Both implementations take up to SPA_PMAX covariate columns per trait.
+        static_assert(saige::spa_gpu::PMAX == saige::gpu2::SPA_PMAX, "device SPA covariate maxima differ");
         std::vector<saige::gpu2::SpaTraitArgs> ta(nBin);
         muCopy.resize(nBin);
         bool ok = true;
+        std::string why;
         for (int t : binTraits) {
             const int b = ctx.meta[t].binIdx;
             SAIGE::SAIGEClass* obj = g_saigeObjs[t];
             obj->get_mu(muCopy[b]);
+            if (obj->m_p > saige::gpu2::SPA_PMAX) {
+                why = "trait '" + ctx.meta[t].name + "' has p = " + std::to_string(obj->m_p) +
+                      " covariate columns incl. the intercept; the device SPA takes at most " +
+                      std::to_string(saige::gpu2::SPA_PMAX);
+                ok = false; break;
+            }
             if (differ && ownS[t]) {
                 const arma::vec mu = muCopy[b];
-                if (obj->m_p > saige::gpu2::SPA_PMAX || !embedRows(t, b, mu)) { ok = false; break; }
+                if (!embedRows(t, b, mu)) { why = "trait '" + ctx.meta[t].name + "': a model's shape is unexpected"; ok = false; break; }
                 ta[b].mu = muCopy[b].memptr();
                 ta[b].XV = xvE[b].memptr();
                 ta[b].XXVX_inv = xxE[b].memptr();
@@ -3189,7 +3198,8 @@ bool mainMarkerMTGpu(
             }
             if ((int)muCopy[b].n_elem != n || (int)obj->m_XV.n_rows != obj->m_p ||
                 (int)obj->m_XV.n_cols != n || (int)obj->m_XXVX_inv.n_rows != n ||
-                (int)obj->m_XXVX_inv.n_cols != obj->m_p || obj->m_p > saige::gpu2::SPA_PMAX) {
+                (int)obj->m_XXVX_inv.n_cols != obj->m_p) {
+                why = "trait '" + ctx.meta[t].name + "': a model's shape is unexpected";
                 ok = false; break;
             }
             ta[b].mu = muCopy[b].memptr();
@@ -3224,9 +3234,10 @@ bool mainMarkerMTGpu(
             la.precision = g_precSPA;
             SL = saige::spa_gpu::create(la);
         }
-        if (SP == nullptr && SL == nullptr)
-            std::cout << "  gpuSpa: device setup failed (or a model's shape is unexpected); "
-                         "SPA stays on the CPU scalar path" << std::endl;
+        if (SP == nullptr && SL == nullptr) {
+            if (why.empty()) why = (g_gpuSpaImpl == "own") ? saige::gpu2::spaLastError() : saige::spa_gpu::lastError();
+            std::cout << "  gpuSpa: device setup failed (" << why << "); SPA stays on the CPU scalar path" << std::endl;
+        }
         else
             std::cout << "  gpuSpa: " << (SL ? "gpu/spa_gpu library" : "gpu/gpu_spa.cu kernel") << " (gpuSpaImpl: "
                       << g_gpuSpaImpl << "), " << nBin << " traits' mu / XV / XXVX_inv resident, "
@@ -3250,12 +3261,19 @@ bool mainMarkerMTGpu(
     if (anyBin && g_gpuFirth && spaDev) {
         std::vector<saige::gpu2::FirthTraitArgs> fa(nBin);
         bool ok = true, any = false;
+        std::string why;
         for (int t : binTraits) {
             const int b = ctx.meta[t].binIdx;
             SAIGE::SAIGEClass* obj = g_saigeObjs[t];
+            if (obj->m_p > saige::gpu2::FIRTH_PMAX) {
+                why = "trait '" + ctx.meta[t].name + "' has p = " + std::to_string(obj->m_p) +
+                      " covariate columns incl. the intercept; the device Firth takes at most " +
+                      std::to_string(saige::gpu2::FIRTH_PMAX);
+                ok = false; break;
+            }
             if (differ && ownS[t]) {
                 // embedded with the device SPA's setup (gpuFirth needs it)
-                if (mask1[b].empty() || obj->m_p > saige::gpu2::FIRTH_PMAX) { ok = false; break; }
+                if (mask1[b].empty()) { why = "trait '" + ctx.meta[t].name + "': a model's shape is unexpected"; ok = false; break; }
                 fa[b].y = yE[b].memptr(); fa[b].offset = offE[b].memptr();
                 fa[b].XV = xvE[b].memptr(); fa[b].XXVX_inv = xxE[b].memptr();
                 fa[b].p = obj->m_p;
@@ -3265,8 +3283,8 @@ bool mainMarkerMTGpu(
             }
             if ((int)obj->m_y.n_elem != n || (int)obj->m_offset.n_elem != n ||
                 (int)obj->m_XV.n_rows != obj->m_p || (int)obj->m_XV.n_cols != n ||
-                (int)obj->m_XXVX_inv.n_rows != n || (int)obj->m_XXVX_inv.n_cols != obj->m_p ||
-                obj->m_p > saige::gpu2::FIRTH_PMAX) {
+                (int)obj->m_XXVX_inv.n_rows != n || (int)obj->m_XXVX_inv.n_cols != obj->m_p) {
+                why = "trait '" + ctx.meta[t].name + "': a model's shape is unexpected";
                 ok = false; break;
             }
             fa[b].y = obj->m_y.memptr(); fa[b].offset = obj->m_offset.memptr();
@@ -3285,9 +3303,10 @@ bool mainMarkerMTGpu(
         }
         if (!any)
             std::cout << "  gpuFirth: no binary trait has is_Firth_beta; nothing to do" << std::endl;
-        else if (FP == nullptr)
-            std::cout << "  gpuFirth: device setup failed (or a model's shape is unexpected); "
-                         "Firth stays on the CPU scalar path" << std::endl;
+        else if (FP == nullptr) {
+            if (why.empty()) why = saige::gpu2::firthLastError();
+            std::cout << "  gpuFirth: device setup failed (" << why << "); Firth stays on the CPU scalar path" << std::endl;
+        }
         else
             std::cout << "  gpuFirth: " << nBin << " traits' y / offset / XV / XXVX_inv resident, "
                       << (saige::gpu2::firthDeviceBytes(FP) >> 20) << " MiB, step cap " << g_gpuFirthMaxStep

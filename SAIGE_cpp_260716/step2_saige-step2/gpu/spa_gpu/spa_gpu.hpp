@@ -133,7 +133,11 @@ namespace spa_gpu {
 
 struct Spa;   // opaque; defined in spa_gpu.cu
 
-constexpr int PMAX = 8;   // covariate columns per trait, incl. intercept
+// Covariate columns per trait, incl. the intercept. The kernel's only per-p
+// storage is the block's shared copy of b = XV g (PMAX doubles, plus hi / lo
+// floats for FP32); pass A forms b PTILE columns at a time (spa_gpu.cu), so p
+// does not touch the register budget. create() refuses a trait with p > PMAX.
+constexpr int PMAX = 64;
 
 // Per-trait null-model pieces, host pointers, copied at create().
 struct TraitArgs {

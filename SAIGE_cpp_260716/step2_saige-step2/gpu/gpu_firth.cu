@@ -25,6 +25,12 @@ namespace {
 
 #define NT 256
 #define NACC 9
+// Covariate columns of b = XV g formed per pass over the samples (pass A):
+// FIRTH_PTILE per-thread accumulators, p / FIRTH_PTILE passes. One pass for
+// p <= FIRTH_PTILE, which is the loop as it was before p > 8 was allowed; for
+// any p, column j is summed over the same samples in the same order, so b
+// does not depend on the tiling.
+constexpr int FIRTH_PTILE = 8;
 
 thread_local std::string lastErrFirth;
 #define CKF(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -137,18 +143,22 @@ firth_pairs(const unsigned char* __restrict__ packed, std::size_t bpv, const dou
         const double* xv  = XV  + (std::size_t)t * traitStride;   // sample i: xv[i*p + j]
         const double* xx  = XX  + (std::size_t)t * traitStride;   // xx[j*N + i]
 
-        // pass A: b = XV g over carriers (getadjGFast's loop over iIndex)
-        double a[FIRTH_PMAX];
-        for (int j = 0; j < FIRTH_PMAX; ++j) a[j] = 0.0;
-        for (int i = threadIdx.x; i < N; i += NT) {
-            const double g = in(i) ? dose(col, L, i) : 0.0;
-            if (g == 0.0) continue;
-            const double* x = xv + (std::size_t)i * p;
-            for (int j = 0; j < p; ++j) a[j] += x[j] * g;
-        }
-        for (int j = 0; j < p; ++j) {
-            const double s = blockSum(a[j], sh);
-            if (threadIdx.x == 0) bsh[j] = s;
+        // pass A: b = XV g over carriers (getadjGFast's loop over iIndex),
+        // FIRTH_PTILE columns per pass
+        for (int j0 = 0; j0 < p; j0 += FIRTH_PTILE) {
+            const int pt = (p - j0 < FIRTH_PTILE) ? p - j0 : FIRTH_PTILE;
+            double a[FIRTH_PTILE];
+            for (int j = 0; j < FIRTH_PTILE; ++j) a[j] = 0.0;
+            for (int i = threadIdx.x; i < N; i += NT) {
+                const double g = in(i) ? dose(col, L, i) : 0.0;
+                if (g == 0.0) continue;
+                const double* x = xv + (std::size_t)i * p + j0;
+                for (int j = 0; j < pt; ++j) a[j] += x[j] * g;
+            }
+            for (int j = 0; j < pt; ++j) {
+                const double s = blockSum(a[j], sh);
+                if (threadIdx.x == 0) bsh[j0 + j] = s;
+            }
         }
         __syncthreads();
         // pass B: g~ = g - XXVX_inv b
@@ -260,7 +270,11 @@ Firth* firthCreate(const FirthCreateArgs& a)
     if (cudaSetDevice(a.device) != cudaSuccess) return nullptr;
     int pMax = 0;
     for (int t = 0; t < a.nTraits; ++t) {
-        if (a.traits[t].p <= 0 || a.traits[t].p > FIRTH_PMAX) return nullptr;
+        if (a.traits[t].p <= 0 || a.traits[t].p > FIRTH_PMAX) {
+            lastErrFirth = "trait " + std::to_string(t) + " has p = " + std::to_string(a.traits[t].p) +
+                           " covariate columns; the device Firth takes 1.." + std::to_string(FIRTH_PMAX);
+            return nullptr;
+        }
         if (!a.traits[t].y || !a.traits[t].offset || !a.traits[t].XV || !a.traits[t].XXVX_inv) return nullptr;
         if (a.traits[t].p > pMax) pMax = a.traits[t].p;
     }
