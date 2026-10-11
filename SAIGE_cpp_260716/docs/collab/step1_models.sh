@@ -5,9 +5,11 @@
 #       otherwise built from STEP1_BFILE on all .fam samples (step 1, make_sparse_grm_only)
 #   (1) full-GRM null model, all BIN_TRAITS in one multi-trait run   -> $OUT_ROOT/step1/full/
 #   (2) sparse-GRM null model, all BIN_TRAITS in one multi-trait run -> $OUT_ROOT/step1/sparse/
-#   (3) $OUT_ROOT/step1/sparse_nofast/: the same sparse models with isFastTest = false. Not a
-#       new fit: symlinks to (2) plus a copy of nullmodel.json with the flag changed (step 2 reads
-#       the fast-test switch from the model; step 1 stores it and does not use it).
+#   (3) $OUT_ROOT/step1/sparse_nofast/: the same sparse models with isFastTest = false in
+#       nullmodel.json. Not a new fit: symlinks to (2) plus a copy of nullmodel.json with the
+#       flag changed. Step 2 no longer reads that flag from the model (it has its own
+#       isFastTest, R's default false; run_matrix.sh writes it per cell), so this view only
+#       keeps the recorded copy consistent with what the cell runs.
 # Step-2 cells with P = 1, 8, 32, ... use the first P traits of BIN_TRAITS from these models.
 #
 # Environment (required): OUT_ROOT, STEP1_BFILE (genome-wide PLINK prefix used for the GRM),

@@ -226,12 +226,22 @@ and a few rare-case traits first. Any order is fine as long as it is recorded
    `RELATEDNESS_CUTOFF`, default 0.05).
 
 The step-2 runs with P = 1, 8, 32 reuse **subsets of the same models** (the first P
-traits). **Fast test on/off needs no separate null model**: in this code step 2
-reads the fast-test switch from the model (`isFastTest` in `nullmodel.json`) and
-step 1 only stores it, so the script makes a second view of the sparse models
-(`step1/sparse_nofast/`: links to the same files, `nullmodel.json` with
-`isFastTest: false`). We checked on simulated data that step 2 on this view gives
-byte-identical results to step 2 on a separate step-1 fit with `fast_test: false`.
+traits). **Fast test on/off needs no separate null model**: the fast test is a
+step-2 setting (`isFastTest`, R's `--is_fastTest`; step 1 records a copy in
+`nullmodel.json` that step 2 does not read), and `run_matrix.sh` writes it into
+each cell's config (`true` for `sparse_fast`, `false` otherwise). The script still
+makes the `step1/sparse_nofast/` view (links to the same files, `nullmodel.json`
+with `isFastTest: false`) so the recorded copy matches what the cell runs. We
+checked on simulated data that step 2 with `isFastTest: false` on the sparse
+models gives byte-identical results to step 2 on a separate step-1 fit with
+`fast_test: false`.
+
+Step 2's defaults are R SAIGE 1.5.2's (`LOCO` true, `is_noadjCov` true,
+`impute_method` best_guess, `isFastTest` false, `is_Firth_beta` false), so every
+cell config writes its test settings out: `LOCO: false`, `isnoadjCov: false`,
+`impute_method: mean`, `isFastTest` per cell, `is_Firth_beta` per cell,
+`pCutoffforFirth: 0.01`, `SPA_Cutoff: 2`, `MACCutoffforER: 4`,
+`relatednessCutoff: 0`; the R jobs get the same flags.
 
 Models are fitted without LOCO (`loco: false`); step 2 tests one chromosome with
 the whole-genome model.
@@ -317,8 +327,9 @@ processes at once. R's own `--nThreads` is not used (in 1.5.2 it only acts toget
 with `--idstoIncludeFile`, splits that marker list over forked processes, and the
 concatenated output can lose rows and run two rows together). The R options match ours: `minMAC`
 1, `maxMissing` 0.15, `SPAcutoff` 2, `max_MAC_for_ER` 4, `pCutoffforFirth` 0.01,
-`is_fastTest=FALSE`, `relatednessCutoff` 0, `LOCO=FALSE`, alt-first; sparse-GRM
-runs also get `--sparseGRMFile/--sparseGRMSampleIDFile` (the files step 1 used).
+`is_noadjCov=FALSE`, `impute_method=mean`, `is_fastTest=FALSE`, `relatednessCutoff` 0,
+`LOCO=FALSE`, alt-first; sparse-GRM runs also get
+`--sparseGRMFile/--sparseGRMSampleIDFile` (the files step 1 used).
 
 ### What each run does
 

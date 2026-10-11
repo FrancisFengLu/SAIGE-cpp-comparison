@@ -136,8 +136,11 @@ mdir() { case $1 in sparse_fast) echo sparse;; *) echo "$1";; esac; }   # model 
 free_gb() { df -Pk "$OUT_ROOT" | awk 'NR==2{print int($4/1048576)}'; }
 
 write_cfg() {   # dir P grm firth geno path extra
-  local d=$1 P=$2 g=$3 f=$4 geno=$5 pth=$6 extra=$7 F=false GPUV=false
-  [ "$f" = 1 ] && F=true; [ "$pth" = gpu ] && GPUV=true
+  local d=$1 P=$2 g=$3 f=$4 geno=$5 pth=$6 extra=$7 F=false GPUV=false FAST=false
+  [ "$f" = 1 ] && F=true; [ "$pth" = gpu ] && GPUV=true; [ "$g" = sparse_fast ] && FAST=true
+  # Step 2's defaults are R's (LOCO true, is_noadjCov true, best_guess, fast test off, Firth
+  # off); every test setting is written out, and the fast test is a step-2 setting (the
+  # model's copy is not read), so sparse_fast / sparse_nofast differ here, not in the model.
   {
     case $geno in
       bed)  printf 'genoType: plink\nplinkFile: %s\nAlleleOrder: alt-first\n' "$GENO" ;;
@@ -149,9 +152,13 @@ minMAF: 0
 minMAC: $MIN_MAC
 maxMissRate: 0.15
 LOCO: false
+isnoadjCov: false
+impute_method: mean
+isFastTest: $FAST
 isFirth: $F
 is_Firth_beta: $F
 pCutoffforFirth: 0.01
+SPA_Cutoff: 2
 MACCutoffforER: 4
 relatednessCutoff: 0
 nThreads: $NTHREADS

@@ -194,7 +194,14 @@ When to use which:
 | `outputFormat: text` or `sgs` | yes | |
 | conditional analysis (`condition`) | no | CPU |
 | `isnoadjCov: true` (the default) and `false` | yes | the per-pair statistics on the device take either form |
+| `isFastTest: true` | yes | the first pass, and the covariate-adjusted recompute of the pairs below `pval_cutoff_for_fastTest` (with the sparse GRM's variance when the model has one), are both on the device |
+| up to 64 covariate columns incl. the intercept | yes | with more, the device SPA / Firth (and the own-list statistics) stay on the CPU; log: `gpuSpa: device setup failed (trait 'b1' has p = 70 covariate columns incl. the intercept; the device SPA takes at most 64); SPA stays on the CPU scalar path` |
+| `is_Firth_beta: true` | yes | the Firth fits run on the device (`gpuFirth`); the per-trait `Firth fits: N; strictly converged A, stopped at maxit (50) B, singular C` line and the optional `Firth.Status` column ([step2.md](step2.md#results)) are the same as on the CPU |
 | region / gene-based tests (`groupFile`) | no | CPU |
+
+The test settings and their defaults are the CPU path's, which are R SAIGE 1.5.2's
+([step2.md](step2.md#flags)): `LOCO` true, `isnoadjCov` true, `impute_method` best_guess,
+`isFastTest` false, `is_Firth_beta` false; the GPU path implements every one of them.
 
 ### Reading the log
 
@@ -207,6 +214,12 @@ Used (per trait, then totals):
 ```
 
 A few markers of a GPU run can go "via the scalar CPU path"; that is normal.
+With Firth on, each binary trait also prints R's `Firth approx was applied to N
+markers. M successfully converged.` and `Firth fits: N; strictly converged A,
+stopped at maxit (50) B, singular C` (R and the first line count a maxit exit as
+converged); with the fast test on, `fast-test recompute (dense, ...): N pairs
+finished on the device; M ... handed to the CPU scalar path (...)` says where
+the recompute ran.
 
 Not used — one line with the reason, then the run continues on the CPU:
 

@@ -69,6 +69,9 @@ say "step 1: $(grep -c '^Converged: yes' s1/full.log)/4 full-GRM and $(grep -c '
 for g in full sparse; do for p in cpu gpu; do
   d=s2/${g}_$p; mkdir -p "$d/out"
   { printf 'genoType: plink\nplinkFile: %s\nAlleleOrder: alt-first\nminMAF: 0\nminMAC: 1\n' "$W/data/geno"
+    # the test settings written out (step 2's defaults are R's: LOCO true, is_noadjCov true,
+    # best_guess, fast test off); these are the settings the recorded md5s were made with
+    printf 'LOCO: false\nisnoadjCov: false\nimpute_method: mean\nisFastTest: true\n'
     printf 'isFirth: true\nis_Firth_beta: true\npCutoffforFirth: 0.01\nnThreads: %s\nuseGPU: %s\nmodels:\n' "$NTHREADS" "$([ $p = gpu ] && echo true || echo false)"
     for t in b1 b2 b3 b4; do
       printf '  - {traitName: %s, modelFile: %s, varianceRatioFile: %s, outputFile: %s}\n' \

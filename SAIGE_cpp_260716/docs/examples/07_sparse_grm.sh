@@ -41,11 +41,14 @@ $SAIGE step1 \
   --outDir sparse/step1 > sparse/step1.log 2>&1
 grep -E "^Converged|\[sparse\] GRM" sparse/step1.log
 
-# (c) step 2
+# (c) step 2. Step 2 has its own test flags (R's defaults); the model's copy of
+# --is_fastTest is not read, so the fast test is asked for here again.
 $SAIGE step2 \
   --step1Dir sparse/step1 \
   --plinkFile data/geno \
   --minMAC 1 \
+  --LOCO=FALSE \
+  --is_fastTest=TRUE \
   --nThreads 8 \
   --useGPU \
   --outDir sparse/step2 > sparse/step2.log 2>&1

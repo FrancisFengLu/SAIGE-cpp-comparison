@@ -12,6 +12,8 @@ run() {   # run <name> <genotype flags...>
     --step1Dir step1_bin \
     --phenoCol b1,b2,b3 \
     --minMAC 1 \
+    --LOCO=FALSE \
+    --is_fastTest=FALSE \
     --nThreads 8 \
     --useGPU \
     --outDir formats/$N > formats_$N.log 2>&1

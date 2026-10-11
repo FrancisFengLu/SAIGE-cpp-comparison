@@ -103,6 +103,7 @@ flags, with R's defaults) and prints a note when the two differ.
 | `--outputFormat text\|sgs` [+] | `outputFormat` | text | sgs: binary columnar output, convert with `sgs2txt` (multi-trait or --useGPU runs) |
 | `--sgsPrecision fp64\|fp32` [+] | `sgsPrecision` | fp64 | width of the .sgs floating-point columns (fp32 is not exact) |
 | `--is_output_moreDetails[=TRUE\|FALSE]` | `isMoreOutput` | FALSE | extra output columns |
+| `--outputFirthStatus[=TRUE\|FALSE]` [+] | `outputFirthStatus` | FALSE | binary traits: a Firth.Status column (not_fitted / converged / maxit / singular) after Is.SPA |
 | `--is_overwrite_output[=TRUE\|FALSE]` | - (checked) | TRUE | FALSE: refuse to run when a result file exists |
 | `--markers_per_chunk N` | `marker_chunksize` | 10000 | markers per progress report |
 
@@ -283,7 +284,18 @@ Quantitative trait:
 
 - `Allele2` is the tested allele; `BETA` is its effect (log-odds for binary traits).
 - `p.value` is the p-value to use. For binary traits it is SPA-corrected when `Is.SPA` is `true`, and `BETA`/`SE` are Firth-corrected when p < `pCutoffforFirth`; `p.value.NA` is the uncorrected p-value.
+- `Is.SPA` is `true` when the SPA converged, and also on the exact-test rows (MAC ≤ `MACCutoffforER`
+  with |Tstat|/sqrt(var) > `SPA_Cutoff`) whose exact p-value was formed, as R SAIGE 1.5.2 prints it
+  (R 1.3.x printed `false` on those rows; the p-values are the same).
 - `--is_output_moreDetails=TRUE` (config `isMoreOutput: true`) adds `N_case_hom N_case_het N_ctrl_hom N_ctrl_het` (binary).
+- `--outputFirthStatus=TRUE` (config `outputFirthStatus: true`) adds `Firth.Status` after `Is.SPA`
+  (binary traits): `not_fitted`, `converged` (the Newton iteration met its tolerances), `maxit`
+  (it stopped at the 50th step; the printed `BETA` is that iterate, as in R) or `singular` (the
+  information matrix could not be inverted). R, and the `Firth approx was applied to N markers. M
+  successfully converged.` line, count a `maxit` fit as converged; the log's next line, `Firth
+  fits: N; strictly converged A, stopped at maxit (50) B, singular C`, is printed per trait on
+  every path whether or not the column is on. Off (the default) the columns are R's. The column
+  is in `.sgs` output too and `sgs2txt` reproduces it.
 
 ## YAML config
 
@@ -352,6 +364,7 @@ not in the model are ignored.
 - `useGPU` — use the GPU (default `false`). See [GPU](gpu.md) for the sub-switches and what is accepted.
 - `outputFormat` — `text` (default) or `sgs` (binary, see [below](#binary-output-sgs)).
 - `isMoreOutput` — extra columns (binary: hom/het counts in cases and controls). Default `false`.
+- `outputFirthStatus` — the `Firth.Status` column (binary traits; see [Results](#results)). Default `false`.
 - `LOCO`, `chrom` — see [LOCO](#loco).
 - `mtRequireSameSamples` — `true` stops the run when the models' sample lists differ (default `false`).
 

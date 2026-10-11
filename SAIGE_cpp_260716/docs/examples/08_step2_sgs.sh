@@ -12,8 +12,12 @@ $SAIGE step2 \
   --plinkFile data/geno \
   --minMAF 0 \
   --minMAC 1 \
+  --LOCO=FALSE \
   --is_Firth_beta=TRUE \
   --pCutoffforFirth 0.01 \
+  --is_noadjCov=TRUE \
+  --impute_method best_guess \
+  --is_fastTest=FALSE \
   --nThreads 8 \
   --useGPU \
   --outputFormat sgs \
